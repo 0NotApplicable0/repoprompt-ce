@@ -63,6 +63,11 @@ enum MCPClientIdentity {
         {
             return "antigravity-client"
         }
+        if matchesFamily(normalized, tokens: ["grok", "client"])
+            || matchesFamily(normalized, tokens: ["grok"])
+        {
+            return "grok-client"
+        }
         if matchesFamily(normalized, tokens: ["repoprompt", "cli"]) { return "repoprompt-cli" }
         return nil
     }
@@ -95,7 +100,8 @@ enum MCPClientIdentity {
     static func isHeadlessAgentClient(_ raw: String?) -> Bool {
         guard let family = canonicalFamilyID(raw) else { return false }
         switch family {
-        case "claude-code", "codex-mcp-client", "gemini-cli-mcp-client", "cursor", "antigravity-client":
+        case "claude-code", "codex-mcp-client", "gemini-cli-mcp-client", "cursor", "antigravity-client",
+             "grok-client":
             return true
         default:
             return false

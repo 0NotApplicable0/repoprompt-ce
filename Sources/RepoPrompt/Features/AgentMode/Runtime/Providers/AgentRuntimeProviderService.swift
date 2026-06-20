@@ -41,6 +41,7 @@ enum AgentProviderKind: String, CaseIterable, Hashable {
     case openCode
     case cursor
     case antigravity
+    case grok
     case claudeCodeGLM
     case kimiCode
     case customClaudeCompatible
@@ -50,6 +51,7 @@ enum AgentProviderKind: String, CaseIterable, Hashable {
     static let openCodeMCPClientID = "opencode"
     static let cursorMCPClientID = "cursor"
     static let antigravityMCPClientID = "antigravity-client"
+    static let grokMCPClientID = "grok-client"
 
     var commandName: String {
         switch self {
@@ -63,6 +65,8 @@ enum AgentProviderKind: String, CaseIterable, Hashable {
             "cursor-agent"
         case .antigravity:
             "agy"
+        case .grok:
+            "grok"
         }
     }
 
@@ -78,6 +82,8 @@ enum AgentProviderKind: String, CaseIterable, Hashable {
             "Cursor CLI"
         case .antigravity:
             "Antigravity CLI"
+        case .grok:
+            "Grok CLI"
         case .claudeCodeGLM:
             ClaudeCodeCompatibleBackendStore.shared.config(for: .glmZAI).normalizedDisplayName
         case .kimiCode:
@@ -99,6 +105,8 @@ enum AgentProviderKind: String, CaseIterable, Hashable {
             Self.cursorMCPClientID
         case .antigravity:
             Self.antigravityMCPClientID
+        case .grok:
+            Self.grokMCPClientID
         }
     }
 
@@ -108,7 +116,7 @@ enum AgentProviderKind: String, CaseIterable, Hashable {
             .openCode
         case .cursor:
             .cursor
-        case .claudeCode, .codexExec, .claudeCodeGLM, .kimiCode, .customClaudeCompatible, .antigravity:
+        case .claudeCode, .codexExec, .claudeCodeGLM, .kimiCode, .customClaudeCompatible, .antigravity, .grok:
             nil
         }
     }
@@ -117,7 +125,7 @@ enum AgentProviderKind: String, CaseIterable, Hashable {
         switch self {
         case .claudeCode, .claudeCodeGLM, .kimiCode, .customClaudeCompatible:
             true
-        case .codexExec, .openCode, .cursor, .antigravity:
+        case .codexExec, .openCode, .cursor, .antigravity, .grok:
             false
         }
     }
@@ -128,7 +136,7 @@ enum AgentProviderKind: String, CaseIterable, Hashable {
 
     var requiresExpectedPIDOwnedAgentModeMCPRouting: Bool {
         switch self {
-        case .claudeCode, .codexExec, .openCode, .cursor, .claudeCodeGLM, .kimiCode, .customClaudeCompatible, .antigravity:
+        case .claudeCode, .codexExec, .openCode, .cursor, .claudeCodeGLM, .kimiCode, .customClaudeCompatible, .antigravity, .grok:
             true
         }
     }
@@ -137,7 +145,7 @@ enum AgentProviderKind: String, CaseIterable, Hashable {
         switch self {
         case .cursor:
             false
-        case .claudeCode, .codexExec, .openCode, .claudeCodeGLM, .kimiCode, .customClaudeCompatible, .antigravity:
+        case .claudeCode, .codexExec, .openCode, .claudeCodeGLM, .kimiCode, .customClaudeCompatible, .antigravity, .grok:
             true
         }
     }
@@ -155,6 +163,8 @@ enum AgentProviderKind: String, CaseIterable, Hashable {
             return "Cursor CLI ACP agent. Uses Cursor's ACP runtime and injects RepoPrompt MCP tools through ACP session configuration."
         case .antigravity:
             return "Google's Antigravity CLI (agy), a Gemini-powered terminal coding agent. Runs headless one-shot prompts and uses RepoPrompt MCP tools."
+        case .grok:
+            return "xAI's Grok CLI (grok), a Grok-powered terminal coding agent. Runs headless one-shot prompts and uses RepoPrompt MCP tools."
         case .claudeCodeGLM:
             let config = ClaudeCodeCompatibleBackendStore.shared.config(for: .glmZAI)
             if case let .claudeSlotMapping(mapping) = config.modelBehavior {
@@ -189,6 +199,8 @@ enum AgentProviderKind: String, CaseIterable, Hashable {
             "cursor_acp"
         case .antigravity:
             "antigravity_native"
+        case .grok:
+            "grok_native"
         }
     }
 
@@ -202,7 +214,7 @@ enum AgentProviderKind: String, CaseIterable, Hashable {
             .kimi
         case .customClaudeCompatible:
             .customCompatible
-        case .codexExec, .openCode, .cursor, .antigravity:
+        case .codexExec, .openCode, .cursor, .antigravity, .grok:
             nil
         }
     }
@@ -232,7 +244,8 @@ final class AgentRuntimeProviderService {
         modelString: String? = nil,
         runType: AgentRunType = .discover,
         workspacePath: String? = nil,
-        antigravityPermissionLevel: AntigravityAgentToolPreferences.PermissionLevel? = nil
+        antigravityPermissionLevel: AntigravityAgentToolPreferences.PermissionLevel? = nil,
+        grokPermissionLevel: GrokAgentToolPreferences.PermissionLevel? = nil
     ) -> HeadlessAgentProvider {
         if Self.enableDebugLogging {
             Self.logger.debug("Creating provider for agent: \(agent.displayName), model: \(modelString ?? "default"), runType: \(String(describing: runType))")
@@ -328,6 +341,31 @@ final class AgentRuntimeProviderService {
                 Self.logger.debug("Created AntigravityAgentProvider")
             }
             return AntigravityAgentProvider(runner: runner, config: config, workspacePath: workspacePath)
+        case .grok:
+            // Real Agent Mode runs pass the session-resolved level (honoring Safe-Managed /
+            // per-provider overrides); discovery / no-session callers omit it and fall back to
+            // the user's global Grok permission preference.
+            let permissionLevel = grokPermissionLevel ?? GrokAgentToolPreferences.permissionLevel()
+            let config = GrokAgentConfig(
+                modelString: modelString,
+                useSandbox: permissionLevel.useSandbox,
+                dangerouslySkipPermissions: permissionLevel.dangerouslySkipPermissions,
+                enableDebugLogging: Self.enableDebugLogging
+            )
+            var processConfig = CLIProcessConfiguration(
+                command: config.commandName,
+                workingDirectory: workspacePath,
+                enableDebugLogging: Self.enableDebugLogging,
+                captureStdoutTailBytes: 0,
+                captureStderrTailBytes: 256 * 1024,
+                logStdinSampleBytes: 0
+            )
+            processConfig.ensureAdditionalPaths(config.additionalPathHints)
+            let runner = CLIProcessRunner(config: processConfig)
+            if Self.enableDebugLogging {
+                Self.logger.debug("Created GrokAgentProvider")
+            }
+            return GrokAgentProvider(runner: runner, config: config, workspacePath: workspacePath)
         }
     }
 }

@@ -22,6 +22,13 @@ enum CLILaunchProfiles {
         "~/.local/bin"
     ]
 
+    /// Grok CLI (`grok`) is typically installed into ~/.local/bin or a Homebrew
+    /// prefix on Unix; supplement the native defaults with these so the resolver
+    /// finds the binary regardless of the inherited child PATH.
+    static let grokProviderSpecificPaths: [String] = [
+        "~/.local/bin"
+    ]
+
     /// Preserve the committed Codex hint order exactly: shell/package-manager
     /// fallbacks first, then Codex.app resources. System bins are intentionally not
     /// added as supplemental hints because the resolver already searches the built
@@ -70,6 +77,12 @@ enum CLILaunchProfiles {
         commandName: "agy",
         preferredBasenames: ["agy"],
         supplementalSearchPaths: nativeDefaultsSupplemented(with: antigravityProviderSpecificPaths)
+    )
+
+    static let grok = CLILaunchProfile(
+        commandName: "grok",
+        preferredBasenames: ["grok"],
+        supplementalSearchPaths: nativeDefaultsSupplemented(with: grokProviderSpecificPaths)
     )
 
     static func nativeDefaultsSupplemented(with providerSpecificPaths: [String]) -> [String] {

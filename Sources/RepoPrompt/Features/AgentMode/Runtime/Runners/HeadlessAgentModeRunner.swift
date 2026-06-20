@@ -24,6 +24,7 @@ final class HeadlessAgentModeRunner {
         attachments: [AgentImageAttachment],
         workspacePath: String?,
         antigravityPermissionLevel: AntigravityAgentToolPreferences.PermissionLevel?,
+        grokPermissionLevel: GrokAgentToolPreferences.PermissionLevel?,
         makeLease: (_ runID: UUID) -> MCPBootstrapLease
     ) async {
         let attachmentReservationID = hooks.reserveAttachmentsForTurn(attachments, session)
@@ -79,7 +80,8 @@ final class HeadlessAgentModeRunner {
                 ? nil
                 : session.selectedModelRaw,
             workspacePath,
-            antigravityPermissionLevel
+            antigravityPermissionLevel,
+            grokPermissionLevel
         )
         session.provider = provider
         session.installRunAttemptTerminalResources(ownership: ownership) { terminalState in

@@ -1103,7 +1103,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         let provider = LifecycleBlockingHeadlessProvider(recorder: recorder)
         let harness = makeHarness(
             recorder: recorder,
-            headlessProviderFactory: { _, _, _, _ in provider }
+            headlessProviderFactory: { _, _, _, _, _ in provider }
         )
         let session = AgentModeViewModel.TabSession(tabID: UUID())
         session.selectedAgent = .cursor
@@ -1146,7 +1146,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         let provider = LifecycleBlockingHeadlessProvider(recorder: recorder)
         let harness = makeHarness(
             recorder: recorder,
-            headlessProviderFactory: { _, _, _, _ in provider }
+            headlessProviderFactory: { _, _, _, _, _ in provider }
         )
         let session = AgentModeViewModel.TabSession(tabID: UUID())
         session.selectedAgent = .cursor
@@ -1189,7 +1189,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         let provider = LifecycleBlockingHeadlessProvider(recorder: recorder)
         let harness = makeHarness(
             recorder: recorder,
-            headlessProviderFactory: { _, _, _, _ in provider }
+            headlessProviderFactory: { _, _, _, _, _ in provider }
         )
         let session = AgentModeViewModel.TabSession(tabID: UUID())
         session.selectedAgent = .cursor
@@ -1233,7 +1233,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         let provider = LifecycleBlockingHeadlessProvider(recorder: recorder)
         let harness = makeHarness(
             recorder: recorder,
-            headlessProviderFactory: { _, _, _, _ in provider }
+            headlessProviderFactory: { _, _, _, _, _ in provider }
         )
         let session = AgentModeViewModel.TabSession(tabID: UUID())
         session.selectedAgent = .cursor
@@ -1276,7 +1276,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
                 recorder: recorder,
                 cancelMCPTools: { _, _ in recorder.record("mcp-cancel") },
                 codexController: codexController,
-                headlessProviderFactory: { _, _, _, _ in headlessProvider }
+                headlessProviderFactory: { _, _, _, _, _ in headlessProvider }
             )
             let session = AgentModeViewModel.TabSession(tabID: UUID())
             session.runState = .running
@@ -1515,7 +1515,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
     ) -> LifecycleHarness {
         let codexController = codexController ?? LifecycleNoopCodexController(recorder: recorder)
         let claudeController = claudeController ?? LifecycleFakeNativeController(recorder: recorder)
-        let headlessProviderFactory = headlessProviderFactory ?? { _, _, _, _ in
+        let headlessProviderFactory = headlessProviderFactory ?? { _, _, _, _, _ in
             recorder.record("factory:headless")
             return LifecycleNoopHeadlessProvider()
         }

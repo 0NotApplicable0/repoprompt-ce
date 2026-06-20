@@ -47,7 +47,7 @@ final class AgentModeViewModel: ObservableObject {
         _ taskLabelKind: AgentModelCatalog.TaskLabelKind?
     ) -> any CodexSessionControlling
     typealias CodexControllerFactoryWithComputerUse = CodexAgentModeCoordinator.CodexControllerFactory
-    typealias HeadlessProviderFactory = (_ agent: AgentProviderKind, _ modelString: String?, _ workspacePath: String?, _ antigravityPermissionLevel: AntigravityAgentToolPreferences.PermissionLevel?) -> HeadlessAgentProvider
+    typealias HeadlessProviderFactory = (_ agent: AgentProviderKind, _ modelString: String?, _ workspacePath: String?, _ antigravityPermissionLevel: AntigravityAgentToolPreferences.PermissionLevel?, _ grokPermissionLevel: GrokAgentToolPreferences.PermissionLevel?) -> HeadlessAgentProvider
     typealias ACPProviderFactory = (_ agent: AgentProviderKind, _ modelString: String?) -> (any ACPAgentProvider)?
     typealias ACPControllerFactory = (_ provider: any ACPAgentProvider, _ runRequest: ACPRunRequest) throws -> ACPAgentSessionController
     typealias ConnectionPolicyInstaller = (
@@ -1341,14 +1341,16 @@ final class AgentModeViewModel: ObservableObject {
         agent: AgentProviderKind,
         modelString: String?,
         workspacePath: String?,
-        antigravityPermissionLevel: AntigravityAgentToolPreferences.PermissionLevel?
+        antigravityPermissionLevel: AntigravityAgentToolPreferences.PermissionLevel?,
+        grokPermissionLevel: GrokAgentToolPreferences.PermissionLevel?
     ) -> HeadlessAgentProvider {
         assert(agent != .codexExec, "Codex native runs must not use headless provider factory.")
         return AgentRuntimeProviderService.shared.makeProvider(
             for: agent,
             modelString: modelString,
             workspacePath: workspacePath,
-            antigravityPermissionLevel: antigravityPermissionLevel
+            antigravityPermissionLevel: antigravityPermissionLevel,
+            grokPermissionLevel: grokPermissionLevel
         )
     }
 
@@ -1585,12 +1587,13 @@ final class AgentModeViewModel: ObservableObject {
             codexControllerFactory: @escaping CodexControllerFactory,
             codexControllerFactoryWithComputerUse: CodexControllerFactoryWithComputerUse? = nil,
             claudeControllerFactory: ClaudeAgentModeCoordinator.ClaudeControllerFactory? = nil,
-            headlessProviderFactory: @escaping HeadlessProviderFactory = { agent, modelString, workspacePath, antigravityPermissionLevel in
+            headlessProviderFactory: @escaping HeadlessProviderFactory = { agent, modelString, workspacePath, antigravityPermissionLevel, grokPermissionLevel in
                 AgentModeViewModel.defaultHeadlessProviderFactory(
                     agent: agent,
                     modelString: modelString,
                     workspacePath: workspacePath,
-                    antigravityPermissionLevel: antigravityPermissionLevel
+                    antigravityPermissionLevel: antigravityPermissionLevel,
+                    grokPermissionLevel: grokPermissionLevel
                 )
             },
             acpProviderFactory: @escaping ACPProviderFactory = { agent, modelString in
@@ -2260,6 +2263,19 @@ final class AgentModeViewModel: ObservableObject {
         // picker re-reads `AgentModelCatalog.options(for: .antigravity)` (which sources labels
         // from `AntigravityModelRegistry`), then resync the composer UI.
         NotificationCenter.default.publisher(for: .antigravityModelsChanged)
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in
+                guard let self else { return }
+                acpDynamicModelRevision &+= 1
+                syncComposerUIState()
+            }
+            .store(in: &cancellables)
+
+        // Refresh the model picker when the Grok (`grok`) live model list changes.
+        // Mirrors the Codex/ACP live-model refresh: bump the dynamic-model revision so the
+        // picker re-reads `AgentModelCatalog.options(for: .grok)` (which sources labels
+        // from `GrokModelRegistry`), then resync the composer UI.
+        NotificationCenter.default.publisher(for: .grokModelsChanged)
             .receive(on: DispatchQueue.main)
             .sink { [weak self] _ in
                 guard let self else { return }
@@ -4019,7 +4035,7 @@ final class AgentModeViewModel: ObservableObject {
                     modelContextWindow: session.codexContextUsage?.modelContextWindow
                 )
             }
-        case .codexExec, .openCode, .cursor, .antigravity:
+        case .codexExec, .openCode, .cursor, .antigravity, .grok:
             break
         }
         session.contextUsageSnapshot = ContextUsageSnapshot.fromAgentContextUsage(
@@ -12710,7 +12726,7 @@ final class AgentModeViewModel: ObservableObject {
         switch agent {
         case .claudeCode, .claudeCodeGLM, .kimiCode, .customClaudeCompatible, .openCode, .cursor:
             return renderAtPathAttachmentMessage(text: text, attachments: attachments)
-        case .codexExec, .antigravity:
+        case .codexExec, .antigravity, .grok:
             return text
         }
     }

@@ -60,7 +60,7 @@ final class AgentRuntimeSidebarViewModel: ObservableObject {
             switch selectedAgent {
             case .claudeCode, .claudeCodeGLM, .kimiCode, .customClaudeCompatible: return 200_000
             case .openCode, .cursor: return 200_000
-            case .codexExec, .antigravity, .none: return 200_000
+            case .codexExec, .antigravity, .grok, .none: return 200_000
             }
         }
     }

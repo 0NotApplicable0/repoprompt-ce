@@ -263,6 +263,7 @@ final class AgentModeRunService {
             attachments: attachments,
             workspacePath: workspacePath,
             antigravityPermissionLevel: runtimePermission.antigravityPermissionLevel,
+            grokPermissionLevel: runtimePermission.grokPermissionLevel,
             makeLease: makeLease
         )
         return nil

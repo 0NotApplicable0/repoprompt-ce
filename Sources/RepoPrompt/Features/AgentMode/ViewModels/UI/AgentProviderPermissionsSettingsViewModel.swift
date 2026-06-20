@@ -179,6 +179,8 @@ final class AgentProviderPermissionsSettingsViewModel: ObservableObject {
             CursorAgentToolPreferences.setPermissionLevel(level, defaults: defaults, secureStore: securePermissions)
         case let .antigravity(level):
             AntigravityAgentToolPreferences.setPermissionLevel(level, defaults: defaults, secureStore: securePermissions)
+        case let .grok(level):
+            GrokAgentToolPreferences.setPermissionLevel(level, defaults: defaults, secureStore: securePermissions)
         }
     }
 

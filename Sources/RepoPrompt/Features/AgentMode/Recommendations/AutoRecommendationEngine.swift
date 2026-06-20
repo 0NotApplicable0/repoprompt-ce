@@ -372,7 +372,7 @@ final class AutoRecommendationEngine {
                 enabledRecommendationProviders.contains(.codex)
             case .cursor:
                 enabledRecommendationProviders.contains(.cursor)
-            case .openCode, .claudeCodeGLM, .kimiCode, .customClaudeCompatible, .antigravity:
+            case .openCode, .claudeCodeGLM, .kimiCode, .customClaudeCompatible, .antigravity, .grok:
                 true
             }
         }) else {

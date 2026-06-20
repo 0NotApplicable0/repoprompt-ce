@@ -188,6 +188,22 @@ struct AgentPermissionCapabilitySummaryBuilder {
                 approvalModeDescription: level.useSandbox ? "Approval: Sandboxed" : "Approval: Auto-approve all",
                 warnings: warnings
             )
+        case .grok:
+            let level = grokPermissionLevel(profile: profile)
+            let warnings = level.dangerouslySkipPermissions
+                ? ["Grok auto-approves all tool requests (no sandbox)."]
+                : []
+            return AgentPermissionCapabilitySummary(
+                providerID: providerID,
+                providerName: providerID.displayName,
+                isAvailable: isAvailable,
+                fileMutation: level.useSandbox ? "Sandboxed" : "Full access (no sandbox)",
+                shell: "Handled by Grok CLI",
+                externalMCP: "RepoPrompt MCP tools available",
+                search: "Managed by Grok CLI",
+                approvalModeDescription: level.useSandbox ? "Approval: Sandboxed" : "Approval: Auto-approve all",
+                warnings: warnings
+            )
         }
     }
 
@@ -210,6 +226,7 @@ struct AgentPermissionCapabilitySummaryBuilder {
         case .openCode: availability.openCodeAvailable
         case .cursor: availability.cursorAvailable
         case .antigravity: availability.antigravityAvailable
+        case .grok: availability.grokAvailable
         }
     }
 
@@ -279,6 +296,19 @@ struct AgentPermissionCapabilitySummaryBuilder {
         case .mcpSafeDefaults:
             .managedDefault
         case let .providerOverride(.antigravity(level)):
+            level
+        case .providerOverride:
+            .managedDefault
+        }
+    }
+
+    private func grokPermissionLevel(profile: AgentProviderPermissionProfile) -> GrokAgentToolPreferences.PermissionLevel {
+        switch profile {
+        case .userConfigured:
+            GrokAgentToolPreferences.permissionLevel(defaults: defaults, secureStore: securePermissions)
+        case .mcpSafeDefaults:
+            .managedDefault
+        case let .providerOverride(.grok(level)):
             level
         case .providerOverride:
             .managedDefault

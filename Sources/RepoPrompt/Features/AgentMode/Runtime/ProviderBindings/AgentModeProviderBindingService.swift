@@ -225,6 +225,8 @@ final class AgentModeProviderBindingService {
                 }
             case .antigravity:
                 break
+            case .grok:
+                break
             }
         }
 

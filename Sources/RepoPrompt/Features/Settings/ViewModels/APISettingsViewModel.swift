@@ -302,6 +302,9 @@ public class APISettingsViewModel: ObservableObject {
     // Antigravity CLI (`agy`) — Pattern 1 auth (user pre-authenticates by running `agy` once).
     @Published var isAntigravityConnected: Bool = UserDefaults.standard.bool(forKey: "AntigravityCLIConnected")
     @Published var antigravityError: String? = nil
+    // Grok CLI (`grok`) — Pattern 1 auth (user pre-authenticates by running `grok login` once).
+    @Published var isGrokConnected: Bool = UserDefaults.standard.bool(forKey: "GrokCLIConnected")
+    @Published var grokError: String? = nil
 
     /// CLI connection flags are persisted configuration hints, not proof that the provider is
     /// usable in the current process. Context Builder restoration waits for this validation pass
@@ -383,6 +386,7 @@ public class APISettingsViewModel: ObservableObject {
             openCodeAvailable: isOpenCodeConnected,
             cursorAvailable: isCursorConnected,
             antigravityAvailable: isAntigravityConnected,
+            grokAvailable: isGrokConnected,
             zaiConfigured: compatibleBackendIsActive(.glmZAI),
             kimiConfigured: compatibleBackendIsActive(.kimi),
             customClaudeCompatibleConfigured: compatibleBackendIsActive(.custom)
@@ -414,6 +418,7 @@ public class APISettingsViewModel: ObservableObject {
             $isOpenCodeConnected.map { _ in () }.eraseToAnyPublisher(),
             $isCursorConnected.map { _ in () }.eraseToAnyPublisher(),
             $isAntigravityConnected.map { _ in () }.eraseToAnyPublisher(),
+            $isGrokConnected.map { _ in () }.eraseToAnyPublisher(),
             $claudeCodeCLIStatus.map { _ in () }.eraseToAnyPublisher(),
             $compatibleBackendConfigs.map { _ in () }.eraseToAnyPublisher(),
             $compatibleBackendSecretPresence.map { _ in () }.eraseToAnyPublisher()
@@ -435,6 +440,7 @@ public class APISettingsViewModel: ObservableObject {
             openCodeAvailable: isVerifiedContextBuilderProvider(.openCode) && isOpenCodeConnected,
             cursorAvailable: isVerifiedContextBuilderProvider(.cursor) && isCursorConnected,
             antigravityAvailable: isVerifiedContextBuilderProvider(.antigravity) && isAntigravityConnected,
+            grokAvailable: isVerifiedContextBuilderProvider(.grok) && isGrokConnected,
             zaiConfigured: compatibleBackendIsActive(.glmZAI),
             kimiConfigured: compatibleBackendIsActive(.kimi),
             customClaudeCompatibleConfigured: compatibleBackendIsActive(.custom)
@@ -489,6 +495,8 @@ public class APISettingsViewModel: ObservableObject {
             isCursorConnected
         case .antigravity:
             isAntigravityConnected
+        case .grok:
+            isGrokConnected
         case .claudeCodeGLM, .kimiCode, .customClaudeCompatible:
             false
         }
@@ -3402,6 +3410,18 @@ public class APISettingsViewModel: ObservableObject {
         Task { await updateAvailableModels() }
     }
 
+    func disconnectGrok() {
+        isGrokConnected = false
+        grokError = nil
+        UserDefaults.standard.set(false, forKey: "GrokCLIConnected")
+        setContextBuilderProviderVerified(.grok, verified: false)
+        // Surgically remove only the RepoPrompt MCP entry from grok's HOME-level config and
+        // drop the cached live-model labels so a stale picker does not survive disconnect.
+        MCPIntegrationHelper.removeGrokInstallEntry()
+        GrokModelRegistry.shared.clearCache()
+        Task { await updateAvailableModels() }
+    }
+
     private func friendlyCursorMessage(for error: Error) -> String {
         if let providerError = error as? AIProviderError {
             switch providerError {
@@ -3529,6 +3549,114 @@ public class APISettingsViewModel: ObservableObject {
                 process.terminate()
                 process.waitUntilExit()
                 throw AIProviderError.invalidConfiguration(detail: "Antigravity CLI (agy) did not respond in time.")
+            }
+            return process.terminationStatus
+        }.value
+    }
+
+    // MARK: - Grok CLI (`grok`)
+
+    /// Lightweight Pattern-1 connection probe for the Grok (`grok`) CLI: the user
+    /// pre-authenticates by running `grok login` once, so the test only verifies that the `grok`
+    /// binary is resolvable and runnable. No LLM/network call is made — we resolve the
+    /// executable through the same PATH machinery other CLI providers use and run
+    /// `grok --version` with a short timeout. Exit 0 marks the provider connected.
+    func testGrokConnection() async throws -> Bool {
+        let grokNotFoundMessage = "Grok CLI (grok) not found. Install it and run `grok login` once to sign in."
+
+        await CLIEnvironmentCache.shared.invalidate()
+        let environmentResult = await ProcessEnvironmentBuilder.build(
+            ProcessEnvironmentRequest(purpose: .cliRunner)
+        )
+        let profile = CLILaunchProfiles.grok
+        let resolvedCommand = CommandPathResolver.resolve(
+            profile.commandName,
+            environment: environmentResult.environment,
+            additionalPaths: profile.supplementalSearchPaths,
+            preferredBasenames: profile.preferredBasenames
+        )
+
+        do {
+            switch CommandPathResolver.launchability(of: resolvedCommand) {
+            case .launchable, .bareCommandFallback:
+                break
+            case .missingPath, .directory, .notExecutable:
+                throw AIProviderError.invalidConfiguration(detail: grokNotFoundMessage)
+            }
+
+            let exitStatus = try await runGrokVersionProbe(
+                executable: resolvedCommand,
+                environment: environmentResult.environment
+            )
+            guard exitStatus == 0 else {
+                // The binary resolved and ran but `grok --version` exited nonzero — distinct from
+                // a missing binary (a broken install, an unexpected grok build, etc.).
+                throw AIProviderError.invalidConfiguration(
+                    detail: "Grok CLI (grok) failed to run (exit \(exitStatus)). Verify your `grok` installation by running `grok --version` in a terminal."
+                )
+            }
+
+            // Install the RepoPrompt MCP server entry now that `grok` is confirmed reachable, so
+            // the MCP-installed flag is set and grok can see RepoPrompt tools on its next run.
+            guard MCPIntegrationHelper.installInGrok().success else {
+                throw AIProviderError.invalidConfiguration(
+                    detail: "Grok CLI is reachable, but installing the RepoPrompt MCP config for Grok failed. Check write access to ~/.grok/config.toml and try again."
+                )
+            }
+
+            isGrokConnected = true
+            grokError = nil
+            UserDefaults.standard.set(true, forKey: "GrokCLIConnected")
+            setContextBuilderProviderVerified(.grok, verified: true)
+            await updateAvailableModels()
+            // Populate the Agent Mode model picker from the live `grok models` list now that the
+            // CLI is reachable. Fire-and-forget: failures leave the picker's static `Default`.
+            Task { await GrokModelRegistry.shared.refresh() }
+            return true
+        } catch {
+            isGrokConnected = false
+            setContextBuilderProviderVerified(.grok, verified: false)
+            // Surface the real failure reason (missing binary vs. run failure vs. timeout)
+            // rather than collapsing every error into the generic "not found" message.
+            let message: String = if let providerError = error as? AIProviderError,
+                                     case let .invalidConfiguration(detail) = providerError
+            {
+                detail
+            } else {
+                grokNotFoundMessage
+            }
+            grokError = message
+            UserDefaults.standard.set(false, forKey: "GrokCLIConnected")
+            await updateAvailableModels()
+            throw AIProviderError.invalidConfiguration(detail: message)
+        }
+    }
+
+    /// Runs `grok --version` and returns the process exit status. Spawned off the main
+    /// actor with a short timeout so a hung binary cannot stall the connection test.
+    private func runGrokVersionProbe(
+        executable: String,
+        environment: [String: String]
+    ) async throws -> Int32 {
+        try await Task.detached(priority: .userInitiated) {
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: executable)
+            process.arguments = ["--version"]
+            process.environment = environment
+            process.standardInput = FileHandle.nullDevice
+            process.standardOutput = FileHandle.nullDevice
+            process.standardError = FileHandle.nullDevice
+
+            try process.run()
+
+            let deadline = Date().addingTimeInterval(5)
+            while process.isRunning, Date() < deadline {
+                try await Task.sleep(nanoseconds: 50_000_000)
+            }
+            if process.isRunning {
+                process.terminate()
+                process.waitUntilExit()
+                throw AIProviderError.invalidConfiguration(detail: "Grok CLI (grok) did not respond in time.")
             }
             return process.terminationStatus
         }.value

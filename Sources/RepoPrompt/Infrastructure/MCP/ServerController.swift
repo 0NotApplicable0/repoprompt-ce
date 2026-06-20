@@ -53,7 +53,8 @@ final actor ServerController: ObservableObject {
         "cursor",
         "cursor-mcp-client",
         "claude-ai",
-        "antigravity-client"
+        "antigravity-client",
+        "grok-client"
     ]
     /// In-memory copy (always mutate on MainActor)
     private var alwaysAllowedClients: Set<String> = ServerController.loadSanitizedAlwaysAllowedClients()

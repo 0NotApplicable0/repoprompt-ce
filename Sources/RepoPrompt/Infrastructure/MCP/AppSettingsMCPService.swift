@@ -1393,6 +1393,8 @@ private enum AppSettingsMCPRegistry {
             .cursor
         case .antigravity:
             nil
+        case .grok:
+            nil
         }
     }
 

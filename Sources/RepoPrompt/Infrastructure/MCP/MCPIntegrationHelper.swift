@@ -634,6 +634,35 @@ enum MCPIntegrationHelper {
         AntigravityIntegrationConfiguration.removeInstallEntry()
     }
 
+    /// Installs the RepoPrompt MCP server into Grok (`grok`) HOME-level config.
+    ///
+    /// Invoked from the UI when users opt-in. `grok` has no per-run MCP injection flag, so the
+    /// entry in `~/.grok/config.toml` is visible to every `grok` invocation.
+    @discardableResult
+    static func installInGrok() -> (success: Bool, wasAlreadyPresent: Bool) {
+        let result = GrokIntegrationConfiguration.ensureServerForDiscovery()
+        if result.success {
+            setMCPServerInstalled()
+        }
+        return result
+    }
+
+    /// Ensures the RepoPrompt MCP server exists in Grok's config for discovery runs.
+    @discardableResult
+    static func ensureGrokServerForDiscovery() -> (success: Bool, wasAlreadyPresent: Bool) {
+        GrokIntegrationConfiguration.ensureServerForDiscovery()
+    }
+
+    static func grokConfigContainsRepoPrompt() -> Bool {
+        GrokIntegrationConfiguration.configContainsRepoPrompt()
+    }
+
+    /// Removes the RepoPrompt MCP server entry from Grok's config (preserving all other
+    /// servers). Called on disconnect to leave grok's `~/.grok` config clean.
+    static func removeGrokInstallEntry() {
+        GrokIntegrationConfiguration.removeInstallEntry()
+    }
+
     static func codexConfigContainsRepoPrompt() -> Bool {
         CodexIntegrationConfiguration.configContainsRepoPrompt()
     }

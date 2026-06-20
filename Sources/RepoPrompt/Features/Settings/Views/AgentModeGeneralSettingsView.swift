@@ -236,6 +236,7 @@ struct AgentModeGeneralSettingsView: View {
         case .openCode: apiSettingsVM.isOpenCodeConnected
         case .cursor: apiSettingsVM.isCursorConnected
         case .antigravity: apiSettingsVM.isAntigravityConnected
+        case .grok: apiSettingsVM.isGrokConnected
         }
     }
 

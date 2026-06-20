@@ -41,6 +41,7 @@ struct CLIProvidersSettingsView: View {
     @State private var isLoadingOpenCode = false
     @State private var isLoadingCursor = false
     @State private var isLoadingAntigravity = false
+    @State private var isLoadingGrok = false
     @State private var isLoadingZAI = false
     @State private var showClaudeCodeTraceDump = false
     @State private var showCodexTraceDump = false
@@ -59,6 +60,7 @@ struct CLIProvidersSettingsView: View {
     @State private var isOpenCodeExpanded: Bool = false
     @State private var isCursorExpanded: Bool = false
     @State private var isAntigravityExpanded = false
+    @State private var isGrokExpanded = false
 
     // Per-backend secret text entry buffers (GLM uses viewModel.zaiApiKey directly).
     // SEARCH-HELPER: Claude-Compatible Backends settings, Kimi API key entry, Custom backend key entry
@@ -135,6 +137,7 @@ struct CLIProvidersSettingsView: View {
                 openCodeCard
                 cursorCard
                 antigravityCard
+                grokCard
             }
             .padding(16)
         }
@@ -1863,6 +1866,76 @@ struct CLIProvidersSettingsView: View {
         }
     }
 
+    // MARK: - Grok Card
+
+    private var grokCard: some View {
+        providerCard(
+            title: "Grok CLI",
+            subtitle: "xAI's Grok (`grok`) CLI. Headless one-shot Agent Mode runs; sign in by running `grok login` once in your terminal. RepoPrompt MCP tools are injected for agent runs.",
+            infoURL: "https://grok.com/",
+            isConnected: viewModel.isGrokConnected,
+            isExpanded: $isGrokExpanded
+        ) {
+            VStack(alignment: .leading, spacing: 12) {
+                if viewModel.isGrokConnected {
+                    HStack(spacing: 8) {
+                        Button(action: { testGrokConnection() }) {
+                            if isLoadingGrok {
+                                ProgressView()
+                                    .scaleEffect(0.6)
+                                    .frame(height: 16)
+                            } else {
+                                Label("Test Connection", systemImage: "antenna.radiowaves.left.and.right")
+                            }
+                        }
+                        .disabled(isLoadingGrok)
+                        .buttonStyle(CustomButtonStyle())
+
+                        Spacer()
+
+                        Button(action: { signOutFromGrok() }) {
+                            Text("Sign Out")
+                                .foregroundColor(.secondary)
+                        }
+                        .buttonStyle(CustomButtonStyle())
+                    }
+
+                    Text("Connected = `grok` found. If runs fail with an auth error, run `grok login` once to sign in.")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+
+                    directProviderInlineControls(for: .grok)
+                } else {
+                    HStack(spacing: 10) {
+                        Button(action: { testGrokConnection() }) {
+                            if isLoadingGrok {
+                                ProgressView()
+                                    .scaleEffect(0.6)
+                                    .frame(height: 16)
+                            } else {
+                                Label("Connect", systemImage: "link")
+                            }
+                        }
+                        .disabled(isLoadingGrok)
+                        .buttonStyle(CustomButtonStyle())
+
+                        if let error = viewModel.grokError, !error.isEmpty {
+                            Text(error)
+                                .font(.caption)
+                                .foregroundColor(.red)
+                                .fixedSize(horizontal: false, vertical: true)
+                        } else {
+                            Text("Run `grok login` in your terminal once to sign in, then Connect.")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     // MARK: - Actions
 
     private func validateAndSaveZAIKey() {
@@ -2256,6 +2329,13 @@ struct CLIProvidersSettingsView: View {
         onAPIKeyUpdated?()
     }
 
+    private func signOutFromGrok() {
+        viewModel.disconnectGrok()
+        alertMessage = "Signed out from Grok CLI"
+        showAlert = true
+        onAPIKeyUpdated?()
+    }
+
     private func testAntigravityConnection() {
         isLoadingAntigravity = true
         Task {
@@ -2273,6 +2353,29 @@ struct CLIProvidersSettingsView: View {
                 await MainActor.run {
                     isLoadingAntigravity = false
                     alertMessage = viewModel.antigravityError ?? error.asFriendlyString()
+                    showAlert = true
+                }
+            }
+        }
+    }
+
+    private func testGrokConnection() {
+        isLoadingGrok = true
+        Task {
+            do {
+                let ok = try await viewModel.testGrokConnection()
+                await MainActor.run {
+                    isLoadingGrok = false
+                    if ok {
+                        alertMessage = "Grok CLI connected."
+                    }
+                    showAlert = true
+                    onAPIKeyUpdated?()
+                }
+            } catch {
+                await MainActor.run {
+                    isLoadingGrok = false
+                    alertMessage = viewModel.grokError ?? error.asFriendlyString()
                     showAlert = true
                 }
             }
