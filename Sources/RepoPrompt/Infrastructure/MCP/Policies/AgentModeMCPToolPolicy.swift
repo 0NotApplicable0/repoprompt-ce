@@ -79,6 +79,8 @@ enum AgentModeMCPToolPolicy {
             openCodeGrantedTools
         case .cursor:
             cursorGrantedTools
+        case .antigravity:
+            codexNativeGrantedTools
         }
     }
 }

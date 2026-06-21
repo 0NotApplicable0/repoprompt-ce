@@ -18,6 +18,7 @@ enum AgentProviderPermissionLevelID: Hashable {
     case claude(ClaudeAgentToolPreferences.PermissionLevel)
     case openCode(OpenCodeAgentToolPreferences.PermissionLevel)
     case cursor(CursorAgentToolPreferences.PermissionLevel)
+    case antigravity(AntigravityAgentToolPreferences.PermissionLevel)
 
     var providerID: AgentProviderBindingID {
         switch self {
@@ -29,6 +30,8 @@ enum AgentProviderPermissionLevelID: Hashable {
             .openCode
         case .cursor:
             .cursor
+        case .antigravity:
+            .antigravity
         }
     }
 
@@ -42,6 +45,8 @@ enum AgentProviderPermissionLevelID: Hashable {
             .openCode(.managedDefault)
         case .cursor:
             .cursor(.managedDefault)
+        case .antigravity:
+            .antigravity(.managedDefault)
         }
     }
 
@@ -55,6 +60,8 @@ enum AgentProviderPermissionLevelID: Hashable {
             OpenCodeAgentToolPreferences.PermissionLevel.allCases.map(AgentProviderPermissionLevelID.openCode)
         case .cursor:
             CursorAgentToolPreferences.PermissionLevel.allCases.map(AgentProviderPermissionLevelID.cursor)
+        case .antigravity:
+            AntigravityAgentToolPreferences.PermissionLevel.allCases.map(AgentProviderPermissionLevelID.antigravity)
         }
     }
 
@@ -73,6 +80,9 @@ enum AgentProviderPermissionLevelID: Hashable {
         case .cursor:
             guard let level = CursorAgentToolPreferences.PermissionLevel(rawValue: raw) else { return nil }
             self = .cursor(level)
+        case .antigravity:
+            guard let level = AntigravityAgentToolPreferences.PermissionLevel(rawValue: raw) else { return nil }
+            self = .antigravity(level)
         }
     }
 
@@ -85,6 +95,8 @@ enum AgentProviderPermissionLevelID: Hashable {
         case let .openCode(level):
             level.rawValue
         case let .cursor(level):
+            level.rawValue
+        case let .antigravity(level):
             level.rawValue
         }
     }
@@ -99,6 +111,8 @@ enum AgentProviderPermissionLevelID: Hashable {
             level.displayName
         case let .cursor(level):
             level.displayName
+        case let .antigravity(level):
+            level.displayName
         }
     }
 
@@ -111,6 +125,8 @@ enum AgentProviderPermissionLevelID: Hashable {
         case let .openCode(level):
             level.iconName
         case let .cursor(level):
+            level.iconName
+        case let .antigravity(level):
             level.iconName
         }
     }
@@ -125,6 +141,8 @@ enum AgentProviderPermissionLevelID: Hashable {
             level.detailText
         case let .cursor(level):
             level.detailText
+        case let .antigravity(level):
+            level.detailText
         }
     }
 
@@ -137,6 +155,8 @@ enum AgentProviderPermissionLevelID: Hashable {
         case let .openCode(level):
             level.isWarning
         case let .cursor(level):
+            level.isWarning
+        case let .antigravity(level):
             level.isWarning
         }
     }
@@ -169,6 +189,10 @@ struct AgentProviderRuntimePermissionBinding: Equatable {
     let acpSessionModeID: String?
     let autoApproveAllACPToolPermissions: Bool
     let acceptsPendingACPApprovalWhenActivated: Bool
+    /// Session-resolved Antigravity (`agy`) permission level. Headless `agy` runs have no
+    /// per-run permission channel, so the resolved level is consumed at provider construction
+    /// (sandbox vs. `--dangerously-skip-permissions`) rather than via an ACP/session field.
+    let antigravityPermissionLevel: AntigravityAgentToolPreferences.PermissionLevel?
 
     init(
         codexSandboxMode: CodexAgentToolPreferences.SandboxMode? = nil,
@@ -177,7 +201,8 @@ struct AgentProviderRuntimePermissionBinding: Equatable {
         claudePermissionMode: String? = nil,
         acpSessionModeID: String? = nil,
         autoApproveAllACPToolPermissions: Bool = false,
-        acceptsPendingACPApprovalWhenActivated: Bool = false
+        acceptsPendingACPApprovalWhenActivated: Bool = false,
+        antigravityPermissionLevel: AntigravityAgentToolPreferences.PermissionLevel? = nil
     ) {
         self.codexSandboxMode = codexSandboxMode
         self.codexApprovalPolicy = codexApprovalPolicy
@@ -186,6 +211,7 @@ struct AgentProviderRuntimePermissionBinding: Equatable {
         self.acpSessionModeID = acpSessionModeID
         self.autoApproveAllACPToolPermissions = autoApproveAllACPToolPermissions
         self.acceptsPendingACPApprovalWhenActivated = acceptsPendingACPApprovalWhenActivated
+        self.antigravityPermissionLevel = antigravityPermissionLevel
     }
 }
 

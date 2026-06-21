@@ -40,6 +40,7 @@ enum AgentProviderKind: String, CaseIterable, Hashable {
     case codexExec
     case openCode
     case cursor
+    case antigravity
     case claudeCodeGLM
     case kimiCode
     case customClaudeCompatible
@@ -48,6 +49,7 @@ enum AgentProviderKind: String, CaseIterable, Hashable {
     static let codexMCPClientID = "codex-mcp-client"
     static let openCodeMCPClientID = "opencode"
     static let cursorMCPClientID = "cursor"
+    static let antigravityMCPClientID = "antigravity-client"
 
     var commandName: String {
         switch self {
@@ -59,6 +61,8 @@ enum AgentProviderKind: String, CaseIterable, Hashable {
             "opencode"
         case .cursor:
             "cursor-agent"
+        case .antigravity:
+            "agy"
         }
     }
 
@@ -72,6 +76,8 @@ enum AgentProviderKind: String, CaseIterable, Hashable {
             "OpenCode"
         case .cursor:
             "Cursor CLI"
+        case .antigravity:
+            "Antigravity CLI"
         case .claudeCodeGLM:
             ClaudeCodeCompatibleBackendStore.shared.config(for: .glmZAI).normalizedDisplayName
         case .kimiCode:
@@ -91,6 +97,8 @@ enum AgentProviderKind: String, CaseIterable, Hashable {
             Self.openCodeMCPClientID
         case .cursor:
             Self.cursorMCPClientID
+        case .antigravity:
+            Self.antigravityMCPClientID
         }
     }
 
@@ -100,7 +108,7 @@ enum AgentProviderKind: String, CaseIterable, Hashable {
             .openCode
         case .cursor:
             .cursor
-        case .claudeCode, .codexExec, .claudeCodeGLM, .kimiCode, .customClaudeCompatible:
+        case .claudeCode, .codexExec, .claudeCodeGLM, .kimiCode, .customClaudeCompatible, .antigravity:
             nil
         }
     }
@@ -109,7 +117,7 @@ enum AgentProviderKind: String, CaseIterable, Hashable {
         switch self {
         case .claudeCode, .claudeCodeGLM, .kimiCode, .customClaudeCompatible:
             true
-        case .codexExec, .openCode, .cursor:
+        case .codexExec, .openCode, .cursor, .antigravity:
             false
         }
     }
@@ -120,7 +128,7 @@ enum AgentProviderKind: String, CaseIterable, Hashable {
 
     var requiresExpectedPIDOwnedAgentModeMCPRouting: Bool {
         switch self {
-        case .claudeCode, .codexExec, .openCode, .cursor, .claudeCodeGLM, .kimiCode, .customClaudeCompatible:
+        case .claudeCode, .codexExec, .openCode, .cursor, .claudeCodeGLM, .kimiCode, .customClaudeCompatible, .antigravity:
             true
         }
     }
@@ -129,7 +137,7 @@ enum AgentProviderKind: String, CaseIterable, Hashable {
         switch self {
         case .cursor:
             false
-        case .claudeCode, .codexExec, .openCode, .claudeCodeGLM, .kimiCode, .customClaudeCompatible:
+        case .claudeCode, .codexExec, .openCode, .claudeCodeGLM, .kimiCode, .customClaudeCompatible, .antigravity:
             true
         }
     }
@@ -145,6 +153,8 @@ enum AgentProviderKind: String, CaseIterable, Hashable {
             return "OpenCode ACP agent. Interactive Agent Mode uses RepoPrompt MCP tools; headless discovery/delegate runs use RepoPrompt's managed no-native-tools mode."
         case .cursor:
             return "Cursor CLI ACP agent. Uses Cursor's ACP runtime and injects RepoPrompt MCP tools through ACP session configuration."
+        case .antigravity:
+            return "Google's Antigravity CLI (agy), a Gemini-powered terminal coding agent. Runs headless one-shot prompts and uses RepoPrompt MCP tools."
         case .claudeCodeGLM:
             let config = ClaudeCodeCompatibleBackendStore.shared.config(for: .glmZAI)
             if case let .claudeSlotMapping(mapping) = config.modelBehavior {
@@ -177,6 +187,8 @@ enum AgentProviderKind: String, CaseIterable, Hashable {
             "opencode_acp"
         case .cursor:
             "cursor_acp"
+        case .antigravity:
+            "antigravity_native"
         }
     }
 
@@ -190,7 +202,7 @@ enum AgentProviderKind: String, CaseIterable, Hashable {
             .kimi
         case .customClaudeCompatible:
             .customCompatible
-        case .codexExec, .openCode, .cursor:
+        case .codexExec, .openCode, .cursor, .antigravity:
             nil
         }
     }
@@ -219,7 +231,8 @@ final class AgentRuntimeProviderService {
         for agent: AgentProviderKind,
         modelString: String? = nil,
         runType: AgentRunType = .discover,
-        workspacePath: String? = nil
+        workspacePath: String? = nil,
+        antigravityPermissionLevel: AntigravityAgentToolPreferences.PermissionLevel? = nil
     ) -> HeadlessAgentProvider {
         if Self.enableDebugLogging {
             Self.logger.debug("Creating provider for agent: \(agent.displayName), model: \(modelString ?? "default"), runType: \(String(describing: runType))")
@@ -290,6 +303,31 @@ final class AgentRuntimeProviderService {
                 Self.logger.debug("Created CursorACPHeadlessAgentProvider")
             }
             return CursorACPHeadlessAgentProvider(config: config, workspacePath: workspacePath)
+        case .antigravity:
+            // Real Agent Mode runs pass the session-resolved level (honoring Safe-Managed /
+            // per-provider overrides); discovery / no-session callers omit it and fall back to
+            // the user's global Antigravity permission preference.
+            let permissionLevel = antigravityPermissionLevel ?? AntigravityAgentToolPreferences.permissionLevel()
+            let config = AntigravityAgentConfig(
+                modelString: modelString,
+                useSandbox: permissionLevel.useSandbox,
+                dangerouslySkipPermissions: permissionLevel.dangerouslySkipPermissions,
+                enableDebugLogging: Self.enableDebugLogging
+            )
+            var processConfig = CLIProcessConfiguration(
+                command: config.commandName,
+                workingDirectory: workspacePath,
+                enableDebugLogging: Self.enableDebugLogging,
+                captureStdoutTailBytes: 0,
+                captureStderrTailBytes: 256 * 1024,
+                logStdinSampleBytes: 0
+            )
+            processConfig.ensureAdditionalPaths(config.additionalPathHints)
+            let runner = CLIProcessRunner(config: processConfig)
+            if Self.enableDebugLogging {
+                Self.logger.debug("Created AntigravityAgentProvider")
+            }
+            return AntigravityAgentProvider(runner: runner, config: config, workspacePath: workspacePath)
         }
     }
 }

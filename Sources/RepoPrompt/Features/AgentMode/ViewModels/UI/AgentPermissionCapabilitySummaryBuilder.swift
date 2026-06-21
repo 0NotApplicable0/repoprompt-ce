@@ -172,6 +172,22 @@ struct AgentPermissionCapabilitySummaryBuilder {
                 approvalModeDescription: level.autoApprovesACPToolPermissions ? "Auto-approve: on" : "Auto-approve: off",
                 warnings: warnings
             )
+        case .antigravity:
+            let level = antigravityPermissionLevel(profile: profile)
+            let warnings = level.dangerouslySkipPermissions
+                ? ["Antigravity auto-approves all tool requests (no sandbox)."]
+                : []
+            return AgentPermissionCapabilitySummary(
+                providerID: providerID,
+                providerName: providerID.displayName,
+                isAvailable: isAvailable,
+                fileMutation: level.useSandbox ? "Sandboxed" : "Full access (no sandbox)",
+                shell: "Handled by Antigravity CLI",
+                externalMCP: "RepoPrompt MCP tools available",
+                search: "Managed by Antigravity CLI",
+                approvalModeDescription: level.useSandbox ? "Approval: Sandboxed" : "Approval: Auto-approve all",
+                warnings: warnings
+            )
         }
     }
 
@@ -193,6 +209,7 @@ struct AgentPermissionCapabilitySummaryBuilder {
         case .claude: availability.claudeCodeAvailable
         case .openCode: availability.openCodeAvailable
         case .cursor: availability.cursorAvailable
+        case .antigravity: availability.antigravityAvailable
         }
     }
 
@@ -249,6 +266,19 @@ struct AgentPermissionCapabilitySummaryBuilder {
         case .mcpSafeDefaults:
             .managedDefault
         case let .providerOverride(.cursor(level)):
+            level
+        case .providerOverride:
+            .managedDefault
+        }
+    }
+
+    private func antigravityPermissionLevel(profile: AgentProviderPermissionProfile) -> AntigravityAgentToolPreferences.PermissionLevel {
+        switch profile {
+        case .userConfigured:
+            AntigravityAgentToolPreferences.permissionLevel(defaults: defaults, secureStore: securePermissions)
+        case .mcpSafeDefaults:
+            .managedDefault
+        case let .providerOverride(.antigravity(level)):
             level
         case .providerOverride:
             .managedDefault

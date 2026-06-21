@@ -135,6 +135,12 @@ final class AgentProviderPreferenceSnapshotStore {
                 autoApproveAllACPToolPermissions: level.autoApprovesACPToolPermissions,
                 acceptsPendingACPApprovalWhenActivated: level.autoApprovesACPToolPermissions
             )
+        case .antigravity:
+            return AgentProviderRuntimePermissionBinding(
+                autoApproveAllACPToolPermissions: false,
+                acceptsPendingACPApprovalWhenActivated: false,
+                antigravityPermissionLevel: effectiveAntigravityPermissionLevel(profile: profile)
+            )
         }
     }
 
@@ -149,6 +155,8 @@ final class AgentProviderPreferenceSnapshotStore {
             OpenCodeAgentToolPreferences.setPermissionLevel(level, defaults: defaults, secureStore: securePermissions)
         case let .cursor(level):
             CursorAgentToolPreferences.setPermissionLevel(level, defaults: defaults, secureStore: securePermissions)
+        case let .antigravity(level):
+            AntigravityAgentToolPreferences.setPermissionLevel(level, defaults: defaults, secureStore: securePermissions)
         }
         bumpRevision(for: id.providerID)
         return id.providerID
@@ -344,6 +352,26 @@ final class AgentProviderPreferenceSnapshotStore {
                     )
                 }
             )
+        case .antigravity:
+            let effective = effectiveAntigravityPermissionLevel(profile: profile)
+            return AgentPermissionChromeBinding(
+                providerID: providerID,
+                displayName: effective.displayName,
+                iconName: effective.iconName,
+                isWarning: effective.isWarning,
+                externallyManagedReason: externallyManagedReason,
+                options: AntigravityAgentToolPreferences.PermissionLevel.allCases.map { level in
+                    AgentPermissionOptionBinding(
+                        id: .antigravity(level),
+                        title: level.displayName,
+                        iconName: level.iconName,
+                        detailText: level.detailText,
+                        isWarning: level.isWarning,
+                        isSelected: level == effective,
+                        isEnabled: externallyManagedReason == nil
+                    )
+                }
+            )
         }
     }
 
@@ -507,12 +535,28 @@ final class AgentProviderPreferenceSnapshotStore {
         }
     }
 
+    private func effectiveAntigravityPermissionLevel(
+        profile: AgentProviderPermissionProfile
+    ) -> AntigravityAgentToolPreferences.PermissionLevel {
+        switch profile {
+        case .userConfigured:
+            AntigravityAgentToolPreferences.permissionLevel(defaults: defaults, secureStore: securePermissions)
+        case .mcpSafeDefaults:
+            .managedDefault
+        case let .providerOverride(.antigravity(level)):
+            level
+        case .providerOverride:
+            .managedDefault
+        }
+    }
+
     private static func representativeAgent(for providerID: AgentProviderBindingID) -> AgentProviderKind {
         switch providerID {
         case .codex: .codexExec
         case .claude: .claudeCode
         case .openCode: .openCode
         case .cursor: .cursor
+        case .antigravity: .antigravity
         }
     }
 

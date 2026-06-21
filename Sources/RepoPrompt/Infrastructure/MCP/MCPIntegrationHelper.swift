@@ -605,6 +605,35 @@ enum MCPIntegrationHelper {
         CodexIntegrationConfiguration.ensureServerForDiscovery()
     }
 
+    /// Installs the RepoPrompt MCP server into Antigravity (`agy`) HOME-level config.
+    ///
+    /// Invoked from the UI when users opt-in. `agy` has no per-run MCP injection flag, so the
+    /// entry in `~/.gemini/config/mcp_config.json` is visible to every `agy` invocation.
+    @discardableResult
+    static func installInAntigravity() -> (success: Bool, wasAlreadyPresent: Bool) {
+        let result = AntigravityIntegrationConfiguration.ensureServerForDiscovery()
+        if result.success {
+            setMCPServerInstalled()
+        }
+        return result
+    }
+
+    /// Ensures the RepoPrompt MCP server exists in Antigravity's config for discovery runs.
+    @discardableResult
+    static func ensureAntigravityServerForDiscovery() -> (success: Bool, wasAlreadyPresent: Bool) {
+        AntigravityIntegrationConfiguration.ensureServerForDiscovery()
+    }
+
+    static func antigravityConfigContainsRepoPrompt() -> Bool {
+        AntigravityIntegrationConfiguration.configContainsRepoPrompt()
+    }
+
+    /// Removes the RepoPrompt MCP server entry from Antigravity's config (preserving all other
+    /// servers). Called on disconnect to leave agy's `~/.gemini` config clean.
+    static func removeAntigravityInstallEntry() {
+        AntigravityIntegrationConfiguration.removeInstallEntry()
+    }
+
     static func codexConfigContainsRepoPrompt() -> Bool {
         CodexIntegrationConfiguration.configContainsRepoPrompt()
     }

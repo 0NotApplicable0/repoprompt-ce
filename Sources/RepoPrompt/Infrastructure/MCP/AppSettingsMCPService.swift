@@ -1391,6 +1391,8 @@ private enum AppSettingsMCPRegistry {
             .openCode
         case .cursor:
             .cursor
+        case .antigravity:
+            nil
         }
     }
 

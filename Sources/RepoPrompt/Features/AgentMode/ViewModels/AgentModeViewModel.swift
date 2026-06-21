@@ -47,7 +47,7 @@ final class AgentModeViewModel: ObservableObject {
         _ taskLabelKind: AgentModelCatalog.TaskLabelKind?
     ) -> any CodexSessionControlling
     typealias CodexControllerFactoryWithComputerUse = CodexAgentModeCoordinator.CodexControllerFactory
-    typealias HeadlessProviderFactory = (_ agent: AgentProviderKind, _ modelString: String?) -> HeadlessAgentProvider
+    typealias HeadlessProviderFactory = (_ agent: AgentProviderKind, _ modelString: String?, _ workspacePath: String?, _ antigravityPermissionLevel: AntigravityAgentToolPreferences.PermissionLevel?) -> HeadlessAgentProvider
     typealias ACPProviderFactory = (_ agent: AgentProviderKind, _ modelString: String?) -> (any ACPAgentProvider)?
     typealias ACPControllerFactory = (_ provider: any ACPAgentProvider, _ runRequest: ACPRunRequest) throws -> ACPAgentSessionController
     typealias ConnectionPolicyInstaller = (
@@ -1339,10 +1339,17 @@ final class AgentModeViewModel: ObservableObject {
 
     private nonisolated static func defaultHeadlessProviderFactory(
         agent: AgentProviderKind,
-        modelString: String?
+        modelString: String?,
+        workspacePath: String?,
+        antigravityPermissionLevel: AntigravityAgentToolPreferences.PermissionLevel?
     ) -> HeadlessAgentProvider {
         assert(agent != .codexExec, "Codex native runs must not use headless provider factory.")
-        return AgentRuntimeProviderService.shared.makeProvider(for: agent, modelString: modelString)
+        return AgentRuntimeProviderService.shared.makeProvider(
+            for: agent,
+            modelString: modelString,
+            workspacePath: workspacePath,
+            antigravityPermissionLevel: antigravityPermissionLevel
+        )
     }
 
     private nonisolated static func defaultConnectionPolicyInstaller(
@@ -1578,8 +1585,13 @@ final class AgentModeViewModel: ObservableObject {
             codexControllerFactory: @escaping CodexControllerFactory,
             codexControllerFactoryWithComputerUse: CodexControllerFactoryWithComputerUse? = nil,
             claudeControllerFactory: ClaudeAgentModeCoordinator.ClaudeControllerFactory? = nil,
-            headlessProviderFactory: @escaping HeadlessProviderFactory = { agent, modelString in
-                AgentModeViewModel.defaultHeadlessProviderFactory(agent: agent, modelString: modelString)
+            headlessProviderFactory: @escaping HeadlessProviderFactory = { agent, modelString, workspacePath, antigravityPermissionLevel in
+                AgentModeViewModel.defaultHeadlessProviderFactory(
+                    agent: agent,
+                    modelString: modelString,
+                    workspacePath: workspacePath,
+                    antigravityPermissionLevel: antigravityPermissionLevel
+                )
             },
             acpProviderFactory: @escaping ACPProviderFactory = { agent, modelString in
                 ACPAgentProviderFactory.makeProvider(for: agent, modelString: modelString)
@@ -2240,6 +2252,19 @@ final class AgentModeViewModel: ObservableObject {
                     return
                 }
                 onTabChanged(notification.userInfo?["tabID"] as? UUID)
+            }
+            .store(in: &cancellables)
+
+        // Refresh the model picker when the Antigravity (`agy`) live model list changes.
+        // Mirrors the Codex/ACP live-model refresh: bump the dynamic-model revision so the
+        // picker re-reads `AgentModelCatalog.options(for: .antigravity)` (which sources labels
+        // from `AntigravityModelRegistry`), then resync the composer UI.
+        NotificationCenter.default.publisher(for: .antigravityModelsChanged)
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in
+                guard let self else { return }
+                acpDynamicModelRevision &+= 1
+                syncComposerUIState()
             }
             .store(in: &cancellables)
 
@@ -3994,7 +4019,7 @@ final class AgentModeViewModel: ObservableObject {
                     modelContextWindow: session.codexContextUsage?.modelContextWindow
                 )
             }
-        case .codexExec, .openCode, .cursor:
+        case .codexExec, .openCode, .cursor, .antigravity:
             break
         }
         session.contextUsageSnapshot = ContextUsageSnapshot.fromAgentContextUsage(
@@ -12685,7 +12710,7 @@ final class AgentModeViewModel: ObservableObject {
         switch agent {
         case .claudeCode, .claudeCodeGLM, .kimiCode, .customClaudeCompatible, .openCode, .cursor:
             return renderAtPathAttachmentMessage(text: text, attachments: attachments)
-        case .codexExec:
+        case .codexExec, .antigravity:
             return text
         }
     }

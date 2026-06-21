@@ -40,6 +40,7 @@ struct CLIProvidersSettingsView: View {
     @State private var isLoggingIntoCodex = false
     @State private var isLoadingOpenCode = false
     @State private var isLoadingCursor = false
+    @State private var isLoadingAntigravity = false
     @State private var isLoadingZAI = false
     @State private var showClaudeCodeTraceDump = false
     @State private var showCodexTraceDump = false
@@ -57,6 +58,7 @@ struct CLIProvidersSettingsView: View {
     @State private var isCodexExpanded: Bool = false
     @State private var isOpenCodeExpanded: Bool = false
     @State private var isCursorExpanded: Bool = false
+    @State private var isAntigravityExpanded = false
 
     // Per-backend secret text entry buffers (GLM uses viewModel.zaiApiKey directly).
     // SEARCH-HELPER: Claude-Compatible Backends settings, Kimi API key entry, Custom backend key entry
@@ -132,6 +134,7 @@ struct CLIProvidersSettingsView: View {
                 claudeCompatibleBackendsSection
                 openCodeCard
                 cursorCard
+                antigravityCard
             }
             .padding(16)
         }
@@ -1790,6 +1793,76 @@ struct CLIProvidersSettingsView: View {
         return hasComposer2 ? "\(base) Composer 2 is available when selected." : "\(base) Auto is the built-in fallback."
     }
 
+    // MARK: - Antigravity Card
+
+    private var antigravityCard: some View {
+        providerCard(
+            title: "Antigravity CLI",
+            subtitle: "Google's Antigravity (`agy`) CLI. Headless one-shot Agent Mode runs; sign in by running `agy` once in your terminal. RepoPrompt MCP tools are injected for agent runs.",
+            infoURL: "https://antigravity.google/",
+            isConnected: viewModel.isAntigravityConnected,
+            isExpanded: $isAntigravityExpanded
+        ) {
+            VStack(alignment: .leading, spacing: 12) {
+                if viewModel.isAntigravityConnected {
+                    HStack(spacing: 8) {
+                        Button(action: { testAntigravityConnection() }) {
+                            if isLoadingAntigravity {
+                                ProgressView()
+                                    .scaleEffect(0.6)
+                                    .frame(height: 16)
+                            } else {
+                                Label("Test Connection", systemImage: "antenna.radiowaves.left.and.right")
+                            }
+                        }
+                        .disabled(isLoadingAntigravity)
+                        .buttonStyle(CustomButtonStyle())
+
+                        Spacer()
+
+                        Button(action: { signOutFromAntigravity() }) {
+                            Text("Sign Out")
+                                .foregroundColor(.secondary)
+                        }
+                        .buttonStyle(CustomButtonStyle())
+                    }
+
+                    Text("Connected = `agy` found. If runs fail with an auth error, run `agy` once to sign in.")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+
+                    directProviderInlineControls(for: .antigravity)
+                } else {
+                    HStack(spacing: 10) {
+                        Button(action: { testAntigravityConnection() }) {
+                            if isLoadingAntigravity {
+                                ProgressView()
+                                    .scaleEffect(0.6)
+                                    .frame(height: 16)
+                            } else {
+                                Label("Connect", systemImage: "link")
+                            }
+                        }
+                        .disabled(isLoadingAntigravity)
+                        .buttonStyle(CustomButtonStyle())
+
+                        if let error = viewModel.antigravityError, !error.isEmpty {
+                            Text(error)
+                                .font(.caption)
+                                .foregroundColor(.red)
+                                .fixedSize(horizontal: false, vertical: true)
+                        } else {
+                            Text("Run `agy` in your terminal once to sign in, then Connect.")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     // MARK: - Actions
 
     private func validateAndSaveZAIKey() {
@@ -2174,5 +2247,35 @@ struct CLIProvidersSettingsView: View {
         showCursorTraceDump = false
         showAlert = true
         onAPIKeyUpdated?()
+    }
+
+    private func signOutFromAntigravity() {
+        viewModel.disconnectAntigravity()
+        alertMessage = "Signed out from Antigravity CLI"
+        showAlert = true
+        onAPIKeyUpdated?()
+    }
+
+    private func testAntigravityConnection() {
+        isLoadingAntigravity = true
+        Task {
+            do {
+                let ok = try await viewModel.testAntigravityConnection()
+                await MainActor.run {
+                    isLoadingAntigravity = false
+                    if ok {
+                        alertMessage = "Antigravity CLI connected."
+                    }
+                    showAlert = true
+                    onAPIKeyUpdated?()
+                }
+            } catch {
+                await MainActor.run {
+                    isLoadingAntigravity = false
+                    alertMessage = viewModel.antigravityError ?? error.asFriendlyString()
+                    showAlert = true
+                }
+            }
+        }
     }
 }

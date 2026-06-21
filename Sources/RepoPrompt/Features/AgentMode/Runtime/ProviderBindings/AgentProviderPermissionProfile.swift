@@ -150,7 +150,7 @@ extension AgentProviderPermissionProfile {
             openCodeSessionModeID
         case .cursor:
             nil
-        case .claudeCode, .claudeCodeGLM, .kimiCode, .customClaudeCompatible, .codexExec:
+        case .claudeCode, .claudeCodeGLM, .kimiCode, .customClaudeCompatible, .codexExec, .antigravity:
             nil
         }
     }

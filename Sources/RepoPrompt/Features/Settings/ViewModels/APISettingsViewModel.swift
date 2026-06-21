@@ -299,6 +299,9 @@ public class APISettingsViewModel: ObservableObject {
     @Published var cursorError: String? = nil
     @Published private(set) var availableCursorModelOptions: [AgentModelOption] = []
     private var cursorLogCollector: CLIProcessLogCollector?
+    // Antigravity CLI (`agy`) — Pattern 1 auth (user pre-authenticates by running `agy` once).
+    @Published var isAntigravityConnected: Bool = UserDefaults.standard.bool(forKey: "AntigravityCLIConnected")
+    @Published var antigravityError: String? = nil
 
     /// CLI connection flags are persisted configuration hints, not proof that the provider is
     /// usable in the current process. Context Builder restoration waits for this validation pass
@@ -379,6 +382,7 @@ public class APISettingsViewModel: ObservableObject {
             codexAvailable: isCodexConnected,
             openCodeAvailable: isOpenCodeConnected,
             cursorAvailable: isCursorConnected,
+            antigravityAvailable: isAntigravityConnected,
             zaiConfigured: compatibleBackendIsActive(.glmZAI),
             kimiConfigured: compatibleBackendIsActive(.kimi),
             customClaudeCompatibleConfigured: compatibleBackendIsActive(.custom)
@@ -409,6 +413,7 @@ public class APISettingsViewModel: ObservableObject {
             $isCodexConnected.map { _ in () }.eraseToAnyPublisher(),
             $isOpenCodeConnected.map { _ in () }.eraseToAnyPublisher(),
             $isCursorConnected.map { _ in () }.eraseToAnyPublisher(),
+            $isAntigravityConnected.map { _ in () }.eraseToAnyPublisher(),
             $claudeCodeCLIStatus.map { _ in () }.eraseToAnyPublisher(),
             $compatibleBackendConfigs.map { _ in () }.eraseToAnyPublisher(),
             $compatibleBackendSecretPresence.map { _ in () }.eraseToAnyPublisher()
@@ -429,6 +434,7 @@ public class APISettingsViewModel: ObservableObject {
             codexAvailable: isVerifiedContextBuilderProvider(.codexExec) && isCodexConnected,
             openCodeAvailable: isVerifiedContextBuilderProvider(.openCode) && isOpenCodeConnected,
             cursorAvailable: isVerifiedContextBuilderProvider(.cursor) && isCursorConnected,
+            antigravityAvailable: isVerifiedContextBuilderProvider(.antigravity) && isAntigravityConnected,
             zaiConfigured: compatibleBackendIsActive(.glmZAI),
             kimiConfigured: compatibleBackendIsActive(.kimi),
             customClaudeCompatibleConfigured: compatibleBackendIsActive(.custom)
@@ -481,6 +487,8 @@ public class APISettingsViewModel: ObservableObject {
             isOpenCodeConnected
         case .cursor:
             isCursorConnected
+        case .antigravity:
+            isAntigravityConnected
         case .claudeCodeGLM, .kimiCode, .customClaudeCompatible:
             false
         }
@@ -3382,6 +3390,18 @@ public class APISettingsViewModel: ObservableObject {
         )
     }
 
+    func disconnectAntigravity() {
+        isAntigravityConnected = false
+        antigravityError = nil
+        UserDefaults.standard.set(false, forKey: "AntigravityCLIConnected")
+        setContextBuilderProviderVerified(.antigravity, verified: false)
+        // Surgically remove only the RepoPrompt MCP entry from agy's HOME-level config and
+        // drop the cached live-model labels so a stale picker does not survive disconnect.
+        MCPIntegrationHelper.removeAntigravityInstallEntry()
+        AntigravityModelRegistry.shared.clearCache()
+        Task { await updateAvailableModels() }
+    }
+
     private func friendlyCursorMessage(for error: Error) -> String {
         if let providerError = error as? AIProviderError {
             switch providerError {
@@ -3408,6 +3428,110 @@ public class APISettingsViewModel: ObservableObject {
             return "Installed Cursor Agent CLI does not support ACP mode. Update Cursor Agent CLI and ensure `cursor-agent acp --help` works."
         }
         return message
+    }
+
+    // MARK: - Antigravity CLI (`agy`)
+
+    /// Lightweight Pattern-1 connection probe for the Antigravity (`agy`) CLI: the user
+    /// pre-authenticates by running `agy` once, so the test only verifies that the `agy`
+    /// binary is resolvable and runnable. No LLM/network call is made — we resolve the
+    /// executable through the same PATH machinery other CLI providers use and run
+    /// `agy --version` with a short timeout. Exit 0 marks the provider connected.
+    func testAntigravityConnection() async throws -> Bool {
+        let antigravityNotFoundMessage = "Antigravity CLI (agy) not found. Install it and run `agy` once to sign in."
+
+        await CLIEnvironmentCache.shared.invalidate()
+        let environmentResult = await ProcessEnvironmentBuilder.build(
+            ProcessEnvironmentRequest(purpose: .cliRunner)
+        )
+        let profile = CLILaunchProfiles.antigravity
+        let resolvedCommand = CommandPathResolver.resolve(
+            profile.commandName,
+            environment: environmentResult.environment,
+            additionalPaths: profile.supplementalSearchPaths,
+            preferredBasenames: profile.preferredBasenames
+        )
+
+        do {
+            switch CommandPathResolver.launchability(of: resolvedCommand) {
+            case .launchable, .bareCommandFallback:
+                break
+            case .missingPath, .directory, .notExecutable:
+                throw AIProviderError.invalidConfiguration(detail: antigravityNotFoundMessage)
+            }
+
+            let exitStatus = try await runAntigravityVersionProbe(
+                executable: resolvedCommand,
+                environment: environmentResult.environment
+            )
+            guard exitStatus == 0 else {
+                // The binary resolved and ran but `agy --version` exited nonzero — distinct from
+                // a missing binary (a broken install, an unexpected agy build, etc.).
+                throw AIProviderError.invalidConfiguration(
+                    detail: "Antigravity CLI (agy) failed to run (exit \(exitStatus)). Verify your `agy` installation by running `agy --version` in a terminal."
+                )
+            }
+
+            // Install the RepoPrompt MCP server entry now that `agy` is confirmed reachable, so
+            // the MCP-installed flag is set and agy can see RepoPrompt tools on its next run.
+            MCPIntegrationHelper.installInAntigravity()
+
+            isAntigravityConnected = true
+            antigravityError = nil
+            UserDefaults.standard.set(true, forKey: "AntigravityCLIConnected")
+            setContextBuilderProviderVerified(.antigravity, verified: true)
+            await updateAvailableModels()
+            // Populate the Agent Mode model picker from the live `agy models` list now that the
+            // CLI is reachable. Fire-and-forget: failures leave the picker's static `Default`.
+            Task { await AntigravityModelRegistry.shared.refresh() }
+            return true
+        } catch {
+            isAntigravityConnected = false
+            setContextBuilderProviderVerified(.antigravity, verified: false)
+            // Surface the real failure reason (missing binary vs. run failure vs. timeout)
+            // rather than collapsing every error into the generic "not found" message.
+            let message: String = if let providerError = error as? AIProviderError,
+                                     case let .invalidConfiguration(detail) = providerError
+            {
+                detail
+            } else {
+                antigravityNotFoundMessage
+            }
+            antigravityError = message
+            UserDefaults.standard.set(false, forKey: "AntigravityCLIConnected")
+            await updateAvailableModels()
+            throw AIProviderError.invalidConfiguration(detail: message)
+        }
+    }
+
+    /// Runs `agy --version` and returns the process exit status. Spawned off the main
+    /// actor with a short timeout so a hung binary cannot stall the connection test.
+    private func runAntigravityVersionProbe(
+        executable: String,
+        environment: [String: String]
+    ) async throws -> Int32 {
+        try await Task.detached(priority: .userInitiated) {
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: executable)
+            process.arguments = ["--version"]
+            process.environment = environment
+            process.standardInput = FileHandle.nullDevice
+            process.standardOutput = FileHandle.nullDevice
+            process.standardError = FileHandle.nullDevice
+
+            try process.run()
+
+            let deadline = Date().addingTimeInterval(5)
+            while process.isRunning, Date() < deadline {
+                try await Task.sleep(nanoseconds: 50_000_000)
+            }
+            if process.isRunning {
+                process.terminate()
+                process.waitUntilExit()
+                throw AIProviderError.invalidConfiguration(detail: "Antigravity CLI (agy) did not respond in time.")
+            }
+            return process.terminationStatus
+        }.value
     }
 
     func hasCursorTrace() -> Bool {

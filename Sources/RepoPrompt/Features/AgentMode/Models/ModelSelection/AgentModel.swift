@@ -212,6 +212,11 @@ enum AgentModel: String, CaseIterable, Codable {
                 .gpt5High,
                 .gpt5XHigh
             ]
+        case .antigravity:
+            // Permissive: agy silently falls back to its default for unknown slugs and we
+            // cannot enumerate live slugs without a signed-in session, so expose only the
+            // default. A specific `--model` slug can still be supplied programmatically.
+            [.defaultModel]
         case .claudeCode:
             // Family priority matches the Claude Code picker catalog:
             // Fable → Opus[1M] → Opus → Sonnet → Haiku. Within each family,

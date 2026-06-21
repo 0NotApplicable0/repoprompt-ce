@@ -38,4 +38,7 @@ extension Notification.Name {
     /// Posted when Cursor CLI connection status changes
     /// userInfo mirrors `claudeCodeConnectionChanged`
     static let cursorConnectionChanged = Notification.Name("cursorConnectionChanged")
+    /// Posted when the cached Antigravity (`agy`) live model list changes.
+    /// Drives an Agent Mode model-picker refresh; carries no userInfo.
+    static let antigravityModelsChanged = Notification.Name("antigravityModelsChanged")
 }

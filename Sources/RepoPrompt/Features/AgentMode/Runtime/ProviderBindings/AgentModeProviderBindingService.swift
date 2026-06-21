@@ -223,6 +223,8 @@ final class AgentModeProviderBindingService {
                         updateActiveBindings(session)
                     }
                 }
+            case .antigravity:
+                break
             }
         }
 

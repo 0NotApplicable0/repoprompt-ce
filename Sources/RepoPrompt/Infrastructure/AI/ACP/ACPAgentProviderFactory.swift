@@ -21,7 +21,7 @@ enum ACPAgentProviderFactory {
                     modelString: modelString
                 )
             )
-        case .claudeCode, .claudeCodeGLM, .kimiCode, .customClaudeCompatible, .codexExec:
+        case .claudeCode, .claudeCodeGLM, .kimiCode, .customClaudeCompatible, .codexExec, .antigravity:
             nil
         }
     }

@@ -15,6 +15,12 @@ enum CLILaunchProfiles {
         "~/.opencode/bin"
     ]
     static let cursorProviderSpecificPaths: [String] = []
+    /// Antigravity CLI (`agy`) installs into ~/.local/bin on Unix; supplement the
+    /// native defaults with it so the resolver finds the binary regardless of the
+    /// inherited child PATH.
+    static let antigravityProviderSpecificPaths: [String] = [
+        "~/.local/bin"
+    ]
 
     /// Preserve the committed Codex hint order exactly: shell/package-manager
     /// fallbacks first, then Codex.app resources. System bins are intentionally not
@@ -58,6 +64,12 @@ enum CLILaunchProfiles {
         commandName: "cursor-agent",
         preferredBasenames: ["cursor-agent"],
         supplementalSearchPaths: nativeDefaultsSupplemented(with: cursorProviderSpecificPaths)
+    )
+
+    static let antigravity = CLILaunchProfile(
+        commandName: "agy",
+        preferredBasenames: ["agy"],
+        supplementalSearchPaths: nativeDefaultsSupplemented(with: antigravityProviderSpecificPaths)
     )
 
     static func nativeDefaultsSupplemented(with providerSpecificPaths: [String]) -> [String] {

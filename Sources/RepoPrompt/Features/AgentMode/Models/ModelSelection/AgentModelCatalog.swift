@@ -6,6 +6,7 @@ enum AgentModelCatalog {
         let codexAvailable: Bool
         let openCodeAvailable: Bool
         let cursorAvailable: Bool
+        let antigravityAvailable: Bool
         let zaiConfigured: Bool
         let kimiConfigured: Bool
         let customClaudeCompatibleConfigured: Bool
@@ -15,6 +16,7 @@ enum AgentModelCatalog {
             codexAvailable: false,
             openCodeAvailable: false,
             cursorAvailable: false,
+            antigravityAvailable: false,
             zaiConfigured: false,
             kimiConfigured: false,
             customClaudeCompatibleConfigured: false
@@ -26,6 +28,7 @@ enum AgentModelCatalog {
                 codexAvailable: codexAvailable && providers.contains(.codex),
                 openCodeAvailable: false,
                 cursorAvailable: cursorAvailable && providers.contains(.cursor),
+                antigravityAvailable: false,
                 zaiConfigured: zaiConfigured && providers.contains(.claudeCode),
                 kimiConfigured: kimiConfigured && providers.contains(.claudeCode),
                 customClaudeCompatibleConfigured: customClaudeCompatibleConfigured && providers.contains(.claudeCode)
@@ -39,6 +42,7 @@ enum AgentModelCatalog {
                 codexAvailable: true,
                 openCodeAvailable: true,
                 cursorAvailable: false,
+                antigravityAvailable: true,
                 zaiConfigured: backendIsAvailable(.glmZAI, store: store),
                 kimiConfigured: backendIsAvailable(.kimi, store: store),
                 customClaudeCompatibleConfigured: backendIsAvailable(.custom, store: store)
@@ -50,6 +54,7 @@ enum AgentModelCatalog {
             codexAvailable: Bool = true,
             openCodeAvailable: Bool = true,
             cursorAvailable: Bool = false,
+            antigravityAvailable: Bool = true,
             zaiConfigured: Bool = false,
             kimiConfigured: Bool = false,
             customClaudeCompatibleConfigured: Bool = false
@@ -58,6 +63,7 @@ enum AgentModelCatalog {
             self.codexAvailable = codexAvailable
             self.openCodeAvailable = openCodeAvailable
             self.cursorAvailable = cursorAvailable
+            self.antigravityAvailable = antigravityAvailable
             self.zaiConfigured = zaiConfigured
             self.kimiConfigured = kimiConfigured
             self.customClaudeCompatibleConfigured = customClaudeCompatibleConfigured
@@ -80,6 +86,7 @@ enum AgentModelCatalog {
                 codexAvailable: codexAvailable || agentKind == .codexExec,
                 openCodeAvailable: openCodeAvailable || agentKind == .openCode,
                 cursorAvailable: cursorAvailable || agentKind == .cursor,
+                antigravityAvailable: antigravityAvailable || agentKind == .antigravity,
                 zaiConfigured: zaiConfigured || agentKind == .claudeCodeGLM,
                 kimiConfigured: kimiConfigured || agentKind == .kimiCode,
                 customClaudeCompatibleConfigured: customClaudeCompatibleConfigured || agentKind == .customClaudeCompatible
@@ -179,14 +186,15 @@ enum AgentModelCatalog {
         .codexExec,
         .claudeCode,
         .openCode,
-        .cursor
+        .cursor,
+        .antigravity
     ]
 
     static func selectableAgents(
         availability: AvailabilityContext = .current,
         surface: AgentSelectionSurface = .general
     ) -> [AgentProviderKind] {
-        [.codexExec, .claudeCode, .openCode, .cursor, .claudeCodeGLM, .kimiCode, .customClaudeCompatible]
+        [.codexExec, .claudeCode, .openCode, .cursor, .antigravity, .claudeCodeGLM, .kimiCode, .customClaudeCompatible]
             .filter { surface.allows($0) && isAgentAvailable($0, availability: availability) }
     }
 
@@ -216,6 +224,8 @@ enum AgentModelCatalog {
             availability.openCodeAvailable
         case .cursor:
             availability.cursorAvailable
+        case .antigravity:
+            availability.antigravityAvailable
         }
     }
 
@@ -239,7 +249,7 @@ enum AgentModelCatalog {
         case .claudeCode, .claudeCodeGLM, .kimiCode, .customClaudeCompatible:
             return ClaudeCompatibleModelCatalogAdapter.defaultModelRaw(for: agentKind, availability: availability)
                 ?? AgentModel.defaultModel.rawValue
-        case .codexExec, .openCode:
+        case .codexExec, .openCode, .antigravity:
             return AgentModel.defaultModel.rawValue
         }
     }
@@ -347,11 +357,43 @@ enum AgentModelCatalog {
                 availability: availability,
                 includeClaudeEffortVariants: includeClaudeEffortVariants
             ) ?? []
+        case .antigravity:
+            return antigravityOptions(for: agentKind, availability: availability)
         case .openCode, .cursor:
             return AgentModel.modelsForAgent(agentKind)
                 .filter { isAvailable($0, for: agentKind, availability: availability) }
                 .map { staticOption($0, for: agentKind) }
         }
+    }
+
+    /// Builds the Antigravity model options: the static `Default` placeholder followed by one
+    /// option per live `agy models` label (raw value == display name == the verbatim label, which
+    /// `agy --model "<LABEL>"` accepts directly — no slug mapping). Mirrors the Codex live-model
+    /// path: a background refresh is kicked off when the cache is stale, and the picker re-reads
+    /// these options when `AntigravityModelRegistry` posts `.antigravityModelsChanged`.
+    private static func antigravityOptions(
+        for agentKind: AgentProviderKind,
+        availability: AvailabilityContext
+    ) -> [AgentModelOption] {
+        // Non-blocking, coalesced background refresh; results surface via the change notification.
+        Task { await AntigravityModelRegistry.shared.refreshIfStale() }
+
+        var options = AgentModel.modelsForAgent(agentKind)
+            .filter { isAvailable($0, for: agentKind, availability: availability) }
+            .map { staticOption($0, for: agentKind) }
+
+        var seen = Set(options.map { $0.rawValue.lowercased() })
+        for label in AntigravityModelRegistry.shared.currentModelLabels() {
+            guard seen.insert(label.lowercased()).inserted else { continue }
+            options.append(AgentModelOption(
+                rawValue: label,
+                displayName: label,
+                description: nil,
+                isPlaceholderDefault: false,
+                isProviderDefault: false
+            ))
+        }
+        return options
     }
 
     static func isValid(
@@ -389,7 +431,7 @@ enum AgentModelCatalog {
         {
             return isValid
         }
-        if agentKind == .codexExec {
+        if agentKind == .codexExec || agentKind == .antigravity {
             return true
         }
         guard let known = AgentModel.resolvedModel(forRaw: normalized, agentKind: agentKind) else { return false }
@@ -1368,7 +1410,7 @@ enum AgentModelCatalog {
             .kimi
         case .customClaudeCompatible:
             .custom
-        case .claudeCode, .codexExec, .openCode, .cursor:
+        case .claudeCode, .codexExec, .openCode, .cursor, .antigravity:
             nil
         }
     }
@@ -1571,7 +1613,7 @@ enum AgentModelCatalog {
             availability.kimiConfigured
         case .customClaudeCompatible:
             availability.customClaudeCompatibleConfigured
-        case .claudeCode, .codexExec, .openCode, .cursor:
+        case .claudeCode, .codexExec, .openCode, .cursor, .antigravity:
             true
         }
     }
@@ -1906,7 +1948,6 @@ enum AgentModelCatalog {
     ) -> [DiscoveryTaskLabel] {
         taskLabels.compactMap { entry in
             guard let resolved = resolveTaskLabelKind(entry.kind, availability: availability) else { return nil }
-            let selectionID = AgentModelSelectionID(agentRaw: resolved.agent.rawValue, modelRaw: resolved.modelRaw)
             let name = displayName(for: resolved.modelRaw, agentKind: resolved.agent, availability: availability)
             return DiscoveryTaskLabel(
                 label: entry.label,
