@@ -204,6 +204,7 @@ enum ProcessLauncher {
         // signals blocked — which hangs runtimes that rely on signal delivery (e.g. the Grok CLI's
         // async gateway never makes progress and the run appears frozen). Reset the child's mask to
         // empty (all signals unblocked) so spawned tools/agents run with a clean signal state.
+        // See docs/architecture/process-spawning.md for the symptom→cause debugging notes.
         var emptySignalMask = sigset_t()
         sigemptyset(&emptySignalMask)
 
