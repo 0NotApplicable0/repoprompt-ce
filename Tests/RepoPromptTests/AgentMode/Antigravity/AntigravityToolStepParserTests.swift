@@ -31,7 +31,7 @@ final class AntigravityToolStepParserTests: XCTestCase {
         let parsed = try XCTUnwrap(p.parse(status: 3, payload: payload(callid: "c1", name: "view_file", json: viewJSON)))
         XCTAssertEqual(parsed.call.type, "tool_call")
         XCTAssertEqual(parsed.call.toolName, "view_file")
-        XCTAssertEqual(parsed.call.toolArgs, "View x.swift") // toolSummary
+        XCTAssertEqual(parsed.call.toolArgs, "/Users/dev/x.swift") // specific arg (AbsolutePath), not the generic summary
         XCTAssertEqual(parsed.call.toolInvocationID, parsed.invocationID)
         XCTAssertEqual(parsed.result?.type, "tool_result")
         XCTAssertEqual(parsed.result?.toolInvocationID, parsed.invocationID)
@@ -57,7 +57,28 @@ final class AntigravityToolStepParserTests: XCTestCase {
         let json = #"{"CommandLine":"git status","Cwd":"/x"}"#
         let parsed = try XCTUnwrap(p.parse(status: 3, payload: payload(callid: "c2", name: "run_command", json: json)))
         XCTAssertEqual(parsed.call.toolName, "run_command")
-        XCTAssertEqual(parsed.call.toolArgs, "git status") // CommandLine when no toolSummary
+        XCTAssertEqual(parsed.call.toolArgs, "git status") // CommandLine, the actual command
+    }
+
+    func testViewFileShowsPathWithLineRange() throws {
+        let p = AntigravityToolStepParser()
+        let json = #"{"AbsolutePath":"/Users/dev/a.swift","StartLine":10,"EndLine":40,"toolSummary":"View a.swift"}"#
+        let parsed = try XCTUnwrap(p.parse(status: 3, payload: payload(callid: "c3", name: "view_file", json: json)))
+        XCTAssertEqual(parsed.call.toolArgs, "/Users/dev/a.swift (lines 10–40)") // path + line range, like grok
+    }
+
+    func testCallMcpToolIsSuppressed() {
+        // agy wraps RepoPrompt MCP calls as `call_mcp_tool`; those are already carded via expected-PID
+        // MCP tool tracking with the real tool name + arguments, so the trajectory duplicate is dropped.
+        let json = #"{"ToolName":"set_status","ServerName":"RepoPromptCE","toolSummary":"Set status"}"#
+        XCTAssertNil(AntigravityToolStepParser().parse(status: 3, payload: payload(callid: "c4", name: "call_mcp_tool", json: json)))
+    }
+
+    func testFallsBackToSummaryWhenNoSpecificArg() throws {
+        let p = AntigravityToolStepParser()
+        let json = #"{"toolSummary":"Did a thing","toolAction":"Doing a thing"}"#
+        let parsed = try XCTUnwrap(p.parse(status: 3, payload: payload(callid: "c5", name: "some_tool", json: json)))
+        XCTAssertEqual(parsed.call.toolArgs, "Did a thing") // human-readable summary only when no specific arg
     }
 
     func testNonToolStepReturnsNil() {
