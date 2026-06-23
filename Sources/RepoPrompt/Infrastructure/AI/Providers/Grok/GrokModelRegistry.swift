@@ -236,7 +236,7 @@ final class GrokModelRegistry {
     private static let droppedLinePrefixes = [
         "you are not authenticated.",
         "available models:",
-        "default model:",
+        "default model:"
     ]
 
     /// Parses `grok models` stdout into trimmed, de-duplicated model ids in source order.

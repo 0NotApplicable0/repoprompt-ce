@@ -2,14 +2,15 @@ import Foundation
 
 /// Headless provider for xAI's Grok CLI (`grok`).
 ///
-/// `grok` v0.2.56 exposes a one-shot headless mode that reads the prompt from a file
-/// (`--prompt-file <PATH>`) and prints a single final JSON object on stdout
-/// (`--output-format json`). This provider mirrors the mechanics of
-/// `CodexExecAgentProvider` — a plain, non-ACP `HeadlessAgentProvider` — but is
-/// intentionally simpler: it accumulates stdout, parses the final JSON tolerantly into
-/// content, and synthesizes a `message_stop`. RepoPrompt MCP tool calls surface via
+/// `grok` exposes a one-shot headless mode that reads the prompt from a file
+/// (`--prompt-file <PATH>`) and, with `--output-format streaming-json`, emits an NDJSON event
+/// stream on stdout (`thought` reasoning deltas, `text` content deltas, a terminal `end`). This
+/// provider mirrors the mechanics of `CodexExecAgentProvider` — a plain, non-ACP
+/// `HeadlessAgentProvider` — framing stdout into lines (`LineFramer`) and parsing each
+/// incrementally (`GrokStreamParser.parseStreamingEvent`) so `reasoning`/`content` surface live,
+/// then a `message_stop` on `end`. RepoPrompt MCP tool calls surface via
 /// `AgentToolTrackingController` plus expected-PID routing (the MCP server attributes calls by
-/// the spawned process id), not via stdout parsing.
+/// the spawned process id); grok's own native tool calls are not on the stdout stream.
 ///
 /// Authentication is the user's responsibility: a prior interactive `grok login` sign-in (xAI
 /// OAuth, stored under `~/.grok/auth.json`) is required. RepoPrompt injects no credentials; the
@@ -53,16 +54,16 @@ final class GrokAgentProvider: HeadlessAgentProvider {
     /// Build the `grok` argv. The (potentially very large) combined system+user prompt is NOT
     /// passed on the command line or over stdin: it is written to a temp file and referenced via
     /// `--prompt-file <PATH>`, which avoids the `ARG_MAX` limit a positional argv would hit and
-    /// keeps stdin free. `--output-format json` is always passed so the single final JSON object
-    /// can be parsed deterministically. Remaining flags are passed via argv (posix_spawn, no
-    /// shell) so values are safe.
+    /// keeps stdin free. `--output-format streaming-json` is always passed so grok emits an NDJSON
+    /// event stream (thought/text/end) that is parsed incrementally for live progress. Remaining
+    /// flags are passed via argv (posix_spawn, no shell) so values are safe.
     static func buildArguments(
         config: GrokAgentConfig,
         workspacePath: String?,
         promptFilePath: String,
         debugFilePath: String?
     ) -> [String] {
-        var args = ["--prompt-file", promptFilePath, "--output-format", "json"]
+        var args = ["--prompt-file", promptFilePath, "--output-format", "streaming-json"]
         if let model = config.modelString?.trimmingCharacters(in: .whitespacesAndNewlines),
            !model.isEmpty, model.lowercased() != "default"
         {
@@ -97,6 +98,12 @@ final class GrokAgentProvider: HeadlessAgentProvider {
         guard ensureSuccess else {
             throw AIProviderError.invalidConfiguration(detail: "Failed to install RepoPrompt MCP config for Grok CLI.")
         }
+        // grok caches its discovered MCP tool catalog per cwd and will not re-list while the cache
+        // exists; purge it so this run re-lists against the bound agent-mode policy and picks up the
+        // granted session-control tool (set_status). The policy binds because grok's announced client
+        // name ("grok-shell-<server>") canonicalizes to the grok family — see
+        // MCPClientIdentity.canonicalFamilyID.
+        GrokIntegrationConfiguration.purgePersistedToolCatalog(workspacePath: workspacePath)
         return HeadlessAgentContext(
             runID: actualRunID,
             configURL: nil,
@@ -107,7 +114,7 @@ final class GrokAgentProvider: HeadlessAgentProvider {
     // MARK: - Streaming
 
     func streamAgentMessage(_ message: AgentMessage, runID: UUID? = nil) async throws -> AsyncThrowingStream<AIStreamResult, Error> {
-        AsyncThrowingStream { continuation in
+        let raw = AsyncThrowingStream<AIStreamResult, Error> { continuation in
             self.streamTask?.cancel()
             self.streamTask = Task { [weak self] in
                 guard let self else { return }
@@ -156,10 +163,52 @@ final class GrokAgentProvider: HeadlessAgentProvider {
                             continuation: continuation
                         )
 
-                        var stdoutData = Data()
+                        // grok does not emit tool calls on stdout — only in its session
+                        // `events.jsonl`. Tail that log concurrently to surface live tool cards;
+                        // the task is cancelled when this run scope exits (defer below).
+                        let toolLog = GrokSessionToolLog(
+                            workspacePath: self.workspacePath,
+                            environment: context.environment
+                        )
+                        let toolLogTask = Task {
+                            guard let toolLog else { return }
+                            let parser = GrokToolEventParser()
+                            await AgentSessionToolLogStream.tail(
+                                into: continuation,
+                                locate: { toolLog.locate() },
+                                parse: { parser.parse($0) }
+                            )
+                        }
+                        defer { toolLogTask.cancel() }
+
+                        var framer = LineFramer()
                         var stderrTail = Data()
                         var exitStatus: Int32?
                         var timedOut = false
+                        var sawEnd = false
+                        var sawContent = false
+                        var streamError: String?
+
+                        /// Parse + forward one NDJSON event live, tracking terminal/error state.
+                        /// `reasoning` events pass through unchanged; `AgentReasoningStatusStream`
+                        /// (applied to the returned stream) turns them into live running-status
+                        /// updates downstream.
+                        func handle(_ lineData: Data) {
+                            guard let result = GrokStreamParser.parseStreamingEvent(lineData) else { return }
+                            switch result.type {
+                            case "error":
+                                // Surface after the loop as a failed run (no message_stop).
+                                if streamError == nil { streamError = result.text }
+                            case "message_stop":
+                                sawEnd = true
+                                continuation.yield(result)
+                            default:
+                                if result.type == "content" || result.type == "reasoning" {
+                                    sawContent = true
+                                }
+                                continuation.yield(result)
+                            }
+                        }
 
                         do {
                             let expectedPIDRunID = context.runID
@@ -183,17 +232,16 @@ final class GrokAgentProvider: HeadlessAgentProvider {
                             for try await event in stream {
                                 switch event {
                                 case let .stdout(chunk):
-                                    stdoutData.append(chunk)
+                                    framer.feed(chunk) { handle($0) }
                                 case let .stderr(chunk):
-                                    stderrTail.append(chunk)
-                                    if stderrTail.count > 64 * 1024 {
-                                        stderrTail = Data(stderrTail.suffix(64 * 1024))
-                                    }
+                                    appendTail(&stderrTail, chunk: chunk, limit: 64 * 1024)
                                 case let .terminated(status, didTimeout):
                                     exitStatus = status
                                     timedOut = didTimeout
                                 }
                             }
+                            // Flush any trailing line without a newline terminator.
+                            framer.flush { handle($0) }
                         } catch {
                             await self.runner.cancelAll()
                             await self.toolTracking.stopTracking()
@@ -213,8 +261,14 @@ final class GrokAgentProvider: HeadlessAgentProvider {
                             )
                         }
 
-                        let results = GrokStreamParser.parseFinalOutput(stdoutData)
-                        if results.isEmpty {
+                        // grok's `streaming-json` surfaces failures as an `{"type":"error"}` event.
+                        // Treat as a FAILED run: any content already streamed stays, but emit NO
+                        // `message_stop` and finish(throwing:) so the runner records a failed state.
+                        if let streamError {
+                            throw AIProviderError.invalidConfiguration(detail: streamError)
+                        }
+
+                        if !sawContent, !sawEnd {
                             let hint = Self.tailOfLogFile(debugFileURL)
                                 ?? "Ensure you are signed in: run `grok login` once to authenticate."
                             throw AIProviderError.invalidConfiguration(
@@ -222,33 +276,21 @@ final class GrokAgentProvider: HeadlessAgentProvider {
                             )
                         }
 
-                        // grok `--output-format json` surfaces failures as a top-level
-                        // `{"type":"error"}` object → an `error` stream result. Treat that as a
-                        // FAILED run: yield any non-error content, emit NO `message_stop`, and
-                        // finish(throwing:) so the runner records a failed terminal state instead
-                        // of `.completed`.
-                        if let failure = results.first(where: { $0.type == "error" }) {
-                            for result in results where result.type != "error" {
-                                continuation.yield(result)
-                            }
-                            throw AIProviderError.invalidConfiguration(
-                                detail: failure.text ?? "Grok CLI reported an error."
+                        // grok emits an explicit `end` event (→ message_stop). If the process
+                        // terminated cleanly without one, synthesize a message_stop so the run
+                        // finalizes deterministically.
+                        if !sawEnd {
+                            continuation.yield(
+                                AIStreamResult(
+                                    type: "message_stop",
+                                    text: nil,
+                                    reasoning: nil,
+                                    promptTokens: nil,
+                                    completionTokens: nil,
+                                    cost: nil
+                                )
                             )
                         }
-
-                        for result in results {
-                            continuation.yield(result)
-                        }
-                        continuation.yield(
-                            AIStreamResult(
-                                type: "message_stop",
-                                text: nil,
-                                reasoning: nil,
-                                promptTokens: nil,
-                                completionTokens: nil,
-                                cost: nil
-                            )
-                        )
                         continuation.finish()
                     } catch is CancellationError {
                         await self.runner.cancelAll()
@@ -267,6 +309,7 @@ final class GrokAgentProvider: HeadlessAgentProvider {
                 self?.streamTask?.cancel()
             }
         }
+        return AgentReasoningStatusStream.withReasoningStatus(raw)
     }
 
     func dispose() async {

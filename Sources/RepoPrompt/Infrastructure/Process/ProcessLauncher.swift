@@ -199,6 +199,14 @@ enum ProcessLauncher {
         sigemptyset(&defaultSignals)
         sigaddset(&defaultSignals, SIGPIPE)
 
+        // We may spawn from a GCD/worker thread whose signal mask has signals blocked. posix_spawn
+        // inherits the calling thread's signal mask, so without resetting it the child starts with
+        // signals blocked — which hangs runtimes that rely on signal delivery (e.g. the Grok CLI's
+        // async gateway never makes progress and the run appears frozen). Reset the child's mask to
+        // empty (all signals unblocked) so spawned tools/agents run with a clean signal state.
+        var emptySignalMask = sigset_t()
+        sigemptyset(&emptySignalMask)
+
         var spawnFlags: Int16 = 0
         let getFlagsResult = posix_spawnattr_getflags(&attributes, &spawnFlags)
         if getFlagsResult != 0 {
@@ -228,7 +236,15 @@ enum ProcessLauncher {
             throw ProcessLauncherError.spawnAttributesFailed(operation: "setpgroup", errno: setProcessGroupResult)
         }
 
-        var configuredSpawnFlags = spawnFlags | Int16(POSIX_SPAWN_SETSIGDEF) | Int16(POSIX_SPAWN_SETPGROUP)
+        let setSigMaskResult = posix_spawnattr_setsigmask(&attributes, &emptySignalMask)
+        if setSigMaskResult != 0 {
+            closePipe(&stdinPipe)
+            closePipe(&stdoutPipe)
+            closePipe(&stderrPipe)
+            throw ProcessLauncherError.spawnAttributesFailed(operation: "setsigmask", errno: setSigMaskResult)
+        }
+
+        var configuredSpawnFlags = spawnFlags | Int16(POSIX_SPAWN_SETSIGDEF) | Int16(POSIX_SPAWN_SETPGROUP) | Int16(POSIX_SPAWN_SETSIGMASK)
         #if canImport(Darwin)
             configuredSpawnFlags |= Int16(POSIX_SPAWN_CLOEXEC_DEFAULT)
         #endif

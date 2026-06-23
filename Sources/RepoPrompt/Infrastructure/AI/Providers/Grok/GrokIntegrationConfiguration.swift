@@ -29,6 +29,36 @@ enum GrokIntegrationConfiguration {
         configDirectoryURL().appendingPathComponent("config.toml")
     }
 
+    /// grok persists its discovered MCP tool catalog per working directory under
+    /// `~/.grok/projects/<dir>/mcps/<server>/` and reuses it without re-listing. When that cache
+    /// was seeded from a connection that lacked the agent-mode grant, it permanently omits gated
+    /// tools (notably `set_status`). Remove it before a run so grok re-lists against the bound
+    /// agent-mode policy; the policy binds because grok's announced client name canonicalizes to the
+    /// grok family (see `MCPClientIdentity.canonicalFamilyID`), so the re-list includes the grant.
+    ///
+    /// grok encodes `<dir>` as the absolute cwd with leading/trailing slashes dropped and the
+    /// remaining slashes replaced by `-` (e.g. `/Users/x/proj` → `Users-x-proj`). Best-effort: a
+    /// missing cache directory is a no-op.
+    static func purgePersistedToolCatalog(workspacePath: String?) {
+        guard let projectDir = persistedProjectDirName(forWorkspacePath: workspacePath) else { return }
+        let serverCache = configDirectoryURL()
+            .appendingPathComponent("projects", isDirectory: true)
+            .appendingPathComponent(projectDir, isDirectory: true)
+            .appendingPathComponent("mcps", isDirectory: true)
+            .appendingPathComponent(repoPromptMCPServerName, isDirectory: true)
+        try? FileManager.default.removeItem(at: serverCache)
+    }
+
+    /// grok's `projects/<dir>` encoding of a workspace cwd: leading/trailing slashes dropped and
+    /// remaining slashes replaced by `-`. Returns `nil` for an empty/slash-only path.
+    static func persistedProjectDirName(forWorkspacePath workspacePath: String?) -> String? {
+        guard let cwd = workspacePath?.trimmingCharacters(in: .whitespaces), !cwd.isEmpty else { return nil }
+        let projectDir = cwd
+            .trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+            .replacingOccurrences(of: "/", with: "-")
+        return projectDir.isEmpty ? nil : projectDir
+    }
+
     /// The fully qualified TOML header for our MCP server section.
     static var sectionHeader: String {
         "[mcp_servers.\(repoPromptMCPServerName)]"

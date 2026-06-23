@@ -55,6 +55,49 @@ enum GrokStreamParser {
         return [contentResult(trimmed)]
     }
 
+    // MARK: - Streaming (`--output-format streaming-json`)
+
+    /// Parse ONE line of grok's `--output-format streaming-json` NDJSON stream into a live stream
+    /// result, or `nil` for lines that carry nothing renderable.
+    ///
+    /// grok streaming-json events (one JSON object per line):
+    ///   - `{"type":"thought","data":"…"}` → incremental reasoning delta (`reasoning`)
+    ///   - `{"type":"text","data":"…"}`    → incremental assistant content delta (`content`)
+    ///   - `{"type":"end","stopReason":"…","sessionId":"…"}` → terminal (`message_stop`)
+    ///   - `{"type":"error","message":"…"}` → error (`error`)
+    ///
+    /// Note: grok does NOT surface tool calls on this stream (they are internal to the CLI), so
+    /// this parser intentionally maps only reasoning/content/terminal/error events. Unknown event
+    /// types degrade to `nil`.
+    static func parseStreamingEvent(_ data: Data) -> AIStreamResult? {
+        guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let type = (object["type"] as? String)?.lowercased()
+        else { return nil }
+
+        switch type {
+        case "thought":
+            guard let text = object["data"] as? String, !text.isEmpty else { return nil }
+            return AIStreamResult(type: "reasoning", text: nil, reasoning: text)
+        case "text":
+            guard let text = object["data"] as? String, !text.isEmpty else { return nil }
+            return contentResult(text)
+        case "end":
+            return AIStreamResult(
+                type: "message_stop",
+                text: nil,
+                providerSessionID: object["sessionId"] as? String,
+                stopReason: object["stopReason"] as? String
+            )
+        case "error":
+            let message = (object["message"] as? String)
+                ?? (object["data"] as? String)
+                ?? "Grok CLI reported an error."
+            return errorResult(message)
+        default:
+            return nil
+        }
+    }
+
     static func contentResult(_ text: String) -> AIStreamResult {
         AIStreamResult(
             type: "content",

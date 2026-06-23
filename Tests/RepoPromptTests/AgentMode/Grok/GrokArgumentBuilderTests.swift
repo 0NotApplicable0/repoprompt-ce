@@ -35,8 +35,8 @@ final class GrokArgumentBuilderTests: XCTestCase {
         // The prompt is delivered via a temp file referenced by `--prompt-file`, never on argv.
         XCTAssertEqual(args.first, "--prompt-file")
         XCTAssertTrue(consecutive(args, ["--prompt-file", "/tmp/prompt.txt"]))
-        // `--output-format json` is always passed so the final JSON object can be parsed.
-        XCTAssertTrue(consecutive(args, ["--output-format", "json"]))
+        // `--output-format streaming-json` is always passed so grok streams NDJSON events.
+        XCTAssertTrue(consecutive(args, ["--output-format", "streaming-json"]))
         // No model, no workspace, no debug configured here.
         XCTAssertFalse(args.contains("--model"))
         XCTAssertFalse(args.contains("--cwd"))
@@ -189,12 +189,12 @@ final class GrokArgumentBuilderTests: XCTestCase {
         )
         XCTAssertEqual(args, [
             "--prompt-file", "/tmp/prompt.txt",
-            "--output-format", "json",
+            "--output-format", "streaming-json",
             "--model", "grok-build",
             "--cwd", "/tmp/ws",
             "--sandbox", "workspace",
             "--permission-mode", "bypassPermissions",
-            "--debug", "--debug-file", "/tmp/grok.log",
+            "--debug", "--debug-file", "/tmp/grok.log"
         ])
     }
 
@@ -210,8 +210,8 @@ final class GrokArgumentBuilderTests: XCTestCase {
         )
         XCTAssertEqual(args, [
             "--prompt-file", "/tmp/prompt.txt",
-            "--output-format", "json",
-            "--permission-mode", "bypassPermissions",
+            "--output-format", "streaming-json",
+            "--permission-mode", "bypassPermissions"
         ])
     }
 

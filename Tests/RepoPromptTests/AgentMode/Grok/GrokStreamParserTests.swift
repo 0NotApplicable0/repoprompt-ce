@@ -88,4 +88,46 @@ final class GrokStreamParserTests: XCTestCase {
         XCTAssertEqual(results.first?.type, "content")
         XCTAssertEqual(results.first?.text, mixed)
     }
+
+    // MARK: - Streaming events (`--output-format streaming-json`)
+
+    func testStreamingThoughtBecomesReasoning() {
+        let result = GrokStreamParser.parseStreamingEvent(data("{\"type\":\"thought\",\"data\":\"hmm\"}"))
+        XCTAssertEqual(result?.type, "reasoning")
+        XCTAssertEqual(result?.reasoning, "hmm")
+        XCTAssertNil(result?.text)
+    }
+
+    func testStreamingTextBecomesContent() {
+        let result = GrokStreamParser.parseStreamingEvent(data("{\"type\":\"text\",\"data\":\"hi\"}"))
+        XCTAssertEqual(result?.type, "content")
+        XCTAssertEqual(result?.text, "hi")
+    }
+
+    func testStreamingEndBecomesMessageStop() {
+        let json = "{\"type\":\"end\",\"stopReason\":\"EndTurn\",\"sessionId\":\"s1\",\"requestId\":\"r1\"}"
+        let result = GrokStreamParser.parseStreamingEvent(data(json))
+        XCTAssertEqual(result?.type, "message_stop")
+        XCTAssertEqual(result?.stopReason, "EndTurn")
+        XCTAssertEqual(result?.providerSessionID, "s1")
+    }
+
+    func testStreamingErrorBecomesError() {
+        let result = GrokStreamParser.parseStreamingEvent(data("{\"type\":\"error\",\"message\":\"boom\"}"))
+        XCTAssertEqual(result?.type, "error")
+        XCTAssertEqual(result?.text, "boom")
+    }
+
+    func testStreamingEmptyThoughtIsIgnored() {
+        XCTAssertNil(GrokStreamParser.parseStreamingEvent(data("{\"type\":\"thought\",\"data\":\"\"}")))
+    }
+
+    func testStreamingUnknownTypeIsIgnored() {
+        XCTAssertNil(GrokStreamParser.parseStreamingEvent(data("{\"type\":\"heartbeat\"}")))
+    }
+
+    func testStreamingNonJSONLineIsIgnored() {
+        XCTAssertNil(GrokStreamParser.parseStreamingEvent(data("not json")))
+        XCTAssertNil(GrokStreamParser.parseStreamingEvent(Data()))
+    }
 }

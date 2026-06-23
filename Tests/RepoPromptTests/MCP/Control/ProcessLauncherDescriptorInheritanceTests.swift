@@ -222,6 +222,37 @@ final class ProcessLauncherDescriptorInheritanceTests: XCTestCase {
         #endif
     }
 
+    func testSpawnedChildSignalMaskIsResetEvenWhenSpawningThreadBlocksSignals() throws {
+        // ProcessLauncher resets the child's signal mask to empty (POSIX_SPAWN_SETSIGMASK) so a child
+        // never inherits a blocked mask from the spawning thread. Without it, processes spawned from a
+        // GCD/worker thread (whose mask has signals blocked) start with signals blocked — which hangs
+        // runtimes that rely on signal delivery (the Grok CLI's async gateway never makes progress and
+        // the run appears frozen). Block SIGUSR1 on this thread, then verify the child still receives it.
+        var blockSet = sigset_t()
+        sigemptyset(&blockSet)
+        sigaddset(&blockSet, SIGUSR1)
+        var previousMask = sigset_t()
+        XCTAssertEqual(pthread_sigmask(SIG_BLOCK, &blockSet, &previousMask), 0)
+        defer { _ = withUnsafePointer(to: previousMask) { pthread_sigmask(SIG_SETMASK, $0, nil) } }
+
+        // If SIGUSR1 is unblocked in the child (mask reset), `kill -USR1 $$` terminates it (default
+        // disposition) before `printf` runs. If it were inherited-blocked, the signal stays pending
+        // and the shell continues to print SURVIVED.
+        let spawned = try ProcessLauncher.spawn(
+            command: "/bin/sh",
+            arguments: ["-c", "kill -USR1 $$; printf SURVIVED"],
+            environment: ProcessInfo.processInfo.environment,
+            workingDirectory: nil
+        )
+        defer { Self.cleanup(spawned) }
+
+        let stdout = String(decoding: spawned.stdout.readDataToEndOfFile(), as: UTF8.self)
+        let status = try Self.waitForExit(spawned.pid)
+
+        XCTAssertFalse(stdout.contains("SURVIVED"), "Child inherited a blocked signal mask; SIGUSR1 was suppressed")
+        XCTAssertEqual(status & 0x7F, SIGUSR1, "Child should be terminated by the now-deliverable SIGUSR1 (raw status \(status))")
+    }
+
     private static func assertSourceContains(
         _ snippets: [String],
         in source: String,

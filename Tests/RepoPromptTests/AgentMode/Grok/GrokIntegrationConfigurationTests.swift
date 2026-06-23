@@ -45,7 +45,7 @@ final class GrokIntegrationConfigurationTests: XCTestCase {
         XCTAssertEqual(occurrences, 1)
     }
 
-    func testContentRemovingRepoPromptStripsOurSectionAndPreservesRest() {
+    func testContentRemovingRepoPromptStripsOurSectionAndPreservesRest() throws {
         let existing = """
         [mcp_servers.other]
         command = "/usr/bin/other"
@@ -54,9 +54,9 @@ final class GrokIntegrationConfigurationTests: XCTestCase {
         """ + GrokIntegrationConfiguration.mcpSectionString(for: .repoPrompt) + "\n"
         let removed = GrokIntegrationConfiguration.contentRemovingRepoPrompt(existingContent: existing)
         XCTAssertNotNil(removed)
-        XCTAssertTrue(removed!.wasMCPServerPresent)
-        XCTAssertFalse(removed!.content.contains(GrokIntegrationConfiguration.sectionHeader))
-        XCTAssertTrue(removed!.content.contains("[mcp_servers.other]"), "unrelated server must survive removal")
+        XCTAssertTrue(try XCTUnwrap(removed?.wasMCPServerPresent))
+        XCTAssertFalse(try XCTUnwrap(removed?.content.contains(GrokIntegrationConfiguration.sectionHeader)))
+        XCTAssertTrue(try XCTUnwrap(removed?.content.contains("[mcp_servers.other]")), "unrelated server must survive removal")
     }
 
     func testContentRemovingRepoPromptNilOnEmpty() {
@@ -64,14 +64,14 @@ final class GrokIntegrationConfigurationTests: XCTestCase {
         XCTAssertNil(GrokIntegrationConfiguration.contentRemovingRepoPrompt(existingContent: ""))
     }
 
-    func testMergeThenRemoveRoundTrips() {
+    func testMergeThenRemoveRoundTrips() throws {
         let merged = GrokIntegrationConfiguration.mergedContent(existingContent: nil)
         let removed = GrokIntegrationConfiguration.contentRemovingRepoPrompt(existingContent: merged.content)
         XCTAssertNotNil(removed)
-        XCTAssertFalse(removed!.content.contains(GrokIntegrationConfiguration.sectionHeader))
+        XCTAssertFalse(try XCTUnwrap(removed?.content.contains(GrokIntegrationConfiguration.sectionHeader)))
     }
 
-    func testRemoveStripsDescendantTables() {
+    func testRemoveStripsDescendantTables() throws {
         let existing = """
         [mcp_servers.other]
         command = "/usr/bin/other"
@@ -85,11 +85,35 @@ final class GrokIntegrationConfigurationTests: XCTestCase {
         """
         let removed = GrokIntegrationConfiguration.contentRemovingRepoPrompt(existingContent: existing)
         XCTAssertNotNil(removed)
-        XCTAssertTrue(removed!.wasMCPServerPresent)
-        XCTAssertFalse(removed!.content.contains(GrokIntegrationConfiguration.sectionHeader))
-        XCTAssertFalse(removed!.content.contains("[mcp_servers.RepoPromptCE.env]"), "descendant table must be removed with its parent")
-        XCTAssertFalse(removed!.content.contains("FOO = \"bar\""))
-        XCTAssertTrue(removed!.content.contains("[mcp_servers.keep]"), "unrelated server after descendant must survive")
-        XCTAssertTrue(removed!.content.contains("[mcp_servers.other]"))
+        XCTAssertTrue(try XCTUnwrap(removed?.wasMCPServerPresent))
+        XCTAssertFalse(try XCTUnwrap(removed?.content.contains(GrokIntegrationConfiguration.sectionHeader)))
+        XCTAssertFalse(try XCTUnwrap(removed?.content.contains("[mcp_servers.RepoPromptCE.env]")), "descendant table must be removed with its parent")
+        XCTAssertFalse(try XCTUnwrap(removed?.content.contains("FOO = \"bar\"")))
+        XCTAssertTrue(try XCTUnwrap(removed?.content.contains("[mcp_servers.keep]")), "unrelated server after descendant must survive")
+        XCTAssertTrue(try XCTUnwrap(removed?.content.contains("[mcp_servers.other]")))
+    }
+
+    // MARK: - Persisted tool catalog cache path
+
+    func testPersistedProjectDirNameMatchesGrokEncoding() {
+        // grok stores its per-cwd MCP catalog under projects/<dir>, encoding the absolute cwd by
+        // dropping the leading slash and replacing remaining slashes with "-".
+        XCTAssertEqual(
+            GrokIntegrationConfiguration.persistedProjectDirName(forWorkspacePath: "/Users/dev/Projects/Repos/repoprompt-ce"),
+            "Users-dev-Projects-Repos-repoprompt-ce"
+        )
+    }
+
+    func testPersistedProjectDirNameTrimsTrailingSlashAndWhitespace() {
+        XCTAssertEqual(
+            GrokIntegrationConfiguration.persistedProjectDirName(forWorkspacePath: "  /Users/dev/proj/  "),
+            "Users-dev-proj"
+        )
+    }
+
+    func testPersistedProjectDirNameNilForEmptyOrSlashOnly() {
+        XCTAssertNil(GrokIntegrationConfiguration.persistedProjectDirName(forWorkspacePath: nil))
+        XCTAssertNil(GrokIntegrationConfiguration.persistedProjectDirName(forWorkspacePath: ""))
+        XCTAssertNil(GrokIntegrationConfiguration.persistedProjectDirName(forWorkspacePath: "///"))
     }
 }

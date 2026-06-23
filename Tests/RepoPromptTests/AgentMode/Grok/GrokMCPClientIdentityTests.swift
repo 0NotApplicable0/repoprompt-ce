@@ -23,6 +23,23 @@ final class GrokMCPClientIdentityTests: XCTestCase {
         XCTAssertEqual(MCPClientIdentity.canonicalFamilyID("grok"), "grok-client")
     }
 
+    func testGrokAnnouncedShellNameCanonicalizesToGrokFamily() {
+        // grok's actual MCP `initialize` clientInfo.name embeds the server, e.g.
+        // "grok-shell-RepoPromptCE". The trailing server-name word suffix would defeat the
+        // version-only suffix rule of the family matcher, so the leading-token path keeps it in the
+        // grok family — which is what lets grok's agent-mode run policy (keyed on "grok-client") bind
+        // to its connection so gated tools like set_status are advertised and accepted.
+        XCTAssertEqual(MCPClientIdentity.canonicalFamilyID("grok-shell-RepoPromptCE"), "grok-client")
+        XCTAssertEqual(MCPClientIdentity.canonicalFamilyID("grok-shell-SomeOtherServer"), "grok-client")
+        XCTAssertTrue(MCPClientIdentity.matches("grok-client", "grok-shell-RepoPromptCE"))
+    }
+
+    func testNonGrokPrefixIsNotMisclassifiedAsGrok() {
+        // A word that merely starts with the letters "grok" but is not a separated leading token
+        // must NOT be swallowed into the grok family.
+        XCTAssertNil(MCPClientIdentity.canonicalFamilyID("grokkenstein"))
+    }
+
     func testGrokMCPClientIDHintMatchesGrokClientID() {
         // The provider kind's MCP client hint is the exact "grok-client" string these tests pin.
         XCTAssertEqual(AgentProviderKind.grokMCPClientID, grokClientID)

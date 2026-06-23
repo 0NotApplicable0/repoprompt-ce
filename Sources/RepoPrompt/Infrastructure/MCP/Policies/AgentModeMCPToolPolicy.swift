@@ -69,6 +69,17 @@ enum AgentModeMCPToolPolicy {
 
     static let cursorGrantedTools: Set<String> = MCPToolCapabilities.toolNames(for: cursorGrantedCapabilities)
 
+    /// Tools granted to grok agent runs. grok is a headless one-shot CLI: it has no user to answer
+    /// `ask_user`, so granting `userInteraction` only risks a headless deadlock if grok ever calls
+    /// it. grok also does not use the agent conversation/oracle-log surface. Grant ONLY
+    /// `agentSessionControl` (set_status) so grok can title its session without exposing blocking
+    /// or unused interaction tools.
+    static let grokGrantedCapabilities: Set<MCPToolCapability> = [
+        .agentSessionControl
+    ]
+
+    static let grokGrantedTools: Set<String> = MCPToolCapabilities.toolNames(for: grokGrantedCapabilities)
+
     static func grantedTools(forAgent agent: AgentProviderKind) -> Set<String> {
         switch agent {
         case .codexExec:
@@ -82,7 +93,7 @@ enum AgentModeMCPToolPolicy {
         case .antigravity:
             codexNativeGrantedTools
         case .grok:
-            codexNativeGrantedTools
+            grokGrantedTools
         }
     }
 }
