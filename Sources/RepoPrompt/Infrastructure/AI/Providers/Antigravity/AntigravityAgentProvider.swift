@@ -133,6 +133,12 @@ final class AntigravityAgentProvider: HeadlessAgentProvider {
                             continuation: continuation
                         )
 
+                        let toolLog = AntigravityTrajectoryToolLog(environment: context.environment)
+                        let toolLogTask = Task {
+                            await AntigravityTrajectoryToolLogStream.tail(into: continuation, locate: { toolLog.locate() })
+                        }
+                        defer { toolLogTask.cancel() }
+
                         var framer = LineFramer()
                         var stdoutData = Data()
                         var stderrTail = Data()
