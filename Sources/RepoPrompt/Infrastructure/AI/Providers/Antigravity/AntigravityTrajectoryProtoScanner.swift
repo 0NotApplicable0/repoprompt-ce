@@ -19,8 +19,11 @@ enum AntigravityTrajectoryProtoScanner {
                 i = n
             case 2: // length-delimited
                 guard let (len, n) = readVarint(bytes, i) else { return result }
+                // Bound the length against remaining bytes BEFORE Int(len): a varint length > Int.max would
+                // trap on conversion. `bytes.count - n` is safe (n <= bytes.count after readVarint) and once
+                // len <= bytes.count - n the Int() conversion and the start+len addition cannot overflow.
+                guard len <= UInt64(bytes.count - n) else { return result }
                 let start = n, stop = start + Int(len)
-                guard len <= UInt64(bytes.count), stop >= start, stop <= bytes.count else { return result }
                 if result[field] == nil { result[field] = Data(bytes[start ..< stop]) }
                 i = stop
             case 5: i += 4

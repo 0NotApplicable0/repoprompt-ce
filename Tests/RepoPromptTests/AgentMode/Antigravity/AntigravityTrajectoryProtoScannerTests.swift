@@ -38,4 +38,12 @@ final class AntigravityTrajectoryProtoScannerTests: XCTestCase {
     func testEmptyInputYieldsNoFields() {
         XCTAssertTrue(AntigravityTrajectoryProtoScanner.lengthDelimitedFields(Data()).isEmpty)
     }
+
+    func testRejectsHugeLengthVarintWithoutTrapping() {
+        // field 1, wire type 2, length = UInt64.max (10-byte varint: 0xFF*9, 0x01). Pre-fix this trapped
+        // on Int(len); now it must return safely with the field rejected (length exceeds the buffer).
+        let bytes: [UInt8] = [0x0A, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x01]
+        let fields = AntigravityTrajectoryProtoScanner.lengthDelimitedFields(Data(bytes))
+        XCTAssertNil(fields[1])
+    }
 }
