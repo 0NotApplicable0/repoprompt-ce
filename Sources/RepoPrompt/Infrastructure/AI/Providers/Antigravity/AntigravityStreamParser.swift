@@ -55,6 +55,18 @@ enum AntigravityStreamParser {
         )
     }
 
+    /// Detects agy's headless `--print` poll-cap timeout (~5 min / 1494 polls). agy prints
+    /// "Error: timed out waiting for response" to stdout and logs "Print mode: timed out after
+    /// N polls"; the process still exits 0, so this content check is how we recognise it.
+    static func isPrintModePollCapTimeout(stdout: String, logTail: String?) -> Bool {
+        for text in [stdout, logTail ?? ""] {
+            let lower = text.lowercased()
+            if lower.contains("timed out waiting for response") { return true }
+            if lower.contains("print mode: timed out after"), lower.contains("polls") { return true }
+        }
+        return false
+    }
+
     private static func looksLikeJSONObject(_ line: Substring) -> Bool {
         let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
         return trimmed.hasPrefix("{") && trimmed.hasSuffix("}")
