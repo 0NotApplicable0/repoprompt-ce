@@ -102,7 +102,7 @@ final class AntigravityAgentProvider: HeadlessAgentProvider {
     // MARK: - Streaming
 
     func streamAgentMessage(_ message: AgentMessage, runID: UUID? = nil) async throws -> AsyncThrowingStream<AIStreamResult, Error> {
-        AsyncThrowingStream { continuation in
+        let raw = AsyncThrowingStream<AIStreamResult, Error> { continuation in
             self.streamTask?.cancel()
             self.streamTask = Task { [weak self] in
                 guard let self else { return }
@@ -133,6 +133,7 @@ final class AntigravityAgentProvider: HeadlessAgentProvider {
                             continuation: continuation
                         )
 
+                        var framer = LineFramer()
                         var stdoutData = Data()
                         var stderrTail = Data()
                         var exitStatus: Int32?
@@ -161,6 +162,11 @@ final class AntigravityAgentProvider: HeadlessAgentProvider {
                                 switch event {
                                 case let .stdout(chunk):
                                     stdoutData.append(chunk)
+                                    framer.feed(chunk) { line in
+                                        if let text = String(data: line, encoding: .utf8) {
+                                            continuation.yield(AntigravityStreamParser.contentResult(text + "\n"))
+                                        }
+                                    }
                                 case let .stderr(chunk):
                                     stderrTail.append(chunk)
                                     if stderrTail.count > 64 * 1024 {
@@ -169,6 +175,12 @@ final class AntigravityAgentProvider: HeadlessAgentProvider {
                                 case let .terminated(status, didTimeout):
                                     exitStatus = status
                                     timedOut = didTimeout
+                                }
+                            }
+                            // Flush any trailing partial line without a newline terminator.
+                            framer.flush { line in
+                                if let text = String(data: line, encoding: .utf8), !text.isEmpty {
+                                    continuation.yield(AntigravityStreamParser.contentResult(text))
                                 }
                             }
                         } catch {
@@ -190,18 +202,23 @@ final class AntigravityAgentProvider: HeadlessAgentProvider {
                             )
                         }
 
-                        let results = AntigravityStreamParser.parseFinalOutput(stdoutData)
-                        if results.isEmpty {
-                            let hint = Self.tailOfLogFile(logFileURL)
-                                ?? "Ensure you are signed in: run `agy` once interactively to authenticate."
+                        let stdoutString = String(data: stdoutData, encoding: .utf8) ?? ""
+                        if AntigravityStreamParser.isPrintModePollCapTimeout(
+                            stdout: stdoutString,
+                            logTail: Self.tailOfLogFile(logFileURL)
+                        ) {
                             throw AIProviderError.invalidConfiguration(
-                                detail: "Antigravity CLI returned no output. \(hint)"
+                                detail:
+                                "Antigravity headless print mode stopped at its ~5-minute limit (1494 polls) before finishing. "
+                                    + "Narrow the task or split it into smaller steps; agy cannot complete very large multi-tool runs headlessly."
                             )
                         }
-
-                        for result in results {
-                            continuation.yield(result)
+                        if stdoutData.isEmpty {
+                            let hint = Self.tailOfLogFile(logFileURL)
+                                ?? "Ensure you are signed in: run `agy` once interactively to authenticate."
+                            throw AIProviderError.invalidConfiguration(detail: "Antigravity CLI returned no output. \(hint)")
                         }
+
                         continuation.yield(
                             AIStreamResult(
                                 type: "message_stop",
@@ -230,6 +247,7 @@ final class AntigravityAgentProvider: HeadlessAgentProvider {
                 self?.streamTask?.cancel()
             }
         }
+        return AgentReasoningStatusStream.withReasoningStatus(raw)
     }
 
     func dispose() async {
