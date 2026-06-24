@@ -19,4 +19,38 @@ final class AntigravityPollCapTimeoutTests: XCTestCase {
             stdout: "Here is the review:\n- looks good\n", logTail: "some normal log line"
         ))
     }
+
+    // MARK: - Auto-resume decision
+
+    func testResumesWhenCappedWithinBudget() {
+        XCTAssertTrue(AntigravityAgentProvider.shouldResume(outcome: .capped, turn: 0, maxResumes: 6, hasConversationID: true))
+        XCTAssertTrue(AntigravityAgentProvider.shouldResume(outcome: .capped, turn: 5, maxResumes: 6, hasConversationID: true))
+    }
+
+    func testDoesNotResumeWhenCompleted() {
+        XCTAssertFalse(AntigravityAgentProvider.shouldResume(outcome: .completed, turn: 0, maxResumes: 6, hasConversationID: true))
+    }
+
+    func testDoesNotResumeWhenBudgetExhausted() {
+        XCTAssertFalse(AntigravityAgentProvider.shouldResume(outcome: .capped, turn: 6, maxResumes: 6, hasConversationID: true))
+    }
+
+    func testDoesNotResumeWhenDisabled() {
+        XCTAssertFalse(AntigravityAgentProvider.shouldResume(outcome: .capped, turn: 0, maxResumes: 0, hasConversationID: true))
+    }
+
+    func testDoesNotResumeWithoutConversationID() {
+        XCTAssertFalse(AntigravityAgentProvider.shouldResume(outcome: .capped, turn: 0, maxResumes: 6, hasConversationID: false))
+    }
+
+    func testExhaustedMessageMentionsResumeCountWhenEnabled() {
+        let msg = AntigravityAgentProvider.cappedExhaustedMessage(maxResumes: 6, resumed: 6)
+        XCTAssertTrue(msg.contains("6 auto-resume"))
+        XCTAssertTrue(msg.localizedCaseInsensitiveContains("split"))
+    }
+
+    func testExhaustedMessageWhenResumeDisabled() {
+        let msg = AntigravityAgentProvider.cappedExhaustedMessage(maxResumes: 0, resumed: 0)
+        XCTAssertTrue(msg.contains("1494 polls"))
+    }
 }

@@ -106,6 +106,33 @@ final class AntigravityArgumentBuilderTests: XCTestCase {
         XCTAssertFalse(args.contains("--sandbox"))
     }
 
+    func testBuildArgumentsOmitsConversationByDefault() {
+        let args = AntigravityAgentProvider.buildArguments(
+            config: AntigravityAgentConfig(),
+            workspacePath: nil,
+            logFilePath: nil
+        )
+        XCTAssertFalse(args.contains("--conversation"))
+    }
+
+    func testBuildArgumentsIncludesConversationWhenResuming() {
+        let args = AntigravityAgentProvider.buildArguments(
+            config: AntigravityAgentConfig(),
+            workspacePath: nil,
+            logFilePath: "/tmp/agy.log",
+            resumeConversationID: "abc-123"
+        )
+        XCTAssertTrue(consecutive(args, ["--conversation", "abc-123"]))
+    }
+
+    func testConfigDefaultMaxPrintResumesIsBounded() {
+        XCTAssertEqual(AntigravityAgentConfig().maxPrintResumes, 6)
+    }
+
+    func testConfigClampsNegativeMaxPrintResumesToZero() {
+        XCTAssertEqual(AntigravityAgentConfig(maxPrintResumes: -3).maxPrintResumes, 0)
+    }
+
     func testPermissionLevelMapping() {
         XCTAssertTrue(AntigravityAgentToolPreferences.PermissionLevel.managedDefault.useSandbox)
         XCTAssertFalse(AntigravityAgentToolPreferences.PermissionLevel.managedDefault.dangerouslySkipPermissions)

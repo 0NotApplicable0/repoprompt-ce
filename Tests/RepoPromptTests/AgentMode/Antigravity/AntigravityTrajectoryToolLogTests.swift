@@ -39,14 +39,14 @@ final class AntigravityTrajectoryToolLogTests: XCTestCase {
 
     func testEmitsCallThenResultAcrossPollsWithoutDuplication() {
         var e = AntigravityTrajectoryEmitter()
-        // Poll 1: idx 1 in-flight (status 1) → call only, watermark stays at 0.
+        // Poll 1: idx 1 in-flight (status 1) → call only, watermark holds (advanceTo nil).
         let p1 = e.process([step(1, 1, "a")])
         XCTAssertEqual(p1.events.map(\.type), ["tool_call"])
-        XCTAssertEqual(p1.nextAfter, 0)
-        // Poll 2: idx 1 now terminal → result only (call already emitted), watermark advances to 1.
+        XCTAssertNil(p1.advanceTo)
+        // Poll 2: idx 1 now terminal → result only (call already emitted), advance to 1.
         let p2 = e.process([step(1, 3, "a")])
         XCTAssertEqual(p2.events.map(\.type), ["tool_result"])
-        XCTAssertEqual(p2.nextAfter, 1)
+        XCTAssertEqual(p2.advanceTo, 1)
     }
 
     func testNonToolStepAdvancesWatermarkSilently() {
@@ -54,6 +54,16 @@ final class AntigravityTrajectoryToolLogTests: XCTestCase {
         let nonTool = AntigravityTrajectoryStore.ToolStep(idx: 5, status: 3, payload: Data([0x08, 0x0F]))
         let r = e.process([nonTool])
         XCTAssertTrue(r.events.isEmpty)
-        XCTAssertEqual(r.nextAfter, 5)
+        XCTAssertEqual(r.advanceTo, 5)
+    }
+
+    func testDedupIsByCallIDNotIdxAcrossForkedDBs() {
+        // A resumed run forks to a NEW DB whose idx restarts; the same call id appearing at a
+        // different idx must NOT re-emit a card (dedup is by invocation id, not row idx).
+        var e = AntigravityTrajectoryEmitter()
+        let first = e.process([step(3, 3, "shared")])
+        XCTAssertEqual(first.events.map(\.type), ["tool_call", "tool_result"])
+        let forked = e.process([step(99, 3, "shared")]) // same call id, different idx (new DB)
+        XCTAssertTrue(forked.events.isEmpty)
     }
 }

@@ -20,6 +20,12 @@ struct AntigravityAgentConfig {
     /// (Full Access). Takes precedence over `useSandbox` — the two flags are mutually exclusive.
     let dangerouslySkipPermissions: Bool
     let enableDebugLogging: Bool
+    /// How many times to auto-resume after agy's headless `--print` mode hits its hardcoded
+    /// ~5-minute / 1494-poll cap (`printmode.go`). Each resume re-invokes `agy --print
+    /// --conversation <id>` on the same conversation with a fresh poll budget, letting a long
+    /// multi-tool run finish across budgets. `0` disables resume (detect-and-report only — the
+    /// prior behavior). Bounded so a never-converging task cannot loop forever.
+    let maxPrintResumes: Int
 
     init(
         commandName: String? = nil,
@@ -27,7 +33,8 @@ struct AntigravityAgentConfig {
         modelString: String? = nil,
         useSandbox: Bool = true,
         dangerouslySkipPermissions: Bool = false,
-        enableDebugLogging: Bool = false
+        enableDebugLogging: Bool = false,
+        maxPrintResumes: Int = 6
     ) {
         self.commandName = commandName ?? "agy"
         self.additionalPathHints = additionalPathHints
@@ -35,5 +42,6 @@ struct AntigravityAgentConfig {
         self.useSandbox = useSandbox
         self.dangerouslySkipPermissions = dangerouslySkipPermissions
         self.enableDebugLogging = enableDebugLogging
+        self.maxPrintResumes = max(0, maxPrintResumes)
     }
 }

@@ -33,64 +33,85 @@ struct AntigravityTrajectoryToolLog {
     }
 }
 
-/// Pure dedup/advance core: turns polled steps into ordered card events, exactly once each, and
-/// computes the next watermark without skipping in-flight tool steps.
+/// Pure dedup core: turns polled steps into ordered card events, exactly once each, and reports the
+/// highest contiguous "done" idx to advance the per-DB query watermark to.
+///
+/// Dedup is keyed on the tool **invocation id** (stable per agy call id), NOT the row `idx`. This
+/// matters because a resumed run forks to a NEW conversation DB whose `idx` restarts at 0 — keying on
+/// idx would collide across DBs. Invocation-id keying lets the SAME emitter span every resume turn
+/// without re-emitting or duplicating a card. This assumes agy re-materializes a resumed
+/// conversation's recalled steps with their ORIGINAL call ids (empirically true); were a future agy
+/// to assign fresh ids to recalled rows, an already-shown card could re-emit — a benign duplicate,
+/// never a crash or hang.
 struct AntigravityTrajectoryEmitter {
     private let parser = AntigravityToolStepParser()
-    private var emittedCalls: Set<Int64> = []
-    private var emittedResults: Set<Int64> = []
-    private var after: Int64 = 0
+    private var emittedCalls: Set<UUID> = []
+    private var emittedResults: Set<UUID> = []
 
-    mutating func process(_ steps: [AntigravityTrajectoryStore.ToolStep]) -> (events: [AIStreamResult], nextAfter: Int64) {
+    /// - Returns: the new card events, plus the highest contiguous "done" idx to advance the caller's
+    ///   per-DB watermark to (`nil` ⇒ don't advance; a not-yet-terminal tool step must be re-read).
+    mutating func process(_ steps: [AntigravityTrajectoryStore.ToolStep]) -> (events: [AIStreamResult], advanceTo: Int64?) {
         var events: [AIStreamResult] = []
+        var advanceTo: Int64?
         var advancing = true
         for step in steps.sorted(by: { $0.idx < $1.idx }) {
             guard let parsed = parser.parse(status: step.status, payload: step.payload) else {
-                if advancing { after = max(after, step.idx) } // non-tool step: done, advance
+                if advancing { advanceTo = step.idx } // non-tool step: done, advance
                 continue
             }
-            if emittedCalls.insert(step.idx).inserted { events.append(parsed.call) }
+            if emittedCalls.insert(parsed.invocationID).inserted { events.append(parsed.call) }
             if let result = parsed.result {
-                if emittedResults.insert(step.idx).inserted { events.append(result) }
-                if advancing { after = max(after, step.idx) } // terminal tool: done, advance
+                if emittedResults.insert(parsed.invocationID).inserted { events.append(result) }
+                if advancing { advanceTo = step.idx } // terminal tool: done, advance
             } else {
                 advancing = false // in-flight: stop advancing, re-read next poll
             }
         }
-        return (events, after)
+        return (events, advanceTo)
     }
 }
 
-/// Tails an agy trajectory DB and forwards tool-card events. Fail-open: waits for the DB to appear,
-/// opens it read-only, polls new steps, and reopens if the `steps` table is not yet present. Runs
-/// until the surrounding task is cancelled.
+/// Tails the run's agy trajectory DB and forwards tool-card events. Fail-open: waits for the DB to
+/// appear, opens it read-only, polls new steps, and reopens if the `steps` table is not yet present.
+///
+/// Handles **auto-resume**: each resumed `--print --conversation` turn forks to a NEWER conversation
+/// DB, so every poll re-evaluates `locate()` (which returns the newest DB to appear) and switches to
+/// it — resetting the per-DB idx watermark while the emitter's invocation-id dedup carries across the
+/// switch. Runs until the surrounding task is cancelled.
 enum AntigravityTrajectoryToolLogStream {
     static func tail(
         into continuation: AsyncThrowingStream<AIStreamResult, Error>.Continuation,
         locate: @Sendable @escaping () -> URL?,
         pollNanos: UInt64 = 200_000_000
     ) async {
-        var url: URL?
-        while !Task.isCancelled, url == nil {
-            url = locate()
-            if url == nil { try? await Task.sleep(nanoseconds: pollNanos) }
+        var currentPath: String?
+        while !Task.isCancelled, currentPath == nil {
+            currentPath = locate()?.path
+            if currentPath == nil { try? await Task.sleep(nanoseconds: pollNanos) }
         }
-        guard !Task.isCancelled, let dbURL = url else { return }
+        guard !Task.isCancelled else { return }
 
-        var emitter = AntigravityTrajectoryEmitter()
+        var emitter = AntigravityTrajectoryEmitter() // invocation-id dedup persists across DB switches
         var store: AntigravityTrajectoryStore?
         var after: Int64 = 0
         while !Task.isCancelled {
-            if store == nil { store = AntigravityTrajectoryStore(path: dbURL.path) }
-            if let s = store {
-                if let rows = s.steps(after: after, limit: 500) {
-                    let (events, nextAfter) = emitter.process(rows)
-                    for event in events {
-                        continuation.yield(event)
+            if let newest = locate()?.path, newest != currentPath {
+                currentPath = newest // a resume turn forked to a newer DB → switch, restart watermark
+                store = nil
+                after = 0
+            }
+            if let path = currentPath {
+                if store == nil { store = AntigravityTrajectoryStore(path: path) }
+                if let s = store {
+                    if let rows = s.steps(after: after, limit: 500) {
+                        let (events, advanceTo) = emitter.process(rows)
+                        for event in events {
+                            continuation.yield(event)
+                        }
+                        if let advanceTo { after = max(after, advanceTo) }
+                    } else {
+                        store = nil // table not ready / query failed → reopen
                     }
-                    after = nextAfter
-                } else {
-                    store = nil // table not ready / query failed → reopen
                 }
             }
             try? await Task.sleep(nanoseconds: pollNanos)
