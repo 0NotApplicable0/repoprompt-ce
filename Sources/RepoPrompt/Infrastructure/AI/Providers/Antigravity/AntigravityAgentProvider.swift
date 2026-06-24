@@ -134,6 +134,7 @@ final class AntigravityAgentProvider: HeadlessAgentProvider {
             self.streamTask = Task { [weak self] in
                 guard let self else { return }
                 await withTaskCancellationHandler(operation: {
+                    var runGateLocked = false
                     do {
                         let context = try await self.prepare(runID: runID)
                         let combinedPrompt = Self.combinedPrompt(
@@ -146,6 +147,11 @@ final class AntigravityAgentProvider: HeadlessAgentProvider {
                             clientNameHint: Self.antigravityMCPClientID,
                             continuation: continuation
                         )
+
+                        // Serialize agy runs in this process: agy hides its conversation id, so DB
+                        // attribution relies on a single-run-at-a-time invariant (see AntigravityRunGate).
+                        await AntigravityRunGate.shared.lock()
+                        runGateLocked = true
 
                         // agy emits no tool calls on stdout — tail the conversation trajectory DB for
                         // live tool cards. The tailer re-locates the newest DB each poll, so it follows
@@ -190,19 +196,37 @@ final class AntigravityAgentProvider: HeadlessAgentProvider {
                             if outcome == .completed { break }
 
                             // Capped: capture this turn's conversation id (newest trajectory DB) and
-                            // resume it, unless resume is disabled/exhausted or the id is unknown.
-                            let nextID = toolLog.locate()?.deletingPathExtension().lastPathComponent
+                            // resume it. The forked DB can lag the process exit by a poll cycle, so
+                            // retry locate() briefly (matching the tailer's 200ms cadence) before
+                            // deciding — otherwise a transient miss is misreported as "task too large".
+                            var nextID: String?
+                            for _ in 0 ..< 15 {
+                                if let id = toolLog.locate()?.deletingPathExtension().lastPathComponent, !id.isEmpty {
+                                    nextID = id
+                                    break
+                                }
+                                try await Task.sleep(nanoseconds: 200_000_000)
+                            }
                             if Self.shouldResume(
                                 outcome: outcome, turn: turn, maxResumes: maxResumes,
-                                hasConversationID: !(nextID ?? "").isEmpty
+                                hasConversationID: nextID != nil
                             ) {
                                 resumeConversationID = nextID
                                 turn += 1
                                 continue
                             }
+                            if nextID == nil, maxResumes > 0, turn < maxResumes {
+                                throw AIProviderError.invalidConfiguration(
+                                    detail: "Antigravity hit its ~5-minute headless limit but its conversation "
+                                        + "database could not be found to resume. Ensure `agy` is authenticated "
+                                        + "and ~/.gemini/antigravity-cli/conversations is writable."
+                                )
+                            }
                             throw AIProviderError.invalidConfiguration(detail: Self.cappedExhaustedMessage(maxResumes: maxResumes, resumed: turn))
                         }
 
+                        await AntigravityRunGate.shared.unlock()
+                        runGateLocked = false
                         await self.toolTracking.stopTracking()
                         continuation.yield(
                             AIStreamResult(
@@ -216,10 +240,12 @@ final class AntigravityAgentProvider: HeadlessAgentProvider {
                         )
                         continuation.finish()
                     } catch is CancellationError {
+                        if runGateLocked { await AntigravityRunGate.shared.unlock() }
                         await self.runner.cancelAll()
                         await self.toolTracking.stopTracking()
                         continuation.finish(throwing: AIProviderError.invalidConfiguration(detail: "Antigravity run cancelled."))
                     } catch {
+                        if runGateLocked { await AntigravityRunGate.shared.unlock() }
                         await self.toolTracking.stopTracking()
                         continuation.finish(throwing: error)
                     }
@@ -276,6 +302,9 @@ final class AntigravityAgentProvider: HeadlessAgentProvider {
                     stdoutData.append(chunk)
                     framer.feed(chunk) { line in
                         if let text = String(data: line, encoding: .utf8) {
+                            // Withhold the poll-cap marker line from streamed content; the turn is
+                            // still classified as capped below via the accumulated stdoutData.
+                            guard !AntigravityStreamParser.isPollCapMarkerLine(text) else { return }
                             continuation.yield(AntigravityStreamParser.contentResult(text + "\n"))
                         }
                     }
@@ -291,6 +320,7 @@ final class AntigravityAgentProvider: HeadlessAgentProvider {
             }
             framer.flush { line in
                 if let text = String(data: line, encoding: .utf8), !text.isEmpty {
+                    guard !AntigravityStreamParser.isPollCapMarkerLine(text) else { return }
                     continuation.yield(AntigravityStreamParser.contentResult(text))
                 }
             }

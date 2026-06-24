@@ -244,7 +244,12 @@ final class GrokAgentProvider: HeadlessAgentProvider {
                             framer.flush { handle($0) }
                         } catch {
                             await self.runner.cancelAll()
-                            await self.toolTracking.stopTracking()
+                            // Stop tracking here only for non-cancellation errors. A CancellationError is
+                            // rethrown to the outer `catch is CancellationError`, which stops tracking once;
+                            // calling it here too would double-stop (stopTracking is not idempotent).
+                            if !(error is CancellationError) {
+                                await self.toolTracking.stopTracking()
+                            }
                             throw error
                         }
 

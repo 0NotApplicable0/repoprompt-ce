@@ -80,6 +80,16 @@ enum AgentModeMCPToolPolicy {
 
     static let grokGrantedTools: Set<String> = MCPToolCapabilities.toolNames(for: grokGrantedCapabilities)
 
+    /// Tools granted to Antigravity (agy) agent runs. Like grok, agy is a headless one-shot `--print`
+    /// CLI with no user to answer `ask_user`, so granting `userInteraction` only risks a headless
+    /// deadlock. agy surfaces tool cards from its native trajectory DB, not the MCP conversation/oracle
+    /// surface. Grant ONLY `agentSessionControl` (set_status) so agy can title its session.
+    static let antigravityGrantedCapabilities: Set<MCPToolCapability> = [
+        .agentSessionControl
+    ]
+
+    static let antigravityGrantedTools: Set<String> = MCPToolCapabilities.toolNames(for: antigravityGrantedCapabilities)
+
     static func grantedTools(forAgent agent: AgentProviderKind) -> Set<String> {
         switch agent {
         case .codexExec:
@@ -91,7 +101,7 @@ enum AgentModeMCPToolPolicy {
         case .cursor:
             cursorGrantedTools
         case .antigravity:
-            codexNativeGrantedTools
+            antigravityGrantedTools
         case .grok:
             grokGrantedTools
         }

@@ -67,6 +67,15 @@ enum AntigravityStreamParser {
         return false
     }
 
+    /// True if a single stdout line is agy's poll-cap marker. Lets the provider withhold the marker
+    /// from streamed content while still classifying the turn as capped via the accumulated stdout.
+    static func isPollCapMarkerLine(_ line: String) -> Bool {
+        let lower = line.lowercased()
+        if lower.contains("timed out waiting for response") { return true }
+        if lower.contains("print mode: timed out after"), lower.contains("polls") { return true }
+        return false
+    }
+
     private static func looksLikeJSONObject(_ line: Substring) -> Bool {
         let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
         return trimmed.hasPrefix("{") && trimmed.hasSuffix("}")
