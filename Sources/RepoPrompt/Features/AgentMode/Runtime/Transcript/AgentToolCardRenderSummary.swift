@@ -465,9 +465,17 @@ enum AgentToolCardRenderSummaryBuilder {
         argsObject: [String: Any]?
     ) -> AgentToolCardRenderSummary? {
         guard isSafeNativeToolName(normalizedToolName), rawObject != nil || argsObject != nil else { return nil }
+        // The specific argument (file path, command, query) first so the card says WHICH file or WHAT
+        // command — including agy's PascalCase keys (`AbsolutePath`, `CommandLine`, …) — then the
+        // existing generic keys, then agy's human-readable `toolSummary`/`toolAction` as a fallback.
         let subtitle = nativeScalarSummary(
             object: argsObject,
-            preferredKeys: ["query", "q", "prompt", "text", "value", "name", "id", "operation", "op"]
+            preferredKeys: [
+                "CommandLine", "AbsolutePath", "FilePath", "Path", "Query", "Pattern", "GlobPattern",
+                "SearchString", "Url",
+                "query", "q", "prompt", "text", "value", "name", "id", "operation", "op",
+                "toolSummary", "toolAction"
+            ]
         )
         let detailText = nativeScalarSummary(
             object: rawObject,
