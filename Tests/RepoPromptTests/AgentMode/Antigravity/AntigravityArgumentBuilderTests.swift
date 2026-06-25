@@ -11,7 +11,9 @@ final class AntigravityArgumentBuilderTests: XCTestCase {
     }
 
     func testCombinedPromptOmitsEmptySystem() {
-        XCTAssertEqual(AntigravityAgentProvider.combinedPrompt(system: "   ", user: "do x"), "do x")
+        let prompt = AntigravityAgentProvider.combinedPrompt(system: "   ", user: "do x")
+        XCTAssertTrue(prompt.contains(AntigravityAgentProvider.executionCompletionGuidance))
+        XCTAssertTrue(prompt.hasSuffix("do x"))
     }
 
     func testCombinedPromptJoinsSystemAndUser() {

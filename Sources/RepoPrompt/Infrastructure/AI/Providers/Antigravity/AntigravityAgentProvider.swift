@@ -40,11 +40,30 @@ final class AntigravityAgentProvider: HeadlessAgentProvider {
 
     /// `agy` has no system-prompt channel; combine the system prompt and user message into the
     /// single `--print` value with an explicit blank-line delimiter.
+    static let executionCompletionGuidance = """
+    Antigravity execution guidance:
+    - Tests and shell commands are allowed when they are relevant to the task.
+    - If a tool, command, or test starts as a background or async task, do not end the turn by \
+    saying you will stop calling tools and wait for it to complete.
+    - Before giving a final response, wait for, poll, or otherwise retrieve the command's final \
+    output and exit status.
+    - If the final command output cannot be retrieved, say verification is still pending or \
+    unavailable instead of presenting the task as complete.
+    """
+
     static func combinedPrompt(system: String, user: String) -> String {
         let trimmedSystem = system.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmedSystem.isEmpty else { return user }
+        guard !trimmedSystem.isEmpty else {
+            return """
+            \(Self.executionCompletionGuidance)
+
+            \(user)
+            """
+        }
         return """
         \(trimmedSystem)
+
+        \(Self.executionCompletionGuidance)
 
         \(user)
         """
