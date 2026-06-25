@@ -111,6 +111,7 @@ final class AntigravityAgentProvider: HeadlessAgentProvider {
     enum TurnOutcome: Equatable {
         case completed // agy finished within its budget
         case capped // agy hit its hardcoded ~5-min / 1494-poll print-mode limit
+        case incomplete // agy exited cleanly before printing a final response
     }
 
     /// Sent on each resume turn so agy continues the unfinished task rather than restarting.
@@ -121,11 +122,11 @@ final class AntigravityAgentProvider: HeadlessAgentProvider {
     and finish the remaining work.
     """
 
-    /// Pure decision: should the loop resume after this turn? Resume only when a turn capped, resume
-    /// is enabled (`maxResumes > 0`), the resume budget isn't exhausted, and a conversation id is
-    /// known to resume.
+    /// Pure decision: should the loop resume after this turn? Resume only when a turn did not
+    /// produce a final response, resume is enabled (`maxResumes > 0`), the resume budget isn't
+    /// exhausted, and a conversation id is known to resume.
     static func shouldResume(outcome: TurnOutcome, turn: Int, maxResumes: Int, hasConversationID: Bool) -> Bool {
-        outcome == .capped && maxResumes > 0 && turn < maxResumes && hasConversationID
+        (outcome == .capped || outcome == .incomplete) && maxResumes > 0 && turn < maxResumes && hasConversationID
     }
 
     func streamAgentMessage(_ message: AgentMessage, runID: UUID? = nil) async throws -> AsyncThrowingStream<AIStreamResult, Error> {
@@ -195,8 +196,8 @@ final class AntigravityAgentProvider: HeadlessAgentProvider {
 
                             if outcome == .completed { break }
 
-                            // Capped: capture this turn's conversation id (newest trajectory DB) and
-                            // resume it. The forked DB can lag the process exit by a poll cycle, so
+                            // Not complete: capture this turn's conversation id (newest trajectory DB)
+                            // and resume it. The forked DB can lag the process exit by a poll cycle, so
                             // retry locate() briefly (matching the tailer's 200ms cadence) before
                             // deciding — otherwise a transient miss is misreported as "task too large".
                             var nextID: String?
@@ -217,12 +218,14 @@ final class AntigravityAgentProvider: HeadlessAgentProvider {
                             }
                             if nextID == nil, maxResumes > 0, turn < maxResumes {
                                 throw AIProviderError.invalidConfiguration(
-                                    detail: "Antigravity hit its ~5-minute headless limit but its conversation "
+                                    detail: Self.missingConversationMessage(outcome: outcome) + " but its conversation "
                                         + "database could not be found to resume. Ensure `agy` is authenticated "
                                         + "and ~/.gemini/antigravity-cli/conversations is writable."
                                 )
                             }
-                            throw AIProviderError.invalidConfiguration(detail: Self.cappedExhaustedMessage(maxResumes: maxResumes, resumed: turn))
+                            throw AIProviderError.invalidConfiguration(
+                                detail: Self.exhaustedMessage(outcome: outcome, maxResumes: maxResumes, resumed: turn)
+                            )
                         }
 
                         await AntigravityRunGate.shared.unlock()
@@ -338,14 +341,24 @@ final class AntigravityAgentProvider: HeadlessAgentProvider {
             )
         }
 
+        return try Self.classifySuccessfulTurn(
+            stdoutData: stdoutData,
+            logTail: Self.tailOfLogFile(logFileURL),
+            isFirstTurn: isFirstTurn
+        )
+    }
+
+    static func classifySuccessfulTurn(stdoutData: Data, logTail: String?, isFirstTurn: Bool) throws -> TurnOutcome {
         let stdoutString = String(data: stdoutData, encoding: .utf8) ?? ""
-        if AntigravityStreamParser.isPrintModePollCapTimeout(stdout: stdoutString, logTail: Self.tailOfLogFile(logFileURL)) {
+        if AntigravityStreamParser.isPrintModePollCapTimeout(stdout: stdoutString, logTail: logTail) {
             return .capped
         }
-        if isFirstTurn, stdoutData.isEmpty {
-            let hint = Self.tailOfLogFile(logFileURL)
-                ?? "Ensure you are signed in: run `agy` once interactively to authenticate."
-            throw AIProviderError.invalidConfiguration(detail: "Antigravity CLI returned no output. \(hint)")
+        if stdoutData.isEmpty {
+            if isFirstTurn {
+                let hint = logTail ?? "Ensure you are signed in: run `agy` once interactively to authenticate."
+                throw AIProviderError.invalidConfiguration(detail: "Antigravity CLI returned no output. \(hint)")
+            }
+            return .incomplete
         }
         return .completed
     }
@@ -359,6 +372,37 @@ final class AntigravityAgentProvider: HeadlessAgentProvider {
         }
         return "Antigravity headless print mode stopped at its ~5-minute limit (1494 polls) before finishing. "
             + "Narrow the task or split it into smaller steps."
+    }
+
+    static func incompleteExhaustedMessage(maxResumes: Int, resumed: Int) -> String {
+        if maxResumes > 0 {
+            return "Antigravity exited without printing a final response after \(resumed) auto-resume(s); "
+                + "the task may still be working through tool output — split it into smaller steps."
+        }
+        return "Antigravity exited without printing a final response before finishing. "
+            + "Narrow the task or split it into smaller steps."
+    }
+
+    static func exhaustedMessage(outcome: TurnOutcome, maxResumes: Int, resumed: Int) -> String {
+        switch outcome {
+        case .completed:
+            ""
+        case .capped:
+            cappedExhaustedMessage(maxResumes: maxResumes, resumed: resumed)
+        case .incomplete:
+            incompleteExhaustedMessage(maxResumes: maxResumes, resumed: resumed)
+        }
+    }
+
+    static func missingConversationMessage(outcome: TurnOutcome) -> String {
+        switch outcome {
+        case .completed:
+            "Antigravity completed"
+        case .capped:
+            "Antigravity hit its ~5-minute headless limit"
+        case .incomplete:
+            "Antigravity exited without printing a final response"
+        }
     }
 
     func dispose() async {
