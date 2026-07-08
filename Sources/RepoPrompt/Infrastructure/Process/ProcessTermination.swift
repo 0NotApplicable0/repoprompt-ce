@@ -134,6 +134,33 @@ enum ProcessTermination {
         return false
     }
 
+    /// Guarantees a spawned process's private process group is fully gone after a
+    /// cooperative cancellation. `waitForTermination` returns as soon as the root PID is
+    /// reaped, but a reparented same-group descendant that ignores SIGTERM (or was
+    /// detached into a background subshell) can outlive the root. When the group still
+    /// has members, escalate straight to a group SIGKILL and wait briefly for it to drain.
+    /// This is a no-op fast path when the group is already empty, so well-behaved
+    /// processes pay nothing.
+    @discardableResult
+    static func ensureProcessGroupTerminated(
+        pid: pid_t,
+        processGroupID: pid_t?,
+        logger: (String) -> Void = { _ in }
+    ) async -> Bool {
+        guard safeProcessGroupID(processGroupID) != nil else { return true }
+        if !processGroupExists(processGroupID) { return true }
+        logger("Process \(pid) group survived cooperative cancellation; escalating to group SIGKILL")
+        _ = signalProcessGroupOrPID(pid: pid, processGroupID: processGroupID, signal: SIGKILL, logger: logger)
+
+        let deadline = ProcessInfo.processInfo.systemUptime + max(currentTiming().sigkillGrace, 0)
+        let pollNs = UInt64(pollInterval * 1_000_000_000)
+        while ProcessInfo.processInfo.systemUptime < deadline {
+            if !processGroupExists(processGroupID) { return true }
+            try? await Task.sleep(nanoseconds: pollNs)
+        }
+        return !processGroupExists(processGroupID)
+    }
+
     private static func waitForExitUntil(
         pid: pid_t,
         processGroupID: pid_t?,

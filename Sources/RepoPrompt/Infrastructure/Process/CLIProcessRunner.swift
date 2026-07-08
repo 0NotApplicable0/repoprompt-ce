@@ -650,6 +650,14 @@ final class CLIProcessRunner {
                         ) { msg in
                             ProcessDiagnostics.log(msg)
                         }
+                        // Reparented same-group descendants that ignore SIGTERM survive the
+                        // cooperative wait above; escalate to a group SIGKILL so nothing leaks.
+                        await ProcessTermination.ensureProcessGroupTerminated(
+                            pid: spawned.pid,
+                            processGroupID: spawned.processGroupID
+                        ) { msg in
+                            ProcessDiagnostics.log(msg)
+                        }
                         // Ensure reader threads unblock even if the monitor path stalls.
                         ProcessDiagnostics.log("🔒 [FD] Closing FDs (onTermination) for pid=\(spawned.pid)")
                         spawned.stdout.closeFile()
@@ -713,6 +721,14 @@ final class CLIProcessRunner {
             } catch {
                 log("Failed to wait for process \(process.pid): \(error)")
             }
+            // The cooperative wait above returns once the root PID is reaped, but a
+            // reparented same-process-group descendant that ignores SIGTERM can outlive
+            // it. Make cancellation authoritative by ensuring the whole spawned group is
+            // gone before returning.
+            await ProcessTermination.ensureProcessGroupTerminated(
+                pid: process.pid,
+                processGroupID: process.processGroupID
+            ) { [weak self] message in self?.log(message) }
         }
     }
 

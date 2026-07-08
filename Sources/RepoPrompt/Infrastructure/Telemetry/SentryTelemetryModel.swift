@@ -189,11 +189,13 @@ extension SentryTelemetryBootstrap {
     }
 
     enum ProviderKind: String {
+        case antigravity
         case claudeCode = "claude_code"
         case claudeCodeGLM = "claude_code_glm"
         case codexExec = "codex_exec"
         case cursor
         case customClaudeCompatible = "custom_claude_compatible"
+        case grok
         case kimiCode = "kimi_code"
         case openCode = "opencode"
 
@@ -213,6 +215,10 @@ extension SentryTelemetryBootstrap {
                 self = .kimiCode
             case .customClaudeCompatible:
                 self = .customClaudeCompatible
+            case .antigravity:
+                self = .antigravity
+            case .grok:
+                self = .grok
             }
         }
 
