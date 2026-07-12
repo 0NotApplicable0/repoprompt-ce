@@ -1,4 +1,4 @@
-@testable import RepoPrompt
+@testable import RepoPromptApp
 import XCTest
 
 /// agy surfaces native tools (`view_file`, `run_command`, …) whose args use PascalCase keys

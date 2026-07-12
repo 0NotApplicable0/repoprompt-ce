@@ -1,11 +1,20 @@
 import Foundation
 import MCP
-@testable import RepoPrompt
+@testable import RepoPromptApp
 import XCTest
 
 #if DEBUG
     @MainActor
     final class MCPAskOracleWorktreeTests: XCTestCase {
+        override func tearDown() async throws {
+            await ServerNetworkManager.shared.debugSetBeforeToolResultFormattingForTesting(nil)
+            await ServerNetworkManager.shared.debugSetResolvedToolOperationOverride(
+                toolName: MCPWindowToolName.readFile,
+                operation: nil
+            )
+            try await super.tearDown()
+        }
+
         func testExplicitWindowProvenanceEndsBeforePostProviderHooks() async throws {
             try await MCPSharedServerTestLease.shared.withLease { lease in
                 let fixture = try await PersistentMCPTestFixture.make(lease: lease)

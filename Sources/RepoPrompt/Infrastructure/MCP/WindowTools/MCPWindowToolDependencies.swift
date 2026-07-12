@@ -5,6 +5,13 @@ import MCP
 ///
 /// Providers receive narrow services/closures instead of an
 /// `MCPServerViewModel` reference.
+struct MCPFileActionMutationAcknowledgement {
+    let warning: String?
+    let operationID: String
+    let mutationState: String
+    let freshness: String
+}
+
 struct MCPWindowToolDependencies {
     struct ContextBuilderTabResolution {
         let tabID: UUID
@@ -152,6 +159,13 @@ struct MCPWindowToolDependencies {
     ) async -> FrozenPromptGitReviewContext
     typealias ParseManageSelectionInputs = @Sendable (_ rawPaths: [String], _ slicesValue: Value?) -> MCPServerViewModel.ManageSelectionInputs
     typealias ResolveFileToolLookupContext = @MainActor @Sendable (_ metadata: MCPServerViewModel.RequestMetadata) async -> WorkspaceLookupContext
+    typealias ResolveMutationFileToolContext = @MainActor @Sendable (
+        _ metadata: MCPServerViewModel.RequestMetadata,
+        _ toolName: String
+    ) async throws -> (
+        resolvedContext: MCPServerViewModel.ResolvedTabContextSnapshot,
+        lookupContext: WorkspaceLookupContext
+    )
     typealias StabilizedVirtualSelection = @MainActor @Sendable (_ context: MCPServerViewModel.TabScopedContext) async -> StoredSelection
     typealias BuildCurrentSelectionReply = @MainActor @Sendable (
         _ includeBlocks: Bool,
@@ -249,7 +263,7 @@ struct MCPWindowToolDependencies {
         _ mutated: Bool
     ) async -> MCPServerViewModel.MCPSelectionPersistenceVerification?
     typealias MakeSelectionHintError = @MainActor @Sendable (_ paths: [String], _ operation: String, _ lookupContext: WorkspaceLookupContext) async -> String
-    typealias PerformFileAction = @MainActor @Sendable (_ action: String, _ path: String, _ content: String?, _ newPath: String?, _ ifExists: String?) async throws -> String?
+    typealias PerformFileAction = @MainActor @Sendable (_ action: String, _ path: String, _ content: String?, _ newPath: String?, _ ifExists: String?, _ operationID: String) async throws -> MCPFileActionMutationAcknowledgement
     typealias BuildCodeStructureDTO = @MainActor @Sendable (_ files: [WorkspaceFileRecord], _ request: MCPServerViewModel.CodeStructureRequest, _ includePathNotFoundIssue: Bool, _ lookupContext: WorkspaceLookupContext) async throws -> ToolResultDTOs.CodeStructureReplyDTO
     typealias ResolveFilesForCodeStructure = @MainActor @Sendable (_ paths: [String], _ lookupRootScope: WorkspaceLookupRootScope, _ maximumSeedCount: Int) async throws -> [WorkspaceFileRecord]
     typealias BuildStoreBackedFileTreeResult = @MainActor @Sendable (_ mode: String, _ maxDepth: Int?, _ startPath: String?, _ lookupContext: WorkspaceLookupContext) async throws -> (result: FileTreeResult, rootCount: Int)
@@ -343,6 +357,7 @@ struct MCPWindowToolDependencies {
     let workspaceSearch: WorkspaceSearch
     let parseManageSelectionInputs: ParseManageSelectionInputs
     let resolveFileToolLookupContext: ResolveFileToolLookupContext
+    let resolveMutationFileToolContext: ResolveMutationFileToolContext
     let stabilizedVirtualSelection: StabilizedVirtualSelection
     let freezePromptGitReviewContext: FreezePromptGitReviewContext
     let buildCurrentSelectionReply: BuildCurrentSelectionReply

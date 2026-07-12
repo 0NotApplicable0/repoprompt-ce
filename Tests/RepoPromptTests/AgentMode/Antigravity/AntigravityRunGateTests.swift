@@ -1,4 +1,4 @@
-@testable import RepoPrompt
+@testable import RepoPromptApp
 import XCTest
 
 /// Contract: `AntigravityRunGate` enforces the single-run-at-a-time invariant that agy conversation-DB

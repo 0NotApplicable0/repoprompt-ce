@@ -1,8 +1,10 @@
 # Releasing RepoPrompt CE
 
-RepoPrompt CE has two release lanes:
+RepoPrompt CE has three release/update lanes:
 
 - Contributors can build an ad-hoc release-candidate archive with no secrets.
+- Maintainers can publish rolling Tip Builds from latest passing `main` through
+  a separate Sparkle update feed for testers who opt in inside the app.
 - Maintainers can publish a Developer ID signed, notarized, stapled GitHub
   Release with Sparkle EdDSA-signed update archive metadata through the
   protected `release` environment.
@@ -48,6 +50,67 @@ The intended process is:
    the existing draft, mirrors the public update assets, publishes both
    releases without rebuilding, explicitly marks that tag as GitHub's latest
    stable release, and runs anonymous post-publish checks.
+
+
+## Tip Builds
+
+Tip Builds are signed and notarized builds from the latest successful protected
+`main` commit. They are official tester builds, not stable releases. Users opt in
+from **Settings → Software Updates → Update Channel → Tip Builds**. The default
+channel remains **Stable**. Returning from Tip Builds to Stable may not downgrade
+immediately; users may need to wait for a newer stable build or reinstall the
+stable app manually.
+
+The app uses separate Sparkle feeds:
+
+```text
+Stable: https://github.com/repoprompt/repoprompt-ce-updates/releases/latest/download/appcast.xml
+Tip:    https://github.com/repoprompt/repoprompt-ce-tip-updates/releases/latest/download/appcast.xml
+```
+
+The initial Tip channel shares the CE Sparkle EdDSA key and Developer ID identity
+with stable releases, but it publishes only to the separate tip update
+repository. Tip workflows must never write to `repoprompt-ce-updates`, must not
+use `v*` tags, and must not feed into `Promote Release`. Stable promotion remains
+the only path that updates the stable appcast.
+
+`Publish Tip` runs after successful CI on `main` and can also be dispatched
+manually. It stages the tip source without secrets, signs and notarizes without
+executing packaged app/helper code, runs the PR #441 hardened packaged smoke on a
+fresh no-secret runner, then publishes a normal GitHub release in the dedicated
+tip update repository using an immutable tag shaped like `tip-<shortsha>`. The
+release is marked latest inside the tip-only repository so GitHub's
+`releases/latest/download/appcast.xml` URL resolves for opted-in clients. Do not
+mark the tip release as a prerelease: GitHub excludes prereleases from
+`releases/latest`.
+
+Tip `CFBundleVersion` values sort between adjacent stable builds. The workflow
+reads the currently published stable appcast and combines that stable build with
+the source commit count. For example, commit sequence `795` on stable build `28`
+becomes Tip build `28.7.95`: it is newer than stable `28`, while stable `29`
+still supersedes it. This keeps Stable and Tip in one monotonic Sparkle version
+space without forcing stable releases to adopt repository-sized build numbers.
+The source commit count must remain at or below `9999`; replace this encoding
+before the repository reaches that limit.
+
+The workflow uses GitHub concurrency to allow one active and one pending run.
+New successful `main` runs replace an older pending run while an active signing
+or notarization run finishes. Before compiling, it checks for a complete release
+for the immutable `tip-<shortsha>` tag and skips an already-published commit.
+
+Configure a protected GitHub Actions environment named `tip-release`. It can use
+the same Developer ID, provisioning, notarization, and Sparkle secrets as stable
+initially, but it needs a separate `TIP_UPDATE_REPOSITORY_TOKEN` scoped only to
+the tip update repository. Optionally set repository variable
+`TIP_UPDATE_REPOSITORY`; it defaults to `repoprompt/repoprompt-ce-tip-updates`.
+The publishing script fails closed if this variable points at the source repo or
+the stable update repo. Tip artifacts also include a small `*-metadata.json` asset
+recording the source commit, immutable tag, marketing version, and build number.
+
+Tip builds currently do not enable the Sentry-linked release build or upload
+dSYMs; that keeps the rolling lane focused on fast tester distribution without
+adding the release symbol-upload dependency. Stable releases remain the official
+Sentry-symbolicated lane.
 
 ## Contributor release candidate
 
@@ -222,7 +285,8 @@ Add these environment secrets:
 | `NOTARYTOOL_ISSUER_ID` | App Store Connect API issuer ID. |
 | `SPARKLE_PRIVATE_KEY` | Modern Sparkle EdDSA private-key seed for the CE update channel. It must decode from base64 to exactly 32 bytes. |
 | `PUBLIC_UPDATE_REPOSITORY_TOKEN` | Fine-grained GitHub token scoped only to `repoprompt/repoprompt-ce-updates` with repository contents read/write permission. |
-| `SENTRY_DSN` | Protected Sentry DSN injected into official signed builds. |
+| `TIP_UPDATE_REPOSITORY_TOKEN` | Fine-grained GitHub token scoped only to `repoprompt/repoprompt-ce-tip-updates` with repository contents read/write permission. Do not reuse the stable update token. |
+| `SENTRY_DSN` | Sentry DSN injected into official signed builds for release routing. It is not a credential, but keep it in the protected release environment so unofficial artifacts do not route telemetry to the official project. |
 | `SENTRY_AUTH_TOKEN` | Sentry auth token used only for uploading release debug symbols during publication. |
 
 Add these non-secret release environment variables when Sentry symbol upload is enabled:
@@ -236,15 +300,19 @@ Add these non-secret release environment variables when Sentry symbol upload is 
 ## Sentry telemetry and debug symbols
 
 Official telemetry-enabled release staging links the Sentry SDK when
-`REPOPROMPT_ENABLE_SENTRY=1`. The protected `SENTRY_DSN` secret is injected into
-`Info.plist` as `RepoPromptSentryDSN` only by `Scripts/sign_staged_release.sh`.
-Do not commit, log, or record the DSN in artifact manifests; manifests record
-only the non-secret `telemetry_enabled` boolean.
+`REPOPROMPT_ENABLE_SENTRY=1`. The protected release environment provides
+`SENTRY_DSN`, and `Scripts/sign_staged_release.sh` injects it into `Info.plist`
+as `RepoPromptSentryDSN`. A DSN is not an auth secret, but it is not committed,
+logged, or recorded in artifact manifests so only official signed artifacts route
+telemetry to the official project. Manifests record only the non-secret
+`telemetry_enabled` boolean.
 
 When Sentry is enabled, release staging generates dSYMs under
 `.build/sentry-symbols/release` and carries them inside the staged release ZIP.
-`release.sh publish-staged` uploads those debug symbols when `SENTRY_AUTH_TOKEN`
-is available, using `REPOPROMPT_SENTRY_ORG` and `REPOPROMPT_SENTRY_PROJECT`.
+`release.sh publish-staged` requires `SENTRY_AUTH_TOKEN` (or
+`REPOPROMPT_SENTRY_AUTH_TOKEN_FILE`), `REPOPROMPT_SENTRY_ORG`, and
+`REPOPROMPT_SENTRY_PROJECT` for official Sentry-enabled releases, then uploads
+those debug symbols.
 The upload helper runs:
 
 ```bash

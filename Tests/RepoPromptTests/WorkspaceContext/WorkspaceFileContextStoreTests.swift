@@ -1,7 +1,7 @@
 import Combine
 import CoreServices
 import CryptoKit
-@testable import RepoPrompt
+@testable import RepoPromptApp
 import XCTest
 
 private enum CodemapInitializationResetBoundary: String, CaseIterable {
@@ -24,6 +24,13 @@ private actor UUIDRecorder {
 
 final class WorkspaceFileContextStoreTests: XCTestCase {
     private var cancellables = Set<AnyCancellable>()
+
+    override func tearDown() {
+        EditFlowPerf.resetDebugCaptureForTesting()
+        MCPToolWorkCountDiagnostics.resetForTesting()
+        cancellables.removeAll()
+        super.tearDown()
+    }
 
     func testRootLoadIndexesFilesFoldersReadsContentAndLooksUpPaths() async throws {
         let rootA = try makeTemporaryRoot(name: "RootA")

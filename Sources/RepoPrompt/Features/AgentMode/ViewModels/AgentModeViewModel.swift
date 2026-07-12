@@ -3414,6 +3414,11 @@ final class AgentModeViewModel: ObservableObject {
             tabID: session.tabID,
             sessionID: sessionID
         )
+        postAgentSessionBindingDidChange(
+            tabID: session.tabID,
+            previousSessionID: previousSessionID,
+            sessionID: sessionID
+        )
 
         if session.tabID == currentTabID {
             publishLoadingTranscriptPresentation(tabID: session.tabID)
@@ -3431,6 +3436,23 @@ final class AgentModeViewModel: ObservableObject {
             )
         #endif
         return binding
+    }
+
+    private func postAgentSessionBindingDidChange(
+        tabID: UUID,
+        previousSessionID: UUID?,
+        sessionID: UUID?
+    ) {
+        NotificationCenter.default.post(
+            name: .agentSessionBindingDidChange,
+            object: self,
+            userInfo: [
+                "tabID": tabID,
+                "windowID": windowID,
+                "previousSessionID": previousSessionID as Any,
+                "sessionID": sessionID as Any
+            ]
+        )
     }
 
     /// Single creation point for attaching an Agent session identity to a compose tab.
@@ -7290,7 +7312,7 @@ final class AgentModeViewModel: ObservableObject {
                 transcript: session.transcript,
                 runState: session.runState
             ),
-            rawToolResultPayloadRenderRevision: session.rawToolResultPayloadRenderRevision
+            rawToolResultPayloadRenderRevisionByItemID: session.rawToolResultPayloadRenderRevisionByItemID
         )
     }
 
@@ -7526,7 +7548,7 @@ final class AgentModeViewModel: ObservableObject {
             hydratedBindingTransitionGeneration: hydratedTransitionGeneration,
             performanceSnapshot: snapshot.performanceSnapshot,
             metadata: snapshot.metadata,
-            rawToolResultPayloadRenderRevision: snapshot.rawToolResultPayloadRenderRevision
+            rawToolResultPayloadRenderRevisionByItemID: snapshot.rawToolResultPayloadRenderRevisionByItemID
         )
     }
 
@@ -9167,7 +9189,7 @@ final class AgentModeViewModel: ObservableObject {
             analyticsSnapshot: session.transcriptAnalyticsSnapshot,
             sanitizedActivityCount: 0,
             performanceSnapshot: session.transcriptPerformanceSnapshot,
-            rawToolResultPayloadRenderRevision: session.rawToolResultPayloadRenderRevision
+            rawToolResultPayloadRenderRevisionByItemID: session.rawToolResultPayloadRenderRevisionByItemID
         )
     }
 
@@ -9348,9 +9370,11 @@ final class AgentModeViewModel: ObservableObject {
             #endif
         }
         let visibleRetainedIDs = visibleToolResultIDs(in: baseProjection)
-        let rawToolResultPayloadRenderRevision = visibleRetainedIDs.reduce(0) { current, itemID in
-            max(current, capturedPayloadRevisionByItemID[itemID] ?? 0)
-        }
+        let rawToolResultPayloadRenderRevisionByItemID = Dictionary(
+            uniqueKeysWithValues: visibleRetainedIDs.compactMap { itemID in
+                capturedPayloadRevisionByItemID[itemID].map { (itemID, $0) }
+            }
+        )
         let fullProjection = degradeCollapsedTranscriptBlocksIfNeeded(
             baseProjection,
             isColdLoad: isColdLoad
@@ -9468,7 +9492,7 @@ final class AgentModeViewModel: ObservableObject {
             ),
             sanitizedActivityCount: sanitizeMetrics.sanitizedActivityCount,
             performanceSnapshot: performanceSnapshot,
-            rawToolResultPayloadRenderRevision: rawToolResultPayloadRenderRevision
+            rawToolResultPayloadRenderRevisionByItemID: rawToolResultPayloadRenderRevisionByItemID
         )
     }
 
@@ -9605,7 +9629,7 @@ final class AgentModeViewModel: ObservableObject {
         session.transcriptCanonicalVisibleRowCount = presentation.canonicalVisibleRowCount
         session.transcriptProjectionCounts = presentation.projectionCounts
         session.transcriptAnalyticsSnapshot = presentation.analyticsSnapshot
-        session.rawToolResultPayloadRenderRevision = presentation.rawToolResultPayloadRenderRevision
+        session.rawToolResultPayloadRenderRevisionByItemID = presentation.rawToolResultPayloadRenderRevisionByItemID
         #if DEBUG || EDIT_FLOW_PERF
             session.transcriptPerformanceSnapshot = presentation.performanceSnapshot
         #else
@@ -15088,22 +15112,6 @@ final class AgentModeViewModel: ObservableObject {
     }
 
     private func cancelPendingApproval(for session: TabSession) {
-        if let pendingApproval = session.pendingApproval {
-            AgentRunSentryTelemetry.recordApprovalDecision(
-                session: session,
-                kind: telemetryApprovalKind(for: pendingApproval.kind),
-                outcome: .denied,
-                cancellationReason: .user
-            )
-        }
-        if session.pendingPermissionsRequest != nil {
-            AgentRunSentryTelemetry.recordApprovalDecision(
-                session: session,
-                kind: .toolPermission,
-                outcome: .denied,
-                cancellationReason: .user
-            )
-        }
         session.pendingApproval = nil
         session.pendingPermissionsRequest = nil
         session.pendingMCPElicitationRequest = nil
@@ -15113,14 +15121,6 @@ final class AgentModeViewModel: ObservableObject {
     }
 
     private func cancelPendingApplyEditsReview(for session: TabSession, reason: String) {
-        if session.pendingApplyEditsReview != nil {
-            AgentRunSentryTelemetry.recordApprovalDecision(
-                session: session,
-                kind: .applyEdits,
-                outcome: .denied,
-                cancellationReason: telemetryCancellationReason(forApprovalCancellationReason: reason)
-            )
-        }
         session.pendingApplyEditsReview = nil
         let scope = applyEditsScope(for: session.tabID)
         Task { [applyEditsApprovalStore] in
@@ -15687,6 +15687,14 @@ final class AgentModeViewModel: ObservableObject {
         removeSessionIndex(sessionID: sessionID)
         if let cleanupRegistration {
             await AgentRunSessionStore.cleanup(registration: cleanupRegistration)
+        }
+
+        for tabID in clearedComposeTabIDs.union(clearedStashedTabIDs) {
+            postAgentSessionBindingDidChange(
+                tabID: tabID,
+                previousSessionID: sessionID,
+                sessionID: nil
+            )
         }
 
         let activeTabID = currentTabID

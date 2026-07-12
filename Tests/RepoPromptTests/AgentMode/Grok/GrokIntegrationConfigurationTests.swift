@@ -1,4 +1,4 @@
-@testable import RepoPrompt
+@testable import RepoPromptApp
 import XCTest
 
 /// Tests for grok's TOML MCP config management (`~/.grok/config.toml`,

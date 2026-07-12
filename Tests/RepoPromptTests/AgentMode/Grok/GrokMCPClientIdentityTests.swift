@@ -1,4 +1,4 @@
-@testable import RepoPrompt
+@testable import RepoPromptApp
 import XCTest
 
 /// Regression coverage for the Grok (`grok`) MCP client identity.
