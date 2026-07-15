@@ -68,6 +68,70 @@ final class AntigravityArgumentBuilderTests: XCTestCase {
         XCTAssertFalse(args.contains("--model"))
     }
 
+    // MARK: - Inline prompt (agy honors `--model` only when the prompt is the `--print` argv value)
+
+    func testBuildArgumentsInlinesPromptAsPrintValueWhenProvided() {
+        let args = AntigravityAgentProvider.buildArguments(
+            config: AntigravityAgentConfig(),
+            workspacePath: nil,
+            logFilePath: nil,
+            inlinePrompt: "do the thing"
+        )
+        // agy drops `--model` when the prompt arrives via a bare `--print` + STDIN, so the prompt
+        // is delivered as the `--print` argument value: argv leads with `--print <prompt>`.
+        XCTAssertEqual(Array(args.prefix(2)), ["--print", "do the thing"])
+    }
+
+    func testBuildArgumentsOmitsInlinePromptValueWhenNil() {
+        let args = AntigravityAgentProvider.buildArguments(
+            config: AntigravityAgentConfig(),
+            workspacePath: nil,
+            logFilePath: nil,
+            inlinePrompt: nil
+        )
+        // No inline prompt: the prompt is delivered via STDIN, so `--print` stays bare and the
+        // token after it is a flag, not prompt text.
+        XCTAssertEqual(args.first, "--print")
+        XCTAssertTrue(args.count == 1 || args[1].hasPrefix("--"))
+    }
+
+    func testBuildArgumentsInlinePromptStillEmitsModelFlag() {
+        let args = AntigravityAgentProvider.buildArguments(
+            config: AntigravityAgentConfig(modelString: "Gemini 3.1 Pro (Low)"),
+            workspacePath: nil,
+            logFilePath: nil,
+            inlinePrompt: "hello"
+        )
+        XCTAssertEqual(Array(args.prefix(2)), ["--print", "hello"])
+        XCTAssertTrue(consecutive(args, ["--model", "Gemini 3.1 Pro (Low)"]))
+    }
+
+    func testShouldInlinePromptTrueForSmallPrompt() {
+        XCTAssertTrue(AntigravityAgentProvider.shouldInlinePrompt("small prompt"))
+        XCTAssertTrue(AntigravityAgentProvider.shouldInlinePrompt(""))
+    }
+
+    func testShouldInlinePromptFalseForOversizedPrompt() {
+        let oversized = String(repeating: "a", count: AntigravityAgentProvider.maxInlinePromptBytes + 1)
+        XCTAssertFalse(AntigravityAgentProvider.shouldInlinePrompt(oversized))
+    }
+
+    func testShouldInlinePromptCountsUTF8BytesNotCharacters() {
+        // A multi-byte grapheme prompt just over the byte budget in UTF-8 must fall back to STDIN
+        // even though its Swift `count` (grapheme count) is far below the budget.
+        let emojiCount = AntigravityAgentProvider.maxInlinePromptBytes / 4 + 1 // each is 4 UTF-8 bytes
+        let oversized = String(repeating: "😀", count: emojiCount)
+        XCTAssertLessThan(oversized.count, AntigravityAgentProvider.maxInlinePromptBytes)
+        XCTAssertGreaterThan(oversized.utf8.count, AntigravityAgentProvider.maxInlinePromptBytes)
+        XCTAssertFalse(AntigravityAgentProvider.shouldInlinePrompt(oversized))
+    }
+
+    func testMaxInlinePromptBytesLeavesArgMaxHeadroom() {
+        // Must stay well under macOS ARG_MAX (1 MiB total for argv + environment) so the inlined
+        // prompt plus flags plus the inherited environment can never hit E2BIG.
+        XCTAssertLessThanOrEqual(AntigravityAgentProvider.maxInlinePromptBytes, 512 * 1024)
+    }
+
     func testSandboxCanBeDisabled() {
         let args = AntigravityAgentProvider.buildArguments(
             config: AntigravityAgentConfig(useSandbox: false),

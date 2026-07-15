@@ -69,18 +69,43 @@ final class AntigravityAgentProvider: HeadlessAgentProvider {
         """
     }
 
-    /// Build the `agy` argv. The prompt is NOT passed on the command line: `agy --print`
-    /// reads it from STDIN when the positional value is omitted (verified against `agy`
-    /// v1.0.10). Delivering the (potentially very large) combined system+user prompt over
-    /// stdin avoids the `ARG_MAX` limit a single `--print <prompt>` argv would hit. Remaining
-    /// flags are passed via argv (posix_spawn, no shell) so values are safe.
+    /// Max prompt size (UTF-8 bytes) to inline as the `--print <prompt>` argv value.
+    ///
+    /// `agy` honors `--model` only when the prompt is the `--print` *argument value*; when the
+    /// prompt arrives via a bare `--print` + STDIN, `agy` silently drops `--model` and falls back
+    /// to its persisted current-session model (verified against `agy` v1.0.10). So the prompt is
+    /// inlined into argv to make model selection work — but only while it fits comfortably under
+    /// macOS `ARG_MAX` (1 MiB total for argv + the inherited environment). Prompts larger than
+    /// this fall back to STDIN, where `agy` ignores the model but the run still proceeds instead
+    /// of failing with `E2BIG`. The margin below `ARG_MAX` covers the environment block and the
+    /// remaining flags.
+    static let maxInlinePromptBytes = 256 * 1024
+
+    /// Whether `prompt` is small enough to inline as the `--print` argv value (honoring `--model`)
+    /// rather than delivering it over STDIN. Measured in UTF-8 bytes, matching the argv encoding.
+    static func shouldInlinePrompt(_ prompt: String) -> Bool {
+        prompt.utf8.count <= maxInlinePromptBytes
+    }
+
+    /// Build the `agy` argv.
+    ///
+    /// When `inlinePrompt` is non-nil the prompt is delivered as the `--print` argument value
+    /// (`agy --print <prompt> ...`), which is the only invocation form where `agy` honors
+    /// `--model` — a bare `--print` reading the prompt from STDIN makes `agy` ignore the requested
+    /// model. When `inlinePrompt` is nil the prompt is delivered over STDIN instead (bare
+    /// `--print`), used for prompts too large to inline safely under `ARG_MAX`. All values are
+    /// passed via argv (posix_spawn, no shell) so they are safe from shell interpretation.
     static func buildArguments(
         config: AntigravityAgentConfig,
         workspacePath: String?,
         logFilePath: String?,
-        resumeConversationID: String? = nil
+        resumeConversationID: String? = nil,
+        inlinePrompt: String? = nil
     ) -> [String] {
         var args = ["--print"]
+        if let inlinePrompt {
+            args.append(inlinePrompt)
+        }
         if let model = config.modelString?.trimmingCharacters(in: .whitespacesAndNewlines),
            !model.isEmpty, model.lowercased() != "default"
         {
@@ -193,20 +218,27 @@ final class AntigravityAgentProvider: HeadlessAgentProvider {
                             let logFileURL = Self.makeLogFileURL(runID: UUID())
                             defer { Self.removeLogFile(logFileURL) }
 
+                            // agy honors `--model` only when the prompt is the `--print` argv value,
+                            // not when it arrives via STDIN. Inline the prompt when it fits under
+                            // ARG_MAX; otherwise fall back to STDIN (model ignored, but the run
+                            // still proceeds instead of failing with E2BIG).
+                            let turnPrompt = turn == 0 ? combinedPrompt : Self.resumeContinuationPrompt
+                            let inlinePrompt = Self.shouldInlinePrompt(turnPrompt)
                             let args = Self.buildArguments(
                                 config: self.config,
                                 workspacePath: self.workspacePath,
                                 logFilePath: logFileURL?.path,
-                                resumeConversationID: resumeConversationID
+                                resumeConversationID: resumeConversationID,
+                                inlinePrompt: inlinePrompt ? turnPrompt : nil
                             )
                             if self.enableDebugLogging {
                                 let flags = args.filter { $0.hasPrefix("--") }
-                                print("[DEBUG] Antigravity: launching agy turn \(turn) (\(args.count) args; flags: \(flags.joined(separator: " ")))")
+                                print("[DEBUG] Antigravity: launching agy turn \(turn) (\(args.count) args; inlinePrompt: \(inlinePrompt); flags: \(flags.joined(separator: " ")))")
                             }
 
                             let outcome = try await self.runPrintTurn(
                                 args: args,
-                                prompt: turn == 0 ? combinedPrompt : Self.resumeContinuationPrompt,
+                                prompt: inlinePrompt ? "" : turnPrompt,
                                 logFileURL: logFileURL,
                                 expectedPIDRunID: context.runID,
                                 isFirstTurn: turn == 0,
@@ -287,6 +319,10 @@ final class AntigravityAgentProvider: HeadlessAgentProvider {
     /// Run ONE `agy --print` invocation: stream its stdout as live `content`, then classify the exit
     /// as `.completed` or `.capped` (poll-cap timeout). Throws on a hard failure (non-zero exit,
     /// runner timeout, or — on the first turn only — no output at all).
+    ///
+    /// `prompt` is written to the child's STDIN. It is empty when the caller already inlined the
+    /// prompt into `args` as the `--print` argument value (the model-honoring path); the child
+    /// then reads its prompt from argv and sees an immediate STDIN EOF.
     private func runPrintTurn(
         args: [String],
         prompt: String,
