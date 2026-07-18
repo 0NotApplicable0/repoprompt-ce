@@ -2064,7 +2064,7 @@ public class APISettingsViewModel: ObservableObject {
                     settingsStore.setPlanningModelRaw(
                         replacement,
                         reason: "api_settings.provider_reset.planning.\(reasonSuffix)",
-                        honorSync: false
+                        honorSync: true
                     )
                 }
                 settingsStore.setPreferredComposeModelRaw(

@@ -9,6 +9,7 @@ TRUSTED_ROOT="$(cd "$CONTROL_PLANE_SCRIPTS_DIR/.." && pwd)"
 cd "$ROOT_DIR"
 
 source "$CONTROL_PLANE_SCRIPTS_DIR/load_release_metadata.sh"
+source "$CONTROL_PLANE_SCRIPTS_DIR/release_sentry_symbols.sh"
 load_release_metadata "$ROOT_DIR"
 
 DIST_DIR="${DIST_DIR:-$ROOT_DIR/dist}"
@@ -54,7 +55,7 @@ require_env() {
 }
 
 sentry_linking_enabled() {
-    [[ "${REPOPROMPT_ENABLE_SENTRY:-}" == "1" ]]
+    release_sentry_linking_enabled
 }
 
 require_release_tag_matches_metadata() {
@@ -86,6 +87,7 @@ run_preflight() {
     require_file "$ROOT_DIR/Vendor/Sparkle/SHA256SUMS"
     require_file "$CONTROL_PLANE_SCRIPTS_DIR/sign_staged_release.sh"
     require_file "$CONTROL_PLANE_SCRIPTS_DIR/upload_sentry_debug_symbols.sh"
+    require_file "$CONTROL_PLANE_SCRIPTS_DIR/release_sentry_symbols.sh"
     require_file "$CONTROL_PLANE_SCRIPTS_DIR/build_swiftpm_release_products.sh"
     require_file "$CONTROL_PLANE_SCRIPTS_DIR/compare_swiftpm_release_resources.py"
     require_file "$CONTROL_PLANE_SCRIPTS_DIR/smoke_embedded_mcp_helper.sh"
@@ -176,12 +178,6 @@ write_final_artifact_manifest() {
         --app "$APP_BUNDLE" \
         --output "$FINAL_ARTIFACT_MANIFEST" \
         --expected-architectures "arm64,x86_64"
-}
-
-require_staged_sentry_symbols_when_enabled() {
-    if sentry_linking_enabled && [[ ! -d "$SENTRY_SYMBOLS_DIR" ]]; then
-        fail "Sentry-enabled release staging did not produce debug symbols at $SENTRY_SYMBOLS_DIR"
-    fi
 }
 
 require_sentry_publish_configuration() {
@@ -375,7 +371,13 @@ finalize_sentry_release() {
 
 upload_required_sentry_symbols() {
     require_sentry_publish_configuration
-    "$CONTROL_PLANE_SCRIPTS_DIR/upload_sentry_debug_symbols.sh" "$SENTRY_SYMBOLS_DIR"
+    upload_release_sentry_symbols \
+        "$SENTRY_SYMBOLS_DIR" \
+        "$CONTROL_PLANE_SCRIPTS_DIR/upload_sentry_debug_symbols.sh" \
+        "$APP_NAME.dSYM" \
+        "$APP_NAME" \
+        "repoprompt-mcp.dSYM" \
+        "repoprompt-mcp"
 }
 
 package_release_candidate() {
@@ -411,6 +413,8 @@ package_release_candidate() {
 }
 
 verify_publish_inputs() {
+    sentry_linking_enabled ||
+        fail "Official release publishing requires REPOPROMPT_ENABLE_SENTRY=1"
     require_env RELEASE_TAG
     require_env RELEASE_COMMIT
     require_env SIGN_IDENTITY
@@ -438,6 +442,8 @@ submit_notarization() {
 }
 
 stage_publish_release() {
+    sentry_linking_enabled ||
+        fail "Official release staging requires REPOPROMPT_ENABLE_SENTRY=1"
     require_env RELEASE_TAG
     require_env RELEASE_COMMIT
     require_command ditto
@@ -456,16 +462,24 @@ stage_publish_release() {
     run_preflight
     validate_packaged_legal "$APP_BUNDLE"
     validate_public_app "$APP_BUNDLE" "$BUILD_ARTIFACT_MANIFEST" "Release staging"
-    require_staged_sentry_symbols_when_enabled
+    require_release_sentry_symbols_when_enabled \
+        "$SENTRY_SYMBOLS_DIR" \
+        "$APP_NAME.dSYM" \
+        "$APP_NAME" \
+        "repoprompt-mcp.dSYM" \
+        "repoprompt-mcp"
     TMP_DIR="$(mktemp -d)"
     local stage_root="$TMP_DIR/release-stage"
     mkdir -p "$stage_root/.build/release"
     ditto "$APP_BUNDLE" "$stage_root/.build/release/$APP_NAME.app"
     cp "$BUILD_ARTIFACT_MANIFEST" "$stage_root/.build/release/$APP_NAME-artifact-manifest.json"
-    if [[ -d "$SENTRY_SYMBOLS_DIR" ]]; then
-        mkdir -p "$stage_root/.build/sentry-symbols"
-        ditto "$SENTRY_SYMBOLS_DIR" "$stage_root/.build/sentry-symbols/release"
-    fi
+    stage_release_sentry_symbols \
+        "$SENTRY_SYMBOLS_DIR" \
+        "$stage_root/.build/sentry-symbols/release" \
+        "$APP_NAME.dSYM" \
+        "$APP_NAME" \
+        "repoprompt-mcp.dSYM" \
+        "repoprompt-mcp"
     cp "$ROOT_DIR/version.env" "$ROOT_DIR/LICENSE" "$ROOT_DIR/THIRD_PARTY_NOTICES.md" "$stage_root/"
     cp -R "$ROOT_DIR/ThirdPartyLicenses" "$stage_root/"
     printf '%s\n' "$RELEASE_COMMIT" > "$stage_root/RELEASE_COMMIT"
@@ -491,6 +505,13 @@ publish_staged_release() {
     [[ -d "$APP_BUNDLE" ]] || fail "Missing secret-free staged app bundle: $APP_BUNDLE"
     REPOPROMPT_RELEASE_SOURCE_ROOT="$ROOT_DIR" \
         "$CONTROL_PLANE_SCRIPTS_DIR/validate_staged_release.sh"
+    verify_release_sentry_symbol_uuids_before_signing \
+        "$SENTRY_SYMBOLS_DIR" \
+        "$APP_BUNDLE" \
+        "$APP_NAME.dSYM" \
+        "$APP_NAME" \
+        "repoprompt-mcp.dSYM" \
+        "repoprompt-mcp"
     REPOPROMPT_RELEASE_SOURCE_ROOT="$ROOT_DIR" \
         "$CONTROL_PLANE_SCRIPTS_DIR/sign_staged_release.sh"
     prepare_dist

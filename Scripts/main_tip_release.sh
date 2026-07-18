@@ -9,6 +9,7 @@ TRUSTED_ROOT="$(cd "$CONTROL_PLANE_SCRIPTS_DIR/.." && pwd)"
 cd "$ROOT_DIR"
 
 source "$CONTROL_PLANE_SCRIPTS_DIR/load_release_metadata.sh"
+source "$CONTROL_PLANE_SCRIPTS_DIR/release_sentry_symbols.sh"
 load_release_metadata "$ROOT_DIR"
 
 fail() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
@@ -37,6 +38,7 @@ DMG="$DIST_DIR/$ARCHIVE_BASENAME.dmg"
 APPCAST="$DIST_DIR/appcast.xml"
 CHECKSUMS="$DIST_DIR/SHA256SUMS"
 BUILD_ARTIFACT_MANIFEST="$ROOT_DIR/.build/release/$APP_NAME-artifact-manifest.json"
+SENTRY_SYMBOLS_DIR="$ROOT_DIR/.build/sentry-symbols/release"
 FINAL_ARTIFACT_MANIFEST="$DIST_DIR/$ARCHIVE_BASENAME-artifact-manifest.json"
 FINAL_METADATA="$DIST_DIR/$ARCHIVE_BASENAME-metadata.json"
 STAGE_ARCHIVE="$DIST_DIR/$ARCHIVE_BASENAME-stage.zip"
@@ -118,6 +120,31 @@ write_tip_metadata() {
 JSON
 }
 
+require_tip_sentry_configuration() {
+    release_sentry_linking_enabled ||
+        fail "Official Tip signing requires REPOPROMPT_ENABLE_SENTRY=1"
+    require_env SENTRY_DSN
+    require_env REPOPROMPT_SENTRY_AUTH_TOKEN_FILE
+    require_file "$REPOPROMPT_SENTRY_AUTH_TOKEN_FILE"
+    [[ -s "$REPOPROMPT_SENTRY_AUTH_TOKEN_FILE" ]] || fail "Tip Sentry auth token file must not be empty"
+    require_env REPOPROMPT_SENTRY_ORG
+    require_env REPOPROMPT_SENTRY_PROJECT
+    require_command sentry-cli
+    require_file "$CONTROL_PLANE_SCRIPTS_DIR/upload_sentry_debug_symbols.sh"
+}
+
+assert_tip_manifest_telemetry_enabled() {
+    python3 - "$FINAL_ARTIFACT_MANIFEST" <<'PYTHON'
+import json
+import sys
+from pathlib import Path
+
+manifest = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+if manifest.get("bundle", {}).get("telemetry_enabled") is not True:
+    raise SystemExit("ERROR: final Tip artifact manifest must record telemetry_enabled=true")
+PYTHON
+}
+
 stage_tip() {
     require_command ditto
     require_command git
@@ -132,17 +159,31 @@ stage_tip() {
         REPOPROMPT_CONTROL_PLANE_SCRIPTS_DIR="$CONTROL_PLANE_SCRIPTS_DIR" \
         MARKETING_VERSION="$MARKETING_VERSION" \
         REPOPROMPT_RELEASE_BUILD_NUMBER_OVERRIDE="$TIP_BUILD_NUMBER" \
+        REPOPROMPT_ENABLE_SENTRY=1 \
         RELEASE_ALLOW_ADHOC_SIGNING=1 \
         "$CONTROL_PLANE_SCRIPTS_DIR/package_app.sh" release
     "$CONTROL_PLANE_SCRIPTS_DIR/release.sh" preflight
     validate_packaged_legal "$APP_BUNDLE"
     validate_public_app "$APP_BUNDLE" "$BUILD_ARTIFACT_MANIFEST" "Tip staging"
+    REPOPROMPT_ENABLE_SENTRY=1 require_release_sentry_symbols_when_enabled \
+        "$SENTRY_SYMBOLS_DIR" \
+        "$APP_NAME.dSYM" \
+        "$APP_NAME" \
+        "repoprompt-mcp.dSYM" \
+        "repoprompt-mcp"
 
     TMP_DIR="$(mktemp -d)"
     local stage_root="$TMP_DIR/tip-stage"
     mkdir -p "$stage_root/.build/release"
     ditto "$APP_BUNDLE" "$stage_root/.build/release/$APP_NAME.app"
     cp "$BUILD_ARTIFACT_MANIFEST" "$stage_root/.build/release/$APP_NAME-artifact-manifest.json"
+    REPOPROMPT_ENABLE_SENTRY=1 stage_release_sentry_symbols \
+        "$SENTRY_SYMBOLS_DIR" \
+        "$stage_root/.build/sentry-symbols/release" \
+        "$APP_NAME.dSYM" \
+        "$APP_NAME" \
+        "repoprompt-mcp.dSYM" \
+        "repoprompt-mcp"
     write_tip_version_env "$stage_root/version.env"
     cp "$ROOT_DIR/LICENSE" "$ROOT_DIR/THIRD_PARTY_NOTICES.md" "$stage_root/"
     cp -R "$ROOT_DIR/ThirdPartyLicenses" "$stage_root/"
@@ -299,11 +340,19 @@ sign_tip() {
     require_env NOTARYTOOL_ISSUER_ID
     require_env RELEASE_COMMIT
     require_env REPOPROMPT_APPROVED_SOURCE_ROOT
+    require_tip_sentry_configuration
     [[ "$RELEASE_COMMIT" == "$TIP_COMMIT" ]] || fail "RELEASE_COMMIT must match TIP_COMMIT"
     [[ -d "$APP_BUNDLE" ]] || fail "Missing staged tip app bundle: $APP_BUNDLE"
     REPOPROMPT_RELEASE_SOURCE_ROOT="$ROOT_DIR" \
         REPOPROMPT_RELEASE_BUILD_NUMBER_OVERRIDE="$TIP_BUILD_NUMBER" \
         "$CONTROL_PLANE_SCRIPTS_DIR/validate_staged_release.sh"
+    verify_release_sentry_symbol_uuids_before_signing \
+        "$SENTRY_SYMBOLS_DIR" \
+        "$APP_BUNDLE" \
+        "$APP_NAME.dSYM" \
+        "$APP_NAME" \
+        "repoprompt-mcp.dSYM" \
+        "repoprompt-mcp"
     REPOPROMPT_RELEASE_SOURCE_ROOT="$ROOT_DIR" \
         REPOPROMPT_RELEASE_BUILD_NUMBER_OVERRIDE="$TIP_BUILD_NUMBER" \
         "$CONTROL_PLANE_SCRIPTS_DIR/sign_staged_release.sh"
@@ -318,8 +367,16 @@ sign_tip() {
         --app "$APP_BUNDLE" \
         --output "$FINAL_ARTIFACT_MANIFEST" \
         --expected-architectures "arm64,x86_64"
+    assert_tip_manifest_telemetry_enabled
     write_tip_metadata
     validate_public_app "$APP_BUNDLE" "$FINAL_ARTIFACT_MANIFEST" "Final tip Developer ID app"
+    upload_release_sentry_symbols \
+        "$SENTRY_SYMBOLS_DIR" \
+        "$CONTROL_PLANE_SCRIPTS_DIR/upload_sentry_debug_symbols.sh" \
+        "$APP_NAME.dSYM" \
+        "$APP_NAME" \
+        "repoprompt-mcp.dSYM" \
+        "repoprompt-mcp"
 
     local distribution_dir="$TMP_DIR/distribution"
     mkdir -p "$distribution_dir"

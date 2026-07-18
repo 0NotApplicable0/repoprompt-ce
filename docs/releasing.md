@@ -95,8 +95,10 @@ before the repository reaches that limit.
 
 The workflow uses GitHub concurrency to allow one active and one pending run.
 New successful `main` runs replace an older pending run while an active signing
-or notarization run finishes. Before compiling, it checks for a complete release
-for the immutable `tip-<shortsha>` tag and skips an already-published commit.
+or notarization run finishes. Before compiling, it uses the workflow's read-only
+`github.token` to check for a complete release for the immutable `tip-<shortsha>`
+tag and skips an already-published commit. The protected update-repository token
+remains confined to the publishing job.
 
 Configure a protected GitHub Actions environment named `tip-release`. It can use
 the same Developer ID, provisioning, notarization, and Sparkle secrets as stable
@@ -107,10 +109,16 @@ The publishing script fails closed if this variable points at the source repo or
 the stable update repo. Tip artifacts also include a small `*-metadata.json` asset
 recording the source commit, immutable tag, marketing version, and build number.
 
-Tip builds currently do not enable the Sentry-linked release build or upload
-dSYMs; that keeps the rolling lane focused on fast tester distribution without
-adding the release symbol-upload dependency. Stable releases remain the official
-Sentry-symbolicated lane.
+Tip builds use the same Sentry-linked binary and symbolication policy as stable
+releases. The secret-free stage enables Sentry linking and carries release dSYMs
+inside the staged archive without a DSN or auth token. Only the protected
+`tip-release` signing job receives `SENTRY_DSN`, `SENTRY_AUTH_TOKEN`, and the
+Sentry org/project variables: it injects the DSN through
+`sign_staged_release.sh`, uploads the staged dSYMs before signed assets leave
+the job, and requires the final artifact manifest to record
+`telemetry_enabled: true`. The workflow materializes Sentry auth in an
+owner-only temporary token file and removes it through the job's always-run
+cleanup step.
 
 ## Contributor release candidate
 
@@ -289,13 +297,15 @@ Add these environment secrets:
 | `SENTRY_DSN` | Sentry DSN injected into official signed builds for release routing. It is not a credential, but keep it in the protected release environment so unofficial artifacts do not route telemetry to the official project. |
 | `SENTRY_AUTH_TOKEN` | Sentry Organization Token used for draft-time debug-symbol/release metadata and verified-promotion deploy recording. Create it with the fixed `org:ci` scope; Organization Token scopes are immutable, and release tooling does not inspect or change them. |
 
-Add these non-secret release environment variables when Sentry symbol upload is enabled:
+Add these non-secret GitHub environment variables for Sentry symbol upload in
+both the `release` and `tip-release` environments. The workflows map them to
+the release scripts' `REPOPROMPT_SENTRY_*` names and explicitly set
+`REPOPROMPT_ENABLE_SENTRY=1` for official staging and signing.
 
 | Variable | Contents |
 | --- | --- |
-| `REPOPROMPT_ENABLE_SENTRY` | `1` for official telemetry-enabled release staging. |
-| `REPOPROMPT_SENTRY_ORG` | Sentry organization slug. |
-| `REPOPROMPT_SENTRY_PROJECT` | Sentry project slug. |
+| `SENTRY_ORG` | Sentry organization slug. |
+| `SENTRY_PROJECT` | Sentry project slug. |
 
 Official stable promotion intentionally requires `SENTRY_AUTH_TOKEN` and the Sentry org/project/environment configuration so it can record the verified production deploy only after public verification.
 
@@ -309,9 +319,11 @@ logged, or recorded in artifact manifests so only official signed artifacts rout
 telemetry to the official project. Manifests record only the non-secret
 `telemetry_enabled` boolean.
 
-When Sentry is enabled, release staging generates dSYMs under
-`.build/sentry-symbols/release` and carries them inside the staged release ZIP.
-`release.sh publish-staged` requires `SENTRY_AUTH_TOKEN` (or
+When Sentry is enabled, stable and Tip staging generate dSYMs under
+`.build/sentry-symbols/release` and carry them inside their staged release ZIPs.
+Both lanes use the shared deterministic symbol policy to require, copy, and
+upload those staged symbols with `upload_sentry_debug_symbols.sh`.
+`release.sh publish-staged` additionally requires `SENTRY_AUTH_TOKEN` (or
 `REPOPROMPT_SENTRY_AUTH_TOKEN_FILE`), `REPOPROMPT_SENTRY_ORG`, and
 `REPOPROMPT_SENTRY_PROJECT` for official Sentry-enabled releases. Before code
 signing or notarization, it performs a read-only release API preflight. Release

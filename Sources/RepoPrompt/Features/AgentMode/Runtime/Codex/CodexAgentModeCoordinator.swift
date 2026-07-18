@@ -302,6 +302,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
     private struct CodexNativeSessionStartResult {
         let sessionRef: CodexNativeSessionController.SessionRef?
         let fallbackReason: CodexNativeSessionFallbackReason?
+        let disposition: AgentModeViewModel.CodexNativeStartupDisposition?
     }
 
     private struct PendingCodexThreadNameSync {
@@ -335,7 +336,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         activeToolQuery: @escaping ActiveToolQuery = { _ in false },
         activeAgentRunWaitQuery: @escaping ActiveAgentRunWaitQuery = { _ in false },
         activeAgentRunWaitDrain: @escaping ActiveAgentRunWaitDrain = { _, _ in true },
-        leaseRoutingTimeoutMs: Int = 2000,
+        leaseRoutingTimeoutMs: Int = 10000,
         idleShutdownDelayNanos: UInt64 = 300_000_000_000,
         stallWatchdogPollIntervalNanos: UInt64 = 5_000_000_000,
         stallWatchdogProbeThreshold: TimeInterval = 0,
@@ -2674,6 +2675,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             session.codexModel = nil
             session.codexReasoningEffort = nil
             session.codexNeedsReconnect = false
+            session.codexNativeStartupDisposition = nil
         }
     }
 
@@ -2704,7 +2706,8 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         guard let controller else {
             return CodexNativeSessionStartResult(
                 sessionRef: nil,
-                fallbackReason: nil
+                fallbackReason: nil,
+                disposition: nil
             )
         }
         do {
@@ -2717,7 +2720,8 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             )
             return CodexNativeSessionStartResult(
                 sessionRef: ref,
-                fallbackReason: nil
+                fallbackReason: nil,
+                disposition: existingRef == nil ? .fresh : .resumed
             )
         } catch {
             guard allowMissingRolloutFallback,
@@ -2735,7 +2739,8 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             )
             return CodexNativeSessionStartResult(
                 sessionRef: ref,
-                fallbackReason: .missingRollout
+                fallbackReason: .missingRollout,
+                disposition: .resumeFellBackToFresh
             )
         }
     }
@@ -2793,14 +2798,54 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         ) != nil
     }
 
+    private static func codexResumeCandidate(
+        for session: AgentModeViewModel.TabSession,
+        skipResumeWhenNoPriorCodexHistory: Bool
+    ) -> CodexNativeSessionController.SessionRef? {
+        guard session.codexNeedsReconnect else { return nil }
+        if skipResumeWhenNoPriorCodexHistory,
+           !hasResumeEligibleCodexHistory(session.items)
+        {
+            return nil
+        }
+        return CodexNativeSessionController.SessionRef(
+            conversationID: session.codexConversationID ?? "",
+            rolloutPath: session.codexRolloutPath,
+            model: session.codexModel,
+            reasoningEffort: session.codexReasoningEffort
+        )
+    }
+
     private static func codexNativeSessionFailurePrefix(attemptedResume: Bool) -> String {
         attemptedResume ? "Codex native resume failed:" : "Codex native start failed:"
     }
 
-    private static func isCodexNativeSessionFailureText(_ text: String) -> Bool {
-        text.hasPrefix(codexNativeSessionFailurePrefix(attemptedResume: false))
+    private static func codexNativeSessionFailurePrefix(
+        disposition: AgentModeViewModel.CodexNativeStartupDisposition
+    ) -> String {
+        disposition == .resumed ? "Codex native resume failed:" : "Codex native start failed:"
+    }
+
+    private static func isCodexNativeSessionFailureText(
+        _ text: String,
+        disposition: AgentModeViewModel.CodexNativeStartupDisposition? = nil
+    ) -> Bool {
+        let matchesDisposition = disposition.map {
+            text.hasPrefix(codexNativeSessionFailurePrefix(disposition: $0))
+        } ?? false
+        return matchesDisposition
+            || text.hasPrefix(codexNativeSessionFailurePrefix(attemptedResume: false))
             || text.hasPrefix(codexNativeSessionFailurePrefix(attemptedResume: true))
     }
+
+    #if DEBUG
+        static func debugIsCodexNativeSessionFailureText(
+            _ text: String,
+            disposition: AgentModeViewModel.CodexNativeStartupDisposition?
+        ) -> Bool {
+            isCodexNativeSessionFailureText(text, disposition: disposition)
+        }
+    #endif
 
     private func resetCodexResumeTimeoutState(for session: AgentModeViewModel.TabSession) {
         session.codexResumeTimeoutState = .init()
@@ -3061,6 +3106,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         to session: AgentModeViewModel.TabSession,
         preferenceGenerationAtStart: Int
     ) {
+        session.codexNativeStartupDisposition = startResult.disposition
         if let fallbackReason = startResult.fallbackReason {
             let recoveryNoticeItem = AgentChatItem.system(
                 Self.recoveryMessage(for: fallbackReason),
@@ -3626,6 +3672,52 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         return description.isEmpty ? String(describing: error) : description
     }
 
+    /// Fail-closed teardown for a Codex child whose RepoPrompt MCP routing never confirmed before its
+    /// first turn (issue #514). The app-server thread has already started, so the live controller is
+    /// torn down — leaving no active thread — and the readiness failure is published as the run's
+    /// terminal outcome. The message carries the native-start failure prefix so that when control
+    /// returns to the send path, its no-active-thread guard treats the failure as already reported and
+    /// finalizes without dispatching a first turn or appending a second error.
+    private func failCodexStartupForRoutingReadiness(
+        session: AgentModeViewModel.TabSession,
+        error: Error,
+        startupDisposition: AgentModeViewModel.CodexNativeStartupDisposition
+    ) async {
+        let failurePrefix = Self.codexNativeSessionFailurePrefix(disposition: startupDisposition)
+        let message = "\(failurePrefix) \(Self.providerStartupFailureMessage(for: error))"
+        _ = invalidateCodexControllerForReconnect(
+            session: session,
+            expectedController: session.codexController,
+            source: "mcp-routing-readiness",
+            preserveRunID: true
+        )
+        if session.activeRunOwnership != nil, terminalCommitBarrier != nil {
+            await finalizeCodexRun(
+                session,
+                turnStatus: .failed,
+                reason: "mcp-routing-readiness",
+                errorMessage: message,
+                notifyOnCompleted: false,
+                deleteDeferredFilesWhenFailureHasNoInFlight: true
+            )
+        } else {
+            let alreadyReported = session.items.last.map {
+                $0.kind == .error && Self.isCodexNativeSessionFailureText(
+                    $0.text,
+                    disposition: startupDisposition
+                )
+            } ?? false
+            if !alreadyReported {
+                session.appendItem(AgentChatItem.error(message, sequenceIndex: session.nextSequenceIndex))
+            }
+            session.runState = .failed
+            setRunningStatus(nil, source: nil, session: session)
+            viewModel?.setAgentRunActive(session.tabID, isActive: false)
+        }
+        viewModel?.requestUIRefresh(tabID: session.tabID, urgent: true)
+        viewModel?.scheduleSave(for: session.tabID)
+    }
+
     func ensureCodexNativeSession(
         session: AgentModeViewModel.TabSession,
         policyAlreadyInstalled: Bool = false,
@@ -3889,6 +3981,17 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             guard acquired else { return }
 
             await lease.providerInitializationStarted(provider: AgentProviderKind.codexExec.rawValue)
+            let routingReadinessResumeCandidate = Self.codexResumeCandidate(
+                for: session,
+                skipResumeWhenNoPriorCodexHistory: skipResumeWhenNoPriorCodexHistory
+            )
+            let routingReadinessAttemptedResume = Self.isCodexResumeAttempt(routingReadinessResumeCandidate)
+                && !shouldSkipResumeAfterRepeatedTimeouts(
+                    session: session,
+                    existingRef: routingReadinessResumeCandidate,
+                    allowResumeTimeoutFallback: allowResumeTimeoutFallback
+                )
+            session.codexNativeStartupDisposition = nil
             await ensureCodexNativeSession(
                 session: session,
                 policyAlreadyInstalled: true,
@@ -3898,6 +4001,8 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                 semanticRunState: semanticRunState
             )
 
+            let routingReadinessStartupDisposition = session.codexNativeStartupDisposition
+                ?? (routingReadinessAttemptedResume ? .resumed : .fresh)
             let providerReady = effectiveRunState.isActive
                 && session.codexController?.hasActiveThread == true
             await lease.providerInitializationCompleted(
@@ -3914,7 +4019,27 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             }
 
             if shouldWaitForRouting {
-                _ = await lease.releaseWhenRouted(timeoutMs: codexLeaseRoutingTimeoutMs)
+                do {
+                    try await lease.requireRouting(timeoutMs: codexLeaseRoutingTimeoutMs)
+                } catch is CancellationError {
+                    // A cancelled routing wait is an ordinary run cancellation, not a fail-closed
+                    // readiness failure; the run's cancellation machinery owns teardown. requireRouting
+                    // has already released the gate, one-shot policy, and routing waiter.
+                    logCodex("[AgentModeVM][CodexBootstrap] routing wait cancelled for tab \(session.tabID) run \(runID)")
+                } catch {
+                    // Fail closed: RepoPrompt MCP routing was never confirmed for this run, so the
+                    // child cannot be trusted to hold RepoPrompt tools and must not reach its first
+                    // turn. requireRouting has already released the gate, one-shot policy, and routing
+                    // waiter; tear down the started thread and publish the readiness failure as the
+                    // run's terminal outcome so the parent sees a failed start instead of a tool-less
+                    // child.
+                    logCodex("[AgentModeVM][CodexBootstrap] routing wait failed for tab \(session.tabID) run \(runID): \(error)")
+                    await failCodexStartupForRoutingReadiness(
+                        session: session,
+                        error: error,
+                        startupDisposition: routingReadinessStartupDisposition
+                    )
+                }
             } else {
                 await lease.releaseWithoutRoutingWait()
             }
@@ -3932,20 +4057,10 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             taskLabelKind: session.mcpControlContext?.taskLabelKind,
             codeMapsDisabled: GlobalSettingsStore.shared.globalCodeMapsDisabled()
         )
-        let resumeCandidate: CodexNativeSessionController.SessionRef? = {
-            guard session.codexNeedsReconnect else { return nil }
-            if skipResumeWhenNoPriorCodexHistory,
-               !Self.hasResumeEligibleCodexHistory(session.items)
-            {
-                return nil
-            }
-            return CodexNativeSessionController.SessionRef(
-                conversationID: session.codexConversationID ?? "",
-                rolloutPath: session.codexRolloutPath,
-                model: session.codexModel,
-                reasoningEffort: session.codexReasoningEffort
-            )
-        }()
+        let resumeCandidate = Self.codexResumeCandidate(
+            for: session,
+            skipResumeWhenNoPriorCodexHistory: skipResumeWhenNoPriorCodexHistory
+        )
         let shouldSkipTimedOutResumeTarget = shouldSkipResumeAfterRepeatedTimeouts(
             session: session,
             existingRef: resumeCandidate,
@@ -3968,7 +4083,8 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             if shouldSkipTimedOutResumeTarget, startResult.fallbackReason == nil {
                 startResult = CodexNativeSessionStartResult(
                     sessionRef: startResult.sessionRef,
-                    fallbackReason: .repeatedResumeTimeout
+                    fallbackReason: .repeatedResumeTimeout,
+                    disposition: .resumeFellBackToFresh
                 )
             }
             applyCodexNativeSessionStartResult(
@@ -4016,7 +4132,8 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                         if shouldSkipTimedOutResumeTarget, recoveredStartResult.fallbackReason == nil {
                             recoveredStartResult = CodexNativeSessionStartResult(
                                 sessionRef: recoveredStartResult.sessionRef,
-                                fallbackReason: .repeatedResumeTimeout
+                                fallbackReason: .repeatedResumeTimeout,
+                                disposition: .resumeFellBackToFresh
                             )
                         }
                         applyCodexNativeSessionStartResult(
@@ -4067,7 +4184,8 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                     if retryResult.fallbackReason == nil {
                         retryResult = CodexNativeSessionStartResult(
                             sessionRef: retryResult.sessionRef,
-                            fallbackReason: .repeatedResumeTimeout
+                            fallbackReason: .repeatedResumeTimeout,
+                            disposition: .resumeFellBackToFresh
                         )
                     }
                     applyCodexNativeSessionStartResult(
@@ -4230,6 +4348,19 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             deferReconnectForCurrentActiveTurn: wasRunAlreadyActive,
             skipResumeWhenNoPriorCodexHistory: !wasRunAlreadyActive && !hadResumeEligibleCodexHistoryBeforeSend
         )
+        if Task.isCancelled {
+            // The run was cancelled during startup — e.g. while the MCP routing wait was suspended. The
+            // controller may still report an active thread before the run's cancellation machinery
+            // invalidates it, so re-check cancellation here rather than trusting the controller guard,
+            // and unwind without dispatching a first turn. Cancellation owns the terminal state, so this
+            // publishes no failure.
+            viewModel?.finalizeAttachmentsForTurn(
+                for: session,
+                reservationID: attachmentReservationID,
+                disposition: .restoreToPending
+            )
+            return .cancelled
+        }
         guard let controller = session.codexController,
               controller.hasActiveThread
         else {
@@ -4239,7 +4370,10 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             clearCodexPendingAuthRetryTurn(session)
             let message = "Codex native send failed: session not ready"
             let alreadyReportedStartFailure = session.items.last.map {
-                $0.kind == .error && Self.isCodexNativeSessionFailureText($0.text)
+                $0.kind == .error && Self.isCodexNativeSessionFailureText(
+                    $0.text,
+                    disposition: session.codexNativeStartupDisposition
+                )
             } ?? false
             if terminalizeRejectedSend {
                 await finalizeCodexRun(
