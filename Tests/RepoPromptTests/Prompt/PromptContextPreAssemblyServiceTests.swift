@@ -410,7 +410,13 @@ final class PromptContextPreAssemblyServiceTests: XCTestCase {
             ]
         )
         addTeardownBlock { repositoryFixture.cleanup() }
-        let store = WorkspaceFileContextStore(codemapProjectionPreloadLaunchPolicyForTesting: .disabled)
+        let codemapFixture = try CodemapStoreFixture(name: #function)
+        addTeardownBlock { await codemapFixture.shutdown() }
+        let store = codemapFixture.makeStore(
+            codemapLocalGitClassificationProbe: .production,
+            codemapGitEligibilityProbe: .production(),
+            codemapProjectionPreloadLaunchPolicy: .disabled
+        )
         _ = try await store.loadRoot(path: logicalRoot.path)
         let materializedProjection = await WorkspaceRootBindingProjectionMaterializer(store: store).materialize(
             sessionID: UUID(),
