@@ -1801,7 +1801,7 @@ struct CLIProvidersSettingsView: View {
     private var antigravityCard: some View {
         providerCard(
             title: "Antigravity CLI",
-            subtitle: "Google's Antigravity (`agy`) CLI. Headless one-shot Agent Mode runs; sign in by running `agy` once in your terminal. RepoPrompt MCP tools are injected for agent runs.",
+            subtitle: "Google's Antigravity (`agy`) CLI. Headless one-shot Agent Mode runs; sign in by running `agy` once in your terminal. Connecting enables the RepoPrompt MCP integration without changing your agy sign-in.",
             infoURL: "https://antigravity.google/",
             isConnected: viewModel.isAntigravityConnected,
             isExpanded: $isAntigravityExpanded
@@ -1823,14 +1823,15 @@ struct CLIProvidersSettingsView: View {
 
                         Spacer()
 
-                        Button(action: { signOutFromAntigravity() }) {
-                            Text("Sign Out")
+                        Button(action: { forgetAntigravityConnection() }) {
+                            Text("Forget Connection")
                                 .foregroundColor(.secondary)
                         }
+                        .disabled(isLoadingAntigravity)
                         .buttonStyle(CustomButtonStyle())
                     }
 
-                    Text("Connected = `agy` found. If runs fail with an auth error, run `agy` once to sign in.")
+                    Text("RepoPrompt verified `agy` and its MCP configuration. Forgetting this connection does not sign out of `agy`; RepoPrompt removes only an unchanged MCP entry it can prove it owns.")
                         .font(.caption)
                         .foregroundColor(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
@@ -1850,16 +1851,33 @@ struct CLIProvidersSettingsView: View {
                         .disabled(isLoadingAntigravity)
                         .buttonStyle(CustomButtonStyle())
 
-                        if let error = viewModel.antigravityError, !error.isEmpty {
-                            Text(error)
-                                .font(.caption)
-                                .foregroundColor(.red)
-                                .fixedSize(horizontal: false, vertical: true)
-                        } else {
-                            Text("Run `agy` in your terminal once to sign in, then Connect.")
-                                .font(.caption)
-                                .foregroundColor(.secondary)
+                        if viewModel.hasOwnedAntigravityMCPEntry {
+                            Spacer()
+                            Button(action: { forgetAntigravityConnection() }) {
+                                Text("Forget Connection")
+                                    .foregroundColor(.secondary)
+                            }
+                            .disabled(isLoadingAntigravity)
+                            .buttonStyle(CustomButtonStyle())
                         }
+                    }
+
+                    if let error = viewModel.antigravityError, !error.isEmpty {
+                        Text(error)
+                            .font(.caption)
+                            .foregroundColor(.red)
+                            .fixedSize(horizontal: false, vertical: true)
+                    } else {
+                        Text("Run `agy` in your terminal once to sign in, then Connect.")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                    }
+
+                    if viewModel.hasOwnedAntigravityMCPEntry {
+                        Text("RepoPrompt still has a recorded MCP ownership marker. You can forget the connection even while agy is unavailable; changed configuration will be preserved.")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
                     }
                 }
             }
@@ -2322,11 +2340,31 @@ struct CLIProvidersSettingsView: View {
         onAPIKeyUpdated?()
     }
 
-    private func signOutFromAntigravity() {
-        viewModel.disconnectAntigravity()
-        alertMessage = "Signed out from Antigravity CLI"
-        showAlert = true
-        onAPIKeyUpdated?()
+    private func forgetAntigravityConnection() {
+        guard !isLoadingAntigravity else { return }
+        isLoadingAntigravity = true
+        Task {
+            let removalResult = await viewModel.disconnectAntigravity()
+            await MainActor.run {
+                isLoadingAntigravity = false
+                alertMessage = switch removalResult {
+                case .removed:
+                    "RepoPrompt forgot the Antigravity connection and removed its owned MCP entry. Your agy sign-in was not changed."
+                case .restoredPreviousEntry:
+                    "RepoPrompt forgot this Antigravity connection and restored the unchanged RepoPrompt MCP entry that existed before Connect. Your agy sign-in was not changed."
+                case .entryAlreadyAbsent:
+                    "RepoPrompt forgot the Antigravity connection. Its owned MCP entry was already absent, and your agy sign-in was not changed."
+                case .noOwnedEntry:
+                    "RepoPrompt forgot the Antigravity connection, but left agy's MCP configuration unchanged because RepoPrompt did not own that entry. agy may continue using the RepoPrompt MCP server; your agy sign-in was not changed."
+                case .preservedChangedEntry:
+                    "RepoPrompt forgot the Antigravity connection, but left the MCP entry in place because it changed after installation. agy may continue using the RepoPrompt MCP server; your agy sign-in was not changed."
+                case let .failed(message):
+                    "RepoPrompt forgot the Antigravity connection, but could not safely update agy's MCP config: \(message) The MCP entry may remain active in agy; your agy sign-in was not changed."
+                }
+                showAlert = true
+                onAPIKeyUpdated?()
+            }
+        }
     }
 
     private func signOutFromGrok() {
@@ -2344,7 +2382,7 @@ struct CLIProvidersSettingsView: View {
                 await MainActor.run {
                     isLoadingAntigravity = false
                     if ok {
-                        alertMessage = "Antigravity CLI connected."
+                        alertMessage = "Antigravity CLI connected. For unattended direct runs, choose Sandboxed Auto-Approve under Agent Permissions. MCP-started agents use Sub-agent Permissions, so choose Inherit Provider Settings or a Custom Antigravity level that supports headless runs. Plain Sandboxed mode may stop when agy requires confirmation."
                     }
                     showAlert = true
                     onAPIKeyUpdated?()

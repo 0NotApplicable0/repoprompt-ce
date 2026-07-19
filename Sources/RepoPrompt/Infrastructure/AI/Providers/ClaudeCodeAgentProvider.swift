@@ -32,7 +32,7 @@ final class ClaudeCodeAgentProvider: HeadlessAgentProvider {
     private let environmentResolver: any ClaudeCodeLaunchEnvironmentResolving
     private let configService = MCPConfigExportService.shared
     private let toolTracking = AgentToolTrackingController()
-    private var streamTask: Task<Void, Never>?
+    private let streamTasks = HeadlessProviderStreamTaskAuthority()
 
     private var enableDebugLogging: Bool {
         config.enableDebugLogging
@@ -340,10 +340,16 @@ final class ClaudeCodeAgentProvider: HeadlessAgentProvider {
     // MARK: - Streaming
 
     func streamAgentMessage(_ message: AgentMessage, runID: UUID? = nil) async throws -> AsyncThrowingStream<AIStreamResult, Error> {
-        AsyncThrowingStream { continuation in
-            // Cancel any previous lingering task (defensive)
-            self.streamTask?.cancel()
-            self.streamTask = Task {
+        let (raw, continuation) = AsyncThrowingStream<AIStreamResult, Error>.makeStream()
+        guard let producer = await streamTasks.start(
+            onDiscarded: {
+                continuation.finish(throwing: AIProviderError.invalidConfiguration(detail: "Claude Code run cancelled."))
+            },
+            operation: { [weak self] in
+                guard let self else {
+                    continuation.finish()
+                    return
+                }
                 await withTaskCancellationHandler(operation: {
                     do {
                         if self.enableDebugLogging {
@@ -376,42 +382,44 @@ final class ClaudeCodeAgentProvider: HeadlessAgentProvider {
                             ) { _, resolverValue in resolverValue }
                             let expectedPIDRunID = context.runID
                             let expectedPIDClientName = self.config.runtimeVariant.agentKind.mcpClientNameHint
-                            let stream = try await self.runner.runStreaming(
-                                args: args,
-                                stdin: userMessage, // Pass the user message via stdin
-                                outputMode: .auto(.streamJson),
-                                timeout: 6000, // 100 minute timeout (matches Codex)
-                                additionalEnvironment: additionalEnvironment,
-                                additionalRemovedKeys: context.launchEnvironment?.removedEnvironmentKeys ?? [],
-                                onProcessStarted: { pid in
-                                    guard let expectedPIDClientName else { return }
-                                    await ServerNetworkManager.shared.registerExpectedAgentPID(
-                                        pid,
-                                        for: expectedPIDClientName,
-                                        runID: expectedPIDRunID
-                                    )
-                                },
-                                onProcessTerminated: { pid in
-                                    guard let expectedPIDClientName else { return }
-                                    await ServerNetworkManager.shared.clearExpectedAgentPID(
-                                        pid,
-                                        for: expectedPIDClientName,
-                                        runID: expectedPIDRunID
-                                    )
-                                }
-                            )
                             try await AsyncScope.withCleanup({}, cleanup: {
                                 await self.runner.cancelAll()
-                                await self.toolTracking.stopTracking()
+                                await self.toolTracking.stopTracking(ifTracking: context.runID)
                             }) {
                                 if self.enableDebugLogging {
                                     print("[DEBUG] ClaudeCodeAgent: CLI process streaming started")
                                 }
 
-                                self.toolTracking.startTracking(
+                                await self.toolTracking.startTracking(
                                     runID: context.runID,
                                     clientNameHint: "claude-code",
                                     continuation: continuation
+                                )
+                                // Install the observer before spawning the child so an immediate MCP
+                                // call cannot outrun tool-event attribution.
+                                let stream = try await self.runner.runStreaming(
+                                    args: args,
+                                    stdin: userMessage, // Pass the user message via stdin
+                                    outputMode: .auto(.streamJson),
+                                    timeout: 6000, // 100 minute timeout (matches Codex)
+                                    additionalEnvironment: additionalEnvironment,
+                                    additionalRemovedKeys: context.launchEnvironment?.removedEnvironmentKeys ?? [],
+                                    onProcessStarted: { pid in
+                                        guard let expectedPIDClientName else { return }
+                                        await ServerNetworkManager.shared.registerExpectedAgentPID(
+                                            pid,
+                                            for: expectedPIDClientName,
+                                            runID: expectedPIDRunID
+                                        )
+                                    },
+                                    onProcessTerminated: { pid in
+                                        guard let expectedPIDClientName else { return }
+                                        await ServerNetworkManager.shared.clearExpectedAgentPID(
+                                            pid,
+                                            for: expectedPIDClientName,
+                                            runID: expectedPIDRunID
+                                        )
+                                    }
                                 )
                                 var framer = LineFramer()
                                 var stdoutTail = Data()
@@ -463,6 +471,7 @@ final class ClaudeCodeAgentProvider: HeadlessAgentProvider {
                                     }
                                     throw error
                                 }
+                                try Task.checkCancellation()
 
                                 framer.flush { lineData in
                                     guard !lineData.isEmpty else { return }
@@ -486,6 +495,7 @@ final class ClaudeCodeAgentProvider: HeadlessAgentProvider {
                                     }
                                     await self.runner.cancelAll()
                                 }
+                                try Task.checkCancellation()
 
                                 if self.enableDebugLogging {
                                     print("[DEBUG] ClaudeCodeAgent: Yielded \(eventCount) events")
@@ -495,7 +505,6 @@ final class ClaudeCodeAgentProvider: HeadlessAgentProvider {
                                         if self.enableDebugLogging {
                                             print("[DEBUG] ClaudeCodeAgent: No termination status, but completion event observed. Treating as success.")
                                         }
-                                        continuation.finish()
                                         return
                                     } else {
                                         throw AIProviderError.apiError(source: NSError(domain: "ClaudeCLI", code: -999, userInfo: [NSLocalizedDescriptionKey: "Claude CLI did not report a termination status."]))
@@ -519,10 +528,13 @@ final class ClaudeCodeAgentProvider: HeadlessAgentProvider {
                                     }
                                     throw self.mapProcessFailure(exitCode: status, stderr: stderrString, timedOut: timedOut)
                                 }
-
-                                continuation.finish()
                             }
                         }
+                        try Task.checkCancellation()
+                        // The scoped cleanup unregisters this run's observer and drains callbacks
+                        // already captured by the MCP server. Finish only after that barrier so a
+                        // final tool result cannot be discarded by the closed continuation.
+                        continuation.finish()
                     } catch {
                         if self.enableDebugLogging {
                             print("[DEBUG] ClaudeCodeAgent: Stream error: \(error)")
@@ -531,28 +543,38 @@ final class ClaudeCodeAgentProvider: HeadlessAgentProvider {
                     }
                 }, onCancel: { [weak self] in
                     if self?.enableDebugLogging == true {
-                        print("[DEBUG] ClaudeCodeAgent: stream task cancellation – cancelling runner")
+                        print("[DEBUG] ClaudeCodeAgent: stream task cancellation observed")
                     }
-                    Task { [weak self] in
-                        // Kill the child aggressively, then ensure our outer stream ends.
-                        await self?.runner.cancelAll()
-                        continuation.finish()
-                    }
+                    // Do not launch runner-wide teardown outside the producer task. Its structured
+                    // cleanup cancels and awaits the runner before the task authority admits a
+                    // replacement, so stale cancellation can never kill the replacement process.
                 })
             }
-            // If the consumer drops the outer stream, stop our task immediately.
-            continuation.onTermination = { [weak self] _ in
-                self?.streamTask?.cancel()
-            }
+        ) else {
+            continuation.finish()
+            throw CancellationError()
         }
+        return try await withTaskCancellationHandler(operation: {
+            HeadlessProviderStreamTaskAuthority.installTerminationHandler(
+                on: continuation,
+                producerTask: producer.task
+            )
+            try Task.checkCancellation()
+            return raw
+        }, onCancel: {
+            producer.task.cancel()
+        })
     }
 
     func dispose() async {
         if enableDebugLogging {
             print("[DEBUG] ClaudeCodeAgent: Disposing provider, cancelling stream task & runners")
         }
-        streamTask?.cancel()
+        let producerTasks = await streamTasks.beginDisposal()
         await runner.cancelAll()
+        for producerTask in producerTasks {
+            await producerTask.value
+        }
     }
 
     // MARK: - Helpers

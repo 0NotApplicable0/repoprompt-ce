@@ -9,6 +9,8 @@ enum AgentPermissionSecureDomain: String, CaseIterable, Hashable {
     case claude
     case openCode
     case cursor
+    case antigravity
+    case grok
 
     var secureStorageAccount: SecureStorageAccount {
         switch self {
@@ -22,6 +24,10 @@ enum AgentPermissionSecureDomain: String, CaseIterable, Hashable {
             .agentPermissionOpenCodeDocument
         case .cursor:
             .agentPermissionCursorDocument
+        case .antigravity:
+            .agentPermissionAntigravityDocument
+        case .grok:
+            .agentPermissionGrokDocument
         }
     }
 
@@ -66,7 +72,7 @@ enum AgentPermissionSecureStoreNotificationKey {
 }
 
 struct SecureSubagentPermissionDocument: Codable, Equatable {
-    static let currentSchemaVersion = 2
+    static let currentSchemaVersion = 3
 
     var schemaVersion: Int
     var updatedAt: Date
@@ -280,6 +286,58 @@ struct SecureCursorPermissionDocument: Codable, Equatable {
     }
 }
 
+struct SecureAntigravityPermissionDocument: Codable, Equatable {
+    static let currentSchemaVersion = 1
+
+    var schemaVersion: Int
+    var updatedAt: Date
+    var permissionLevelRaw: String?
+
+    init(
+        schemaVersion: Int = currentSchemaVersion,
+        updatedAt: Date = Date(),
+        permissionLevelRaw: String? = AntigravityAgentToolPreferences.PermissionLevel.managedDefault.rawValue
+    ) {
+        self.schemaVersion = schemaVersion
+        self.updatedAt = updatedAt
+        self.permissionLevelRaw = permissionLevelRaw
+    }
+
+    static func failClosedDocument(now: Date = Date()) -> SecureAntigravityPermissionDocument {
+        SecureAntigravityPermissionDocument(updatedAt: now)
+    }
+
+    func permissionLevel() -> AntigravityAgentToolPreferences.PermissionLevel {
+        AntigravityAgentToolPreferences.PermissionLevel.from(rawValue: permissionLevelRaw)
+    }
+}
+
+struct SecureGrokPermissionDocument: Codable, Equatable {
+    static let currentSchemaVersion = 1
+
+    var schemaVersion: Int
+    var updatedAt: Date
+    var permissionLevelRaw: String?
+
+    init(
+        schemaVersion: Int = currentSchemaVersion,
+        updatedAt: Date = Date(),
+        permissionLevelRaw: String? = GrokAgentToolPreferences.PermissionLevel.managedDefault.rawValue
+    ) {
+        self.schemaVersion = schemaVersion
+        self.updatedAt = updatedAt
+        self.permissionLevelRaw = permissionLevelRaw
+    }
+
+    static func failClosedDocument(now: Date = Date()) -> SecureGrokPermissionDocument {
+        SecureGrokPermissionDocument(updatedAt: now)
+    }
+
+    func permissionLevel() -> GrokAgentToolPreferences.PermissionLevel {
+        GrokAgentToolPreferences.PermissionLevel.from(rawValue: permissionLevelRaw)
+    }
+}
+
 final class AgentPermissionSecureStore {
     static let shared = AgentPermissionSecureStore(secureStrings: SecureKeysService())
 
@@ -295,8 +353,15 @@ final class AgentPermissionSecureStore {
     private var claudeCache: SecureClaudePermissionDocument?
     private var openCodeCache: SecureOpenCodePermissionDocument?
     private var cursorCache: SecureCursorPermissionDocument?
+    private var antigravityCache: SecureAntigravityPermissionDocument?
+    private var grokCache: SecureGrokPermissionDocument?
+    private var unpersistedMissingDomains: Set<AgentPermissionSecureDomain> = []
     private var diagnosticsByDomain: [AgentPermissionSecureDomain: AgentPermissionStorageDiagnostic] = [:]
     private let permissionDecisionAccessMode: KeychainAccessMode = .nonInteractive(reason: .permissionDecision)
+
+    var persistsValuesAcrossLaunches: Bool {
+        secureStrings.persistsValuesAcrossLaunches
+    }
 
     private struct DeferredSideEffects {
         private var requestedDiagnosticsDomains: Set<AgentPermissionSecureDomain> = []
@@ -342,6 +407,9 @@ final class AgentPermissionSecureStore {
             claudeCache = nil
             openCodeCache = nil
             cursorCache = nil
+            antigravityCache = nil
+            grokCache = nil
+            unpersistedMissingDomains.removeAll()
         }
     }
 
@@ -379,6 +447,17 @@ final class AgentPermissionSecureStore {
             var cursor = SecureCursorPermissionDocument.failClosedDocument(now: resetDate)
             _ = normalizeCursor(&cursor)
             record(.cursor, resetLocked(cursor, domain: .cursor, cache: &cursorCache, deferred: &effects))
+
+            var antigravity = SecureAntigravityPermissionDocument.failClosedDocument(now: resetDate)
+            _ = normalizeAntigravity(&antigravity)
+            record(
+                .antigravity,
+                resetLocked(antigravity, domain: .antigravity, cache: &antigravityCache, deferred: &effects)
+            )
+
+            var grok = SecureGrokPermissionDocument.failClosedDocument(now: resetDate)
+            _ = normalizeGrok(&grok)
+            record(.grok, resetLocked(grok, domain: .grok, cache: &grokCache, deferred: &effects))
 
             return AgentPermissionStorageResetResult(
                 succeededDomains: succeededDomains,
@@ -427,12 +506,26 @@ final class AgentPermissionSecureStore {
         }
     }
 
+    func antigravityPermissions() -> SecureAntigravityPermissionDocument {
+        withLockAndDeferredSideEffects { effects in
+            loadAntigravityPermissionsLocked(deferred: &effects)
+        }
+    }
+
+    func grokPermissions() -> SecureGrokPermissionDocument {
+        withLockAndDeferredSideEffects { effects in
+            loadGrokPermissionsLocked(deferred: &effects)
+        }
+    }
+
     // MARK: - Public writes
 
     @discardableResult
     func updateSubagentPermissions(_ mutation: (inout SecureSubagentPermissionDocument) -> Void) -> Bool {
         withLockAndDeferredSideEffects { effects in
+            resetFailedCacheBeforeMutation(domain: .subagent, cache: &subagentCache)
             var document = loadSubagentPermissionsLocked(deferred: &effects)
+            guard mutationCanProceed(domain: .subagent, deferred: &effects) else { return false }
             mutation(&document)
             normalizeSubagent(&document)
             document.updatedAt = now()
@@ -443,7 +536,9 @@ final class AgentPermissionSecureStore {
     @discardableResult
     func updateCodexPermissions(_ mutation: (inout SecureCodexPermissionDocument) -> Void) -> Bool {
         withLockAndDeferredSideEffects { effects in
+            resetFailedCacheBeforeMutation(domain: .codex, cache: &codexCache)
             var document = loadCodexPermissionsLocked(deferred: &effects)
+            guard mutationCanProceed(domain: .codex, deferred: &effects) else { return false }
             mutation(&document)
             normalizeCodex(&document)
             document.updatedAt = now()
@@ -454,7 +549,9 @@ final class AgentPermissionSecureStore {
     @discardableResult
     func updateClaudePermissions(_ mutation: (inout SecureClaudePermissionDocument) -> Void) -> Bool {
         withLockAndDeferredSideEffects { effects in
+            resetFailedCacheBeforeMutation(domain: .claude, cache: &claudeCache)
             var document = loadClaudePermissionsLocked(deferred: &effects)
+            guard mutationCanProceed(domain: .claude, deferred: &effects) else { return false }
             mutation(&document)
             normalizeClaude(&document)
             document.updatedAt = now()
@@ -465,7 +562,9 @@ final class AgentPermissionSecureStore {
     @discardableResult
     func updateOpenCodePermissions(_ mutation: (inout SecureOpenCodePermissionDocument) -> Void) -> Bool {
         withLockAndDeferredSideEffects { effects in
+            resetFailedCacheBeforeMutation(domain: .openCode, cache: &openCodeCache)
             var document = loadOpenCodePermissionsLocked(deferred: &effects)
+            guard mutationCanProceed(domain: .openCode, deferred: &effects) else { return false }
             mutation(&document)
             normalizeOpenCode(&document)
             document.updatedAt = now()
@@ -476,11 +575,39 @@ final class AgentPermissionSecureStore {
     @discardableResult
     func updateCursorPermissions(_ mutation: (inout SecureCursorPermissionDocument) -> Void) -> Bool {
         withLockAndDeferredSideEffects { effects in
+            resetFailedCacheBeforeMutation(domain: .cursor, cache: &cursorCache)
             var document = loadCursorPermissionsLocked(deferred: &effects)
+            guard mutationCanProceed(domain: .cursor, deferred: &effects) else { return false }
             mutation(&document)
             normalizeCursor(&document)
             document.updatedAt = now()
             return saveLocked(document, domain: .cursor, cache: &cursorCache, deferred: &effects)
+        }
+    }
+
+    @discardableResult
+    func updateAntigravityPermissions(_ mutation: (inout SecureAntigravityPermissionDocument) -> Void) -> Bool {
+        withLockAndDeferredSideEffects { effects in
+            resetFailedCacheBeforeMutation(domain: .antigravity, cache: &antigravityCache)
+            var document = loadAntigravityPermissionsLocked(deferred: &effects)
+            guard mutationCanProceed(domain: .antigravity, deferred: &effects) else { return false }
+            mutation(&document)
+            normalizeAntigravity(&document)
+            document.updatedAt = now()
+            return saveLocked(document, domain: .antigravity, cache: &antigravityCache, deferred: &effects)
+        }
+    }
+
+    @discardableResult
+    func updateGrokPermissions(_ mutation: (inout SecureGrokPermissionDocument) -> Void) -> Bool {
+        withLockAndDeferredSideEffects { effects in
+            resetFailedCacheBeforeMutation(domain: .grok, cache: &grokCache)
+            var document = loadGrokPermissionsLocked(deferred: &effects)
+            guard mutationCanProceed(domain: .grok, deferred: &effects) else { return false }
+            mutation(&document)
+            normalizeGrok(&document)
+            document.updatedAt = now()
+            return saveLocked(document, domain: .grok, cache: &grokCache, deferred: &effects)
         }
     }
 
@@ -511,6 +638,78 @@ final class AgentPermissionSecureStore {
     func setCursorPermissionLevel(_ level: CursorAgentToolPreferences.PermissionLevel) -> Bool {
         updateCursorPermissions { document in
             document.permissionLevelRaw = level.rawValue
+        }
+    }
+
+    @discardableResult
+    func setAntigravityPermissionLevel(_ level: AntigravityAgentToolPreferences.PermissionLevel) -> Bool {
+        updateAntigravityPermissions { document in
+            document.permissionLevelRaw = level.rawValue
+        }
+    }
+
+    @discardableResult
+    func setGrokPermissionLevel(_ level: GrokAgentToolPreferences.PermissionLevel) -> Bool {
+        updateGrokPermissions { document in
+            document.permissionLevelRaw = level.rawValue
+        }
+    }
+
+    /// Imports a legacy preference only when no canonical secure document exists. A malformed,
+    /// unreadable, or future-schema document is authoritative and therefore fails closed instead
+    /// of being replaced by a potentially permissive legacy value.
+    /// - Returns: `true` when canonical secure state is usable. Callers may remove a legacy key
+    ///   only when the secure backend also persists across launches.
+    @discardableResult
+    func migrateLegacyAntigravityPermissionLevelIfNeeded(
+        _ level: AntigravityAgentToolPreferences.PermissionLevel?
+    ) -> Bool {
+        withLockAndDeferredSideEffects { effects in
+            // Re-read only a cache explicitly known to come from a non-persisting missing-document
+            // read. A cache carrying a failed user write must retain its diagnostic and legacy key.
+            if unpersistedMissingDomains.remove(.antigravity) != nil {
+                antigravityCache = nil
+            }
+            let requestedLevel = level ?? .managedDefault
+            let persistedLevel = AntigravityAgentToolPreferences.PermissionLevel.allCases.contains(requestedLevel)
+                ? requestedLevel
+                : .managedDefault
+            _ = loadLocked(
+                domain: .antigravity,
+                cache: &antigravityCache,
+                missingDocument: SecureAntigravityPermissionDocument(
+                    updatedAt: now(),
+                    permissionLevelRaw: persistedLevel.rawValue
+                ),
+                failClosedDocument: SecureAntigravityPermissionDocument.failClosedDocument(now: now()),
+                normalize: normalizeAntigravity,
+                deferred: &effects
+            )
+            return diagnosticsByDomain[.antigravity] == nil
+        }
+    }
+
+    /// Imports a legacy preference only when no canonical secure document exists. See the
+    /// Antigravity migration above for the fail-closed precedence and return-value contracts.
+    @discardableResult
+    func migrateLegacyGrokPermissionLevelIfNeeded(_ level: GrokAgentToolPreferences.PermissionLevel?) -> Bool {
+        withLockAndDeferredSideEffects { effects in
+            if unpersistedMissingDomains.remove(.grok) != nil {
+                grokCache = nil
+            }
+            let persistedLevel = level ?? .managedDefault
+            _ = loadLocked(
+                domain: .grok,
+                cache: &grokCache,
+                missingDocument: SecureGrokPermissionDocument(
+                    updatedAt: now(),
+                    permissionLevelRaw: persistedLevel.rawValue
+                ),
+                failClosedDocument: SecureGrokPermissionDocument.failClosedDocument(now: now()),
+                normalize: normalizeGrok,
+                deferred: &effects
+            )
+            return diagnosticsByDomain[.grok] == nil
         }
     }
 
@@ -567,6 +766,30 @@ final class AgentPermissionSecureStore {
         )
     }
 
+    private func loadAntigravityPermissionsLocked(
+        deferred effects: inout DeferredSideEffects
+    ) -> SecureAntigravityPermissionDocument {
+        loadLocked(
+            domain: .antigravity,
+            cache: &antigravityCache,
+            failClosedDocument: SecureAntigravityPermissionDocument.failClosedDocument(now: now()),
+            normalize: normalizeAntigravity,
+            persistMissingDocument: false,
+            deferred: &effects
+        )
+    }
+
+    private func loadGrokPermissionsLocked(deferred effects: inout DeferredSideEffects) -> SecureGrokPermissionDocument {
+        loadLocked(
+            domain: .grok,
+            cache: &grokCache,
+            failClosedDocument: SecureGrokPermissionDocument.failClosedDocument(now: now()),
+            normalize: normalizeGrok,
+            persistMissingDocument: false,
+            deferred: &effects
+        )
+    }
+
     private struct StoredDocumentFailure {
         let kind: AgentPermissionStorageDiagnostic.Kind
         let message: String
@@ -583,6 +806,7 @@ final class AgentPermissionSecureStore {
         missingDocument: Document? = nil,
         failClosedDocument: Document,
         normalize: (inout Document) -> Bool,
+        persistMissingDocument: Bool = true,
         deferred effects: inout DeferredSideEffects
     ) -> Document {
         if let cache {
@@ -596,6 +820,7 @@ final class AgentPermissionSecureStore {
                 accessMode: permissionDecisionAccessMode
             )
         } catch {
+            unpersistedMissingDomains.remove(domain)
             let kind = readFailureKind(for: error)
             return failClosed(
                 domain: domain,
@@ -609,6 +834,15 @@ final class AgentPermissionSecureStore {
         guard let payload = plainPayload else {
             var document = missingDocument ?? failClosedDocument
             _ = normalize(&document)
+            guard persistMissingDocument else {
+                unpersistedMissingDomains.insert(domain)
+                cache = document
+                if clearDiagnostic(for: domain) {
+                    effects.requestDiagnosticsNotification(for: domain)
+                }
+                return document
+            }
+            unpersistedMissingDomains.remove(domain)
             do {
                 try saveDocument(document, domain: domain, accessMode: permissionDecisionAccessMode)
                 cache = document
@@ -624,6 +858,8 @@ final class AgentPermissionSecureStore {
                 return failClosedDocument
             }
         }
+
+        unpersistedMissingDomains.remove(domain)
 
         switch decodeStoredDocument(payload, normalize: normalize) {
         case let .success(document, normalized):
@@ -643,9 +879,24 @@ final class AgentPermissionSecureStore {
         _ payload: String,
         normalize: (inout Document) -> Bool
     ) -> StoredDocumentDecodeResult<Document> {
+        let data = Data(payload.utf8)
+        do {
+            if try JSONDuplicateKeyScanner.containsDuplicateKeys(in: data) {
+                return .failure(StoredDocumentFailure(
+                    kind: .decodeFailed,
+                    message: "Secure permission document contains duplicate JSON object keys."
+                ))
+            }
+        } catch {
+            return .failure(StoredDocumentFailure(
+                kind: .decodeFailed,
+                message: "Secure permission document byte encoding could not be validated safely."
+            ))
+        }
+
         let document: Document
         do {
-            document = try decoder.decode(Document.self, from: Data(payload.utf8))
+            document = try decoder.decode(Document.self, from: data)
         } catch {
             return .failure(StoredDocumentFailure(kind: .decodeFailed, message: error.localizedDescription))
         }
@@ -706,6 +957,7 @@ final class AgentPermissionSecureStore {
         cache: inout Document?,
         deferred effects: inout DeferredSideEffects
     ) -> Bool {
+        unpersistedMissingDomains.remove(domain)
         do {
             try saveDocument(document, domain: domain)
             cache = document
@@ -723,12 +975,35 @@ final class AgentPermissionSecureStore {
         }
     }
 
+    /// A failed read/decode/normalization write leaves a conservative cache that must never be
+    /// treated as authoritative for a later user mutation. Retry the source read first; if it is
+    /// still degraded, refuse the write and preserve the unknown document byte-for-byte.
+    private func resetFailedCacheBeforeMutation(
+        domain: AgentPermissionSecureDomain,
+        cache: inout (some Any)?
+    ) {
+        guard diagnosticsByDomain[domain] != nil else { return }
+        cache = nil
+    }
+
+    private func mutationCanProceed(
+        domain: AgentPermissionSecureDomain,
+        deferred effects: inout DeferredSideEffects
+    ) -> Bool {
+        guard diagnosticsByDomain[domain] == nil else {
+            effects.requestChangeNotification(domain: domain, writeSucceeded: false)
+            return false
+        }
+        return true
+    }
+
     private func resetLocked<Document: Codable>(
         _ document: Document,
         domain: AgentPermissionSecureDomain,
         cache: inout Document?,
         deferred effects: inout DeferredSideEffects
     ) -> Bool {
+        unpersistedMissingDomains.remove(domain)
         do {
             try saveDocument(document, domain: domain)
             cache = document
@@ -887,6 +1162,36 @@ final class AgentPermissionSecureStore {
         return changed
     }
 
+    @discardableResult
+    private func normalizeAntigravity(_ document: inout SecureAntigravityPermissionDocument) -> Bool {
+        var changed = false
+        if document.schemaVersion != SecureAntigravityPermissionDocument.currentSchemaVersion {
+            document.schemaVersion = SecureAntigravityPermissionDocument.currentSchemaVersion
+            changed = true
+        }
+        let level = AntigravityAgentToolPreferences.PermissionLevel.from(rawValue: document.permissionLevelRaw)
+        if document.permissionLevelRaw != level.rawValue {
+            document.permissionLevelRaw = level.rawValue
+            changed = true
+        }
+        return changed
+    }
+
+    @discardableResult
+    private func normalizeGrok(_ document: inout SecureGrokPermissionDocument) -> Bool {
+        var changed = false
+        if document.schemaVersion != SecureGrokPermissionDocument.currentSchemaVersion {
+            document.schemaVersion = SecureGrokPermissionDocument.currentSchemaVersion
+            changed = true
+        }
+        let level = GrokAgentToolPreferences.PermissionLevel.from(rawValue: document.permissionLevelRaw)
+        if document.permissionLevelRaw != level.rawValue {
+            document.permissionLevelRaw = level.rawValue
+            changed = true
+        }
+        return changed
+    }
+
     // MARK: - Helpers
 
     private func supportedSchemaVersion(of document: some Any) -> Int {
@@ -901,6 +1206,10 @@ final class AgentPermissionSecureStore {
             SecureOpenCodePermissionDocument.currentSchemaVersion
         case _ as SecureCursorPermissionDocument:
             SecureCursorPermissionDocument.currentSchemaVersion
+        case _ as SecureAntigravityPermissionDocument:
+            SecureAntigravityPermissionDocument.currentSchemaVersion
+        case _ as SecureGrokPermissionDocument:
+            SecureGrokPermissionDocument.currentSchemaVersion
         default:
             1
         }
@@ -917,6 +1226,10 @@ final class AgentPermissionSecureStore {
         case let value as SecureOpenCodePermissionDocument:
             value.schemaVersion
         case let value as SecureCursorPermissionDocument:
+            value.schemaVersion
+        case let value as SecureAntigravityPermissionDocument:
+            value.schemaVersion
+        case let value as SecureGrokPermissionDocument:
             value.schemaVersion
         default:
             1
@@ -935,6 +1248,10 @@ final class AgentPermissionSecureStore {
             SecureOpenCodePermissionDocument.failClosedDocument(now: now())
         case .cursor:
             SecureCursorPermissionDocument.failClosedDocument(now: now())
+        case .antigravity:
+            SecureAntigravityPermissionDocument.failClosedDocument(now: now())
+        case .grok:
+            SecureGrokPermissionDocument.failClosedDocument(now: now())
         }
     }
 

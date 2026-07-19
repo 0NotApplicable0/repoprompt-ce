@@ -246,4 +246,21 @@ final class GrokArgumentBuilderTests: XCTestCase {
         XCTAssertTrue(consecutive(args, ["--permission-mode", "bypassPermissions"]))
         XCTAssertFalse(args.contains("--sandbox"))
     }
+
+    func testManagedCapabilitySummaryDisclosesGlobalAutoApprovalRisk() throws {
+        let suiteName = "GrokArgumentBuilderTests.managed-capability-summary.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        let summary = AgentPermissionCapabilitySummaryBuilder(defaults: defaults).summary(
+            for: .grok,
+            profile: .providerOverride(.grok(.managedDefault)),
+            availability: .none
+        )
+
+        XCTAssertEqual(summary.shell, "Grok workspace sandbox enabled")
+        XCTAssertEqual(summary.externalMCP, "All configured MCP tools auto-approved")
+        XCTAssertEqual(summary.approvalModeDescription, "Approval: Auto-approve all; workspace sandbox on")
+        XCTAssertTrue(summary.warnings.contains { $0.contains("external MCP side effects") })
+    }
 }

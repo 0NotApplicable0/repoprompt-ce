@@ -305,6 +305,107 @@
             XCTAssertEqual(finalSecondObserverCount, 0)
         }
 
+        func testContinuationStartRegistersBeforeReturnAndScopedStopUnregistersObserver() async {
+            let manager = ServerNetworkManager.shared
+            let controller = AgentToolTrackingController()
+            let runID = UUID()
+            let (stream, continuation) = AsyncThrowingStream<AIStreamResult, Error>.makeStream()
+            let drainTask = Task {
+                do {
+                    for try await _ in stream {}
+                } catch {}
+            }
+            addTeardownBlock {
+                continuation.finish()
+                await controller.stopTracking()
+                await manager.unregisterToolObservers(for: runID)
+                drainTask.cancel()
+                _ = await drainTask.result
+            }
+
+            await controller.startTracking(
+                runID: runID,
+                clientNameHint: "continuation-registration-test",
+                continuation: continuation
+            )
+
+            let registeredObserverCount = await manager.toolEventObserverCount(for: runID)
+            XCTAssertEqual(registeredObserverCount, 1)
+
+            await controller.stopTracking(ifTracking: runID)
+
+            let stoppedObserverCount = await manager.toolEventObserverCount(for: runID)
+            XCTAssertEqual(stoppedObserverCount, 0)
+        }
+
+        func testScopedStopForReplacedContinuationRunDoesNotStopCurrentObserver() async {
+            let manager = ServerNetworkManager.shared
+            let controller = AgentToolTrackingController()
+            let firstRunID = UUID()
+            let secondRunID = UUID()
+            let (firstStream, firstContinuation) = AsyncThrowingStream<AIStreamResult, Error>.makeStream()
+            let (secondStream, secondContinuation) = AsyncThrowingStream<AIStreamResult, Error>.makeStream()
+            let secondEventReceived = SynchronousCheckpoint()
+            let firstDrainTask = Task {
+                do {
+                    for try await _ in firstStream {}
+                } catch {}
+            }
+            let secondDrainTask = Task {
+                do {
+                    for try await event in secondStream where event.type == "tool_call" {
+                        secondEventReceived.signal()
+                    }
+                } catch {}
+            }
+            addTeardownBlock {
+                firstContinuation.finish()
+                secondContinuation.finish()
+                await controller.stopTracking()
+                await manager.unregisterToolObservers(for: firstRunID)
+                await manager.unregisterToolObservers(for: secondRunID)
+                firstDrainTask.cancel()
+                secondDrainTask.cancel()
+                _ = await firstDrainTask.result
+                _ = await secondDrainTask.result
+            }
+
+            await controller.startTracking(
+                runID: firstRunID,
+                clientNameHint: "continuation-replacement-first",
+                continuation: firstContinuation
+            )
+            await controller.startTracking(
+                runID: secondRunID,
+                clientNameHint: "continuation-replacement-second",
+                continuation: secondContinuation
+            )
+
+            let replacedObserverCount = await manager.toolEventObserverCount(for: firstRunID)
+            let replacementObserverCount = await manager.toolEventObserverCount(for: secondRunID)
+            XCTAssertEqual(replacedObserverCount, 0)
+            XCTAssertEqual(replacementObserverCount, 1)
+
+            await controller.stopTracking(ifTracking: firstRunID)
+
+            let replacementCountAfterStaleStop = await manager.toolEventObserverCount(for: secondRunID)
+            XCTAssertEqual(replacementCountAfterStaleStop, 1)
+
+            let firedCount = await manager.debugFireToolCalledObservers(
+                runID: secondRunID,
+                invocationID: UUID(),
+                toolName: "read_file"
+            )
+            await controller.waitForPendingEventDeliveriesForTesting()
+            XCTAssertEqual(firedCount, 1)
+            let didReceiveReplacementEvent = await waitForCheckpoint(secondEventReceived)
+            XCTAssertTrue(didReceiveReplacementEvent)
+
+            await controller.stopTracking(ifTracking: secondRunID)
+            let finalReplacementObserverCount = await manager.toolEventObserverCount(for: secondRunID)
+            XCTAssertEqual(finalReplacementObserverCount, 0)
+        }
+
         private nonisolated static func elapsedMilliseconds(since startedAt: UInt64) -> Double {
             Double(DispatchTime.now().uptimeNanoseconds - startedAt) / 1_000_000
         }

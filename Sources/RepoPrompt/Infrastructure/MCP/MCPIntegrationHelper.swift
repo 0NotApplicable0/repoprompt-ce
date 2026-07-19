@@ -13,11 +13,33 @@ enum MCPIntegrationHelper {
     private static let agentsSkillsPerProjectVersionDefaultsKey = "AgentsSkillsVersionByWorkspace"
     private static let agentsCLISkillsPerProjectVersionDefaultsKey = "AgentsSkillsVersionCLIByWorkspace"
     private static let mcpServerInstalledDefaultsKey = "MCPServerInstalled"
-
     typealias CLIToolContext = AgentCLIToolContext
     typealias CodexServerEntry = CodexIntegrationConfiguration.ServerEntry
     typealias ClaudeCodeInstallResult = ClaudeCodeIntegrationConfiguration.InstallResult
     typealias ClaudeCodeBatchInstallResult = ClaudeCodeIntegrationConfiguration.BatchInstallResult
+
+    struct AntigravityInstallResult {
+        let success: Bool
+        let wasAlreadyPresent: Bool
+        let isEntryOwnedByRepoPrompt: Bool
+        let failureMessage: String?
+    }
+
+    enum AntigravityRemovalResult {
+        case removed
+        case restoredPreviousEntry
+        case noOwnedEntry
+        case entryAlreadyAbsent
+        case preservedChangedEntry
+        case failed(String)
+
+        var failureMessage: String? {
+            if case let .failed(message) = self { return message }
+            return nil
+        }
+    }
+
+    typealias AntigravityConnectionObservation = AntigravityIntegrationConfiguration.ConnectionObservation
 
     static let desiredCodexToolOutputTokenLimit = CodexIntegrationConfiguration.desiredToolOutputTokenLimit
     static var claudeProcessEnvironmentOverridePairs: [(String, String)] {
@@ -610,28 +632,87 @@ enum MCPIntegrationHelper {
     /// Invoked from the UI when users opt-in. `agy` has no per-run MCP injection flag, so the
     /// entry in `~/.gemini/config/mcp_config.json` is visible to every `agy` invocation.
     @discardableResult
-    static func installInAntigravity() -> (success: Bool, wasAlreadyPresent: Bool) {
-        let result = AntigravityIntegrationConfiguration.ensureServerForDiscovery()
+    static func installInAntigravity() -> AntigravityInstallResult {
+        let result = installAntigravityMCPEntry(intent: .explicitConnect)
         if result.success {
             setMCPServerInstalled()
         }
         return result
     }
 
-    /// Ensures the RepoPrompt MCP server exists in Antigravity's config for discovery runs.
+    /// Validates the existing RepoPrompt MCP server for discovery runs. Because agy's MCP config
+    /// is global, provider preparation never creates, claims, or switches an entry; users must
+    /// choose Connect explicitly for those mutations. Exact recovery of a journal left prepared by
+    /// an interrupted Connect is the sole ownership-journal mutation exception and never writes
+    /// agy's config.
     @discardableResult
-    static func ensureAntigravityServerForDiscovery() -> (success: Bool, wasAlreadyPresent: Bool) {
-        AntigravityIntegrationConfiguration.ensureServerForDiscovery()
+    static func ensureAntigravityServerForDiscovery() -> AntigravityInstallResult {
+        installAntigravityMCPEntry(intent: .discovery)
     }
 
     static func antigravityConfigContainsRepoPrompt() -> Bool {
         AntigravityIntegrationConfiguration.configContainsRepoPrompt()
     }
 
-    /// Removes the RepoPrompt MCP server entry from Antigravity's config (preserving all other
-    /// servers). Called on disconnect to leave agy's `~/.gemini` config clean.
-    static func removeAntigravityInstallEntry() {
-        AntigravityIntegrationConfiguration.removeInstallEntry()
+    static func antigravityConfigValidationFailureMessage() -> String? {
+        AntigravityIntegrationConfiguration.configValidationFailureMessage()
+    }
+
+    static func observeAntigravityConnection() -> AntigravityConnectionObservation {
+        AntigravityIntegrationConfiguration.connectionObservation()
+    }
+
+    static func hasOwnedAntigravityMCPEntry() -> Bool {
+        AntigravityIntegrationConfiguration.hasRecordedOwnershipMarker()
+    }
+
+    /// Removes the RepoPrompt MCP server entry only when this app recorded creating it and its
+    /// current value still matches that ownership snapshot. A pre-existing or user-modified entry
+    /// remains untouched.
+    @discardableResult
+    static func removeAntigravityInstallEntry() -> AntigravityRemovalResult {
+        do {
+            switch try AntigravityIntegrationConfiguration.removeOwnedInstallEntry() {
+            case .removed:
+                return .removed
+            case .restoredPreviousEntry:
+                return .restoredPreviousEntry
+            case .noOwnedEntry:
+                return .noOwnedEntry
+            case .entryAbsent:
+                return .entryAlreadyAbsent
+            case .preservedChangedEntry:
+                return .preservedChangedEntry
+            }
+        } catch {
+            return .failed(error.localizedDescription)
+        }
+    }
+
+    static func installAntigravityMCPEntry(
+        intent: AntigravityIntegrationConfiguration.MutationIntent,
+        ensureConfig: (() throws -> AntigravityIntegrationConfiguration.PersistentMCPConfigResult)? = nil
+    ) -> AntigravityInstallResult {
+        do {
+            let result: AntigravityIntegrationConfiguration.PersistentMCPConfigResult = if let ensureConfig {
+                try ensureConfig()
+            } else {
+                try AntigravityIntegrationConfiguration.ensurePersistentMCPConfig(intent: intent)
+            }
+            return AntigravityInstallResult(
+                success: true,
+                wasAlreadyPresent: result.wasMCPServerAlreadyPresent,
+                isEntryOwnedByRepoPrompt: result.isEntryOwnedByRepoPrompt,
+                failureMessage: nil
+            )
+        } catch {
+            return AntigravityInstallResult(
+                success: false,
+                wasAlreadyPresent: false,
+                isEntryOwnedByRepoPrompt: false,
+                failureMessage: error.localizedDescription
+            )
+        }
     }
 
     /// Installs the RepoPrompt MCP server into Grok (`grok`) HOME-level config.

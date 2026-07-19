@@ -88,7 +88,9 @@ enum AgentProviderPermissionLevelID: Hashable {
             guard let level = CursorAgentToolPreferences.PermissionLevel(rawValue: raw) else { return nil }
             self = .cursor(level)
         case .antigravity:
-            guard let level = AntigravityAgentToolPreferences.PermissionLevel(rawValue: raw) else { return nil }
+            guard let level = AntigravityAgentToolPreferences.PermissionLevel(rawValue: raw),
+                  AntigravityAgentToolPreferences.PermissionLevel.allCases.contains(level)
+            else { return nil }
             self = .antigravity(level)
         case .grok:
             guard let level = GrokAgentToolPreferences.PermissionLevel(rawValue: raw) else { return nil }
@@ -211,7 +213,11 @@ struct AgentProviderRuntimePermissionBinding: Equatable {
     let acceptsPendingACPApprovalWhenActivated: Bool
     /// Session-resolved Antigravity (`agy`) permission level. Headless `agy` runs have no
     /// per-run permission channel, so the resolved level is consumed at provider construction
-    /// (sandbox vs. `--dangerously-skip-permissions`) rather than via an ACP/session field.
+    /// (`--sandbox`, `--sandbox --dangerously-skip-permissions`, or bypass without a sandbox)
+    /// rather than via an ACP/session field. Headless mode cannot prompt, but bypass remains an
+    /// explicit opt-in because it also approves globally configured third-party MCP servers.
+    /// MCP Safe Managed resolves to an internal unavailable sentinel because agy's global config
+    /// and persisted grants cannot be isolated per run.
     let antigravityPermissionLevel: AntigravityAgentToolPreferences.PermissionLevel?
     /// Session-resolved Grok (`grok`) permission level. Headless `grok` runs have no
     /// per-run permission channel, so the resolved level is consumed at provider construction

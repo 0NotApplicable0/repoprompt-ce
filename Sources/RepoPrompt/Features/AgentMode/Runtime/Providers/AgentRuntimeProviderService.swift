@@ -325,6 +325,7 @@ final class AgentRuntimeProviderService {
                 modelString: modelString,
                 useSandbox: permissionLevel.useSandbox,
                 dangerouslySkipPermissions: permissionLevel.dangerouslySkipPermissions,
+                supportsHeadlessRun: permissionLevel.supportsHeadlessRun,
                 enableDebugLogging: Self.enableDebugLogging
             )
             var processConfig = CLIProcessConfiguration(

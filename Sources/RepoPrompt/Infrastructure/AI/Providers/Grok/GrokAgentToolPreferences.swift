@@ -17,7 +17,7 @@ enum GrokAgentToolPreferences {
         var detailText: String {
             switch self {
             case .managedDefault:
-                "Grok runs kernel-sandboxed to the workspace (`--sandbox workspace --permission-mode bypassPermissions`); RepoPrompt MCP tools are injected and auto-approved."
+                "Grok runs kernel-sandboxed to the workspace, but `--permission-mode bypassPermissions` auto-approves every native and configured MCP tool request. The workspace sandbox does not contain external MCP side effects."
             case .fullAccess:
                 "Grok auto-approves all tool requests (`--permission-mode bypassPermissions`). No sandbox — writes are not confined to the workspace."
             }
@@ -72,7 +72,19 @@ enum GrokAgentToolPreferences {
         defaults: UserDefaults = .standard,
         secureStore: AgentPermissionSecureStore? = nil
     ) -> PermissionLevel {
-        _ = secureStore
+        if let secureStore = resolvedSecureStore(defaults: defaults, secureStore: secureStore) {
+            let hasLegacyLevel = defaults.object(forKey: permissionLevelKey) != nil
+            let legacyLevel = hasLegacyLevel
+                ? PermissionLevel.from(rawValue: defaults.string(forKey: permissionLevelKey))
+                : nil
+            if secureStore.migrateLegacyGrokPermissionLevelIfNeeded(legacyLevel),
+               hasLegacyLevel,
+               secureStore.persistsValuesAcrossLaunches
+            {
+                defaults.removeObject(forKey: permissionLevelKey)
+            }
+            return secureStore.grokPermissions().permissionLevel()
+        }
         return PermissionLevel.from(rawValue: defaults.string(forKey: permissionLevelKey))
     }
 
@@ -81,7 +93,24 @@ enum GrokAgentToolPreferences {
         defaults: UserDefaults = .standard,
         secureStore: AgentPermissionSecureStore? = nil
     ) {
-        _ = secureStore
+        if let secureStore = resolvedSecureStore(defaults: defaults, secureStore: secureStore) {
+            if secureStore.setGrokPermissionLevel(level),
+               secureStore.persistsValuesAcrossLaunches
+            {
+                defaults.removeObject(forKey: permissionLevelKey)
+            }
+            return
+        }
         defaults.set(level.rawValue, forKey: permissionLevelKey)
+    }
+
+    private static func resolvedSecureStore(
+        defaults: UserDefaults,
+        secureStore: AgentPermissionSecureStore?
+    ) -> AgentPermissionSecureStore? {
+        if let secureStore {
+            return secureStore
+        }
+        return defaults === UserDefaults.standard ? AgentPermissionSecureStore.shared : nil
     }
 }

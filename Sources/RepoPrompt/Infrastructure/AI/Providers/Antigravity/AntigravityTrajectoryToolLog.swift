@@ -55,16 +55,27 @@ struct AntigravityTrajectoryEmitter {
         var advanceTo: Int64?
         var advancing = true
         for step in steps.sorted(by: { $0.idx < $1.idx }) {
-            guard let parsed = parser.parse(status: step.status, payload: step.payload) else {
+            switch parser.parseRow(
+                status: step.status,
+                payload: step.payload,
+                failureKind: step.failureKind
+            ) {
+            case .nonTool:
                 if advancing { advanceTo = step.idx } // non-tool step: done, advance
-                continue
-            }
-            if emittedCalls.insert(parsed.invocationID).inserted { events.append(parsed.call) }
-            if let result = parsed.result {
-                if emittedResults.insert(parsed.invocationID).inserted { events.append(result) }
-                if advancing { advanceTo = step.idx } // terminal tool: done, advance
-            } else {
-                advancing = false // in-flight: stop advancing, re-read next poll
+            case let .suppressedMCP(isTerminal):
+                if isTerminal {
+                    if advancing { advanceTo = step.idx } // successful MCP card came from expected-PID tracking
+                } else {
+                    advancing = false // suppressed but in-flight: hold the watermark until final status
+                }
+            case let .visible(parsed):
+                if emittedCalls.insert(parsed.invocationID).inserted { events.append(parsed.call) }
+                if let result = parsed.result {
+                    if emittedResults.insert(parsed.invocationID).inserted { events.append(result) }
+                    if advancing { advanceTo = step.idx } // terminal tool: done, advance
+                } else {
+                    advancing = false // in-flight: stop advancing, re-read next poll
+                }
             }
         }
         return (events, advanceTo)
@@ -79,42 +90,143 @@ struct AntigravityTrajectoryEmitter {
 /// it — resetting the per-DB idx watermark while the emitter's invocation-id dedup carries across the
 /// switch. Runs until the surrounding task is cancelled.
 enum AntigravityTrajectoryToolLogStream {
+    private static let pageLimit: Int32 = 500
+    private static let finalDrainMaxAttempts = 8
+    private static let finalDrainTimeBudget: Duration = .milliseconds(250)
+
+    private enum PollResult {
+        case drained
+        case hasMore
+        case retryable
+    }
+
     static func tail(
         into continuation: AsyncThrowingStream<AIStreamResult, Error>.Continuation,
         locate: @Sendable @escaping () -> URL?,
-        pollNanos: UInt64 = 200_000_000
+        pollNanos: UInt64 = 200_000_000,
+        waitBetweenPolls: @Sendable @escaping (UInt64) async -> Void = { nanos in
+            try? await Task.sleep(nanoseconds: nanos)
+        },
+        waitForFinalDrainRetry: @Sendable @escaping (Duration) async -> Void = { duration in
+            // The tail task is already cancelled when the final drain runs, so an ordinary
+            // Task.sleep would return immediately. Isolate the short bounded wait from the
+            // caller's cancellation state to give a just-committing WAL writer time to settle.
+            await Task.detached {
+                try? await Task.sleep(for: duration)
+            }.value
+        },
+        storeFactory: @Sendable @escaping (String) -> (any AntigravityTrajectoryStoreReading)? = {
+            AntigravityTrajectoryStore(path: $0)
+        }
     ) async {
         var currentPath: String?
-        while !Task.isCancelled, currentPath == nil {
-            currentPath = locate()?.path
-            if currentPath == nil { try? await Task.sleep(nanoseconds: pollNanos) }
-        }
-        guard !Task.isCancelled else { return }
-
         var emitter = AntigravityTrajectoryEmitter() // invocation-id dedup persists across DB switches
-        var store: AntigravityTrajectoryStore?
+        var store: (any AntigravityTrajectoryStoreReading)?
         var after: Int64 = 0
         while !Task.isCancelled {
-            if let newest = locate()?.path, newest != currentPath {
-                currentPath = newest // a resume turn forked to a newer DB → switch, restart watermark
-                store = nil
-                after = 0
+            pollOnce(
+                into: continuation,
+                locate: locate,
+                storeFactory: storeFactory,
+                currentPath: &currentPath,
+                store: &store,
+                after: &after,
+                emitter: &emitter
+            )
+            await waitBetweenPolls(pollNanos)
+        }
+
+        // The process can commit terminal statuses or a multi-page backlog after the preceding poll
+        // but immediately before provider teardown. Cancellation is the synchronization edge: drain
+        // with the same path/store/watermark/emitter under a small attempt and wall-clock budget.
+        if Task.isCancelled {
+            await drainOnCancellation(
+                into: continuation,
+                locate: locate,
+                storeFactory: storeFactory,
+                currentPath: &currentPath,
+                store: &store,
+                after: &after,
+                emitter: &emitter,
+                waitForRetry: waitForFinalDrainRetry
+            )
+        }
+    }
+
+    @discardableResult
+    private static func pollOnce(
+        into continuation: AsyncThrowingStream<AIStreamResult, Error>.Continuation,
+        locate: @Sendable () -> URL?,
+        storeFactory: @Sendable (String) -> (any AntigravityTrajectoryStoreReading)?,
+        currentPath: inout String?,
+        store: inout (any AntigravityTrajectoryStoreReading)?,
+        after: inout Int64,
+        emitter: inout AntigravityTrajectoryEmitter
+    ) -> PollResult {
+        if let newest = locate()?.path, newest != currentPath {
+            currentPath = newest // a resume turn forked to a newer DB → switch, restart watermark
+            store = nil
+            after = 0
+        }
+        guard let path = currentPath else { return .retryable }
+        if store == nil { store = storeFactory(path) }
+        guard let activeStore = store else { return .retryable }
+        guard let rows = activeStore.steps(after: after, limit: pageLimit) else {
+            // The table is not ready or the query failed. Reopen on the next ordinary/final poll.
+            store = nil
+            return .retryable
+        }
+        guard !rows.isEmpty else { return .drained }
+
+        let (events, advanceTo) = emitter.process(rows)
+        for event in events {
+            continuation.yield(event)
+        }
+        if let advanceTo { after = max(after, advanceTo) }
+
+        // A fully consumed short page reaches the current end. A full consumed page may have more
+        // rows behind it. No contiguous advancement means an in-flight row must be retried.
+        let consumedThroughPage = rows.last.map { after >= $0.idx } == true
+        if consumedThroughPage, rows.count < Int(pageLimit) { return .drained }
+        return consumedThroughPage ? .hasMore : .retryable
+    }
+
+    private static func drainOnCancellation(
+        into continuation: AsyncThrowingStream<AIStreamResult, Error>.Continuation,
+        locate: @Sendable () -> URL?,
+        storeFactory: @Sendable (String) -> (any AntigravityTrajectoryStoreReading)?,
+        currentPath: inout String?,
+        store: inout (any AntigravityTrajectoryStoreReading)?,
+        after: inout Int64,
+        emitter: inout AntigravityTrajectoryEmitter,
+        waitForRetry: @Sendable (Duration) async -> Void
+    ) async {
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: finalDrainTimeBudget)
+        for attempt in 0 ..< finalDrainMaxAttempts {
+            guard attempt == 0 || clock.now < deadline else { return }
+            switch pollOnce(
+                into: continuation,
+                locate: locate,
+                storeFactory: storeFactory,
+                currentPath: &currentPath,
+                store: &store,
+                after: &after,
+                emitter: &emitter
+            ) {
+            case .drained:
+                return
+            case .hasMore:
+                continue
+            case .retryable:
+                guard attempt + 1 < finalDrainMaxAttempts else { return }
+                let remaining = clock.now.duration(to: deadline)
+                guard remaining > .zero else { return }
+                // Back off across the grace window instead of burning every attempt immediately:
+                // 10, 20, 30, then 40 ms (capped), always clipped to the monotonic deadline.
+                let requested = Duration.milliseconds(min((attempt + 1) * 10, 40))
+                await waitForRetry(min(requested, remaining))
             }
-            if let path = currentPath {
-                if store == nil { store = AntigravityTrajectoryStore(path: path) }
-                if let s = store {
-                    if let rows = s.steps(after: after, limit: 500) {
-                        let (events, advanceTo) = emitter.process(rows)
-                        for event in events {
-                            continuation.yield(event)
-                        }
-                        if let advanceTo { after = max(after, advanceTo) }
-                    } else {
-                        store = nil // table not ready / query failed → reopen
-                    }
-                }
-            }
-            try? await Task.sleep(nanoseconds: pollNanos)
         }
     }
 }

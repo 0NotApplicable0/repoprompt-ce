@@ -42,6 +42,53 @@ final class AntigravityTrajectoryStoreTests: XCTestCase {
         let store = try XCTUnwrap(AntigravityTrajectoryStore(path: path))
         XCTAssertEqual(store.steps(after: 0, limit: 100)?.map(\.idx), [3, 4, 6]) // no step_type filter
         XCTAssertEqual(store.steps(after: 4, limit: 100)?.map(\.idx), [6]) // watermark respected
+        XCTAssertTrue(store.steps(after: 0, limit: 100)?.allSatisfy { $0.failureKind == nil } == true)
+    }
+
+    func testErrorDetailsAreBoundedAndReducedToRedactedFailureKinds() throws {
+        let path = NSTemporaryDirectory() + "agy-error-details-\(UUID().uuidString).db"
+        var db: OpaquePointer?
+        XCTAssertEqual(sqlite3_open(path, &db), SQLITE_OK)
+        defer {
+            sqlite3_close(db)
+            try? FileManager.default.removeItem(atPath: path)
+        }
+        XCTAssertEqual(sqlite3_exec(
+            db,
+            "CREATE TABLE steps (idx INTEGER PRIMARY KEY, status INTEGER, error_details BLOB, step_payload BLOB);",
+            nil,
+            nil,
+            nil
+        ), SQLITE_OK)
+
+        let marker = Data("User denied permission for mcp(RepoPromptCE/set_status).".utf8)
+        var markerBeyondBound = Data(repeating: 0x78, count: AntigravityTrajectoryStore.maxErrorDetailsBytes)
+        markerBeyondBound.append(marker)
+        let details = [marker, Data("network request failed with private diagnostics".utf8), markerBeyondBound]
+        let sqliteTransient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
+        for (offset, detail) in details.enumerated() {
+            var stmt: OpaquePointer?
+            XCTAssertEqual(sqlite3_prepare_v2(
+                db,
+                "INSERT INTO steps (idx, status, error_details, step_payload) VALUES (?, 7, ?, X'');",
+                -1,
+                &stmt,
+                nil
+            ), SQLITE_OK)
+            sqlite3_bind_int64(stmt, 1, Int64(offset + 1))
+            detail.withUnsafeBytes {
+                _ = sqlite3_bind_blob(stmt, 2, $0.baseAddress, Int32(detail.count), sqliteTransient)
+            }
+            XCTAssertEqual(sqlite3_step(stmt), SQLITE_DONE)
+            sqlite3_finalize(stmt)
+        }
+
+        let store = try XCTUnwrap(AntigravityTrajectoryStore(path: path))
+        let rows = try XCTUnwrap(store.steps(after: 0, limit: 100))
+        XCTAssertEqual(
+            rows.map(\.failureKind),
+            [.headlessPermissionDenied, .other, .other]
+        )
     }
 
     func testMissingStepsTableReturnsNilNotEmpty() throws {
@@ -49,6 +96,40 @@ final class AntigravityTrajectoryStoreTests: XCTestCase {
         defer { try? FileManager.default.removeItem(atPath: path) }
         let store = try XCTUnwrap(AntigravityTrajectoryStore(path: path))
         XCTAssertNil(store.steps(after: 0, limit: 100)) // table not ready → nil (reopen signal)
+    }
+
+    func testLegacyFallbackRequiresConfirmedMissingErrorDetailsColumn() {
+        XCTAssertTrue(AntigravityTrajectoryStore.shouldUseLegacyQuery(
+            afterPrepareResult: SQLITE_ERROR,
+            message: "no such column: error_details"
+        ))
+        XCTAssertFalse(AntigravityTrajectoryStore.shouldUseLegacyQuery(
+            afterPrepareResult: SQLITE_BUSY,
+            message: "database is locked"
+        ))
+        XCTAssertFalse(AntigravityTrajectoryStore.shouldUseLegacyQuery(
+            afterPrepareResult: SQLITE_LOCKED,
+            message: "database table is locked"
+        ))
+        XCTAssertFalse(AntigravityTrajectoryStore.shouldUseLegacyQuery(
+            afterPrepareResult: SQLITE_ERROR,
+            message: "no such table: steps"
+        ))
+    }
+
+    func testLockedReadReturnsNilSoFinalDrainCanRetry() throws {
+        let path = try makeDB(withSteps: true)
+        defer { try? FileManager.default.removeItem(atPath: path) }
+        let store = try XCTUnwrap(AntigravityTrajectoryStore(path: path))
+
+        var writer: OpaquePointer?
+        XCTAssertEqual(sqlite3_open(path, &writer), SQLITE_OK)
+        defer { sqlite3_close(writer) }
+        XCTAssertEqual(sqlite3_exec(writer, "BEGIN EXCLUSIVE;", nil, nil, nil), SQLITE_OK)
+
+        XCTAssertNil(store.steps(after: 0, limit: 100))
+        XCTAssertEqual(sqlite3_exec(writer, "ROLLBACK;", nil, nil, nil), SQLITE_OK)
+        XCTAssertEqual(store.steps(after: 0, limit: 100)?.map(\.idx), [3, 4, 6])
     }
 
     func testInitFailsForMissingFile() {

@@ -405,46 +405,50 @@ final class AgentToolTrackingController {
     // MARK: - Continuation-Based API (used by headless providers)
 
     /// Start tracking and yield tool events into an `AsyncThrowingStream` continuation.
-    /// This is the original API retained for headless provider compatibility.
-    func startTracking(
+    /// Headless providers share the same generation-safe registration lifecycle as callback clients.
+    @MainActor func startTracking(
         runID: UUID,
         clientNameHint: String,
         continuation: AsyncThrowingStream<AIStreamResult, any Swift.Error>.Continuation
-    ) {
-        trackingTask?.cancel()
-        trackingTask = Task {
-            await tracker.startEnhanced(
-                runID: runID,
-                clientNameHint: clientNameHint,
-                onCalled: { invocationID, toolName, args in
-                    let argsJSON = Self.encodeArgsToJSON(args)
-                    let event = AIStreamResult(
-                        type: "tool_call",
-                        text: nil,
-                        toolName: toolName,
-                        toolArgs: argsJSON,
-                        toolInvocationID: invocationID,
-                        toolArgsJSON: argsJSON
-                    )
-                    continuation.yield(event)
-                },
-                onCompleted: { invocationID, toolName, args, resultJSON, isError in
-                    let argsJSON = Self.encodeArgsToJSON(args)
-                    let event = AIStreamResult(
-                        type: "tool_result",
-                        text: nil,
-                        toolName: toolName,
-                        toolArgs: argsJSON,
-                        toolOutput: resultJSON,
-                        toolInvocationID: invocationID,
-                        toolResultJSON: resultJSON,
-                        toolArgsJSON: argsJSON,
-                        toolIsError: isError
-                    )
-                    continuation.yield(event)
-                }
-            )
-        }
+    ) async {
+        await startTracking(
+            runID: runID,
+            clientNameHint: clientNameHint,
+            onCalled: { invocationID, toolName, args in
+                let argsJSON = Self.encodeArgsToJSON(args)
+                let event = AIStreamResult(
+                    type: "tool_call",
+                    text: nil,
+                    toolName: toolName,
+                    toolArgs: argsJSON,
+                    toolInvocationID: invocationID,
+                    toolArgsJSON: argsJSON
+                )
+                continuation.yield(event)
+            },
+            onCompleted: { invocationID, toolName, args, resultJSON, isError in
+                let argsJSON = Self.encodeArgsToJSON(args)
+                let event = AIStreamResult(
+                    type: "tool_result",
+                    text: nil,
+                    toolName: toolName,
+                    toolArgs: argsJSON,
+                    toolOutput: resultJSON,
+                    toolInvocationID: invocationID,
+                    toolResultJSON: resultJSON,
+                    toolArgsJSON: argsJSON,
+                    toolIsError: isError
+                )
+                continuation.yield(event)
+            }
+        )
+    }
+
+    /// Stops tracking only while this controller still owns `runID`.
+    /// Stale provider cleanup must not tear down an observer installed by a replacement run.
+    @MainActor func stopTracking(ifTracking runID: UUID) async {
+        guard trackedRunID == runID || registrationRunID == runID else { return }
+        await stopTracking()
     }
 
     // MARK: - Lifecycle

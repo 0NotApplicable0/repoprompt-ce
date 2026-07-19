@@ -25,7 +25,7 @@ final class GrokAgentProvider: HeadlessAgentProvider {
     private let config: GrokAgentConfig
     private let workspacePath: String?
     private let toolTracking = AgentToolTrackingController()
-    private var streamTask: Task<Void, Never>?
+    private let streamTasks = HeadlessProviderStreamTaskAuthority()
 
     private var enableDebugLogging: Bool {
         config.enableDebugLogging
@@ -114,13 +114,22 @@ final class GrokAgentProvider: HeadlessAgentProvider {
     // MARK: - Streaming
 
     func streamAgentMessage(_ message: AgentMessage, runID: UUID? = nil) async throws -> AsyncThrowingStream<AIStreamResult, Error> {
-        let raw = AsyncThrowingStream<AIStreamResult, Error> { continuation in
-            self.streamTask?.cancel()
-            self.streamTask = Task { [weak self] in
-                guard let self else { return }
+        let (raw, continuation) = AsyncThrowingStream<AIStreamResult, Error>.makeStream()
+        guard let producer = await streamTasks.start(
+            onDiscarded: {
+                continuation.finish(throwing: AIProviderError.invalidConfiguration(detail: "Grok run cancelled."))
+            },
+            operation: { [weak self] in
+                guard let self else {
+                    continuation.finish()
+                    return
+                }
                 await withTaskCancellationHandler(operation: {
+                    var trackingRunID: UUID?
+                    var toolLogTask: Task<Void, Never>?
                     do {
                         let context = try await self.prepare(runID: runID)
+                        trackingRunID = context.runID
                         let debugFileURL = Self.makeDebugFileURL(runID: context.runID)
                         defer { Self.removeFile(debugFileURL) }
 
@@ -157,7 +166,7 @@ final class GrokAgentProvider: HeadlessAgentProvider {
                             print("[DEBUG] Grok: launching grok (\(args.count) args; flags: \(flags.joined(separator: " ")))")
                         }
 
-                        self.toolTracking.startTracking(
+                        await self.toolTracking.startTracking(
                             runID: context.runID,
                             clientNameHint: Self.grokMCPClientID,
                             continuation: continuation
@@ -170,7 +179,7 @@ final class GrokAgentProvider: HeadlessAgentProvider {
                             workspacePath: self.workspacePath,
                             environment: context.environment
                         )
-                        let toolLogTask = Task {
+                        toolLogTask = Task {
                             guard let toolLog else { return }
                             let parser = GrokToolEventParser()
                             await AgentSessionToolLogStream.tail(
@@ -179,7 +188,6 @@ final class GrokAgentProvider: HeadlessAgentProvider {
                                 parse: { parser.parse($0) }
                             )
                         }
-                        defer { toolLogTask.cancel() }
 
                         var framer = LineFramer()
                         var stderrTail = Data()
@@ -240,20 +248,20 @@ final class GrokAgentProvider: HeadlessAgentProvider {
                                     timedOut = didTimeout
                                 }
                             }
+                            try Task.checkCancellation()
                             // Flush any trailing line without a newline terminator.
                             framer.flush { handle($0) }
+                            try Task.checkCancellation()
                         } catch {
                             await self.runner.cancelAll()
-                            // Stop tracking here only for non-cancellation errors. A CancellationError is
-                            // rethrown to the outer `catch is CancellationError`, which stops tracking once;
-                            // calling it here too would double-stop (stopTracking is not idempotent).
-                            if !(error is CancellationError) {
-                                await self.toolTracking.stopTracking()
-                            }
+                            await Self.cancelAndAwaitToolLogTask(toolLogTask)
+                            await self.toolTracking.stopTracking(ifTracking: context.runID)
                             throw error
                         }
 
-                        await self.toolTracking.stopTracking()
+                        await Self.cancelAndAwaitToolLogTask(toolLogTask)
+                        await self.toolTracking.stopTracking(ifTracking: context.runID)
+                        try Task.checkCancellation()
 
                         let status = exitStatus ?? 0
                         if status != 0 || timedOut {
@@ -299,30 +307,51 @@ final class GrokAgentProvider: HeadlessAgentProvider {
                         continuation.finish()
                     } catch is CancellationError {
                         await self.runner.cancelAll()
-                        await self.toolTracking.stopTracking()
+                        await Self.cancelAndAwaitToolLogTask(toolLogTask)
+                        if let trackingRunID {
+                            await self.toolTracking.stopTracking(ifTracking: trackingRunID)
+                        }
                         continuation.finish(throwing: AIProviderError.invalidConfiguration(detail: "Grok run cancelled."))
                     } catch {
                         continuation.finish(throwing: error)
                     }
-                }, onCancel: { [weak self] in
-                    Task { [weak self] in
-                        await self?.runner.cancelAll()
-                    }
+                }, onCancel: {
+                    // The structured error/cancellation paths cancel and await runner cleanup before
+                    // the task authority admits a replacement. Runner-wide teardown must not escape
+                    // into an unowned task that can later cancel the replacement process.
                 })
             }
-            continuation.onTermination = { [weak self] _ in
-                self?.streamTask?.cancel()
-            }
+        ) else {
+            continuation.finish()
+            throw CancellationError()
         }
-        return AgentReasoningStatusStream.withReasoningStatus(raw)
+        return try await withTaskCancellationHandler(operation: {
+            HeadlessProviderStreamTaskAuthority.installTerminationHandler(
+                on: continuation,
+                producerTask: producer.task
+            )
+            try Task.checkCancellation()
+            return AgentReasoningStatusStream.withReasoningStatus(raw)
+        }, onCancel: {
+            producer.task.cancel()
+        })
     }
 
     func dispose() async {
-        streamTask?.cancel()
+        let producerTasks = await streamTasks.beginDisposal()
         await runner.cancelAll()
+        for producerTask in producerTasks {
+            await producerTask.value
+        }
     }
 
     // MARK: - Errors & logging
+
+    private static func cancelAndAwaitToolLogTask(_ task: Task<Void, Never>?) async {
+        guard let task else { return }
+        task.cancel()
+        await task.value
+    }
 
     private func mapProcessFailure(exitCode: Int32, timedOut: Bool, stderr: String, logTail: String?) -> Error {
         if timedOut {

@@ -14,11 +14,16 @@ struct AntigravityAgentConfig {
     /// so the live picker's display label is forwarded as-is. `nil` lets `agy` pick its default;
     /// `agy` silently falls back to its default for unrecognized values, so this is permissive.
     let modelString: String?
-    /// When true, pass `--sandbox` to restrict terminal access (conservative default).
+    /// When true, pass `--sandbox` to restrict terminal access. This does not scope or approve
+    /// MCP calls; headless tool approval is controlled independently below.
     let useSandbox: Bool
-    /// When true, pass `--dangerously-skip-permissions` to auto-approve all tool requests
-    /// (Full Access). Takes precedence over `useSandbox` — the two flags are mutually exclusive.
+    /// When true, pass `--dangerously-skip-permissions` to auto-approve all native and MCP tool
+    /// requests. Headless `agy` cannot prompt for confirmation, but this remains an explicit opt-in
+    /// because it also approves globally configured third-party MCP servers.
     let dangerouslySkipPermissions: Bool
+    /// False for MCP-started Safe Managed runs. agy's global MCP config and persisted grants cannot
+    /// currently be isolated per run, so pretending to provide that boundary would be unsafe.
+    let supportsHeadlessRun: Bool
     let enableDebugLogging: Bool
     /// How many times to auto-resume after agy's headless `--print` mode hits its hardcoded
     /// ~5-minute / 1494-poll cap (`printmode.go`). Each resume re-invokes `agy --print
@@ -33,6 +38,7 @@ struct AntigravityAgentConfig {
         modelString: String? = nil,
         useSandbox: Bool = true,
         dangerouslySkipPermissions: Bool = false,
+        supportsHeadlessRun: Bool = true,
         enableDebugLogging: Bool = false,
         maxPrintResumes: Int = 6
     ) {
@@ -41,6 +47,7 @@ struct AntigravityAgentConfig {
         self.modelString = modelString
         self.useSandbox = useSandbox
         self.dangerouslySkipPermissions = dangerouslySkipPermissions
+        self.supportsHeadlessRun = supportsHeadlessRun
         self.enableDebugLogging = enableDebugLogging
         self.maxPrintResumes = max(0, maxPrintResumes)
     }

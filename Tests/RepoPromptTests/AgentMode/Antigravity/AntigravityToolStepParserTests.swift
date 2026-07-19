@@ -74,6 +74,76 @@ final class AntigravityToolStepParserTests: XCTestCase {
         XCTAssertNil(AntigravityToolStepParser().parse(status: 3, payload: payload(callid: "c4", name: "call_mcp_tool", json: json)))
     }
 
+    func testDeniedMcpToolSurfacesStableFailedCardWithNestedIdentity() throws {
+        let p = AntigravityToolStepParser()
+        let json = #"{"ToolName":"set_status","ServerName":"RepoPromptCE","toolSummary":"Set status","Arguments":{"status_text":"private"}}"#
+        let denied = try XCTUnwrap(
+            p.parse(
+                status: 7,
+                payload: payload(callid: "denied-mcp", name: "call_mcp_tool", json: json),
+                failureKind: .headlessPermissionDenied
+            )
+        )
+
+        XCTAssertEqual(denied.call.type, "tool_call")
+        XCTAssertEqual(denied.call.toolName, "set_status")
+        XCTAssertEqual(denied.call.toolArgs, "RepoPromptCE/set_status")
+        XCTAssertEqual(denied.call.toolInvocationID, denied.invocationID)
+        XCTAssertEqual(denied.result?.type, "tool_result")
+        XCTAssertEqual(denied.result?.toolName, "set_status")
+        XCTAssertEqual(denied.result?.toolInvocationID, denied.invocationID)
+        XCTAssertEqual(denied.result?.toolIsError, true)
+        XCTAssertEqual(
+            denied.result?.toolResultJSON,
+            #"{"status":"failed","error":"Antigravity denied tool permission in headless mode."}"#
+        )
+        XCTAssertFalse(denied.result?.toolResultJSON?.contains("private") == true)
+
+        let repeated = try XCTUnwrap(
+            p.parse(
+                status: 7,
+                payload: payload(callid: "denied-mcp", name: "call_mcp_tool", json: json),
+                failureKind: .headlessPermissionDenied
+            )
+        )
+        XCTAssertEqual(repeated.invocationID, denied.invocationID)
+    }
+
+    func testGenericFailedMcpToolRemainsSuppressed() {
+        let p = AntigravityToolStepParser()
+        let json = #"{"ToolName":"set_status","ServerName":"RepoPromptCE","toolSummary":"Set status"}"#
+        let payload = payload(callid: "failed-mcp", name: "call_mcp_tool", json: json)
+
+        XCTAssertNil(p.parse(status: 7, payload: payload, failureKind: .other))
+        XCTAssertNil(p.parse(status: 7, payload: payload)) // legacy schema: failure kind unavailable
+        guard case let .suppressedMCP(isTerminal) = p.parseRow(
+            status: 7,
+            payload: payload,
+            failureKind: .other
+        ) else {
+            return XCTFail("Expected generic failed MCP wrapper to remain suppressed")
+        }
+        XCTAssertTrue(isTerminal)
+    }
+
+    func testFailedNativeToolEmitsTerminalErrorResult() throws {
+        let parsed = try XCTUnwrap(
+            AntigravityToolStepParser().parse(
+                status: 7,
+                payload: payload(callid: "failed-native", name: "run_command", json: #"{"CommandLine":"false"}"#),
+                failureKind: .other
+            )
+        )
+
+        XCTAssertEqual(parsed.call.toolName, "run_command")
+        XCTAssertEqual(parsed.result?.type, "tool_result")
+        XCTAssertEqual(parsed.result?.toolIsError, true)
+        XCTAssertEqual(
+            parsed.result?.toolResultJSON,
+            #"{"status":"failed","error":"Antigravity reported a failed tool step."}"#
+        )
+    }
+
     func testFallsBackToSummaryWhenNoSpecificArg() throws {
         let p = AntigravityToolStepParser()
         let json = #"{"toolSummary":"Did a thing","toolAction":"Doing a thing"}"#

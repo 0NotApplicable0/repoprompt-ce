@@ -1,9 +1,127 @@
 import Foundation
 
+/// Provider-local authority for stream creation and producer ownership. A replacement request can
+/// arrive while its predecessor is still preparing, parked on the app-wide AGY run gate, or between
+/// gate acquisition and producer activation. Keeping the generation and exact producer task in one
+/// actor makes those transitions atomic: invalidation can never miss a producer that activates later.
+actor AntigravityStreamRequestCoordinator {
+    typealias Stream = AsyncThrowingStream<AIStreamResult, Error>
+
+    struct Token: Equatable {
+        fileprivate let value: UInt64
+    }
+
+    struct Request {
+        let token: Token
+        let task: Task<Stream, Error>
+    }
+
+    struct DisposalTasks {
+        let requests: [Task<Stream, Error>]
+        let producers: [Task<Void, Never>]
+    }
+
+    private var generation: UInt64 = 0
+    private var requestTasks: [UInt64: Task<Stream, Error>] = [:]
+    private var producerTasks: [UInt64: Task<Void, Never>] = [:]
+    private var isDisposed = false
+
+    func begin() -> Token {
+        cancelOutstandingTasks()
+        generation &+= 1
+        return Token(value: generation)
+    }
+
+    /// Creates and registers the entire preparation/gate/handoff request in one actor turn. Disposal
+    /// can therefore cancel a task parked on the run gate and join it before returning.
+    func startRequest(
+        operation: @escaping @Sendable (Token) async throws -> Stream
+    ) -> Request? {
+        guard !isDisposed, !Task.isCancelled else { return nil }
+        let token = begin()
+        let task = Task<Stream, Error> { [weak self] in
+            do {
+                let stream = try await operation(token)
+                await self?.requestDidFinish(token)
+                return stream
+            } catch {
+                await self?.requestDidFinish(token)
+                throw error
+            }
+        }
+        requestTasks[token.value] = task
+        return Request(token: token, task: task)
+    }
+
+    /// Focused activation-test invalidation. Production disposal uses `beginDisposal()` so every
+    /// retained request and producer can be joined.
+    func invalidate() -> Task<Void, Never>? {
+        generation &+= 1
+        cancelOutstandingTasks()
+        return producerTasks.values.first
+    }
+
+    func beginDisposal() -> DisposalTasks {
+        isDisposed = true
+        generation &+= 1
+        cancelOutstandingTasks()
+        return DisposalTasks(
+            requests: Array(requestTasks.values),
+            producers: Array(producerTasks.values)
+        )
+    }
+
+    /// Invalidates `token` only while it is still the current request. A stale caller must never
+    /// cancel a replacement request or producer.
+    func cancel(_ token: Token) {
+        guard token.value == generation else { return }
+        generation &+= 1
+        requestTasks[token.value]?.cancel()
+        producerTasks[token.value]?.cancel()
+    }
+
+    func isCurrent(_ token: Token) -> Bool {
+        !isDisposed && token.value == generation
+    }
+
+    /// Atomically validates the request and installs its producer. Because the task is created on
+    /// this actor and the actor does not suspend before storing it, replacement/disposal either sees
+    /// the producer or makes activation fail; there is no unowned producer window.
+    func activate(
+        _ token: Token,
+        operation: @escaping @Sendable () async -> Void
+    ) -> Task<Void, Never>? {
+        guard !isDisposed, token.value == generation, !Task.isCancelled else { return nil }
+        let task = Task { [weak self] in
+            await operation()
+            await self?.producerDidFinish(token)
+        }
+        producerTasks[token.value] = task
+        return task
+    }
+
+    private func requestDidFinish(_ token: Token) {
+        requestTasks[token.value] = nil
+    }
+
+    private func producerDidFinish(_ token: Token) {
+        producerTasks[token.value] = nil
+    }
+
+    private func cancelOutstandingTasks() {
+        for request in requestTasks.values {
+            request.cancel()
+        }
+        for producer in producerTasks.values {
+            producer.cancel()
+        }
+    }
+}
+
 /// Headless provider for Google's Antigravity CLI (`agy`).
 ///
-/// `agy` v1.0.9 exposes a one-shot headless mode (`--print <prompt>`) that prints a
-/// plain-text response on stdout (no JSON/streaming flag). This provider mirrors the
+/// `agy` exposes a one-shot headless mode (`--print <prompt>`) that prints a plain-text
+/// response on stdout (no JSON/streaming flag). This provider mirrors the
 /// mechanics of `CodexExecAgentProvider` — a plain, non-ACP `HeadlessAgentProvider` — but is
 /// intentionally simpler: it accumulates stdout, parses it tolerantly into content, and
 /// synthesizes a `message_stop`. RepoPrompt MCP tool calls surface via
@@ -24,7 +142,7 @@ final class AntigravityAgentProvider: HeadlessAgentProvider {
     private let config: AntigravityAgentConfig
     private let workspacePath: String?
     private let toolTracking = AgentToolTrackingController()
-    private var streamTask: Task<Void, Never>?
+    private let streamRequests = AntigravityStreamRequestCoordinator()
 
     private var enableDebugLogging: Bool {
         config.enableDebugLogging
@@ -114,10 +232,13 @@ final class AntigravityAgentProvider: HeadlessAgentProvider {
         if let workspacePath, !workspacePath.isEmpty {
             args += ["--add-dir", workspacePath]
         }
+        // These flags control independent boundaries. The sandbox restricts terminal access;
+        // skip-permissions is an explicit opt-in required only for unattended tool approvals.
+        if config.useSandbox {
+            args.append("--sandbox")
+        }
         if config.dangerouslySkipPermissions {
             args.append("--dangerously-skip-permissions")
-        } else if config.useSandbox {
-            args.append("--sandbox")
         }
         args += ["--print-timeout", "\(printTimeoutSeconds)s"]
         // Resume turns chain the same conversation so a long run continues across poll budgets;
@@ -133,14 +254,31 @@ final class AntigravityAgentProvider: HeadlessAgentProvider {
 
     // MARK: - Preparation
 
+    static func mcpPreparationFailureMessage(
+        for result: MCPIntegrationHelper.AntigravityInstallResult
+    ) -> String? {
+        guard !result.success else { return nil }
+        return result.failureMessage
+            ?? "Failed to install RepoPrompt MCP config for Antigravity CLI."
+    }
+
+    static let safeManagedUnavailableMessage = "Antigravity cannot run under Safe Managed because its global MCP configuration and persisted tool grants cannot be isolated per run. In Sub-agent Permissions, choose Custom per provider or Inherit provider settings, then select an explicit Antigravity permission level."
+
+    static func preparationPolicyFailureMessage(for config: AntigravityAgentConfig) -> String? {
+        config.supportsHeadlessRun ? nil : safeManagedUnavailableMessage
+    }
+
     func prepare(runID: UUID? = nil) async throws -> HeadlessAgentContext {
+        if let policyFailure = Self.preparationPolicyFailureMessage(for: config) {
+            throw AIProviderError.invalidConfiguration(detail: policyFailure)
+        }
         let actualRunID = runID ?? UUID()
         guard await ServerNetworkManager.shared.isRunning() else {
             throw AIProviderError.invalidConfiguration(detail: "Could not start MCP server. Check MCP settings and try again.")
         }
-        let (ensureSuccess, _) = MCPIntegrationHelper.ensureAntigravityServerForDiscovery()
-        guard ensureSuccess else {
-            throw AIProviderError.invalidConfiguration(detail: "Failed to install RepoPrompt MCP config for Antigravity CLI.")
+        let ensureResult = MCPIntegrationHelper.ensureAntigravityServerForDiscovery()
+        if let failureMessage = Self.mcpPreparationFailureMessage(for: ensureResult) {
+            throw AIProviderError.invalidConfiguration(detail: failureMessage)
         }
         return HeadlessAgentContext(
             runID: actualRunID,
@@ -174,43 +312,98 @@ final class AntigravityAgentProvider: HeadlessAgentProvider {
     }
 
     func streamAgentMessage(_ message: AgentMessage, runID: UUID? = nil) async throws -> AsyncThrowingStream<AIStreamResult, Error> {
-        let raw = AsyncThrowingStream<AIStreamResult, Error> { continuation in
-            self.streamTask?.cancel()
-            self.streamTask = Task { [weak self] in
-                guard let self else { return }
-                await withTaskCancellationHandler(operation: {
-                    var runGateLocked = false
+        guard let request = await streamRequests.startRequest(operation: { [weak self] streamRequest in
+            guard let self else { throw CancellationError() }
+            return try await self.makeStream(
+                message,
+                runID: runID,
+                streamRequest: streamRequest
+            )
+        }) else {
+            throw CancellationError()
+        }
+        return try await withTaskCancellationHandler(operation: {
+            try await request.task.value
+        }, onCancel: { [streamRequests] in
+            Task {
+                await streamRequests.cancel(request.token)
+            }
+        })
+    }
+
+    private func makeStream(
+        _ message: AgentMessage,
+        runID: UUID?,
+        streamRequest: AntigravityStreamRequestCoordinator.Token
+    ) async throws -> AsyncThrowingStream<AIStreamResult, Error> {
+        // Reject unsupported Safe Managed runs synchronously. Returning a stream first would let
+        // the caller report the provider as ready and wait for routing before it consumed the
+        // buffered policy error from the stream task.
+        if let policyFailure = Self.preparationPolicyFailureMessage(for: config) {
+            throw AIProviderError.invalidConfiguration(detail: policyFailure)
+        }
+        // Complete MCP/config preparation before returning the stream for the same reason. The
+        // headless runner treats successful stream construction as provider readiness and waits
+        // for MCP routing before consuming elements, so buffering a preparation failure inside
+        // the stream would hide the actionable error behind that routing timeout.
+        let context = try await prepare(runID: runID)
+        try Task.checkCancellation()
+        guard await streamRequests.isCurrent(streamRequest) else {
+            throw CancellationError()
+        }
+        // Acquire the single-run slot before stream construction signals provider readiness. If a
+        // queued run returned a stream first, the runner's bounded MCP-routing lease could expire
+        // while another long AGY run still held this gate, dropping the queued run's routing policy
+        // before it ever launched.
+        try await Self.acquireRunGate(
+            AntigravityRunGate.shared,
+            requestIsCurrent: { [streamRequests] in
+                await streamRequests.isCurrent(streamRequest)
+            }
+        )
+        return try await withTaskCancellationHandler(operation: {
+            let (raw, continuation) = AsyncThrowingStream<AIStreamResult, Error>.makeStream()
+            let producerTask: Task<Void, Never>
+            do {
+                producerTask = try await Self.activateProducer(
+                    requests: streamRequests,
+                    request: streamRequest,
+                    runGate: AntigravityRunGate.shared
+                ) { [weak self] in
+                    guard let self else {
+                        continuation.finish()
+                        await AntigravityRunGate.shared.unlock()
+                        return
+                    }
+                    var runGateLocked = true
+                    var toolLogTask: Task<Void, Never>?
                     do {
-                        let context = try await self.prepare(runID: runID)
+                        guard await streamRequests.isCurrent(streamRequest) else {
+                            throw CancellationError()
+                        }
                         let combinedPrompt = Self.combinedPrompt(
                             system: message.systemPrompt,
                             user: message.userMessage
                         )
 
-                        self.toolTracking.startTracking(
+                        await toolTracking.startTracking(
                             runID: context.runID,
                             clientNameHint: Self.antigravityMCPClientID,
                             continuation: continuation
                         )
 
-                        // Serialize agy runs in this process: agy hides its conversation id, so DB
-                        // attribution relies on a single-run-at-a-time invariant (see AntigravityRunGate).
-                        await AntigravityRunGate.shared.lock()
-                        runGateLocked = true
-
                         // agy emits no tool calls on stdout — tail the conversation trajectory DB for
                         // live tool cards. The tailer re-locates the newest DB each poll, so it follows
                         // the run across auto-resume forks.
                         let toolLog = AntigravityTrajectoryToolLog(environment: context.environment)
-                        let toolLogTask = Task {
+                        toolLogTask = Task {
                             await AntigravityTrajectoryToolLogStream.tail(into: continuation, locate: { toolLog.locate() })
                         }
-                        defer { toolLogTask.cancel() }
 
                         // Auto-resume loop: agy's headless `--print` caps at ~5 min / 1494 polls. On a
                         // cap, resume the same conversation (`--conversation <id>`, fresh budget) and
                         // continue — up to `config.maxPrintResumes` times — so a long run can finish.
-                        let maxResumes = self.config.maxPrintResumes
+                        let maxResumes = config.maxPrintResumes
                         var resumeConversationID: String?
                         var turn = 0
                         while true {
@@ -225,18 +418,18 @@ final class AntigravityAgentProvider: HeadlessAgentProvider {
                             let turnPrompt = turn == 0 ? combinedPrompt : Self.resumeContinuationPrompt
                             let inlinePrompt = Self.shouldInlinePrompt(turnPrompt)
                             let args = Self.buildArguments(
-                                config: self.config,
-                                workspacePath: self.workspacePath,
+                                config: config,
+                                workspacePath: workspacePath,
                                 logFilePath: logFileURL?.path,
                                 resumeConversationID: resumeConversationID,
                                 inlinePrompt: inlinePrompt ? turnPrompt : nil
                             )
-                            if self.enableDebugLogging {
+                            if enableDebugLogging {
                                 let flags = args.filter { $0.hasPrefix("--") }
                                 print("[DEBUG] Antigravity: launching agy turn \(turn) (\(args.count) args; inlinePrompt: \(inlinePrompt); flags: \(flags.joined(separator: " ")))")
                             }
 
-                            let outcome = try await self.runPrintTurn(
+                            let outcome = try await runPrintTurn(
                                 args: args,
                                 prompt: inlinePrompt ? "" : turnPrompt,
                                 logFileURL: logFileURL,
@@ -279,41 +472,153 @@ final class AntigravityAgentProvider: HeadlessAgentProvider {
                             )
                         }
 
-                        await AntigravityRunGate.shared.unlock()
-                        runGateLocked = false
-                        await self.toolTracking.stopTracking()
-                        continuation.yield(
-                            AIStreamResult(
-                                type: "message_stop",
-                                text: nil,
-                                reasoning: nil,
-                                promptTokens: nil,
-                                completionTokens: nil,
-                                cost: nil
+                        // Cancellation tells the tailer to perform its final bounded DB drain. Await
+                        // that synchronization edge before releasing attribution or closing output.
+                        await Self.cancelAndAwaitToolLogTask(toolLogTask)
+                        await Self.releaseRunGateAfterCleanup(AntigravityRunGate.shared) {
+                            await self.toolTracking.stopTracking(ifTracking: context.runID)
+                            continuation.yield(
+                                AIStreamResult(
+                                    type: "message_stop",
+                                    text: nil,
+                                    reasoning: nil,
+                                    promptTokens: nil,
+                                    completionTokens: nil,
+                                    cost: nil
+                                )
                             )
-                        )
-                        continuation.finish()
+                            continuation.finish()
+                        }
+                        runGateLocked = false
                     } catch is CancellationError {
-                        if runGateLocked { await AntigravityRunGate.shared.unlock() }
-                        await self.runner.cancelAll()
-                        await self.toolTracking.stopTracking()
-                        continuation.finish(throwing: AIProviderError.invalidConfiguration(detail: "Antigravity run cancelled."))
+                        await runner.cancelAll()
+                        await Self.cancelAndAwaitToolLogTask(toolLogTask)
+                        if runGateLocked {
+                            await Self.releaseRunGateAfterCleanup(AntigravityRunGate.shared) {
+                                await self.toolTracking.stopTracking(ifTracking: context.runID)
+                                continuation.finish(throwing: AIProviderError.invalidConfiguration(detail: "Antigravity run cancelled."))
+                            }
+                            runGateLocked = false
+                        }
                     } catch {
-                        if runGateLocked { await AntigravityRunGate.shared.unlock() }
-                        await self.toolTracking.stopTracking()
-                        continuation.finish(throwing: error)
+                        await Self.cancelAndAwaitToolLogTask(toolLogTask)
+                        if runGateLocked {
+                            await Self.releaseRunGateAfterCleanup(AntigravityRunGate.shared) {
+                                await self.toolTracking.stopTracking(ifTracking: context.runID)
+                                continuation.finish(throwing: error)
+                            }
+                            runGateLocked = false
+                        }
                     }
-                }, onCancel: { [weak self] in
-                    Task { [weak self] in
-                        await self?.runner.cancelAll()
-                    }
-                })
+                }
+            } catch {
+                continuation.finish()
+                throw error
             }
-            continuation.onTermination = { [weak self] _ in
-                self?.streamTask?.cancel()
+            Self.installTerminationHandler(on: continuation, producerTask: producerTask)
+            return AgentReasoningStatusStream.withReasoningStatus(raw)
+        }, onCancel: {
+            Task {
+                await streamRequests.cancel(streamRequest)
             }
+        })
+    }
+
+    /// Acquires the single-run permit and closes the cancellation race between FIFO handoff and
+    /// transferring ownership to the stream producer. The hook is a deterministic test seam.
+    static func acquireRunGate(
+        _ runGate: AntigravityRunGate,
+        beforeCancellationCheck: (() async -> Void)? = nil,
+        requestIsCurrent: (() async -> Bool)? = nil
+    ) async throws {
+        try await runGate.lock()
+        await beforeCancellationCheck?()
+        do {
+            try Task.checkCancellation()
+            if let requestIsCurrent, await !requestIsCurrent() {
+                throw CancellationError()
+            }
+        } catch {
+            await runGate.unlock()
+            throw error
         }
-        return AgentReasoningStatusStream.withReasoningStatus(raw)
+    }
+
+    /// Atomically transfers an already-acquired gate permit to an actor-registered producer. The
+    /// cancellation handler invalidates the request whether cancellation lands before or after
+    /// registration. When activation never occurs this helper retains ownership and releases the
+    /// gate; once activation succeeds the producer is solely responsible for cleanup and release.
+    static func activateProducer(
+        requests: AntigravityStreamRequestCoordinator,
+        request: AntigravityStreamRequestCoordinator.Token,
+        runGate: AntigravityRunGate,
+        beforeActivation: (() async -> Void)? = nil,
+        afterActivation: (() async -> Void)? = nil,
+        operation: @escaping @Sendable () async -> Void
+    ) async throws -> Task<Void, Never> {
+        try await withTaskCancellationHandler(operation: {
+            await beforeActivation?()
+            var producerTask: Task<Void, Never>?
+            do {
+                try Task.checkCancellation()
+                guard let activatedTask = await requests.activate(request, operation: operation) else {
+                    throw CancellationError()
+                }
+                producerTask = activatedTask
+                await afterActivation?()
+                try Task.checkCancellation()
+                guard await requests.isCurrent(request) else {
+                    throw CancellationError()
+                }
+                return activatedTask
+            } catch {
+                if producerTask == nil {
+                    await runGate.unlock()
+                } else {
+                    await requests.cancel(request)
+                }
+                throw error
+            }
+        }, onCancel: {
+            Task {
+                await requests.cancel(request)
+            }
+        })
+    }
+
+    /// The current run retains the gate until all tracker/continuation cleanup is complete, so a
+    /// queued replacement cannot be touched by stale teardown from its predecessor.
+    static func releaseRunGateAfterCleanup(
+        _ runGate: AntigravityRunGate,
+        cleanup: () async -> Void
+    ) async {
+        await cleanup()
+        await runGate.unlock()
+    }
+
+    /// A terminated stream may cancel only its captured producer. Looking up the coordinator's
+    /// current producer here would let an old continuation cancel a replacement task.
+    static func installTerminationHandler(
+        on continuation: AsyncThrowingStream<AIStreamResult, Error>.Continuation,
+        producerTask: Task<Void, Never>
+    ) {
+        continuation.onTermination = { termination in
+            Self.handleTermination(termination, producerTask: producerTask)
+        }
+    }
+
+    static func handleTermination(
+        _ termination: AsyncThrowingStream<AIStreamResult, Error>.Continuation.Termination,
+        producerTask: Task<Void, Never>
+    ) {
+        guard case .cancelled = termination else { return }
+        producerTask.cancel()
+    }
+
+    private static func cancelAndAwaitToolLogTask(_ task: Task<Void, Never>?) async {
+        guard let task else { return }
+        task.cancel()
+        await task.value
     }
 
     /// Run ONE `agy --print` invocation: stream its stdout as live `content`, then classify the exit
@@ -376,6 +681,10 @@ final class AntigravityAgentProvider: HeadlessAgentProvider {
                     timedOut = didTimeout
                 }
             }
+            // AsyncThrowingStream iteration may end normally when its consumer task is cancelled.
+            // Reify that cancellation before classifying a missing termination event as a CLI error;
+            // the structured catch below then awaits runner cleanup before the AGY gate is released.
+            try Task.checkCancellation()
             framer.flush { line in
                 if let text = String(data: line, encoding: .utf8), !text.isEmpty {
                     guard !AntigravityStreamParser.isPollCapMarkerLine(text) else { return }
@@ -387,31 +696,47 @@ final class AntigravityAgentProvider: HeadlessAgentProvider {
             throw error
         }
 
-        let status = exitStatus ?? 0
-        if status != 0 || timedOut {
-            let stderrString = String(data: stderrTail, encoding: .utf8) ?? ""
-            throw mapProcessFailure(
-                exitCode: status, timedOut: timedOut, stderr: stderrString,
-                logTail: Self.tailOfLogFile(logFileURL)
-            )
+        let stderrString = String(decoding: stderrTail, as: UTF8.self)
+        let logTail = Self.tailOfLogFile(logFileURL)
+        if let processFailure = Self.processFailure(
+            exitStatus: exitStatus,
+            timedOut: timedOut,
+            stderr: stderrString,
+            logTail: logTail
+        ) {
+            throw processFailure
         }
 
         return try Self.classifySuccessfulTurn(
             stdoutData: stdoutData,
-            logTail: Self.tailOfLogFile(logFileURL),
+            stderr: stderrString,
+            logTail: logTail,
             isFirstTurn: isFirstTurn
         )
     }
 
-    static func classifySuccessfulTurn(stdoutData: Data, logTail: String?, isFirstTurn: Bool) throws -> TurnOutcome {
+    static func classifySuccessfulTurn(
+        stdoutData: Data,
+        stderr: String? = nil,
+        logTail: String?,
+        isFirstTurn: Bool
+    ) throws -> TurnOutcome {
+        if isHeadlessPermissionDenial(stderr: stderr, logTail: logTail) {
+            throw headlessPermissionDenialError
+        }
+
         let stdoutString = String(data: stdoutData, encoding: .utf8) ?? ""
         if AntigravityStreamParser.isPrintModePollCapTimeout(stdout: stdoutString, logTail: logTail) {
             return .capped
         }
-        if stdoutData.isEmpty {
+        let hasMeaningfulOutput = String(data: stdoutData, encoding: .utf8)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .isEmpty == false
+        if !hasMeaningfulOutput {
             if isFirstTurn {
-                let hint = logTail ?? "Ensure you are signed in: run `agy` once interactively to authenticate."
-                throw AIProviderError.invalidConfiguration(detail: "Antigravity CLI returned no output. \(hint)")
+                throw AIProviderError.invalidConfiguration(
+                    detail: "Antigravity CLI returned no meaningful output. Ensure you are signed in by running `agy` once interactively."
+                )
             }
             return .incomplete
         }
@@ -461,28 +786,80 @@ final class AntigravityAgentProvider: HeadlessAgentProvider {
     }
 
     func dispose() async {
-        streamTask?.cancel()
+        let disposalTasks = await streamRequests.beginDisposal()
         await runner.cancelAll()
+        for requestTask in disposalTasks.requests {
+            _ = await requestTask.result
+        }
+        for producerTask in disposalTasks.producers {
+            await producerTask.value
+        }
     }
 
     // MARK: - Errors & logging
 
-    private func mapProcessFailure(exitCode: Int32, timedOut: Bool, stderr: String, logTail: String?) -> Error {
+    static let headlessPermissionDenialMessage = "Antigravity denied a tool because headless mode cannot prompt. In Agent Permissions, choose Sandboxed Auto-Approve (keeps the terminal sandbox but auto-approves every configured MCP server) or Full Access, then retry. For MCP-started sub-agents, use Custom per provider or Inherit provider settings instead of Safe Managed. If auto-approval is already selected, update `agy` or run it interactively to inspect the request."
+
+    private static var headlessPermissionDenialError: AIProviderError {
+        AIProviderError.invalidConfiguration(detail: headlessPermissionDenialMessage)
+    }
+
+    static func isHeadlessPermissionDenial(stderr: String?, logTail: String?) -> Bool {
+        let diagnostics = [stderr, logTail]
+            .compactMap(\.self)
+            .joined(separator: "\n")
+            .lowercased()
+        guard !diagnostics.isEmpty else { return false }
+
+        let headlessAutoDenial = diagnostics.contains("headless mode cannot prompt")
+            && (diagnostics.contains("required approval") || diagnostics.contains("auto-denied"))
+        let rejectedConfirmation = diagnostics.contains("tool confirmation")
+            && diagnostics.contains("approved=false")
+        return diagnostics.contains("soft-denying tool confirmation")
+            || diagnostics.contains("user denied permission for mcp(")
+            || headlessAutoDenial
+            || rejectedConfirmation
+    }
+
+    /// Maps process-level diagnostics without exposing raw stderr or log content in the UI.
+    /// Returns nil only for a confirmed, successful exit; callers then classify the turn output.
+    static func processFailure(
+        exitStatus: Int32?,
+        timedOut: Bool,
+        stderr: String,
+        logTail: String?
+    ) -> Error? {
+        if isHeadlessPermissionDenial(stderr: stderr, logTail: logTail) {
+            return headlessPermissionDenialError
+        }
         if timedOut {
             return AIProviderError.invalidConfiguration(detail: "Antigravity CLI timed out.")
         }
-        var detail = "Antigravity CLI failed (exit \(exitCode))."
-        let trimmedStderr = stderr.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !trimmedStderr.isEmpty {
-            detail += " \(trimmedStderr)"
+        guard let exitStatus else {
+            return AIProviderError.invalidConfiguration(
+                detail: "Antigravity CLI ended without reporting an exit status. Try again or run `agy` interactively to inspect the failure."
+            )
         }
-        if let logTail, !logTail.isEmpty {
-            if logTail.localizedCaseInsensitiveContains("not logged into") || logTail.localizedCaseInsensitiveContains("token source") {
-                detail += " You may need to sign in: run `agy` once interactively."
-            }
-            detail += "\n\(logTail)"
+        guard exitStatus != 0 else { return nil }
+
+        let diagnostics = [stderr, logTail]
+            .compactMap(\.self)
+            .joined(separator: "\n")
+        let normalizedDiagnostics = diagnostics.lowercased()
+        let authenticationFailureSignatures = [
+            "not logged into",
+            "failed to get token source",
+            "error getting token source",
+            "failed to get token from token source"
+        ]
+        if authenticationFailureSignatures.contains(where: normalizedDiagnostics.contains) {
+            return AIProviderError.invalidConfiguration(
+                detail: "Antigravity CLI is not authenticated. Run `agy` once interactively to sign in."
+            )
         }
-        return AIProviderError.invalidConfiguration(detail: detail)
+        return AIProviderError.invalidConfiguration(
+            detail: "Antigravity CLI failed (exit \(exitStatus)). Run `agy` interactively to inspect the failure."
+        )
     }
 
     private static func makeLogFileURL(runID: UUID) -> URL? {
@@ -497,11 +874,20 @@ final class AntigravityAgentProvider: HeadlessAgentProvider {
     }
 
     private static func tailOfLogFile(_ url: URL?, maxBytes: Int = 4096) -> String? {
-        guard let url, let data = try? Data(contentsOf: url), !data.isEmpty else { return nil }
-        let tail = data.count > maxBytes ? Data(data.suffix(maxBytes)) : data
-        guard let text = String(data: tail, encoding: .utf8) else { return nil }
-        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        return trimmed.isEmpty ? nil : trimmed
+        guard let url, maxBytes > 0, let handle = try? FileHandle(forReadingFrom: url) else { return nil }
+        defer { try? handle.close() }
+        do {
+            let size = try handle.seekToEnd()
+            guard size > 0 else { return nil }
+            let start = size > UInt64(maxBytes) ? size - UInt64(maxBytes) : 0
+            try handle.seek(toOffset: start)
+            guard let data = try handle.readToEnd(), !data.isEmpty else { return nil }
+            let text = String(decoding: data, as: UTF8.self)
+            let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+            return trimmed.isEmpty ? nil : trimmed
+        } catch {
+            return nil
+        }
     }
 
     private static func removeLogFile(_ url: URL?) {

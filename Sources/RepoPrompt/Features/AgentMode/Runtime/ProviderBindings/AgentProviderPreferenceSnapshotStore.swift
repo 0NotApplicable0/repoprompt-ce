@@ -570,7 +570,7 @@ final class AgentProviderPreferenceSnapshotStore {
         case .userConfigured:
             AntigravityAgentToolPreferences.permissionLevel(defaults: defaults, secureStore: securePermissions)
         case .mcpSafeDefaults:
-            .managedDefault
+            .safeManagedUnavailable
         case let .providerOverride(.antigravity(level)):
             level
         case .providerOverride:

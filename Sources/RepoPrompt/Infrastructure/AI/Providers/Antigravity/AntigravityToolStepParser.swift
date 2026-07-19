@@ -5,34 +5,77 @@ import Foundation
 /// agy stores tool activity as nested protobuf `step_payload` (nothing on stdout):
 /// `payload → field 5 (step) → field 4 (tool) → {1: callId, 2: toolName, 3: argsJSON}`. A row is a
 /// tool call iff that tool name exists. We emit a `tool_call` always and a `tool_result` ONLY when
-/// the step is terminal (`status == 3`) — never fabricating completion for an in-flight tool. One
-/// invocation id per call id keeps the card stable across polls. Output bodies are not extracted
-/// (agy stores them as an opaque binary blob). Fail-open: any missing field returns nil.
+/// the step is terminal (`status == 3` for success, `status == 7` for failure) — never fabricating
+/// completion for an in-flight tool. One invocation id per call id keeps the card stable across
+/// polls. Output bodies are not extracted (agy stores them as an opaque binary blob). Fail-open:
+/// any missing field is classified as a non-tool row.
 /// `@unchecked Sendable`: touched only from the single trajectory tailer task.
 final class AntigravityToolStepParser: @unchecked Sendable {
     static let terminalStatus: Int64 = 3
+    static let failedTerminalStatus: Int64 = 7
 
-    struct ParsedToolStep { let invocationID: UUID
+    enum ParseOutcome {
+        case nonTool
+        case suppressedMCP(isTerminal: Bool)
+        case visible(ParsedToolStep)
+    }
+
+    struct ParsedToolStep {
+        let invocationID: UUID
         let call: AIStreamResult
         let result: AIStreamResult?
     }
 
     private var invocationIDs: [String: UUID] = [:]
     private static let summaryLimit = 600
+    private static let deniedMCPResultJSON =
+        #"{"status":"failed","error":"Antigravity denied tool permission in headless mode."}"#
+    private static let failedNativeResultJSON =
+        #"{"status":"failed","error":"Antigravity reported a failed tool step."}"#
 
-    func parse(status: Int64, payload: Data) -> ParsedToolStep? {
+    func parse(
+        status: Int64,
+        payload: Data,
+        failureKind: AntigravityTrajectoryStore.FailureKind? = nil
+    ) -> ParsedToolStep? {
+        guard case let .visible(parsed) = parseRow(
+            status: status,
+            payload: payload,
+            failureKind: failureKind
+        ) else { return nil }
+        return parsed
+    }
+
+    func parseRow(
+        status: Int64,
+        payload: Data,
+        failureKind: AntigravityTrajectoryStore.FailureKind? = nil
+    ) -> ParseOutcome {
         let top = AntigravityTrajectoryProtoScanner.lengthDelimitedFields(payload)
-        guard let step = top[5] else { return nil }
+        guard let step = top[5] else { return .nonTool }
         let stepFields = AntigravityTrajectoryProtoScanner.lengthDelimitedFields(step)
-        guard let tool = stepFields[4] else { return nil } // non-tool step (no tool message)
+        guard let tool = stepFields[4] else { return .nonTool } // non-tool step (no tool message)
         let toolFields = AntigravityTrajectoryProtoScanner.lengthDelimitedFields(tool)
         guard let nameData = toolFields[2], let toolName = String(data: nameData, encoding: .utf8),
-              !toolName.isEmpty else { return nil }
+              !toolName.isEmpty else { return .nonTool }
+
+        let isFailed = status == Self.failedTerminalStatus
+        let isTerminal = status == Self.terminalStatus || isFailed
+        let argsJSON = toolFields[3].flatMap { String(data: $0, encoding: .utf8) }
+        let isMCPWrapper = toolName == "call_mcp_tool"
 
         // agy wraps RepoPrompt MCP calls as `call_mcp_tool`; those already surface as cards via
         // expected-PID MCP tool tracking with the real tool name + arguments, so skip the generic
-        // trajectory duplicate (avoids a doubled, less-detailed card).
-        if toolName == "call_mcp_tool" { return nil }
+        // trajectory duplicate (avoids a doubled, less-detailed card). A confirmed permission
+        // denial never reaches RepoPrompt's MCP server, so surface only that narrowly classified
+        // fallback. Other status-7 wrappers remain suppressed: status 7 is a generic failure and
+        // expected-PID MCP tracking remains authoritative. Keep pending wrappers distinct from
+        // non-tool rows so the trajectory watermark waits for their final status.
+        if isMCPWrapper,
+           !(isFailed && failureKind == .headlessPermissionDenied)
+        {
+            return .suppressedMCP(isTerminal: isTerminal)
+        }
 
         let callID = toolFields[1].flatMap { String(data: $0, encoding: .utf8) } ?? UUID().uuidString
         let invocationID = invocationIDs[callID] ?? {
@@ -41,26 +84,62 @@ final class AntigravityToolStepParser: @unchecked Sendable {
             return id
         }()
 
-        let argsJSON = toolFields[3].flatMap { String(data: $0, encoding: .utf8) }
-        let summary = argsJSON.flatMap(Self.summary(fromArgsJSON:))
+        let mcpIdentity = isMCPWrapper ? argsJSON.flatMap(Self.mcpIdentity(fromArgsJSON:)) : nil
+        let visibleToolName = mcpIdentity?.toolName ?? toolName
+        let summary = mcpIdentity?.summary ?? argsJSON.flatMap(Self.summary(fromArgsJSON:))
 
         let call = AIStreamResult(
             type: "tool_call", text: nil,
-            toolName: toolName,
+            toolName: visibleToolName,
             toolArgs: summary.map(Self.truncate),
             toolInvocationID: invocationID,
             toolArgsJSON: argsJSON
         )
-        let result: AIStreamResult? = status == Self.terminalStatus
+        let result: AIStreamResult? = isTerminal
             ? AIStreamResult(
                 type: "tool_result",
                 text: nil,
-                toolName: toolName,
+                toolName: visibleToolName,
+                toolOutput: isFailed
+                    ? (isMCPWrapper ? Self.deniedMCPResultJSON : Self.failedNativeResultJSON)
+                    : nil,
                 toolInvocationID: invocationID,
-                toolIsError: false
+                toolResultJSON: isFailed
+                    ? (isMCPWrapper ? Self.deniedMCPResultJSON : Self.failedNativeResultJSON)
+                    : nil,
+                toolIsError: isFailed
             )
             : nil
-        return ParsedToolStep(invocationID: invocationID, call: call, result: result)
+        return .visible(ParsedToolStep(invocationID: invocationID, call: call, result: result))
+    }
+
+    private struct MCPIdentity {
+        let toolName: String?
+        let serverName: String?
+
+        var summary: String? {
+            switch (serverName, toolName) {
+            case let (server?, tool?): "\(server)/\(tool)"
+            case let (server?, nil): server
+            case (nil, _): nil
+            }
+        }
+    }
+
+    private static func mcpIdentity(fromArgsJSON json: String) -> MCPIdentity? {
+        guard let data = json.data(using: .utf8),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+        else { return nil }
+        func nonemptyString(_ key: String) -> String? {
+            guard let value = obj[key] as? String else { return nil }
+            let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+            return trimmed.isEmpty ? nil : trimmed
+        }
+        let identity = MCPIdentity(
+            toolName: nonemptyString("ToolName"),
+            serverName: nonemptyString("ServerName")
+        )
+        return identity.toolName == nil && identity.serverName == nil ? nil : identity
     }
 
     /// The card's argument line. Prefers the SPECIFIC argument — the actual command, file path

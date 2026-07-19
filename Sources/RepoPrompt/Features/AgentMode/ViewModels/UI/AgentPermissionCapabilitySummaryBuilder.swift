@@ -174,34 +174,70 @@ struct AgentPermissionCapabilitySummaryBuilder {
             )
         case .antigravity:
             let level = antigravityPermissionLevel(profile: profile)
-            let warnings = level.dangerouslySkipPermissions
-                ? ["Antigravity auto-approves all tool requests (no sandbox)."]
-                : []
+            let fileMutation: String
+            let shell: String
+            let externalMCP: String
+            let approvalModeDescription: String
+            let warnings: [String]
+            switch level {
+            case .managedDefault:
+                fileMutation = "Antigravity terminal sandbox enabled"
+                shell = "Antigravity terminal sandbox enabled"
+                externalMCP = "Approval bypass off; Antigravity's stored permissions still apply"
+                approvalModeDescription = "Approval bypass: off; headless prompts unavailable"
+                warnings = [
+                    "Requests that still require a prompt fail in headless mode; persisted Antigravity grants remain outside RepoPrompt's control."
+                ]
+            case .sandboxedAutoApprove:
+                fileMutation = "Auto-approved; Antigravity sandbox enabled"
+                shell = "Antigravity terminal sandbox enabled"
+                externalMCP = "All configured MCP tools auto-approved"
+                approvalModeDescription = "Approval: Auto-approve all; terminal sandbox on"
+                warnings = [
+                    "Antigravity auto-approves every native and MCP tool request. Its sandbox adds terminal restrictions but does not contain third-party MCP side effects."
+                ]
+            case .fullAccess:
+                fileMutation = "Auto-approved; no sandbox"
+                shell = "Full access"
+                externalMCP = "All configured MCP tools auto-approved"
+                approvalModeDescription = "Approval: Auto-approve all; terminal sandbox off"
+                warnings = ["Antigravity auto-approves every native and MCP tool request with no terminal sandbox."]
+            case .safeManagedUnavailable:
+                fileMutation = "Unavailable under Safe Managed"
+                shell = "Not launched"
+                externalMCP = "Global MCP state cannot be isolated per run"
+                approvalModeDescription = "Choose Custom per provider or Inherit provider settings"
+                warnings = [
+                    "Antigravity is disabled for Safe Managed sub-agents because its global MCP configuration and persisted grants cannot provide that boundary."
+                ]
+            }
             return AgentPermissionCapabilitySummary(
                 providerID: providerID,
                 providerName: providerID.displayName,
                 isAvailable: isAvailable,
-                fileMutation: level.useSandbox ? "Sandboxed" : "Full access (no sandbox)",
-                shell: "Handled by Antigravity CLI",
-                externalMCP: "RepoPrompt MCP tools available",
+                fileMutation: fileMutation,
+                shell: shell,
+                externalMCP: externalMCP,
                 search: "Managed by Antigravity CLI",
-                approvalModeDescription: level.useSandbox ? "Approval: Sandboxed" : "Approval: Auto-approve all",
+                approvalModeDescription: approvalModeDescription,
                 warnings: warnings
             )
         case .grok:
             let level = grokPermissionLevel(profile: profile)
-            let warnings = level.dangerouslySkipPermissions
-                ? ["Grok auto-approves all tool requests (no sandbox)."]
-                : []
+            let warnings = level.useSandbox
+                ? ["Grok auto-approves every native and configured MCP tool request. Its workspace sandbox does not contain external MCP side effects."]
+                : ["Grok auto-approves every native and configured MCP tool request with no sandbox."]
             return AgentPermissionCapabilitySummary(
                 providerID: providerID,
                 providerName: providerID.displayName,
                 isAvailable: isAvailable,
-                fileMutation: level.useSandbox ? "Sandboxed" : "Full access (no sandbox)",
-                shell: "Handled by Grok CLI",
-                externalMCP: "RepoPrompt MCP tools available",
+                fileMutation: level.useSandbox ? "Auto-approved; workspace sandbox enabled" : "Auto-approved; no sandbox",
+                shell: level.useSandbox ? "Grok workspace sandbox enabled" : "Full access",
+                externalMCP: "All configured MCP tools auto-approved",
                 search: "Managed by Grok CLI",
-                approvalModeDescription: level.useSandbox ? "Approval: Sandboxed" : "Approval: Auto-approve all",
+                approvalModeDescription: level.useSandbox
+                    ? "Approval: Auto-approve all; workspace sandbox on"
+                    : "Approval: Auto-approve all; workspace sandbox off",
                 warnings: warnings
             )
         }
@@ -294,7 +330,7 @@ struct AgentPermissionCapabilitySummaryBuilder {
         case .userConfigured:
             AntigravityAgentToolPreferences.permissionLevel(defaults: defaults, secureStore: securePermissions)
         case .mcpSafeDefaults:
-            .managedDefault
+            .safeManagedUnavailable
         case let .providerOverride(.antigravity(level)):
             level
         case .providerOverride:

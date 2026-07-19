@@ -33,6 +33,7 @@ final class AntigravityArgumentBuilderTests: XCTestCase {
         XCTAssertEqual(args.first, "--print")
         XCTAssertFalse(args.contains("hello"))
         XCTAssertTrue(args.contains("--sandbox"))
+        XCTAssertFalse(args.contains("--dangerously-skip-permissions"))
         XCTAssertTrue(args.contains("--print-timeout"))
         XCTAssertFalse(args.contains("--model"))
         XCTAssertFalse(args.contains("--add-dir"))
@@ -141,7 +142,7 @@ final class AntigravityArgumentBuilderTests: XCTestCase {
         XCTAssertFalse(args.contains("--sandbox"))
     }
 
-    func testBuildArgumentsSandboxedConfigEmitsSandbox() {
+    func testBuildArgumentsExplicitSandboxOnlyConfigEmitsSandbox() {
         let args = AntigravityAgentProvider.buildArguments(
             config: AntigravityAgentConfig(useSandbox: true, dangerouslySkipPermissions: false),
             workspacePath: nil,
@@ -161,15 +162,14 @@ final class AntigravityArgumentBuilderTests: XCTestCase {
         XCTAssertFalse(args.contains("--sandbox"))
     }
 
-    func testBuildArgumentsFullAccessWinsWhenBothFlagsSet() {
-        // Defensive: dangerouslySkipPermissions takes precedence over useSandbox.
+    func testBuildArgumentsSandboxedAutoApproveEmitsBothFlags() {
         let args = AntigravityAgentProvider.buildArguments(
             config: AntigravityAgentConfig(useSandbox: true, dangerouslySkipPermissions: true),
             workspacePath: nil,
             logFilePath: nil
         )
         XCTAssertTrue(args.contains("--dangerously-skip-permissions"))
-        XCTAssertFalse(args.contains("--sandbox"))
+        XCTAssertTrue(args.contains("--sandbox"))
     }
 
     func testBuildArgumentsOmitsConversationByDefault() {
@@ -202,18 +202,178 @@ final class AntigravityArgumentBuilderTests: XCTestCase {
     func testPermissionLevelMapping() {
         XCTAssertTrue(AntigravityAgentToolPreferences.PermissionLevel.managedDefault.useSandbox)
         XCTAssertFalse(AntigravityAgentToolPreferences.PermissionLevel.managedDefault.dangerouslySkipPermissions)
+        XCTAssertFalse(AntigravityAgentToolPreferences.PermissionLevel.managedDefault.isWarning)
+        XCTAssertTrue(AntigravityAgentToolPreferences.PermissionLevel.managedDefault.supportsHeadlessRun)
+        XCTAssertTrue(AntigravityAgentToolPreferences.PermissionLevel.sandboxedAutoApprove.useSandbox)
+        XCTAssertTrue(AntigravityAgentToolPreferences.PermissionLevel.sandboxedAutoApprove.dangerouslySkipPermissions)
+        XCTAssertTrue(AntigravityAgentToolPreferences.PermissionLevel.sandboxedAutoApprove.isWarning)
+        XCTAssertTrue(AntigravityAgentToolPreferences.PermissionLevel.sandboxedAutoApprove.supportsHeadlessRun)
         XCTAssertFalse(AntigravityAgentToolPreferences.PermissionLevel.fullAccess.useSandbox)
         XCTAssertTrue(AntigravityAgentToolPreferences.PermissionLevel.fullAccess.dangerouslySkipPermissions)
+        XCTAssertTrue(AntigravityAgentToolPreferences.PermissionLevel.fullAccess.isWarning)
+        XCTAssertTrue(AntigravityAgentToolPreferences.PermissionLevel.fullAccess.supportsHeadlessRun)
+        XCTAssertFalse(AntigravityAgentToolPreferences.PermissionLevel.safeManagedUnavailable.dangerouslySkipPermissions)
+        XCTAssertFalse(AntigravityAgentToolPreferences.PermissionLevel.safeManagedUnavailable.supportsHeadlessRun)
     }
 
-    func testPermissionLevelHasTwoCases() {
-        XCTAssertEqual(AntigravityAgentToolPreferences.PermissionLevel.allCases.count, 2)
+    func testPermissionLevelHasThreeUserSelectableCases() {
+        XCTAssertEqual(
+            AntigravityAgentToolPreferences.PermissionLevel.allCases,
+            [.managedDefault, .sandboxedAutoApprove, .fullAccess]
+        )
+        XCTAssertFalse(
+            AntigravityAgentToolPreferences.PermissionLevel.allCases.contains(.safeManagedUnavailable)
+        )
     }
 
     func testPermissionLevelFromRawValue() {
         XCTAssertEqual(AntigravityAgentToolPreferences.PermissionLevel.from(rawValue: "fullAccess"), .fullAccess)
+        XCTAssertEqual(
+            AntigravityAgentToolPreferences.PermissionLevel.from(rawValue: "sandboxedAutoApprove"),
+            .sandboxedAutoApprove
+        )
         XCTAssertEqual(AntigravityAgentToolPreferences.PermissionLevel.from(rawValue: "managedDefault"), .managedDefault)
+        XCTAssertEqual(
+            AntigravityAgentToolPreferences.PermissionLevel.from(rawValue: "safeManagedUnavailable"),
+            .managedDefault
+        )
         XCTAssertEqual(AntigravityAgentToolPreferences.PermissionLevel.from(rawValue: nil), .managedDefault)
         XCTAssertEqual(AntigravityAgentToolPreferences.PermissionLevel.from(rawValue: "bogus"), .managedDefault)
+    }
+
+    func testRuntimeOnlyPermissionLevelCannotBePersisted() throws {
+        let suiteName = "AntigravityArgumentBuilderTests.runtime-only-permission.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        AntigravityAgentToolPreferences.setPermissionLevel(
+            .safeManagedUnavailable,
+            defaults: defaults
+        )
+
+        XCTAssertEqual(
+            AntigravityAgentToolPreferences.permissionLevel(defaults: defaults),
+            .managedDefault
+        )
+    }
+
+    func testPermissionBindingParserRejectsInternalSafeManagedSentinel() {
+        XCTAssertNil(AgentProviderPermissionLevelID(
+            providerID: .antigravity,
+            subagentRawValue: AntigravityAgentToolPreferences.PermissionLevel.safeManagedUnavailable.rawValue
+        ))
+        XCTAssertEqual(
+            AgentProviderPermissionLevelID(
+                providerID: .antigravity,
+                subagentRawValue: AntigravityAgentToolPreferences.PermissionLevel.sandboxedAutoApprove.rawValue
+            ),
+            .antigravity(.sandboxedAutoApprove)
+        )
+    }
+
+    func testSubagentPreferenceSetterCannotPersistInternalSafeManagedSentinel() throws {
+        let suiteName = "AntigravityArgumentBuilderTests.subagent-runtime-only-permission.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        AgentModePermissionPreferences.setProviderSubagentPermissionLevel(
+            .antigravity(.safeManagedUnavailable),
+            for: .antigravity,
+            defaults: defaults
+        )
+
+        XCTAssertEqual(
+            defaults.string(forKey: AgentModePermissionPreferences.providerPermissionLevelKey(for: .antigravity)),
+            AntigravityAgentToolPreferences.PermissionLevel.managedDefault.rawValue
+        )
+        XCTAssertEqual(
+            AgentModePermissionPreferences.providerSubagentPermissionLevel(
+                for: .antigravity,
+                defaults: defaults
+            ),
+            .antigravity(.managedDefault)
+        )
+    }
+
+    @MainActor
+    func testRuntimePermissionBindingPropagatesSafeAndExplicitProfiles() throws {
+        let suiteName = "AntigravityArgumentBuilderTests.runtime-permissions.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let store = AgentProviderPreferenceSnapshotStore(
+            defaults: defaults,
+            securePermissions: nil,
+            codexMCPServerEntries: { [] }
+        )
+
+        XCTAssertEqual(
+            store.runtimePermission(for: .antigravity, profile: .mcpSafeDefaults)
+                .antigravityPermissionLevel,
+            .safeManagedUnavailable
+        )
+        XCTAssertEqual(
+            store.runtimePermission(
+                for: .antigravity,
+                profile: .providerOverride(.antigravity(.sandboxedAutoApprove))
+            ).antigravityPermissionLevel,
+            .sandboxedAutoApprove
+        )
+    }
+
+    func testSafeManagedPreparationFailsBeforeLaunchingAntigravity() async {
+        let config = AntigravityAgentConfig(supportsHeadlessRun: false)
+        let runner = CLIProcessRunner(config: CLIProcessConfiguration(
+            command: "/definitely/not/an/agy/binary",
+            additionalPaths: []
+        ))
+        let provider = AntigravityAgentProvider(runner: runner, config: config)
+
+        do {
+            _ = try await provider.streamAgentMessage(AgentMessage(userMessage: "do not launch"))
+            XCTFail("Safe Managed must fail before returning a runnable stream")
+        } catch {
+            XCTAssertEqual(
+                error.localizedDescription,
+                AntigravityAgentProvider.safeManagedUnavailableMessage
+            )
+        }
+        await provider.dispose()
+        XCTAssertEqual(
+            AntigravityAgentProvider.preparationPolicyFailureMessage(for: config),
+            AntigravityAgentProvider.safeManagedUnavailableMessage
+        )
+    }
+
+    func testSafeManagedCapabilitySummaryReportsAntigravityUnavailable() throws {
+        let suiteName = "AntigravityArgumentBuilderTests.safe-managed.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        let summary = AgentPermissionCapabilitySummaryBuilder(defaults: defaults).summary(
+            for: .antigravity,
+            profile: .mcpSafeDefaults,
+            availability: .none
+        )
+
+        XCTAssertEqual(summary.fileMutation, "Unavailable under Safe Managed")
+        XCTAssertEqual(summary.shell, "Not launched")
+        XCTAssertTrue(summary.externalMCP.contains("cannot be isolated"))
+        XCTAssertTrue(summary.warnings.contains { $0.contains("disabled for Safe Managed") })
+    }
+
+    func testSandboxedAutoApproveCapabilitySummaryDisclosesGlobalMCPRisk() throws {
+        let suiteName = "AntigravityArgumentBuilderTests.sandboxed-auto-approve.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        let summary = AgentPermissionCapabilitySummaryBuilder(defaults: defaults).summary(
+            for: .antigravity,
+            profile: .providerOverride(.antigravity(.sandboxedAutoApprove)),
+            availability: .none
+        )
+
+        XCTAssertEqual(summary.shell, "Antigravity terminal sandbox enabled")
+        XCTAssertEqual(summary.externalMCP, "All configured MCP tools auto-approved")
+        XCTAssertTrue(summary.warnings.contains { $0.contains("third-party MCP side effects") })
     }
 }
