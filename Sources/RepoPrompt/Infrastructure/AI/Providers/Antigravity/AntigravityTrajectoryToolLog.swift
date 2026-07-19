@@ -1,35 +1,116 @@
 import Foundation
 
-/// Locates the agy conversation trajectory DB created for the current run (newest DB that appears
-/// after launch), mirroring grok's `GrokSessionToolLog`. agy creates exactly one new
-/// `~/.gemini/antigravity-cli/conversations/<id>.db` per `--print` run.
-struct AntigravityTrajectoryToolLog {
+/// Resolves the exact agy conversation trajectory DB announced by the current turn's unique
+/// `--log-file`. This avoids guessing from globally newest DB timestamps, which can cross-wire a
+/// RepoPrompt run with a simultaneously launched external `agy` process.
+final class AntigravityTrajectoryToolLog: @unchecked Sendable {
+    private static let maxConversationLogPrefixBytes = 256 * 1024
+
     private let conversationsRoot: URL
-    private let preexisting: Set<String>
+    private let lock = NSLock()
+    private var turnGeneration: UInt64 = 0
+    private var turnLogFileURL: URL?
+    private var resolvedConversationURL: URL?
+    private var validatedLogFileSize: Int?
 
     init(environment: [String: String]) {
         let home: URL = if let h = environment["HOME"], !h.isEmpty { URL(fileURLWithPath: h) }
         else { FileManager.default.homeDirectoryForCurrentUser }
         conversationsRoot = home.appendingPathComponent(".gemini/antigravity-cli/conversations", isDirectory: true)
-        preexisting = Self.dbNames(in: conversationsRoot)
+    }
+
+    /// Starts a new correlation window before launching one `agy --print` turn. A resume invocation
+    /// creates a new conversation id and log file, so the prior binding must never carry forward.
+    func beginTurn(logFileURL: URL?) {
+        lock.withLock {
+            turnGeneration &+= 1
+            turnLogFileURL = logFileURL
+            resolvedConversationURL = nil
+            validatedLogFileSize = nil
+        }
     }
 
     func locate() -> URL? {
-        let fresh = Self.dbNames(in: conversationsRoot).subtracting(preexisting)
-        guard !fresh.isEmpty else { return nil }
-        return fresh.map { conversationsRoot.appendingPathComponent($0) }
-            .max { Self.modified($0) < Self.modified($1) }
+        let snapshot = lock.withLock {
+            (turnGeneration, turnLogFileURL, resolvedConversationURL, validatedLogFileSize)
+        }
+        guard let logFileURL = snapshot.1,
+              let currentLogFileSize = Self.regularFileSize(logFileURL)
+        else { return nil }
+
+        if let resolved = snapshot.2, snapshot.3 == currentLogFileSize {
+            guard Self.isRegularFile(resolved) else { return nil }
+            return lock.withLock {
+                // `beginTurn` can replace the binding while the filesystem check is in flight.
+                // A cached predecessor must not surface even once in the successor turn.
+                guard turnGeneration == snapshot.0,
+                      resolvedConversationURL == resolved,
+                      validatedLogFileSize == currentLogFileSize
+                else { return nil }
+                return resolved
+            }
+        }
+
+        guard let conversationID = Self.conversationID(inLogAt: logFileURL) else { return nil }
+
+        let candidate = conversationsRoot.appendingPathComponent("\(conversationID).db")
+        guard Self.isRegularFile(candidate) else { return nil }
+
+        return lock.withLock {
+            // A resume can replace the active log while this filesystem read is in flight. Never
+            // publish the predecessor's DB into the successor turn.
+            guard turnGeneration == snapshot.0 else { return nil }
+            guard resolvedConversationURL == nil || resolvedConversationURL == candidate else { return nil }
+            resolvedConversationURL = candidate
+            validatedLogFileSize = currentLogFileSize
+            return candidate
+        }
     }
 
-    private static func dbNames(in root: URL) -> Set<String> {
-        guard let e = try? FileManager.default.contentsOfDirectory(
-            at: root, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles]
-        ) else { return [] }
-        return Set(e.filter { $0.pathExtension == "db" }.map(\.lastPathComponent))
+    /// Extracts one canonical UUID from complete `Created conversation <UUID>` log lines. Multiple
+    /// distinct ids are ambiguous and fail closed; arbitrary UUIDs elsewhere in diagnostics never
+    /// become trajectory authority.
+    static func conversationID(inLogData data: Data) -> String? {
+        let marker = "Created conversation "
+        var matches = Set<String>()
+        for line in String(decoding: data, as: UTF8.self).split(whereSeparator: \.isNewline) {
+            guard let markerRange = line.range(of: marker) else { continue }
+            let token = String(line[markerRange.upperBound...])
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            guard
+                token.count == 36,
+                let uuid = UUID(uuidString: token),
+                uuid.uuidString.caseInsensitiveCompare(token) == .orderedSame
+            else { continue }
+            matches.insert(uuid.uuidString.lowercased())
+        }
+        guard matches.count == 1 else { return nil }
+        return matches.first
     }
 
-    private static func modified(_ url: URL) -> Date {
-        (try? url.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
+    private static func conversationID(inLogAt url: URL) -> String? {
+        guard let handle = try? FileHandle(forReadingFrom: url) else { return nil }
+        defer { try? handle.close() }
+        do {
+            guard let data = try handle.read(upToCount: maxConversationLogPrefixBytes),
+                  !data.isEmpty
+            else { return nil }
+            return conversationID(inLogData: data)
+        } catch {
+            return nil
+        }
+    }
+
+    private static func isRegularFile(_ url: URL) -> Bool {
+        (try? url.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) == true
+    }
+
+    private static func regularFileSize(_ url: URL) -> Int? {
+        guard let attributes = try? FileManager.default.attributesOfItem(atPath: url.path),
+              attributes[.type] as? FileAttributeType == .typeRegular,
+              let size = attributes[.size] as? NSNumber
+        else { return nil }
+        return size.intValue
     }
 }
 
@@ -85,10 +166,10 @@ struct AntigravityTrajectoryEmitter {
 /// Tails the run's agy trajectory DB and forwards tool-card events. Fail-open: waits for the DB to
 /// appear, opens it read-only, polls new steps, and reopens if the `steps` table is not yet present.
 ///
-/// Handles **auto-resume**: each resumed `--print --conversation` turn forks to a NEWER conversation
-/// DB, so every poll re-evaluates `locate()` (which returns the newest DB to appear) and switches to
-/// it — resetting the per-DB idx watermark while the emitter's invocation-id dedup carries across the
-/// switch. Runs until the surrounding task is cancelled.
+/// Handles **auto-resume**: each resumed `--print --conversation` turn forks to a new conversation
+/// DB. The provider starts a new per-turn log correlation window, so a later poll switches to that
+/// exact announced DB — resetting the per-DB idx watermark while the emitter's invocation-id dedup
+/// carries across the switch. Runs until the surrounding task is cancelled.
 enum AntigravityTrajectoryToolLogStream {
     private static let pageLimit: Int32 = 500
     private static let finalDrainMaxAttempts = 8
@@ -164,7 +245,7 @@ enum AntigravityTrajectoryToolLogStream {
         emitter: inout AntigravityTrajectoryEmitter
     ) -> PollResult {
         if let newest = locate()?.path, newest != currentPath {
-            currentPath = newest // a resume turn forked to a newer DB → switch, restart watermark
+            currentPath = newest // a resume turn announced its exact forked DB → restart watermark
             store = nil
             after = 0
         }

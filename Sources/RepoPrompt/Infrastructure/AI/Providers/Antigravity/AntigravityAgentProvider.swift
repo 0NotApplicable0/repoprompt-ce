@@ -377,6 +377,15 @@ final class AntigravityAgentProvider: HeadlessAgentProvider {
                     }
                     var runGateLocked = true
                     var toolLogTask: Task<Void, Never>?
+                    var turnLogFileURLs: [URL] = []
+                    // Keep every turn log available until the tailer completes its final bounded
+                    // drain. Removing the completed turn's log at loop exit could otherwise erase
+                    // the only conversation-id authority before a late trajectory DB appears.
+                    defer {
+                        for logFileURL in turnLogFileURLs {
+                            Self.removeLogFile(logFileURL)
+                        }
+                    }
                     do {
                         guard await streamRequests.isCurrent(streamRequest) else {
                             throw CancellationError()
@@ -393,8 +402,8 @@ final class AntigravityAgentProvider: HeadlessAgentProvider {
                         )
 
                         // agy emits no tool calls on stdout — tail the conversation trajectory DB for
-                        // live tool cards. The tailer re-locates the newest DB each poll, so it follows
-                        // the run across auto-resume forks.
+                        // live tool cards. Each turn's unique log announces its exact conversation id,
+                        // so external agy runs cannot redirect the tailer or auto-resume path.
                         let toolLog = AntigravityTrajectoryToolLog(environment: context.environment)
                         toolLogTask = Task {
                             await AntigravityTrajectoryToolLogStream.tail(into: continuation, locate: { toolLog.locate() })
@@ -409,7 +418,10 @@ final class AntigravityAgentProvider: HeadlessAgentProvider {
                         while true {
                             try Task.checkCancellation()
                             let logFileURL = Self.makeLogFileURL(runID: UUID())
-                            defer { Self.removeLogFile(logFileURL) }
+                            if let logFileURL {
+                                turnLogFileURLs.append(logFileURL)
+                            }
+                            toolLog.beginTurn(logFileURL: logFileURL)
 
                             // agy honors `--model` only when the prompt is the `--print` argv value,
                             // not when it arrives via STDIN. Inline the prompt when it fits under
@@ -440,7 +452,7 @@ final class AntigravityAgentProvider: HeadlessAgentProvider {
 
                             if outcome == .completed { break }
 
-                            // Not complete: capture this turn's conversation id (newest trajectory DB)
+                            // Not complete: capture this turn's exact log-announced conversation id
                             // and resume it. The forked DB can lag the process exit by a poll cycle, so
                             // retry locate() briefly (matching the tailer's 200ms cadence) before
                             // deciding — otherwise a transient miss is misreported as "task too large".

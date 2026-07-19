@@ -2,15 +2,12 @@ import Foundation
 
 /// Serializes `agy --print` runs within this process.
 ///
-/// agy auto-assigns conversation ids and exposes no way to read them (not on stdout, not in the
-/// `--log-file`) or to supply one (`--conversation <new-id>` is ignored; agy mints its own). The
-/// only handle on "which conversation DB belongs to this run" is therefore "the newest DB created
-/// after launch" (see `AntigravityTrajectoryToolLog`). That guess is correct only when at most one
-/// agy run executes at a time — otherwise two concurrent runs could tail or resume each other's
-/// conversation, cross-wiring tool cards and the auto-resume `--conversation` id.
+/// agy auto-assigns conversation ids. `AntigravityTrajectoryToolLog` binds each turn to the exact id
+/// announced in that turn's unique `--log-file`, so an external agy process cannot cross-wire tool
+/// cards or the auto-resume `--conversation` id.
 ///
-/// This actor enforces that single-run invariant for in-process runs (FIFO). Runs from external
-/// agy processes are out of scope, mirroring grok's cwd-scoping assumption.
+/// This actor still serializes in-process runs (FIFO), bounding AGY resource use and preserving the
+/// existing provider lifecycle ordering independently of that filesystem correlation.
 actor AntigravityRunGate {
     static let shared = AntigravityRunGate()
 

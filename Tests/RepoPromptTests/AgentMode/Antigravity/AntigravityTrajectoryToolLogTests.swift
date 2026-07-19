@@ -32,11 +32,53 @@ final class AntigravityTrajectoryToolLogTests: XCTestCase {
         let root = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("agy-\(UUID().uuidString)")
         let convs = root.appendingPathComponent(".gemini/antigravity-cli/conversations")
         try FileManager.default.createDirectory(at: convs, withIntermediateDirectories: true)
-        try Data().write(to: convs.appendingPathComponent("old.db"))
+        defer { try? FileManager.default.removeItem(at: root) }
         let log = AntigravityTrajectoryToolLog(environment: ["HOME": root.path])
+
+        let firstLog = root.appendingPathComponent("first.log")
+        log.beginTurn(logFileURL: firstLog)
         XCTAssertNil(log.locate())
-        try Data().write(to: convs.appendingPathComponent("new.db"))
-        XCTAssertEqual(log.locate()?.lastPathComponent, "new.db")
+
+        let firstID = UUID()
+        try Data("I0719 server.go:1] Created conversation not-a-uuid\n".utf8).write(to: firstLog)
+        let unrelatedID = UUID()
+        try Data().write(to: convs.appendingPathComponent("\(unrelatedID.uuidString.lowercased()).db"))
+        XCTAssertNil(log.locate(), "malformed and unrelated conversations must never be guessed")
+
+        try Data("I0719 server.go:1] Created conversation \(firstID.uuidString.lowercased())\n".utf8)
+            .write(to: firstLog)
+        XCTAssertNil(log.locate(), "the exact announced DB may legitimately lag the log line")
+        try Data().write(to: convs.appendingPathComponent("\(firstID.uuidString.lowercased()).db"))
+        XCTAssertEqual(log.locate()?.lastPathComponent, "\(firstID.uuidString.lowercased()).db")
+
+        // Once bound, a later external AGY DB cannot redirect the current turn.
+        let laterExternalID = UUID()
+        try Data().write(to: convs.appendingPathComponent("\(laterExternalID.uuidString.lowercased()).db"))
+        XCTAssertEqual(log.locate()?.lastPathComponent, "\(firstID.uuidString.lowercased()).db")
+
+        // The log can keep growing after the first bind. A second announced id makes the turn
+        // ambiguous even when it appears later, so the cached first DB must no longer be returned.
+        let appendedAmbiguousID = UUID()
+        try Data("""
+        I0719 server.go:1] Created conversation \(firstID.uuidString.lowercased())
+        I0719 server.go:2] Created conversation \(appendedAmbiguousID.uuidString)
+        """.utf8).write(to: firstLog)
+        XCTAssertNil(log.locate())
+
+        // Resume turns get a new log and exact DB binding; the predecessor cannot leak forward.
+        let secondID = UUID()
+        let secondLog = root.appendingPathComponent("second.log")
+        try Data("I0719 server.go:2] Created conversation \(secondID.uuidString)\n".utf8).write(to: secondLog)
+        try Data().write(to: convs.appendingPathComponent("\(secondID.uuidString.lowercased()).db"))
+        log.beginTurn(logFileURL: secondLog)
+        XCTAssertEqual(log.locate()?.lastPathComponent, "\(secondID.uuidString.lowercased()).db")
+
+        let thirdID = UUID()
+        let ambiguous = Data("""
+        I0719 server.go:3] Created conversation \(secondID.uuidString)
+        I0719 server.go:4] Created conversation \(thirdID.uuidString)
+        """.utf8)
+        XCTAssertNil(AntigravityTrajectoryToolLog.conversationID(inLogData: ambiguous))
     }
 
     /// — Emitter dedup/advance (pure) —
