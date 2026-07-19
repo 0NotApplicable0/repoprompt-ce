@@ -154,6 +154,80 @@ import XCTest
             }
         }
 
+        func testHistoryPartialResultLeavesPersistentConnectionUsable() async throws {
+            try await MCPSharedServerTestLease.shared.withLease { lease in
+                let fixture = try await PersistentMCPTestFixture.make(lease: lease)
+                let recorder = MCPExecutionTraceRecorder()
+                let manager = fixture.networkManager
+                let endpoint = try fixture.endpointA()
+
+                let applicationSupportRoot = FileManager.default.temporaryDirectory
+                    .appendingPathComponent("HistoryPersistentBudget-\(UUID().uuidString)", isDirectory: true)
+                let workspaceDirectories = (0 ... 5000).map { index in
+                    applicationSupportRoot
+                        .appendingPathComponent("Workspaces", isDirectory: true)
+                        .appendingPathComponent("Workspace-Synthetic-\(index)", isDirectory: true)
+                }
+                let scanner = HistorySessionScanner(
+                    applicationSupportRoot: applicationSupportRoot,
+                    workspaceDirectoryProvider: { _ in workspaceDirectories }
+                )
+                let runtime = MCPWindowToolRuntime(windowID: 42) { name, _, arguments, implementation in
+                    try await implementation(
+                        MCPWindowToolContext(toolName: name, windowID: 42),
+                        arguments
+                    )
+                }
+                let provider = MCPHistoryToolProvider(runtime: runtime, scannerFactory: { scanner })
+
+                MCPToolExecutionTracer.setTestSink { recorder.append($0) }
+                await manager.debugSetResolvedToolOperationOverride(toolName: MCPWindowToolName.history) {
+                    try await provider.execute(args: ["op": "list_sessions"])
+                }
+
+                do {
+                    let response = try await endpoint.callTool(
+                        name: MCPWindowToolName.history,
+                        arguments: [
+                            "op": "list_sessions",
+                            "context_id": fixture.contextA.tabID.uuidString
+                        ]
+                    )
+                    let text = try Self.toolResultText(response)
+                    XCTAssertTrue(text.contains("History Sessions ⚠️"), text)
+                    XCTAssertTrue(text.contains("workspace_count"), text)
+                    XCTAssertTrue(text.contains("5000/5000 workspaces"), text)
+
+                    _ = try await endpoint.client.request(method: "tools/list", params: [:])
+                    let isTerminal = await manager.debugIsExecutionWatchdogTerminal(
+                        connectionID: endpoint.connectionID
+                    )
+                    XCTAssertFalse(isTerminal)
+                    XCTAssertTrue(recorder.snapshot().contains {
+                        $0.connectionID == endpoint.connectionID
+                            && $0.toolName == MCPWindowToolName.history
+                            && $0.phase == .handlerCompleted
+                    })
+
+                    MCPToolExecutionTracer.setTestSink(nil)
+                    await manager.debugSetResolvedToolOperationOverride(
+                        toolName: MCPWindowToolName.history,
+                        operation: nil
+                    )
+                    await fixture.cleanup()
+                    try await fixture.assertCleanedUp()
+                } catch {
+                    MCPToolExecutionTracer.setTestSink(nil)
+                    await manager.debugSetResolvedToolOperationOverride(
+                        toolName: MCPWindowToolName.history,
+                        operation: nil
+                    )
+                    await fixture.cleanup()
+                    throw error
+                }
+            }
+        }
+
         func testSameWindowExclusiveResourceReleasesBeforeCompletionObserverTail() async throws {
             try await MCPSharedServerTestLease.shared.withLease { lease in
                 let fixture = try await PersistentMCPTestFixture.make(lease: lease)
