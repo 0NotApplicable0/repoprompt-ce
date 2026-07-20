@@ -3,6 +3,7 @@ import SQLite3
 
 protocol AntigravityTrajectoryStoreReading: AnyObject {
     func steps(after idx: Int64, limit: Int32) -> [AntigravityTrajectoryStore.ToolStep]?
+    func latestFailureKind() -> AntigravityTrajectoryStore.FailureKind?
 }
 
 /// Read-only reader over one agy conversation trajectory DB (`conversations/<id>.db`). Returns
@@ -13,6 +14,7 @@ protocol AntigravityTrajectoryStoreReading: AnyObject {
 final class AntigravityTrajectoryStore: AntigravityTrajectoryStoreReading {
     enum FailureKind: Equatable {
         case headlessPermissionDenied
+        case conversationContextLost
         case other
     }
 
@@ -33,6 +35,16 @@ final class AntigravityTrajectoryStore: AntigravityTrajectoryStoreReading {
     /// `error_details` can include a full stack trace. Only inspect a small prefix and immediately
     /// reduce it to a non-sensitive classification; raw diagnostics never leave this store.
     static let maxErrorDetailsBytes = 4 * 1024
+
+    /// AGY 1.1.x records request-builder failures in a terminal ephemeral-message payload rather
+    /// than `error_details`. Read only the newest row and a small payload prefix, then immediately
+    /// reduce the exact upstream signature to a non-sensitive category.
+    static let maxFailurePayloadBytes = 4 * 1024
+    private static let ephemeralMessageStepType: Int64 = 17
+    private static let completedStatus: Int64 = 3
+    private static let zeroChatMessagesMarker = Data(
+        "agent executor error: trajectory converted to zero chat messages".utf8
+    )
 
     static func shouldUseLegacyQuery(afterPrepareResult result: Int32, message: String) -> Bool {
         result == SQLITE_ERROR && message == "no such column: error_details"
@@ -117,5 +129,32 @@ final class AntigravityTrajectoryStore: AntigravityTrajectoryStoreReading {
         // Returning nil keeps the tailer's reopen/retry path active for the bounded final drain.
         guard stepResult == SQLITE_DONE else { return nil }
         return out
+    }
+
+    func latestFailureKind() -> FailureKind? {
+        guard let db else { return nil }
+        var stmt: OpaquePointer?
+        let sql = "SELECT step_type, status, substr(step_payload, 1, ?) FROM steps ORDER BY idx DESC LIMIT 1;"
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return nil }
+        defer { sqlite3_finalize(stmt) }
+        sqlite3_bind_int(stmt, 1, Int32(Self.maxFailurePayloadBytes))
+        guard sqlite3_step(stmt) == SQLITE_ROW else { return nil }
+
+        var payload = Data()
+        if let blob = sqlite3_column_blob(stmt, 2) {
+            payload = Data(bytes: blob, count: Int(sqlite3_column_bytes(stmt, 2)))
+        }
+        return Self.failureKind(
+            stepType: sqlite3_column_int64(stmt, 0),
+            status: sqlite3_column_int64(stmt, 1),
+            payload: payload
+        )
+    }
+
+    static func failureKind(stepType: Int64, status: Int64, payload: Data) -> FailureKind? {
+        guard stepType == ephemeralMessageStepType, status == completedStatus else { return nil }
+        let boundedPayload = Data(payload.prefix(maxFailurePayloadBytes))
+        guard boundedPayload.range(of: zeroChatMessagesMarker) != nil else { return nil }
+        return .conversationContextLost
     }
 }

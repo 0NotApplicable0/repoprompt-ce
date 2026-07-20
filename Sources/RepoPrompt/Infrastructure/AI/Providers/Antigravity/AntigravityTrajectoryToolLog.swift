@@ -5,6 +5,8 @@ import Foundation
 /// RepoPrompt run with a simultaneously launched external `agy` process.
 final class AntigravityTrajectoryToolLog: @unchecked Sendable {
     private static let maxConversationLogPrefixBytes = 256 * 1024
+    private static let failureReadMaxAttempts = 8
+    private static let failureReadTimeBudget: Duration = .milliseconds(250)
 
     private let conversationsRoot: URL
     private let lock = NSLock()
@@ -65,6 +67,39 @@ final class AntigravityTrajectoryToolLog: @unchecked Sendable {
             validatedLogFileSize = currentLogFileSize
             return candidate
         }
+    }
+
+    /// Reads the newest terminal failure from this turn's exact log-announced conversation. AGY can
+    /// commit its final WAL row just after the child exits, so retry under a short attempt and
+    /// monotonic-time budget. Raw trajectory payloads never leave the read-only store.
+    func latestCorrelatedFailureKind(
+        maxAttempts: Int = failureReadMaxAttempts,
+        timeBudget: Duration = failureReadTimeBudget,
+        waitForRetry: @Sendable @escaping (Duration) async -> Void = { duration in
+            try? await Task.sleep(for: duration)
+        },
+        storeFactory: @Sendable @escaping (String) -> (any AntigravityTrajectoryStoreReading)? = {
+            AntigravityTrajectoryStore(path: $0)
+        }
+    ) async throws -> AntigravityTrajectoryStore.FailureKind? {
+        guard maxAttempts > 0 else { return nil }
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: timeBudget)
+        for attempt in 0 ..< maxAttempts {
+            try Task.checkCancellation()
+            guard attempt == 0 || clock.now < deadline else { return nil }
+            if let path = locate()?.path,
+               let failureKind = storeFactory(path)?.latestFailureKind()
+            {
+                return failureKind
+            }
+            guard attempt + 1 < maxAttempts else { return nil }
+            let remaining = clock.now.duration(to: deadline)
+            guard remaining > .zero else { return nil }
+            let requested = Duration.milliseconds(min((attempt + 1) * 10, 40))
+            await waitForRetry(min(requested, remaining))
+        }
+        return nil
     }
 
     /// Extracts one canonical UUID from complete `Created conversation <UUID>` log lines. Multiple
@@ -199,7 +234,7 @@ enum AntigravityTrajectoryToolLogStream {
         storeFactory: @Sendable @escaping (String) -> (any AntigravityTrajectoryStoreReading)? = {
             AntigravityTrajectoryStore(path: $0)
         }
-    ) async {
+    ) async -> AntigravityTrajectoryStore.FailureKind? {
         var currentPath: String?
         var emitter = AntigravityTrajectoryEmitter() // invocation-id dedup persists across DB switches
         var store: (any AntigravityTrajectoryStoreReading)?
@@ -232,6 +267,11 @@ enum AntigravityTrajectoryToolLogStream {
                 waitForRetry: waitForFinalDrainRetry
             )
         }
+
+        // Resolve terminal evidence from a fresh store after the final drain. Never reuse
+        // `currentPath`: `beginTurn` may have replaced the binding while the prior poll was active.
+        guard let finalPath = locate()?.path else { return nil }
+        return storeFactory(finalPath)?.latestFailureKind()
     }
 
     @discardableResult

@@ -12,6 +12,10 @@ private final class SequencedAntigravityTrajectoryStore: AntigravityTrajectorySt
     func steps(after _: Int64, limit _: Int32) -> [AntigravityTrajectoryStore.ToolStep]? {
         responses.isEmpty ? [] : responses.removeFirst()
     }
+
+    func latestFailureKind() -> AntigravityTrajectoryStore.FailureKind? {
+        nil
+    }
 }
 
 private actor AntigravityFinalDrainRetryRecorder {
@@ -23,6 +27,44 @@ private actor AntigravityFinalDrainRetryRecorder {
 
     func snapshot() -> [Duration] {
         durations
+    }
+}
+
+private actor AntigravityLateContextLossWriter {
+    private let path: String
+    private var appended = false
+
+    init(path: String) {
+        self.path = path
+    }
+
+    func appendOnce() -> Bool {
+        guard !appended else { return true }
+        var db: OpaquePointer?
+        guard sqlite3_open(path, &db) == SQLITE_OK, let db else { return false }
+        defer { sqlite3_close(db) }
+
+        let payload = Data("agent executor error: trajectory converted to zero chat messages".utf8)
+        let sqliteTransient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(
+            db,
+            "INSERT INTO steps (idx, step_type, status, step_payload) VALUES (2, 17, 3, ?);",
+            -1,
+            &stmt,
+            nil
+        ) == SQLITE_OK else { return false }
+        defer { sqlite3_finalize(stmt) }
+        payload.withUnsafeBytes {
+            _ = sqlite3_bind_blob(stmt, 1, $0.baseAddress, Int32(payload.count), sqliteTransient)
+        }
+        guard sqlite3_step(stmt) == SQLITE_DONE else { return false }
+        appended = true
+        return true
+    }
+
+    func didAppend() -> Bool {
+        appended
     }
 }
 
@@ -81,6 +123,39 @@ final class AntigravityTrajectoryToolLogTests: XCTestCase {
         XCTAssertNil(AntigravityTrajectoryToolLog.conversationID(inLogData: ambiguous))
     }
 
+    func testCorrelatedFailureReadRetriesForLateWALCommit() async throws {
+        let root = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("agy-failure-\(UUID().uuidString)")
+        let conversations = root.appendingPathComponent(".gemini/antigravity-cli/conversations")
+        try FileManager.default.createDirectory(at: conversations, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let conversationID = UUID()
+        let logFile = root.appendingPathComponent("turn.log")
+        try Data("Created conversation \(conversationID.uuidString)\n".utf8).write(to: logFile)
+        let databaseURL = conversations.appendingPathComponent("\(conversationID.uuidString.lowercased()).db")
+        try createFailureProbeDatabase(at: databaseURL.path)
+
+        let log = AntigravityTrajectoryToolLog(environment: ["HOME": root.path])
+        log.beginTurn(logFileURL: logFile)
+        let writer = AntigravityLateContextLossWriter(path: databaseURL.path)
+        let retryRecorder = AntigravityFinalDrainRetryRecorder()
+
+        let failure = try await log.latestCorrelatedFailureKind(
+            maxAttempts: 4,
+            timeBudget: .seconds(1),
+            waitForRetry: { duration in
+                await retryRecorder.record(duration)
+                _ = await writer.appendOnce()
+            }
+        )
+
+        XCTAssertEqual(failure, .conversationContextLost)
+        let didAppend = await writer.didAppend()
+        XCTAssertTrue(didAppend)
+        let retryDurations = await retryRecorder.snapshot()
+        XCTAssertEqual(retryDurations, [.milliseconds(10)])
+    }
+
     /// — Emitter dedup/advance (pure) —
     private func toolPayload(
         _ callid: String,
@@ -111,6 +186,27 @@ final class AntigravityTrajectoryToolLogTests: XCTestCase {
         failureKind: AntigravityTrajectoryStore.FailureKind? = nil
     ) -> AntigravityTrajectoryStore.ToolStep {
         .init(idx: idx, status: status, payload: toolPayload(callid), failureKind: failureKind)
+    }
+
+    private func createFailureProbeDatabase(at path: String) throws {
+        var db: OpaquePointer?
+        XCTAssertEqual(sqlite3_open(path, &db), SQLITE_OK)
+        defer { sqlite3_close(db) }
+        XCTAssertEqual(sqlite3_exec(db, "PRAGMA journal_mode=WAL;", nil, nil, nil), SQLITE_OK)
+        XCTAssertEqual(sqlite3_exec(
+            db,
+            "CREATE TABLE steps (idx INTEGER PRIMARY KEY, step_type INTEGER, status INTEGER, step_payload BLOB);",
+            nil,
+            nil,
+            nil
+        ), SQLITE_OK)
+        XCTAssertEqual(sqlite3_exec(
+            db,
+            "INSERT INTO steps VALUES (1, 17, 3, X'6F7264696E617279');",
+            nil,
+            nil,
+            nil
+        ), SQLITE_OK)
     }
 
     private func createTrajectoryDB(at path: String, payload: Data) throws {
@@ -318,7 +414,7 @@ final class AntigravityTrajectoryToolLogTests: XCTestCase {
         // ordinary second poll, so cancellation itself is the only possible flush signal.
         try updateTrajectoryStatus(at: path, to: 3)
         tailTask.cancel()
-        await tailTask.value
+        _ = await tailTask.value
         pollGateContinuation.finish()
         continuation.finish()
 
@@ -330,6 +426,52 @@ final class AntigravityTrajectoryToolLogTests: XCTestCase {
         XCTAssertEqual(events.count(where: { $0.type == "tool_call" }), 1)
         XCTAssertEqual(events.count(where: { $0.type == "tool_result" }), 1)
         XCTAssertEqual(events[0].toolInvocationID, events[1].toolInvocationID)
+    }
+
+    func testCancellationFinalDrainReturnsLateContextLossEvidence() async throws {
+        let root = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("agy-final-failure-\(UUID().uuidString)")
+        let conversations = root.appendingPathComponent(".gemini/antigravity-cli/conversations")
+        try FileManager.default.createDirectory(at: conversations, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let conversationID = UUID()
+        let logFile = root.appendingPathComponent("turn.log")
+        try Data("Created conversation \(conversationID.uuidString)\n".utf8).write(to: logFile)
+        let databaseURL = conversations.appendingPathComponent("\(conversationID.uuidString.lowercased()).db")
+        try createFailureProbeDatabase(at: databaseURL.path)
+
+        let log = AntigravityTrajectoryToolLog(environment: ["HOME": root.path])
+        log.beginTurn(logFileURL: logFile)
+        let writer = AntigravityLateContextLossWriter(path: databaseURL.path)
+        let (_, continuation) = AsyncThrowingStream<AIStreamResult, Error>.makeStream()
+        let (pollGate, pollGateContinuation) = AsyncStream<Void>.makeStream()
+        let firstPoll = AsyncTestCondition(false)
+        let tailTask = Task {
+            await AntigravityTrajectoryToolLogStream.tail(
+                into: continuation,
+                locate: { log.locate() },
+                waitBetweenPolls: { _ in
+                    firstPoll.update { $0 = true }
+                    var iterator = pollGate.makeAsyncIterator()
+                    _ = await iterator.next()
+                }
+            )
+        }
+        defer {
+            tailTask.cancel()
+            pollGateContinuation.finish()
+            continuation.finish()
+        }
+
+        try await firstPoll.waitUntil("initial trajectory poll") { $0 }
+        let didAppend = await writer.appendOnce()
+        XCTAssertTrue(didAppend)
+        tailTask.cancel()
+        let failureKind = await tailTask.value
+        pollGateContinuation.finish()
+        continuation.finish()
+
+        XCTAssertEqual(failureKind, .conversationContextLost)
     }
 
     func testCancellationFinalDrainConsumesMoreThanOnePageExactlyOnce() async throws {
@@ -363,7 +505,7 @@ final class AntigravityTrajectoryToolLogTests: XCTestCase {
         try await didPoll.waitUntil("initial empty trajectory poll") { $0 }
         try insertTerminalTrajectorySteps(at: path, count: 501)
         tailTask.cancel()
-        await tailTask.value
+        _ = await tailTask.value
         pollGateContinuation.finish()
         continuation.finish()
 
@@ -408,7 +550,7 @@ final class AntigravityTrajectoryToolLogTests: XCTestCase {
 
         try await firstPoll.waitUntil("initial transient trajectory poll") { $0 }
         tailTask.cancel()
-        await tailTask.value
+        _ = await tailTask.value
         pollGateContinuation.finish()
         continuation.finish()
 

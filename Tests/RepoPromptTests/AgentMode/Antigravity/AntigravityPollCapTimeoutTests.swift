@@ -217,6 +217,53 @@ final class AntigravityPollCapTimeoutTests: XCTestCase {
         XCTAssertFalse(error?.localizedDescription.contains("secret-trace") == true)
     }
 
+    func testFinalContextLossErrorPrecedence() {
+        let error = AntigravityAgentProvider.processFailure(
+            exitStatus: 1,
+            timedOut: false,
+            stderr: "private upstream diagnostics",
+            logTail: nil,
+            trajectoryFailureKind: .conversationContextLost
+        )
+
+        XCTAssertEqual(error?.localizedDescription, AntigravityAgentProvider.conversationContextLostMessage)
+        XCTAssertFalse(error?.localizedDescription.contains("private upstream diagnostics") == true)
+
+        let permissionError = AIProviderError.invalidConfiguration(
+            detail: AntigravityAgentProvider.headlessPermissionDenialMessage
+        )
+        XCTAssertEqual(
+            AntigravityAgentProvider.terminalError(
+                permissionError,
+                finalTrajectoryFailureKind: .conversationContextLost
+            ).localizedDescription,
+            AntigravityAgentProvider.headlessPermissionDenialMessage
+        )
+
+        let timeoutError = AIProviderError.invalidConfiguration(detail: "Antigravity CLI timed out.")
+        XCTAssertEqual(
+            AntigravityAgentProvider.terminalError(
+                timeoutError,
+                finalTrajectoryFailureKind: .conversationContextLost
+            ).localizedDescription,
+            "Antigravity CLI timed out."
+        )
+    }
+
+    func testContextLossOverridesPartialOutputAndSuccessfulExit() {
+        XCTAssertThrowsError(try AntigravityAgentProvider.classifyTurn(
+            exitStatus: 0,
+            timedOut: false,
+            stdoutData: Data("I will inspect the requested files.".utf8),
+            stderr: "",
+            logTail: nil,
+            isFirstTurn: true,
+            trajectoryFailureKind: .conversationContextLost
+        )) { error in
+            XCTAssertEqual(error.localizedDescription, AntigravityAgentProvider.conversationContextLostMessage)
+        }
+    }
+
     func testInformationalTokenSourceDoesNotImplyAuthenticationFailure() {
         let error = AntigravityAgentProvider.processFailure(
             exitStatus: 17,

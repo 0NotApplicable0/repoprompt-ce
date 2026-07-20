@@ -91,6 +91,72 @@ final class AntigravityTrajectoryStoreTests: XCTestCase {
         )
     }
 
+    func testLatestFailureRequiresNewestTerminalEphemeralMessage() throws {
+        let path = NSTemporaryDirectory() + "agy-context-loss-\(UUID().uuidString).db"
+        var db: OpaquePointer?
+        XCTAssertEqual(sqlite3_open(path, &db), SQLITE_OK)
+        defer {
+            sqlite3_close(db)
+            try? FileManager.default.removeItem(atPath: path)
+        }
+        XCTAssertEqual(sqlite3_exec(
+            db,
+            "CREATE TABLE steps (idx INTEGER PRIMARY KEY, step_type INTEGER, status INTEGER, step_payload BLOB);",
+            nil,
+            nil,
+            nil
+        ), SQLITE_OK)
+        XCTAssertEqual(sqlite3_exec(
+            db,
+            "INSERT INTO steps VALUES (1, 17, 3, X'756E72656C61746564');",
+            nil,
+            nil,
+            nil
+        ), SQLITE_OK)
+
+        let payload = Data([0x12, 0x02, 0x00, 0x01])
+            + Data("agent executor error: trajectory converted to zero chat messages".utf8)
+        let sqliteTransient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
+        var stmt: OpaquePointer?
+        XCTAssertEqual(sqlite3_prepare_v2(
+            db,
+            "INSERT INTO steps VALUES (2, 17, 3, ?);",
+            -1,
+            &stmt,
+            nil
+        ), SQLITE_OK)
+        payload.withUnsafeBytes {
+            _ = sqlite3_bind_blob(stmt, 1, $0.baseAddress, Int32(payload.count), sqliteTransient)
+        }
+        XCTAssertEqual(sqlite3_step(stmt), SQLITE_DONE)
+        sqlite3_finalize(stmt)
+
+        let store = try XCTUnwrap(AntigravityTrajectoryStore(path: path))
+        XCTAssertEqual(store.latestFailureKind(), .conversationContextLost)
+
+        // A resumed/forked trajectory can copy older rows. Once any newer row exists, the stale
+        // marker must not poison the current turn even if the newer row is an ordinary tool step.
+        XCTAssertEqual(sqlite3_exec(
+            db,
+            "INSERT INTO steps VALUES (3, 8, 3, X'6E6577657220746F6F6C20726F77');",
+            nil,
+            nil,
+            nil
+        ), SQLITE_OK)
+        XCTAssertNil(store.latestFailureKind())
+    }
+
+    func testFailureClassifierRejectsUnrelatedPayloadAndWrongRowShape() {
+        let marker = Data("agent executor error: trajectory converted to zero chat messages".utf8)
+        XCTAssertNil(AntigravityTrajectoryStore.failureKind(stepType: 17, status: 3, payload: Data("unrelated".utf8)))
+        XCTAssertNil(AntigravityTrajectoryStore.failureKind(stepType: 8, status: 3, payload: marker))
+        XCTAssertNil(AntigravityTrajectoryStore.failureKind(stepType: 17, status: 7, payload: marker))
+
+        var beyondBound = Data(repeating: 0x78, count: AntigravityTrajectoryStore.maxFailurePayloadBytes)
+        beyondBound.append(marker)
+        XCTAssertNil(AntigravityTrajectoryStore.failureKind(stepType: 17, status: 3, payload: beyondBound))
+    }
+
     func testMissingStepsTableReturnsNilNotEmpty() throws {
         let path = try makeDB(withSteps: false)
         defer { try? FileManager.default.removeItem(atPath: path) }
