@@ -235,6 +235,9 @@ final class GrokModelRegistry {
     /// `Default model: …` line, which carries a value).
     private static let droppedLinePrefixes = [
         "you are not authenticated.",
+        // Signed-in counterpart of the not-authenticated notice, e.g. "You are logged in with
+        // grok.com." Without it the greeting is parsed as a model and poisons the picker.
+        "you are logged in with",
         "available models:",
         "default model:"
     ]

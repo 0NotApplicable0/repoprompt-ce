@@ -54,6 +54,23 @@ final class GrokModelRegistryTests: XCTestCase {
         XCTAssertEqual(labels, ["grok-build"])
     }
 
+    func testSignedInGreetingIsDropped() {
+        // Live `grok models` output for a signed-in session leads with a greeting line; parsing it
+        // as a model would put "You are logged in with grok.com." in the picker and send it as
+        // `--model`.
+        let output = """
+        You are logged in with grok.com.
+
+        Default model: grok-4.6
+
+        Available models:
+          * grok-4.6 (default)
+          - grok-4.5
+        """
+        let labels = GrokModelRegistry.parseModels(from: output)
+        XCTAssertEqual(labels, ["grok-4.6", "grok-4.5"])
+    }
+
     func testTrailingDefaultAnnotationIsStripped() {
         // The `(default)` annotation (case-insensitive, plus any whitespace before it) is removed
         // so the default model collapses onto the same bare id as a non-default entry.
