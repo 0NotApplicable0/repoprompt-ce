@@ -205,6 +205,17 @@ final class AntigravityAgentProvider: HeadlessAgentProvider {
         prompt.utf8.count <= maxInlinePromptBytes
     }
 
+    /// Reduce a persisted model selection to the id `agy --model` accepts.
+    ///
+    /// Selections stored while the picker mirrored whole `agy models` lines hold the tab-joined
+    /// `<id>\t<Display Label>` form, which `agy` rejects with `invalid model selection`. Keeping
+    /// only the id column lets those saved selections keep working without a re-pick; values that
+    /// are already a bare id pass through untouched.
+    static func normalizedModelID(_ model: String) -> String {
+        guard let tabIndex = model.firstIndex(of: "\t") else { return model }
+        return String(model[model.startIndex ..< tabIndex]).trimmingCharacters(in: .whitespaces)
+    }
+
     /// Build the `agy` argv.
     ///
     /// When `inlinePrompt` is non-nil the prompt is delivered as the `--print` argument value
@@ -224,10 +235,11 @@ final class AntigravityAgentProvider: HeadlessAgentProvider {
         if let inlinePrompt {
             args.append(inlinePrompt)
         }
-        if let model = config.modelString?.trimmingCharacters(in: .whitespacesAndNewlines),
-           !model.isEmpty, model.lowercased() != "default"
-        {
-            args += ["--model", model]
+        if let rawModel = config.modelString?.trimmingCharacters(in: .whitespacesAndNewlines) {
+            let model = Self.normalizedModelID(rawModel)
+            if !model.isEmpty, model.lowercased() != "default" {
+                args += ["--model", model]
+            }
         }
         if let workspacePath, !workspacePath.isEmpty {
             args += ["--add-dir", workspacePath]

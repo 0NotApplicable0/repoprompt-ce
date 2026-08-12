@@ -2,64 +2,96 @@
 import XCTest
 
 final class AntigravityModelRegistryTests: XCTestCase {
-    func testMultilineOutputBecomesTrimmedLabels() {
+    func testTabSeparatedOutputSplitsIDsFromDisplayLabels() {
+        // `agy` 1.1.12+ prints `<model-id>\t<Display Label>`; only the id is accepted by `--model`.
         let output = """
-        Gemini 3.5 Flash (Medium)
-        Gemini 3.5 Flash (High)
-        Gemini 3.5 Flash (Low)
-        Gemini 3.1 Pro (Low)
-        Gemini 3.1 Pro (High)
-        Claude Sonnet 4.6 (Thinking)
-        Claude Opus 4.6 (Thinking)
-        GPT-OSS 120B (Medium)
+        gemini-3.6-flash-high\tGemini 3.6 Flash (High)
+        gemini-3.1-pro-low\tGemini 3.1 Pro (Low)
+        claude-opus-4-6-thinking\tClaude Opus 4.6 (Thinking)
         """
-        let labels = AntigravityModelRegistry.parseModels(from: output)
-        XCTAssertEqual(labels, [
-            "Gemini 3.5 Flash (Medium)",
-            "Gemini 3.5 Flash (High)",
-            "Gemini 3.5 Flash (Low)",
+        let models = AntigravityModelRegistry.parseModels(from: output)
+        XCTAssertEqual(models.map(\.id), [
+            "gemini-3.6-flash-high",
+            "gemini-3.1-pro-low",
+            "claude-opus-4-6-thinking"
+        ])
+        XCTAssertEqual(models.map(\.displayName), [
+            "Gemini 3.6 Flash (High)",
             "Gemini 3.1 Pro (Low)",
-            "Gemini 3.1 Pro (High)",
-            "Claude Sonnet 4.6 (Thinking)",
-            "Claude Opus 4.6 (Thinking)",
-            "GPT-OSS 120B (Medium)"
+            "Claude Opus 4.6 (Thinking)"
         ])
     }
 
-    func testBlankAndWhitespaceLinesAreIgnored() {
-        let output = "\n  Gemini 3.5 Flash (Low)  \n\n\t\n  \n Gemini 3.1 Pro (High)\n\n"
-        let labels = AntigravityModelRegistry.parseModels(from: output)
-        XCTAssertEqual(labels, ["Gemini 3.5 Flash (Low)", "Gemini 3.1 Pro (High)"])
+    func testUntabbedLineIsBothIDAndDisplayName() {
+        // Pre-1.1.12 `agy` printed a bare display label that `--model` accepted verbatim.
+        let output = """
+        Gemini 3.5 Flash (Medium)
+        Gemini 3.5 Flash (Low)
+        """
+        let models = AntigravityModelRegistry.parseModels(from: output)
+        XCTAssertEqual(models, [
+            .init(id: "Gemini 3.5 Flash (Medium)", displayName: "Gemini 3.5 Flash (Medium)"),
+            .init(id: "Gemini 3.5 Flash (Low)", displayName: "Gemini 3.5 Flash (Low)")
+        ])
     }
 
-    func testEmptyOutputYieldsNoLabels() {
+    func testOnlyFirstTabSeparatesIDFromLabel() {
+        let models = AntigravityModelRegistry.parseModels(from: "some-id\tLabel\twith tab")
+        XCTAssertEqual(models, [.init(id: "some-id", displayName: "Label\twith tab")])
+    }
+
+    func testBlankLabelColumnFallsBackToID() {
+        let models = AntigravityModelRegistry.parseModels(from: "gemini-3.6-flash-low\t   ")
+        XCTAssertEqual(models, [.init(id: "gemini-3.6-flash-low", displayName: "gemini-3.6-flash-low")])
+    }
+
+    func testLeadingTabCollapsesToLegacyLabelForm() {
+        // Line trimming strips a leading tab before the split, so a record with a blank id column
+        // (which `agy` never emits) degrades to the pre-1.1.12 bare-label shape rather than
+        // yielding an empty id.
+        let models = AntigravityModelRegistry.parseModels(from: "\tGemini 3.6 Flash (High)")
+        XCTAssertEqual(models, [.init(id: "Gemini 3.6 Flash (High)", displayName: "Gemini 3.6 Flash (High)")])
+    }
+
+    func testBlankAndWhitespaceLinesAreIgnored() {
+        let output = "\n  gemini-3.6-flash-low\tGemini 3.6 Flash (Low)  \n\n \n gemini-3.1-pro-high\tGemini 3.1 Pro (High)\n\n"
+        let models = AntigravityModelRegistry.parseModels(from: output)
+        XCTAssertEqual(models.map(\.id), ["gemini-3.6-flash-low", "gemini-3.1-pro-high"])
+        XCTAssertEqual(models.map(\.displayName), ["Gemini 3.6 Flash (Low)", "Gemini 3.1 Pro (High)"])
+    }
+
+    func testEmptyOutputYieldsNoModels() {
         XCTAssertTrue(AntigravityModelRegistry.parseModels(from: "").isEmpty)
         XCTAssertTrue(AntigravityModelRegistry.parseModels(from: "   \n \t \n").isEmpty)
     }
 
-    func testDuplicateLabelsAreCollapsedPreservingFirstOrder() {
+    func testDuplicateIDsAreCollapsedPreservingFirstOrder() {
         let output = """
-        Gemini 3.5 Flash (Low)
-        Gemini 3.1 Pro (High)
-        Gemini 3.5 Flash (Low)
+        gemini-3.6-flash-low\tGemini 3.6 Flash (Low)
+        gemini-3.1-pro-high\tGemini 3.1 Pro (High)
+        GEMINI-3.6-FLASH-LOW\tGemini 3.6 Flash (Low) Again
         """
-        let labels = AntigravityModelRegistry.parseModels(from: output)
-        XCTAssertEqual(labels, ["Gemini 3.5 Flash (Low)", "Gemini 3.1 Pro (High)"])
+        let models = AntigravityModelRegistry.parseModels(from: output)
+        XCTAssertEqual(models.map(\.id), ["gemini-3.6-flash-low", "gemini-3.1-pro-high"])
     }
 
     func testTrailingCarriageReturnsAreTrimmed() {
         // `agy` output captured on some terminals may include CRLF line endings.
-        let output = "Gemini 3.5 Flash (Low)\r\nGemini 3.1 Pro (High)\r\n"
-        let labels = AntigravityModelRegistry.parseModels(from: output)
-        XCTAssertEqual(labels, ["Gemini 3.5 Flash (Low)", "Gemini 3.1 Pro (High)"])
+        let output = "gemini-3.6-flash-low\tGemini 3.6 Flash (Low)\r\ngemini-3.1-pro-high\tGemini 3.1 Pro (High)\r\n"
+        let models = AntigravityModelRegistry.parseModels(from: output)
+        XCTAssertEqual(models.map(\.id), ["gemini-3.6-flash-low", "gemini-3.1-pro-high"])
+        XCTAssertEqual(models.map(\.displayName), ["Gemini 3.6 Flash (Low)", "Gemini 3.1 Pro (High)"])
     }
 
     @MainActor
-    func testCatalogOptionsIncludeDefaultPlusLiveLabels() {
+    func testCatalogOptionsExposeIDAsRawValueAndLabelAsDisplayName() {
         let registry = AntigravityModelRegistry.shared
         registry.test_reset()
         defer { registry.test_reset() }
-        registry.test_setLabels(["Gemini 3.5 Flash (Low)", "Claude Opus 4.6 (Thinking)"])
+        registry.test_setModels([
+            .init(id: "gemini-3.6-flash-low", displayName: "Gemini 3.6 Flash (Low)"),
+            .init(id: "claude-opus-4-6-thinking", displayName: "Claude Opus 4.6 (Thinking)")
+        ])
 
         let availability = AgentModelCatalog.AvailabilityContext(antigravityAvailable: true)
         let options = AgentModelCatalog.options(for: .antigravity, availability: availability)
@@ -67,29 +99,31 @@ final class AntigravityModelRegistryTests: XCTestCase {
 
         XCTAssertEqual(options.first?.rawValue, AgentModel.defaultModel.rawValue)
         XCTAssertTrue(options.first?.isPlaceholderDefault == true)
-        XCTAssertTrue(raws.contains("Gemini 3.5 Flash (Low)"))
-        XCTAssertTrue(raws.contains("Claude Opus 4.6 (Thinking)"))
-        // The live labels are exposed verbatim as both raw value and display name.
+        // The raw value must be the bare id: it is what lands after `agy --model`.
+        XCTAssertTrue(raws.contains("gemini-3.6-flash-low"))
+        XCTAssertTrue(raws.contains("claude-opus-4-6-thinking"))
         XCTAssertEqual(
-            options.first(where: { $0.rawValue == "Gemini 3.5 Flash (Low)" })?.displayName,
-            "Gemini 3.5 Flash (Low)"
+            options.first(where: { $0.rawValue == "gemini-3.6-flash-low" })?.displayName,
+            "Gemini 3.6 Flash (Low)"
         )
+        // No option may carry the tab-joined line that `agy` rejects.
+        XCTAssertFalse(raws.contains { $0.contains("\t") })
     }
 
     @MainActor
-    func testClearCacheEmptiesLabelsAndPostsChange() {
+    func testClearCacheEmptiesModelsAndPostsChange() {
         let registry = AntigravityModelRegistry.shared
         registry.test_reset()
         defer { registry.test_reset() }
-        registry.test_setLabels(["Gemini 3.5 Flash (Low)"])
-        XCTAssertFalse(registry.currentModelLabels().isEmpty)
+        registry.test_setModels([.init(id: "gemini-3.6-flash-low", displayName: "Gemini 3.6 Flash (Low)")])
+        XCTAssertFalse(registry.currentModels().isEmpty)
         XCTAssertNotNil(registry.lastRefresh())
 
         let expectation = expectation(forNotification: .antigravityModelsChanged, object: nil)
         registry.clearCache()
         wait(for: [expectation], timeout: 2.0)
 
-        XCTAssertTrue(registry.currentModelLabels().isEmpty)
+        XCTAssertTrue(registry.currentModels().isEmpty)
         XCTAssertNil(registry.lastRefresh())
     }
 
@@ -98,8 +132,8 @@ final class AntigravityModelRegistryTests: XCTestCase {
         let registry = AntigravityModelRegistry.shared
         registry.test_reset()
         registry.clearCache()
-        // Reset already empties; clearCache on an empty cache must not regress labels.
-        XCTAssertTrue(registry.currentModelLabels().isEmpty)
+        // Reset already empties; clearCache on an empty cache must not regress the cache.
+        XCTAssertTrue(registry.currentModels().isEmpty)
     }
 
     func testRefreshBacksOffAndDoesNotImmediatelyRespawnWithinStalenessWindow() async {
@@ -138,7 +172,7 @@ final class AntigravityModelRegistryTests: XCTestCase {
         defer { registry.test_reset() }
 
         registry.test_simulateFailedRefreshAttempt()
-        XCTAssertTrue(registry.currentModelLabels().isEmpty, "Failed attempt must not populate cache")
+        XCTAssertTrue(registry.currentModels().isEmpty, "Failed attempt must not populate cache")
         XCTAssertNil(registry.lastRefresh(), "Failed attempt must not set the success timestamp")
 
         // Now a render-triggered refreshIfStale must back off (attempt time is fresh).

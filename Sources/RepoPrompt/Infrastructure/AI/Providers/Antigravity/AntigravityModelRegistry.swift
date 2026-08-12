@@ -4,15 +4,18 @@ import Foundation
 /// Centralized registry for Antigravity (`agy`) dynamic models.
 ///
 /// Mirrors `AgentCodexModelRegistry` (the canonical store the Codex live-model picker reads),
-/// adapted to `agy`'s much simpler contract: `agy models` prints one plain-text model *label*
-/// per line (e.g. `Gemini 3.5 Flash (Low)`), and `agy --model "<LABEL>"` accepts that label
-/// verbatim — there is no slug mapping, so the raw value and the display name are both the label.
+/// adapted to `agy`'s contract: as of `agy` 1.1.12 `agy models` prints one tab-separated
+/// `<model-id>\t<Display Label>` record per line (e.g. `gemini-3.6-flash-high\tGemini 3.6 Flash
+/// (High)`), and `agy --model` accepts only the *id* field — passing the display label, or the
+/// whole line, fails the run with `invalid model selection`. Older `agy` builds printed one bare
+/// display label per line and accepted that label verbatim, so a line with no tab is treated as
+/// both the id and the display name.
 ///
 /// Owns:
-/// - A thread-safe cache of model labels plus the last-refresh timestamp.
+/// - A thread-safe cache of models plus the last-refresh timestamp.
 /// - An `async refresh()` that resolves `agy` (the same PATH machinery used by
 ///   `APISettingsViewModel.testAntigravityConnection()`), runs `agy models` with a short
-///   timeout (no LLM/network round-trip), and parses non-empty stdout lines into labels.
+///   timeout (no LLM/network round-trip), and parses non-empty stdout lines into models.
 /// - Broadcasting a `Notification` (`.antigravityModelsChanged`) when the cache changes so the
 ///   Agent Mode model picker re-reads its options (mirrors the Codex/ACP live-model refresh).
 ///
@@ -21,10 +24,18 @@ import Foundation
 /// static `Default` option.
 ///
 /// Related:
-/// - `AgentModelCatalog.options(for: .antigravity)` (consumes `currentModelLabels()`)
+/// - `AgentModelCatalog.options(for: .antigravity)` (consumes `currentModels()`)
 /// - `CodexModelPollingService` / `AgentCodexModelRegistry` (the pattern this mirrors)
 final class AntigravityModelRegistry {
     static let shared = AntigravityModelRegistry()
+
+    /// One live `agy models` entry. `id` is the only form `agy --model` accepts; `displayName`
+    /// is the human-facing label shown in the picker. They are equal for pre-1.1.12 `agy`
+    /// output, which carried no id column.
+    struct Model: Equatable {
+        let id: String
+        let displayName: String
+    }
 
     /// Cache is considered stale after this interval, used to gate background refreshes triggered
     /// from `options(...)` so the picker does not spawn a process on every render.
@@ -35,7 +46,7 @@ final class AntigravityModelRegistry {
     private static let processTimeoutSeconds: TimeInterval = 8
 
     private let lock = NSLock()
-    private var labels: [String] = []
+    private var models: [Model] = []
     private var lastRefreshDate: Date?
     /// Timestamp of the last refresh *attempt*, whether it succeeded or failed. Used to back
     /// off `refreshIfStale()` so a failing `agy models` (missing binary, not signed in, nonzero
@@ -55,11 +66,11 @@ final class AntigravityModelRegistry {
 
     // MARK: - Synchronous cache reads
 
-    /// Returns the cached model labels (non-blocking). Empty when no successful refresh has run.
-    func currentModelLabels() -> [String] {
+    /// Returns the cached models (non-blocking). Empty when no successful refresh has run.
+    func currentModels() -> [Model] {
         lock.lock()
         defer { lock.unlock() }
-        return labels
+        return models
     }
 
     /// Timestamp of the last successful refresh, or `nil` if none has completed.
@@ -139,7 +150,7 @@ final class AntigravityModelRegistry {
         guard let output = await Self.runModelsCommand() else { return }
         let parsed = Self.parseModels(from: output)
         guard !parsed.isEmpty else { return }
-        applyLabels(parsed)
+        applyModels(parsed)
     }
 
     private func recordAttempt() {
@@ -148,10 +159,10 @@ final class AntigravityModelRegistry {
         lock.unlock()
     }
 
-    private func applyLabels(_ newLabels: [String]) {
+    private func applyModels(_ newModels: [Model]) {
         lock.lock()
-        let didChange = newLabels != labels
-        labels = newLabels
+        let didChange = newModels != models
+        models = newModels
         let now = Date()
         lastRefreshDate = now
         lastAttemptDate = now
@@ -228,31 +239,50 @@ final class AntigravityModelRegistry {
 
     // MARK: - Parsing
 
-    /// Parses `agy models` stdout into trimmed, non-empty model labels in source order.
+    /// Parses `agy models` stdout into trimmed, non-empty models in source order.
     ///
-    /// `agy models` prints one label per line as plain text. Blank/whitespace-only lines are
-    /// dropped and duplicates are collapsed (first occurrence wins) so the picker stays clean.
-    static func parseModels(from output: String) -> [String] {
+    /// Each line is `<model-id>\t<Display Label>` (agy 1.1.12+). Only the first tab separates the
+    /// two fields, so a label containing tabs still resolves. A line with no tab is older `agy`
+    /// output, where the single field is both the id and the display name. Blank/whitespace-only
+    /// lines are dropped and duplicate ids are collapsed (first occurrence wins) so the picker
+    /// stays clean.
+    static func parseModels(from output: String) -> [Model] {
         var seen = Set<String>()
-        var result: [String] = []
+        var result: [Model] = []
         // Split on any newline variant (LF, CRLF, CR). Note `\r\n` is a single Swift
         // grapheme, so `.newlines` (which includes the CR/LF scalars) is used rather than a
-        // `Character`-based split to keep CRLF-terminated `agy` output one label per line.
+        // `Character`-based split to keep CRLF-terminated `agy` output one record per line.
         for rawLine in output.components(separatedBy: .newlines) {
-            let label = rawLine.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !label.isEmpty, seen.insert(label).inserted else { continue }
-            result.append(label)
+            let line = rawLine.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !line.isEmpty else { continue }
+
+            let id: String
+            let displayName: String
+            if let tabIndex = line.firstIndex(of: "\t") {
+                id = String(line[line.startIndex ..< tabIndex])
+                    .trimmingCharacters(in: .whitespaces)
+                let trailing = String(line[line.index(after: tabIndex)...])
+                    .trimmingCharacters(in: .whitespaces)
+                // A record whose label column is blank still selects fine by id.
+                displayName = trailing.isEmpty ? id : trailing
+            } else {
+                id = line
+                displayName = line
+            }
+
+            guard !id.isEmpty, seen.insert(id.lowercased()).inserted else { continue }
+            result.append(Model(id: id, displayName: displayName))
         }
         return result
     }
 
-    /// Clears the cached model labels and last-refresh timestamp. Called on disconnect so a
+    /// Clears the cached models and last-refresh timestamp. Called on disconnect so a
     /// stale model picker does not survive after the user removes the Antigravity integration.
     func clearCache() {
         let didChange: Bool
         lock.lock()
-        didChange = !labels.isEmpty
-        labels = []
+        didChange = !models.isEmpty
+        models = []
         lastRefreshDate = nil
         lastAttemptDate = nil
         lock.unlock()
@@ -261,9 +291,9 @@ final class AntigravityModelRegistry {
     }
 
     #if DEBUG
-        func test_setLabels(_ newLabels: [String]) {
+        func test_setModels(_ newModels: [Model]) {
             lock.lock()
-            labels = newLabels
+            models = newModels
             let now = Date()
             lastRefreshDate = now
             lastAttemptDate = now
@@ -272,7 +302,7 @@ final class AntigravityModelRegistry {
 
         func test_reset() {
             lock.lock()
-            labels = []
+            models = []
             lastRefreshDate = nil
             lastAttemptDate = nil
             refreshAttemptCount = 0

@@ -69,6 +69,34 @@ final class AntigravityArgumentBuilderTests: XCTestCase {
         XCTAssertFalse(args.contains("--model"))
     }
 
+    func testBuildArgumentsReducesPersistedTabJoinedModelToID() {
+        // Selections saved while the picker mirrored whole `agy models` lines hold
+        // `<id>\t<Display Label>`; `agy` rejects that with `invalid model selection`.
+        let args = AntigravityAgentProvider.buildArguments(
+            config: AntigravityAgentConfig(modelString: "gemini-3.6-flash-high\tGemini 3.6 Flash (High)"),
+            workspacePath: nil,
+            logFilePath: nil
+        )
+        XCTAssertTrue(consecutive(args, ["--model", "gemini-3.6-flash-high"]))
+        XCTAssertFalse(args.contains { $0.contains("\t") })
+    }
+
+    func testNormalizedModelIDPassesBareIDThrough() {
+        XCTAssertEqual(
+            AntigravityAgentProvider.normalizedModelID("gemini-3.6-flash-high"),
+            "gemini-3.6-flash-high"
+        )
+    }
+
+    func testNormalizedModelIDKeepsLegacyDisplayLabel() {
+        // Pre-1.1.12 `agy` accepted a bare display label, so a persisted label with no id column
+        // must pass through untouched rather than being reduced to nothing.
+        XCTAssertEqual(
+            AntigravityAgentProvider.normalizedModelID("Gemini 3.6 Flash (High)"),
+            "Gemini 3.6 Flash (High)"
+        )
+    }
+
     // MARK: - Inline prompt (agy honors `--model` only when the prompt is the `--print` argv value)
 
     func testBuildArgumentsInlinesPromptAsPrintValueWhenProvided() {

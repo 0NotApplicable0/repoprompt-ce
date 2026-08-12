@@ -379,10 +379,10 @@ enum AgentModelCatalog {
     }
 
     /// Builds the Antigravity model options: the static `Default` placeholder followed by one
-    /// option per live `agy models` label (raw value == display name == the verbatim label, which
-    /// `agy --model "<LABEL>"` accepts directly — no slug mapping). Mirrors the Codex live-model
-    /// path: a background refresh is kicked off when the cache is stale, and the picker re-reads
-    /// these options when `AntigravityModelRegistry` posts `.antigravityModelsChanged`.
+    /// option per live `agy models` record. The raw value is the model *id* (the only form
+    /// `agy --model` accepts) and the display name is the label column. Mirrors the Codex
+    /// live-model path: a background refresh is kicked off when the cache is stale, and the picker
+    /// re-reads these options when `AntigravityModelRegistry` posts `.antigravityModelsChanged`.
     private static func antigravityOptions(
         for agentKind: AgentProviderKind,
         availability: AvailabilityContext
@@ -395,11 +395,11 @@ enum AgentModelCatalog {
             .map { staticOption($0, for: agentKind) }
 
         var seen = Set(options.map { $0.rawValue.lowercased() })
-        for label in AntigravityModelRegistry.shared.currentModelLabels() {
-            guard seen.insert(label.lowercased()).inserted else { continue }
+        for model in AntigravityModelRegistry.shared.currentModels() {
+            guard seen.insert(model.id.lowercased()).inserted else { continue }
             options.append(AgentModelOption(
-                rawValue: label,
-                displayName: label,
+                rawValue: model.id,
+                displayName: model.displayName,
                 description: nil,
                 isPlaceholderDefault: false,
                 isProviderDefault: false
