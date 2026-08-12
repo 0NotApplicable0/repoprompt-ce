@@ -559,6 +559,10 @@ final class MCPToolExecutionWatchdogTests: XCTestCase {
         let invocationID = UUID()
         let event = MCPToolExecutionTraceEvent(
             toolName: MCPWindowToolName.manageSelection,
+            operationIdentity: MCPDomainToolCatalog.operationIdentity(
+                for: MCPWindowToolName.manageSelection,
+                input: .missing
+            ),
             connectionID: UUID(),
             invocationID: invocationID,
             runID: nil,
@@ -588,27 +592,23 @@ final class MCPToolExecutionWatchdogTests: XCTestCase {
         XCTAssertEqual(
             [
                 MCPToolExecutionHandlerPhase.getCodeStructureSeedResolution,
-                .getCodeStructureSeedDemand,
-                .getCodeStructureProjectionWait,
-                .getCodeStructureGraphQuery,
-                .getCodeStructureTargetDemand,
-                .getCodeStructureGraphRequery,
+                .getCodeStructureGraphSnapshot,
+                .getCodeStructureGraphTraversal,
+                .getCodeStructureGraphRevalidation,
+                .getCodeStructureRenderDemand,
                 .getCodeStructureFreeze,
                 .getCodeStructureRender,
-                .getCodeStructureAssembly,
-                .getCodeStructurePublicationRevalidation
+                .getCodeStructureAssembly
             ].map(\.rawValue),
             [
                 "get_code_structure.seed_resolution",
-                "get_code_structure.seed_demand",
-                "get_code_structure.projection_wait",
-                "get_code_structure.graph_query",
-                "get_code_structure.target_demand",
-                "get_code_structure.graph_requery",
+                "get_code_structure.graph_snapshot",
+                "get_code_structure.graph_traversal",
+                "get_code_structure.graph_revalidation",
+                "get_code_structure.render_demand",
                 "get_code_structure.freeze",
                 "get_code_structure.render",
-                "get_code_structure.assembly",
-                "get_code_structure.publication_revalidation"
+                "get_code_structure.assembly"
             ]
         )
         XCTAssertTrue(event.description.contains("cleanup_disposition=detach_and_settle"))

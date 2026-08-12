@@ -87,10 +87,10 @@ final class ModelPickerStringOrderingTests: XCTestCase {
             "claude-sonnet-5:low",
             "claude-sonnet-5:medium",
             "claude-sonnet-5:high",
-            "claude-sonnet-5:max",
-            "claude-sonnet-5:xhigh"
+            "claude-sonnet-5:xhigh",
+            "claude-sonnet-5:max"
         ])
-        XCTAssertEqual(sonnet5Group.options.map(\.displayName), ["Low", "Medium", "High", "Max", "XHigh"])
+        XCTAssertEqual(sonnet5Group.options.map(\.displayName), ["Low", "Medium", "High", "XHigh", "Max"])
     }
 
     func testClaudeCodeProviderResolvesSonnet5EffortSpecifierForCLI() throws {
@@ -101,6 +101,159 @@ final class ModelPickerStringOrderingTests: XCTestCase {
         let xhighSelection = try ClaudeCodeProvider.resolveCLIModelSelection(for: .claudeCodeModel(specifier: "claude-sonnet-5:xhigh"))
         XCTAssertEqual(xhighSelection.modelArgument, "claude-sonnet-5")
         XCTAssertEqual(xhighSelection.effortLevel, .xhigh)
+    }
+
+    func testClaudeCodePickerExposesOpus5WithOfficialEffortsAndStableOrdering() throws {
+        let models = AIModel.modelsForProvider(.claudeCode)
+        let opus5 = AIModel.claudeCodeModel(specifier: "claude-opus-5")
+        XCTAssertTrue(models.contains(opus5))
+        XCTAssertEqual(
+            ClaudeCodeAIModelCatalog.validatedModel(specifier: "claude-opus-5:xhigh"),
+            .claudeCodeModel(specifier: "claude-opus-5:xhigh")
+        )
+        XCTAssertNil(ClaudeCodeAIModelCatalog.validatedModel(specifier: "claude-opus-5:ultra"))
+        XCTAssertEqual(
+            AIModel.fromModelName("\(ClaudeCodeAIModelCatalog.rawPrefix)claude-opus-5:max"),
+            .claudeCodeModel(specifier: "claude-opus-5:max")
+        )
+
+        let menu = AIModel.claudeCodeMenu(for: models)
+        XCTAssertEqual(Array(menu.groups.prefix(6).map(\.baseModelRaw)), [
+            "claude-fable-5",
+            "opus[1m]",
+            "opus",
+            "claude-opus-5",
+            "claude-opus-4-8",
+            "claude-opus-4-7"
+        ])
+        let opus5Group = try XCTUnwrap(menu.groups.first { $0.baseModelRaw == "claude-opus-5" })
+        XCTAssertEqual(opus5Group.displayName, "Opus 5")
+        XCTAssertEqual(opus5Group.options.compactMap(\.model.claudeCodeRuntimeSpecifierRaw), [
+            "claude-opus-5:low",
+            "claude-opus-5:medium",
+            "claude-opus-5:high",
+            "claude-opus-5:xhigh",
+            "claude-opus-5:max"
+        ])
+        XCTAssertEqual(opus5Group.options.map(\.displayName), ["Low", "Medium", "High", "XHigh", "Max"])
+
+        XCTAssertEqual(AgentModel(rawValue: "claude-opus-5"), .claudeOpus5)
+        XCTAssertEqual(AgentModel.claudeOpus5.contextWindowTokens, 1_000_000)
+        XCTAssertTrue(AgentModel.claudeOpus5.isExtendedContext)
+        XCTAssertEqual(try JSONDecoder().decode(AgentModel.self, from: JSONEncoder().encode(AgentModel.claudeOpus5)), .claudeOpus5)
+
+        let suiteName = "ModelPickerStringOrderingTests.Opus5.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        XCTAssertEqual(
+            ClaudeAgentToolPreferences.effortLevel(
+                forModelRaw: "claude-opus-5",
+                agentKind: .claudeCode,
+                defaults: defaults
+            ),
+            .high
+        )
+
+        let maxSelection = try ClaudeCodeProvider.resolveCLIModelSelection(for: .claudeCodeModel(specifier: "claude-opus-5:max"))
+        XCTAssertEqual(maxSelection.modelArgument, "claude-opus-5")
+        XCTAssertEqual(maxSelection.effortLevel, .max)
+        let xhighSelection = try ClaudeCodeProvider.resolveCLIModelSelection(for: .claudeCodeModel(specifier: "claude-opus-5:xhigh"))
+        XCTAssertEqual(xhighSelection.modelArgument, "claude-opus-5")
+        XCTAssertEqual(xhighSelection.effortLevel, .xhigh)
+    }
+
+    func testClaudeCodePickerExposesOpus48AsPinnedOneMillionTokenModel() throws {
+        let baseRaw = "claude-opus-4-8"
+        let effortRaws = [
+            "claude-opus-4-8:low",
+            "claude-opus-4-8:medium",
+            "claude-opus-4-8:high",
+            "claude-opus-4-8:xhigh",
+            "claude-opus-4-8:max"
+        ]
+        let expectedModels = ([baseRaw] + effortRaws).map {
+            AIModel.claudeCodeModel(specifier: $0)
+        }
+
+        let models = AIModel.modelsForProvider(.claudeCode)
+        for model in expectedModels {
+            XCTAssertTrue(models.contains(model), "Missing Claude Code picker model \(model.rawValue)")
+        }
+        XCTAssertFalse(models.contains(.claudeCodeModel(specifier: "claude-opus-4-8[1m]")))
+
+        let menu = AIModel.claudeCodeMenu(for: models)
+        let groupRaws = menu.groups.map(\.baseModelRaw)
+        let opus48Index = try XCTUnwrap(groupRaws.firstIndex(of: baseRaw))
+        XCTAssertGreaterThan(opus48Index, 0)
+        XCTAssertLessThan(opus48Index + 1, groupRaws.count)
+        XCTAssertEqual(groupRaws[opus48Index - 1], "claude-opus-5")
+        XCTAssertEqual(groupRaws[opus48Index + 1], "claude-opus-4-7")
+
+        let opus48Group = menu.groups[opus48Index]
+        XCTAssertEqual(opus48Group.displayName, "Opus 4.8")
+        XCTAssertEqual(opus48Group.options.compactMap(\.model.claudeCodeRuntimeSpecifierRaw), effortRaws)
+        XCTAssertEqual(opus48Group.options.map(\.displayName), ["Low", "Medium", "High", "XHigh", "Max"])
+
+        for (raw, expectedModel) in zip([baseRaw] + effortRaws, expectedModels) {
+            XCTAssertEqual(
+                AIModel.fromModelName("\(ClaudeCodeAIModelCatalog.rawPrefix)\(raw)"),
+                expectedModel
+            )
+        }
+        XCTAssertNil(AIModel.fromModelName("\(ClaudeCodeAIModelCatalog.rawPrefix)claude-opus-4-8:ultra"))
+        XCTAssertNil(AIModel.fromModelName("\(ClaudeCodeAIModelCatalog.rawPrefix)claude-opus-4-8[1m]"))
+
+        let effortLevels: [ClaudeCodeEffortLevel] = [.low, .medium, .high, .xhigh, .max]
+        for (raw, effort) in zip(effortRaws, effortLevels) {
+            let selection = try ClaudeCodeProvider.resolveCLIModelSelection(
+                for: .claudeCodeModel(specifier: raw)
+            )
+            XCTAssertEqual(selection.modelArgument, baseRaw)
+            XCTAssertEqual(selection.effortLevel, effort)
+        }
+
+        let agentModel = try XCTUnwrap(AgentModel(rawValue: baseRaw))
+        XCTAssertEqual(agentModel, .claudeOpus48)
+        XCTAssertEqual(agentModel.displayName, "Opus 4.8")
+        XCTAssertEqual(
+            agentModel.description,
+            "Pinned Claude Opus 4.8 with native 1M context. Opus-tier capability for complex reasoning and architecture."
+        )
+        XCTAssertEqual(agentModel.contextWindowTokens, 1_000_000)
+        XCTAssertTrue(agentModel.isExtendedContext)
+        XCTAssertEqual(AgentModel.resolvedModel(forRaw: "claude-opus-4-8:max", agentKind: .claudeCode), .claudeOpus48)
+
+        let claudeModels = AgentModel.modelsForAgent(.claudeCode)
+        let agentModelIndex = try XCTUnwrap(claudeModels.firstIndex(of: .claudeOpus48))
+        XCTAssertGreaterThan(agentModelIndex, 0)
+        XCTAssertLessThan(agentModelIndex + 1, claudeModels.count)
+        XCTAssertEqual(claudeModels[agentModelIndex - 1], .claudeOpus5)
+        XCTAssertEqual(claudeModels[agentModelIndex + 1], .claudeOpus47)
+
+        let encoded = try JSONEncoder().encode(agentModel)
+        XCTAssertEqual(encoded, Data("\"claude-opus-4-8\"".utf8))
+        XCTAssertEqual(try JSONDecoder().decode(AgentModel.self, from: encoded), .claudeOpus48)
+
+        let availability = AgentModelCatalog.AvailabilityContext(claudeCodeAvailable: true)
+        for raw in [baseRaw] + effortRaws {
+            let normalized = AgentModelCatalog.normalizePersistedSelection(
+                agentRaw: AgentProviderKind.claudeCode.rawValue,
+                modelRaw: raw,
+                availability: availability
+            )
+            XCTAssertEqual(normalized.agent, .claudeCode)
+            XCTAssertEqual(normalized.modelRaw, raw)
+        }
+    }
+
+    func testClaudeOpusRecommendationCopyTracksStableAlias() {
+        XCTAssertEqual(
+            BestPracticeProfiles.claudeCodeOpusRecommendationLabel,
+            "Claude Opus via Claude Code's stable Opus alias (Opus 5 on the Anthropic API)"
+        )
+        XCTAssertTrue(BestPracticeProfiles.claudeStrengths.contains(BestPracticeProfiles.claudeCodeOpusRecommendationLabel))
+        XCTAssertFalse(BestPracticeProfiles.claudeStrengths.contains("Claude Opus 4.6"))
+        XCTAssertEqual(AIModel.claudeCodeOpus.claudeCodeRuntimeSpecifierRaw, "opus")
     }
 
     func testCodexReasoningEffortParsesExtendedEffortsWithoutChangingRecommendations() {

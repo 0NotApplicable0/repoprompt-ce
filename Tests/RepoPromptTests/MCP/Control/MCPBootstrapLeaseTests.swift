@@ -101,6 +101,49 @@ final class MCPBootstrapLeaseTests: XCTestCase {
         #endif
     }
 
+    func testIndefiniteRoutedOutcomeRemainsObservableForLeaseLifetime() async {
+        let runID = UUID()
+        let policyRecorder = PolicyRecorder()
+        await HeadlessAgentConnectionGate.cancelAll()
+        await MCPRoutingWaiter.cleanup(runID: runID)
+
+        let lease = MCPBootstrapLease(
+            spec: MCPBootstrapLeaseSpec(
+                runID: runID,
+                gateID: UUID(),
+                windowID: 1,
+                tabID: UUID(),
+                clientName: "bootstrap-indefinite-terminal-cache",
+                restrictedTools: [],
+                additionalTools: nil,
+                oneShot: true,
+                reason: "indefinite routed terminal lifetime regression",
+                ttl: 10,
+                purpose: .discoverRun,
+                taskLabelKind: nil,
+                allowsAgentExternalControlTools: false,
+                requiresExpectedAgentPID: false
+            ),
+            policyInstaller: { _ in await policyRecorder.recordInstall() },
+            policyClearer: { _ in await policyRecorder.recordClear() }
+        )
+        let acquired = await lease.acquire()
+        XCTAssertTrue(acquired)
+
+        await MCPRoutingWaiter.notifyRouted(runID: runID)
+        let releaseOutcome = await lease.releaseWhenRoutedIndefinitely()
+        let globalOutcomeAfterCleanup = await MCPRoutingWaiter.currentTerminalOutcome(runID: runID)
+        let firstLeaseOutcomeAfterCleanup = await lease.currentRoutingTerminalOutcome()
+        let secondLeaseOutcomeAfterCleanup = await lease.currentRoutingTerminalOutcome()
+        let clearCount = await policyRecorder.clearCount
+
+        XCTAssertEqual(releaseOutcome, .routed)
+        XCTAssertNil(globalOutcomeAfterCleanup)
+        XCTAssertEqual(firstLeaseOutcomeAfterCleanup, .routed)
+        XCTAssertEqual(secondLeaseOutcomeAfterCleanup, .routed)
+        XCTAssertEqual(clearCount, 0)
+    }
+
     func testPIDOwnedEarlyReleaseCleanupRemovesRetainedPolicyForEveryExit() async throws {
         #if DEBUG
             enum ExitMode: String, CaseIterable {
@@ -260,6 +303,113 @@ final class MCPBootstrapLeaseTests: XCTestCase {
                 XCTAssertEqual(waiterCount, 0)
                 await MCPRoutingWaiter.cleanup(runID: runID)
             }
+
+            let indefiniteRunID = UUID()
+            let indefinitePolicyRecorder = PolicyRecorder()
+            await MCPRoutingWaiter.cleanup(runID: indefiniteRunID)
+            let indefiniteLease = MCPBootstrapLease(
+                spec: MCPBootstrapLeaseSpec(
+                    runID: indefiniteRunID,
+                    gateID: UUID(),
+                    windowID: 1,
+                    tabID: UUID(),
+                    clientName: "bootstrap-progress-indefinite",
+                    restrictedTools: [],
+                    additionalTools: nil,
+                    oneShot: true,
+                    reason: "indefinite routing cancellation regression",
+                    ttl: 0.001,
+                    purpose: .discoverRun,
+                    taskLabelKind: nil,
+                    allowsAgentExternalControlTools: false,
+                    requiresExpectedAgentPID: false
+                ),
+                policyInstaller: { _ in await indefinitePolicyRecorder.recordInstall() },
+                policyClearer: { _ in await indefinitePolicyRecorder.recordClear() }
+            )
+            let indefiniteAcquired = await indefiniteLease.acquire()
+            XCTAssertTrue(indefiniteAcquired)
+            let indefiniteWait = Task {
+                await indefiniteLease.releaseWhenRoutedIndefinitely()
+            }
+            await Task.yield()
+            indefiniteWait.cancel()
+            let indefiniteOutcome = await indefiniteWait.value
+            let indefiniteClearCount = await indefinitePolicyRecorder.clearCount
+            XCTAssertEqual(indefiniteOutcome, .cancelled)
+            XCTAssertEqual(indefiniteClearCount, 1)
+            await MCPRoutingWaiter.notifyRouted(runID: indefiniteRunID)
+            let lateRouteContinuationCount = await MCPRoutingWaiter.debugContinuationCount(runID: indefiniteRunID)
+            XCTAssertEqual(lateRouteContinuationCount, 0)
+
+            let settlementRunID = UUID()
+            let settlementClientName = "bootstrap-settlement-policy-\(settlementRunID.uuidString)"
+            let settlementLease = MCPBootstrapLease(
+                spec: MCPBootstrapLeaseSpec(
+                    runID: settlementRunID,
+                    gateID: UUID(),
+                    windowID: 1,
+                    tabID: UUID(),
+                    clientName: settlementClientName,
+                    restrictedTools: [],
+                    additionalTools: nil,
+                    oneShot: true,
+                    reason: "settlement-scoped policy pruning regression",
+                    ttl: -1,
+                    purpose: .discoverRun,
+                    taskLabelKind: nil,
+                    allowsAgentExternalControlTools: false,
+                    requiresExpectedAgentPID: false
+                )
+            )
+            let settlementAcquired = await settlementLease.acquire()
+            XCTAssertTrue(settlementAcquired)
+            _ = await ServerNetworkManager.shared.requireExpectedAgentPIDForPendingPolicy(
+                for: settlementClientName,
+                runID: settlementRunID,
+                windowID: 1
+            )
+            let pendingAfterAgePrune = await ServerNetworkManager.shared.debugPendingPolicySnapshot(
+                for: settlementClientName
+            )
+            XCTAssertTrue(pendingAfterAgePrune.contains { $0.runID == settlementRunID })
+
+            await settlementLease.cancelAndCleanup()
+            let pendingAfterSettlement = await ServerNetworkManager.shared.debugPendingPolicySnapshot(
+                for: settlementClientName
+            )
+            XCTAssertFalse(pendingAfterSettlement.contains { $0.runID == settlementRunID })
+
+            let providerCompletionRunID = UUID()
+            await MCPRoutingWaiter.register(runID: providerCompletionRunID)
+            let committedAtProviderCompletionLease = MCPBootstrapLease(
+                spec: MCPBootstrapLeaseSpec(
+                    runID: providerCompletionRunID,
+                    gateID: UUID(),
+                    windowID: 1,
+                    tabID: UUID(),
+                    clientName: "bootstrap-provider-completion-race",
+                    restrictedTools: [],
+                    additionalTools: nil,
+                    oneShot: true,
+                    reason: "provider completion route authority regression",
+                    ttl: 1,
+                    purpose: .discoverRun,
+                    taskLabelKind: nil,
+                    allowsAgentExternalControlTools: false,
+                    requiresExpectedAgentPID: false
+                ),
+                routeAuthorityResolver: { _ in .committed }
+            )
+            let providerCompletionAuthority = await committedAtProviderCompletionLease
+                .resolveRouteAuthorityAtProviderCompletion()
+            XCTAssertEqual(providerCompletionAuthority, .committed)
+            let providerCompletionWaitOutcome = await MCPRoutingWaiter.waitForRoutingOutcome(
+                runID: providerCompletionRunID,
+                timeoutSeconds: 0
+            )
+            XCTAssertEqual(providerCompletionWaitOutcome, .routed)
+            await MCPRoutingWaiter.cleanup(runID: providerCompletionRunID)
         #else
             throw XCTSkip("Bootstrap routing progress diagnostics require DEBUG helpers.")
         #endif
@@ -424,6 +574,43 @@ final class MCPBootstrapLeaseTests: XCTestCase {
 
     func testPIDOwnedAcquireFailsClosedWhenPolicyCannotBeArmed() async throws {
         #if DEBUG
+            do {
+                let runID = UUID()
+                let recorder = PolicyRecorder()
+                await HeadlessAgentConnectionGate.cancelAll()
+                await MCPRoutingWaiter.cleanup(runID: runID)
+
+                let lease = MCPBootstrapLease(
+                    spec: MCPBootstrapLeaseSpec(
+                        runID: runID,
+                        gateID: UUID(),
+                        windowID: 1,
+                        tabID: UUID(),
+                        clientName: "bootstrap-lease-enabler-failure",
+                        restrictedTools: [],
+                        additionalTools: nil,
+                        oneShot: true,
+                        reason: "MCP enabler failure regression",
+                        ttl: 10,
+                        purpose: .agentModeRun,
+                        taskLabelKind: nil,
+                        allowsAgentExternalControlTools: false,
+                        requiresExpectedAgentPID: false
+                    ),
+                    mcpServerEnabler: { false },
+                    policyInstaller: { _ in await recorder.recordInstall() }
+                )
+
+                let acquired = await lease.acquire()
+                let installCount = await recorder.installCount
+                let waiterCount = await MCPRoutingWaiter.debugContinuationCount(runID: runID)
+                let activeGate = await HeadlessAgentConnectionGate.shared.debugActiveConnectionID()
+                XCTAssertFalse(acquired)
+                XCTAssertEqual(installCount, 0)
+                XCTAssertEqual(waiterCount, 0)
+                XCTAssertNil(activeGate)
+            }
+
             let runID = UUID()
             let gateID = UUID()
             let recorder = PolicyRecorder()
@@ -614,7 +801,6 @@ final class MCPBootstrapLeaseTests: XCTestCase {
             await window.workspaceManager.awaitInitialized()
 
             let catalogService = window.mcpServer.windowMCPToolCatalogService
-            var ownedRoutingService: WindowRoutingService?
             var lease: MCPBootstrapLease?
             var loadedRootID: UUID?
 
@@ -636,10 +822,7 @@ final class MCPBootstrapLeaseTests: XCTestCase {
                 await manager.cleanupRunRoutingState(for: runID, windowID: window.windowID)
                 await MCPRoutingWaiter.cleanup(runID: runID)
                 await HeadlessAgentConnectionGate.cancelAll()
-                ServiceRegistry.unregister(catalogService)
-                if let ownedRoutingService {
-                    ServiceRegistry.unregister(ownedRoutingService)
-                }
+                await AppDomainRuntimeComposition.shared.unregister(catalogService)
                 if let loadedRootID {
                     await window.workspaceFileContextStore.unloadRoot(id: loadedRootID)
                 }
@@ -675,9 +858,8 @@ final class MCPBootstrapLeaseTests: XCTestCase {
                 let loadedRoot = try await WorkspaceRootLoadTestSupport.loadRootMatchingCurrentFileSystemSettings(in: window, path: rootURL.path)
                 loadedRootID = loadedRoot.id
 
-                ServiceRegistry.register(catalogService)
-                let routing = try await Self.ensureRoutingService()
-                ownedRoutingService = routing.owned ? routing.service : nil
+                try await AppDomainRuntimeComposition.shared.register(catalogService)
+                try await Self.ensureRoutingService()
 
                 let cursorAdditionalTools = AgentModeMCPPolicyInstaller.additionalTools(for: .cursor)
                 XCTAssertTrue(cursorAdditionalTools.contains(MCPWindowToolName.oracleChatLog))
@@ -1076,21 +1258,12 @@ private extension MCPBootstrapLeaseTests {
     #endif
 
     @MainActor
-    static func ensureRoutingService() async throws -> (service: WindowRoutingService, owned: Bool) {
-        if let existing = ServiceRegistry.services.first(where: { $0 is WindowRoutingService }) as? WindowRoutingService {
-            return (existing, false)
+    static func ensureRoutingService() async throws {
+        try await AppGlobalMCPServiceComposition.shared.ensureRegistered()
+        let snapshot = await AppDomainRuntimeComposition.shared.catalogSnapshot()
+        guard snapshot.activeScopesByToolName[MCPGlobalToolName.bindContext]?.contains(.application) == true else {
+            throw MCPBootstrapLeaseTestError.routingServiceUnavailable
         }
-        let service = WindowRoutingService(windowStates: .shared, networkMgr: .shared)
-        for _ in 0 ..< 100 {
-            let registered = ServiceRegistry.services.contains { $0 as AnyObject === service as AnyObject }
-            let names = await service.tools.map(\.name)
-            if registered, names.contains("bind_context") {
-                return (service, true)
-            }
-            try await Task.sleep(for: .milliseconds(10))
-        }
-        ServiceRegistry.unregister(service)
-        throw MCPBootstrapLeaseTestError.routingServiceUnavailable
     }
 }
 

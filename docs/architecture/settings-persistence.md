@@ -1,6 +1,6 @@
 # Settings Persistence
 
-Current as of 2026-07-14. This document is contributor-facing: use it when changing durable settings, workspace overrides, Agent Models settings, or MCP settings surfaces.
+Current as of 2026-08-11. This document is contributor-facing: use it when changing durable settings, workspace overrides, Agent Models settings, or MCP settings surfaces.
 
 ## Durable settings file
 
@@ -125,6 +125,75 @@ session. The store owns dismissal across workspace windows and clears it when th
 changes or persistence unblocks. It is never stored in `UserDefaults`. The Settings
 window always shows the active warning and recovery controls.
 
+## Agent Mode Handoff instructions
+
+The reusable titlebar Handoff default is one optional app-wide scalar:
+
+```text
+scalarPreferences.agentMode.agentSessionHandoffInstructions
+```
+
+This setting is global across workspaces. It does not use the Agent Models
+workspace-profile system, which is feature-specific rather than a generic
+layered-settings authority. Workspace-scoped Handoff instructions require a
+separate persistence and migration design.
+
+The field is a JSON string when present. An absent or decoded `null` field resolves to
+exactly `""` through `GlobalSettingsStore.agentSessionHandoffInstructions()` without
+materializing the field or rewriting the file. The typed setter preserves text verbatim:
+leading and trailing whitespace, blank lines, and whitespace-only values are significant.
+Setting exactly `""` removes the optional field (`nil`); clearing an already absent field
+is an accepted no-op that does not publish or save.
+
+Supported UI and store writes accept at most 20,000 Swift `Character`s, counted with
+`String.count`. Exactly 20,000 is valid. The setter rejects 20,001 or more without changing
+memory or disk and never trims or truncates. An oversized value from externally authored
+JSON remains loaded so Settings can show the full invalid draft for correction or clearing;
+it does not make the document corrupt or authorize a compatibility fallback that silently
+omits configured instructions.
+
+This scalar belongs to the existing baseline scalar container, requires no schema-version
+bump or migration, and leaves baseline-only documents stamped v2. Compatible import retains
+a type-compatible string. False-v4 normalization changes only the raw root `schemaVersion`,
+so the raw Handoff field and its exact value survive unchanged. Setting or clearing this
+field uses the sibling-preserving Agent Mode scalar update path.
+
+The setting is intentionally local to the Agent Mode settings UI and titlebar Handoff flow.
+It has no `app_settings` descriptor, catalog key, getter, setter, candidate schema, or MCP
+tool property. Do not expose `agent_mode.handoff_instructions` (or an equivalent key)
+without a separate public-surface design and migration decision.
+
+If global-settings persistence is blocked, an accepted Save or Clear remains active in
+memory for the current launch and the Handoff card surfaces a noninteractive warning. The
+existing global-settings warning and recovery controls remain the only recovery authority;
+the card does not roll back the accepted value or create a second recovery path.
+
+## Context Builder behavior
+
+The seven controls shown in Settings → Context Builder use one app-wide scalar group:
+
+```text
+scalarPreferences.contextBuilder.contextTokenBudget
+scalarPreferences.contextBuilder.analysisTokenBudget
+scalarPreferences.contextBuilder.enhancementMode
+scalarPreferences.contextBuilder.questionTimeoutSeconds
+scalarPreferences.contextBuilder.allowUIClarifyingQuestions
+scalarPreferences.contextBuilder.allowMCPClarifyingQuestions
+scalarPreferences.contextBuilder.followUpAnalysisEnabled
+```
+
+`GlobalSettingsStore.contextBuilderBehaviorSettings()` resolves a complete non-optional `ContextBuilderBehaviorSettings` value through `ContextBuilderDefaults`; the whole-snapshot setter preserves sibling scalar groups and publishes through the store. Every window reads this same authority. Workspace and tab changes do not change these values, and Context Builder behavior does not use Agent Models workspace inheritance.
+
+The optional scalar group is baseline schema-v2 content. It does not add a feature-version constant or change `requiredSchemaVersion`: documents without workspace Agent Models profiles remain v2, documents with profiles remain v4, and all future/foreign preservation and false-v4 rules continue to apply.
+
+When the scalar group is absent, load and reload migrate legacy workspace fields deterministically. Workspace entries are sorted by UUID string, then each field independently takes the first applicable value; invalid enhancement modes are skipped and missing values use `ContextBuilderDefaults`. The complete scalar group is materialized and legacy `ChatGlobalSettings` Context Builder fields are stripped. Startup normalization writes these changes, an absent `scalarPreferences.fileSystem.globalIgnoreDefaults` value, and repairs to invalid Oracle ↔ Built-in Chat synchronized-model state through one raw-preserving transaction. The transaction patches only its owned JSON paths, canonicalizes workspace Agent Models UUID keys with the same deterministic winner used during typed decoding, and preserves unknown root, scalar, global-default, workspace, and UUID-backed profile fields, including when false-v4 normalization runs first. Compatible import reconstructs UUID-keyed maps from decoded projections before content-derived schema stamping while retaining the original bytes in the import backup. If persistence is blocked or the save fails, repaired values remain active in memory while the original disk bytes remain under the existing recovery contract. Those optional workspace properties remain decode-compatible legacy migration inputs only. Dormant `GlobalDefaults.discoveryTokenBudget` and `discoveryEnhancementMode` never participate in migration or runtime resolution.
+
+The legacy nested tab key `discover.autoGeneratePlan` is ignored on decode and disappears when that tab is re-encoded. Context Builder instructions, selected prompt IDs, and follow-up type remain tab-specific. Global behavior is never mirrored back into workspace or tab documents.
+
+UI and MCP runs resolve an immutable `ContextBuilderRunBehavior` alongside the run’s prompt and selection snapshot before asynchronous provider work. UI runs use Context Budget when Follow-up Analysis is disabled and Analysis Budget plus the captured tab-selected follow-up (plan, review, or question) when enabled. MCP runs with `response_type` omitted or set to `clarify` use Context Budget; `plan`, `question`, and `review` use Analysis Budget independently of Follow-up Analysis. MCP inactive-target safety disables clarifying questions while retaining the global budgets, enhancement mode, and timeout. Later Settings edits or disk reloads affect future runs only.
+
+Context Builder `ask_user` calls without an explicit timeout use the Question Timeout captured for that run. Question Timeout is also the live app-wide default for Agent Mode `ask_user`; Agent Mode reads the current global value rather than a Context Builder run snapshot. The seven behavioral controls are managed in the UI and are not exposed through the MCP `app_settings` catalog.
+
 ## Agent Models profiles
 
 Agent Models settings cover the controls shown on Settings → Agent Models:
@@ -197,7 +266,7 @@ The following runtime surfaces use this effective profile:
 - `MCPAgentRoleDefaultsService` and MCP agent tools for role-label defaults in the active workspace.
 - `AutoRecommendationEngine` for recommendation satisfaction and apply targets.
 
-Context Builder discovery budget, enhancement mode, clarifying-question behavior, and related per-workspace discovery options remain in workspace chat settings. Only the Context Builder agent/model selection moved into Agent Models profiles.
+Context Builder agent/model selection follows the effective Agent Models profile. The seven Context Builder behavioral controls use the app-wide scalar authority described in [Context Builder behavior](#context-builder-behavior).
 
 ## Change notifications
 

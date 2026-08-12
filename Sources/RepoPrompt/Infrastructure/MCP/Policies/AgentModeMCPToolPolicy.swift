@@ -1,81 +1,43 @@
 import Foundation
+import RepoPromptDomainRuntime
 
-/// MCP tool policy for agent mode runs.
-/// Controls which tools are restricted and which special tools are granted.
+/// App provider-kind adapter over the canonical domain-runtime client policy.
 enum AgentModeMCPToolPolicy {
-    /// Agent mode is tab-scoped, so advanced routing and the live oracle helper surface stay blocked.
-    static let restrictedCapabilities: Set<MCPToolCapability> = [
-        .routingAdvanced,
-        .conversationHelper,
-        .conversationSend
-    ]
+    static let restrictedCapabilities = MCPClientToolPolicyCatalog.agentModeRestrictedCapabilities
+    static let restrictedTools = MCPToolCapabilities.toolNames(for: restrictedCapabilities)
 
-    static let restrictedTools: Set<String> = MCPToolCapabilities.toolNames(for: restrictedCapabilities)
+    static let grantedCapabilities = MCPClientToolPolicyCatalog
+        .classification(for: .agentModeGenericEngineer)
+        .grantedCapabilities
+    static let grantedTools = MCPToolCapabilities.toolNames(for: grantedCapabilities)
 
-    /// Tools granted to legacy/generic agent mode runs (from MCPPolicyGatedTools).
-    /// These enable user interaction, agent workflow control, and agent-only oracle recovery.
-    static let grantedCapabilities: Set<MCPToolCapability> = [
-        .userInteraction,
-        .agentReasoningControl,
-        .agentSessionControl,
-        .agentConversationSend,
-        .conversationLog
-    ]
+    static let claudeNativeGrantedCapabilities = MCPClientToolPolicyCatalog
+        .classification(for: .agentModeClaudeEngineer)
+        .grantedCapabilities
+    static let claudeNativeGrantedTools = MCPToolCapabilities.toolNames(for: claudeNativeGrantedCapabilities)
 
-    static let grantedTools: Set<String> = MCPToolCapabilities.toolNames(for: grantedCapabilities)
+    static let codexNativeGrantedCapabilities = MCPClientToolPolicyCatalog
+        .classification(for: .agentModeCodexEngineer)
+        .grantedCapabilities
+    static let codexNativeGrantedTools = MCPToolCapabilities.toolNames(for: codexNativeGrantedCapabilities)
 
-    /// Tools granted to Claude native-style agent runs.
-    /// Claude no longer relies on share_thoughts or wait_for_next_user_instruction,
-    /// but it does use set_status to rename the active session.
-    static let claudeNativeGrantedCapabilities: Set<MCPToolCapability> = [
-        .userInteraction,
-        .agentSessionControl,
-        .agentConversationSend,
-        .conversationLog
-    ]
+    static let openCodeGrantedCapabilities = MCPClientToolPolicyCatalog
+        .classification(for: .agentModeOpenCodeEngineer)
+        .grantedCapabilities
+    static let openCodeGrantedTools = MCPToolCapabilities.toolNames(for: openCodeGrantedCapabilities)
 
-    static let claudeNativeGrantedTools: Set<String> = MCPToolCapabilities.toolNames(for: claudeNativeGrantedCapabilities)
-
-    /// Tools granted to Codex native agent runs.
-    /// Codex native still needs ask_user + set_status even though it doesn't use
-    /// share_thoughts or wait_for_next_user_instruction.
-    /// set_status is title-only; running status now comes from native reasoning summaries.
-    static let codexNativeGrantedCapabilities: Set<MCPToolCapability> = [
-        .userInteraction,
-        .agentSessionControl,
-        .agentConversationSend,
-        .conversationLog
-    ]
-
-    static let codexNativeGrantedTools: Set<String> = MCPToolCapabilities.toolNames(for: codexNativeGrantedCapabilities)
-
-    /// OpenCode ACP uses the Agent Mode app/session control surface.
-    static let openCodeGrantedCapabilities: Set<MCPToolCapability> = [
-        .userInteraction,
-        .agentSessionControl,
-        .agentConversationSend,
-        .conversationLog
-    ]
-
-    static let openCodeGrantedTools: Set<String> = MCPToolCapabilities.toolNames(for: openCodeGrantedCapabilities)
-
-    /// Cursor ACP uses the same Agent Mode app/session control surface as OpenCode.
-    static let cursorGrantedCapabilities: Set<MCPToolCapability> = [
-        .userInteraction,
-        .agentSessionControl,
-        .agentConversationSend,
-        .conversationLog
-    ]
-
-    static let cursorGrantedTools: Set<String> = MCPToolCapabilities.toolNames(for: cursorGrantedCapabilities)
+    static let cursorGrantedCapabilities = MCPClientToolPolicyCatalog
+        .classification(for: .agentModeCursorEngineer)
+        .grantedCapabilities
+    static let cursorGrantedTools = MCPToolCapabilities.toolNames(for: cursorGrantedCapabilities)
 
     /// Tools granted to grok agent runs. grok is a headless one-shot CLI: it has no user to answer
     /// `ask_user`, so granting `userInteraction` only risks a headless deadlock if grok ever calls
     /// it. grok also does not use the agent conversation/oracle-log surface. Grant ONLY
-    /// `agentSessionControl` (set_status) so grok can title its session without exposing blocking
+    /// `statusPublication` (set_status) so grok can title its session without exposing blocking
     /// or unused interaction tools.
     static let grokGrantedCapabilities: Set<MCPToolCapability> = [
-        .agentSessionControl
+        .statusPublication
     ]
 
     static let grokGrantedTools: Set<String> = MCPToolCapabilities.toolNames(for: grokGrantedCapabilities)
@@ -83,9 +45,9 @@ enum AgentModeMCPToolPolicy {
     /// Tools granted to Antigravity (agy) agent runs. Like grok, agy is a headless one-shot `--print`
     /// CLI with no user to answer `ask_user`, so granting `userInteraction` only risks a headless
     /// deadlock. agy surfaces tool cards from its native trajectory DB, not the MCP conversation/oracle
-    /// surface. Grant ONLY `agentSessionControl` (set_status) so agy can title its session.
+    /// surface. Grant ONLY `statusPublication` (set_status) so agy can title its session.
     static let antigravityGrantedCapabilities: Set<MCPToolCapability> = [
-        .agentSessionControl
+        .statusPublication
     ]
 
     static let antigravityGrantedTools: Set<String> = MCPToolCapabilities.toolNames(for: antigravityGrantedCapabilities)

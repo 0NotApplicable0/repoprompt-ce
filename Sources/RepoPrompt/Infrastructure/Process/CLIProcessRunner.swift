@@ -368,7 +368,7 @@ final class CLIProcessRunner {
     ) async throws -> AsyncThrowingStream<StreamEvent, Error> {
         // Hold the permit for the entire lifetime of the child process
         ProcessDiagnostics.log("🔵 [GATE] Acquiring gate...")
-        await gate.acquire()
+        guard await gate.acquire() else { throw CancellationError() }
         ProcessDiagnostics.log("🟢 [GATE] Acquired")
 
         // If the caller cancelled before we even start heavy work, bail out now.
@@ -696,7 +696,6 @@ final class CLIProcessRunner {
     func cancelAll() async {
         // Do not steal cleanup ownership from runStreaming; just request termination.
         let processes = await registry.current()
-        let timeout = ProcessTermination.cooperativeCancellationWaitTimeout()
         for process in processes {
             // Stop further input and ask the child to exit. The waitpid cleanup will close stdout/stderr.
             process.stdin?.closeFile()
@@ -708,18 +707,12 @@ final class CLIProcessRunner {
             )
         }
         for process in processes {
-            // Give every child a chance to begin exiting before we await individual reaping.
-            do {
-                let (status, _) = try await Self.waitForTerminationAsync(
-                    pid: process.pid,
-                    processGroupID: process.processGroupID,
-                    timeout: timeout
-                ) { [weak self] message in
-                    self?.log(message)
-                }
-                log("Cancelled process \(process.pid) with status \(status)")
-            } catch {
-                log("Failed to wait for process \(process.pid): \(error)")
+            // The streaming wait task remains the sole waitpid owner. Escalate only through the
+            // process group so a promptly-exited root cannot leave TERM-ignoring descendants
+            // alive or race a second destructive reap.
+            guard let processGroupID = process.processGroupID else {
+                log("Cannot escalate process \(process.pid) cancellation without a process group")
+                continue
             }
             // The cooperative wait above returns once the root PID is reaped, but a
             // reparented same-process-group descendant that ignores SIGTERM can outlive
@@ -727,7 +720,7 @@ final class CLIProcessRunner {
             // gone before returning.
             await ProcessTermination.ensureProcessGroupTerminated(
                 pid: process.pid,
-                processGroupID: process.processGroupID
+                processGroupID: processGroupID
             ) { [weak self] message in self?.log(message) }
         }
     }

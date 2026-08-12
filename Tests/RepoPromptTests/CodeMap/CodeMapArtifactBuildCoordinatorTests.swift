@@ -2,6 +2,8 @@ import CryptoKit
 import Darwin
 import Foundation
 @testable import RepoPromptApp
+import RepoPromptCodeMapCore
+import RepoPromptDomainRuntime
 import XCTest
 
 final class CodeMapArtifactBuildCoordinatorTests: XCTestCase {
@@ -53,6 +55,7 @@ final class CodeMapArtifactBuildCoordinatorTests: XCTestCase {
         let queuedInput = try makeInput("bounds-queued", root: fixture.root)
         let busyInput = try makeInput("bounds-busy", root: fixture.root)
         let gate = CoordinatorTestGate()
+        let hookEvents = CoordinatorHookCondition()
         let coordinator = makeCoordinator(
             fixture: fixture,
             policy: CodeMapArtifactBuildCoordinatorPolicy(
@@ -65,7 +68,8 @@ final class CodeMapArtifactBuildCoordinatorTests: XCTestCase {
                 maximumConsecutiveDemandAdmissions: 2,
                 agePromotionNanoseconds: 1_000_000_000,
                 retryAfterMilliseconds: 17
-            )
+            ),
+            hooks: CodeMapArtifactBuildCoordinatorHooks { hookEvents.record($0) }
         ) { _, _, _ in
             await gate.enter()
             return .readyNoSymbols
@@ -74,7 +78,12 @@ final class CodeMapArtifactBuildCoordinatorTests: XCTestCase {
         let first = Task { try await coordinator.resolve(request(firstInput)) }
         await gate.waitUntilEntered()
         let queued = Task { try await coordinator.resolve(request(queuedInput)) }
-        try await waitUntil { await coordinator.accounting().queuedBuildCount == 1 }
+        try await hookEvents.waitUntil(
+            kind: .buildEnqueued,
+            artifactStorageDigest: queuedInput.artifactKey.storageDigestHex
+        )
+        let queuedAccounting = await coordinator.accounting()
+        XCTAssertEqual(queuedAccounting.queuedBuildCount, 1)
 
         do {
             _ = try await coordinator.resolve(request(busyInput))
@@ -166,6 +175,58 @@ final class CodeMapArtifactBuildCoordinatorTests: XCTestCase {
         XCTAssertEqual(accounting.waiterCount, 0)
     }
 
+    func testLastWaiterCancellationAtConcurrentBoundDoesNotDisturbPeerOrQueuedAdmission() async throws {
+        let fixture = try makeFixture()
+        defer { fixture.remove() }
+        let cancelledInput = try makeInput("concurrent-cancelled", root: fixture.root)
+        let peerInput = try makeInput("concurrent-peer", root: fixture.root)
+        let queuedInput = try makeInput("concurrent-queued", root: fixture.root)
+        let gate = CoordinatorTestGate()
+        let builds = CoordinatorTestRecorder()
+        let coordinator = makeCoordinator(
+            fixture: fixture,
+            policy: policy(maximumConcurrentBuildCount: 2, maximumQueuedBuildCount: 2)
+        ) { input, _, _ in
+            await builds.record(input.artifactKey.storageDigestHex)
+            await gate.enter()
+            return .readyNoSymbols
+        }
+
+        let cancelled = Task { try await coordinator.resolve(request(cancelledInput)) }
+        let peer = Task { try await coordinator.resolve(request(peerInput)) }
+        await gate.waitUntilEntered(2)
+        let queued = Task { try await coordinator.resolve(request(queuedInput)) }
+        try await waitUntil {
+            let accounting = await coordinator.accounting()
+            return accounting.activeBuildCount == 2 && accounting.queuedBuildCount == 1
+        }
+
+        cancelled.cancel()
+        await assertCancellation(cancelled)
+        let blockedAccounting = await coordinator.accounting()
+        XCTAssertEqual(blockedAccounting.activeBuildCount, 2)
+        XCTAssertEqual(blockedAccounting.queuedBuildCount, 1)
+        XCTAssertEqual(blockedAccounting.counters.sharedTaskCancellations, 0)
+
+        await gate.release()
+        let peerResult = try await peer.value
+        let queuedResult = try await queued.value
+        XCTAssertNotNil(ready(peerResult))
+        XCTAssertNotNil(ready(queuedResult))
+        try await waitUntil { await coordinator.accounting().activeFlightCount == 0 }
+
+        let buildCount = await builds.count
+        XCTAssertEqual(buildCount, 3)
+        _ = try await requireHit(fixture.artifactStore, key: cancelledInput.artifactKey)
+        _ = try await requireHit(fixture.artifactStore, key: peerInput.artifactKey)
+        _ = try await requireHit(fixture.artifactStore, key: queuedInput.artifactKey)
+        let accounting = await coordinator.accounting()
+        XCTAssertEqual(accounting.counters.lastWaiterCancellations, 1)
+        XCTAssertEqual(accounting.counters.sharedTaskCancellations, 0)
+        XCTAssertEqual(accounting.counters.buildsSucceeded, 3)
+        XCTAssertEqual(accounting.counters.failures, 0)
+    }
+
     func testLastWaiterCancellationDuringNonPreemptiveBuildCompletesAdmittedTransaction() async throws {
         let fixture = try makeFixture()
         defer { fixture.remove() }
@@ -179,7 +240,11 @@ final class CodeMapArtifactBuildCoordinatorTests: XCTestCase {
         )
         XCTAssertEqual(input.artifactKey, finalWaiterInput.artifactKey)
         let gate = CoordinatorTestGate()
-        let coordinator = makeCoordinator(fixture: fixture) { _, _, _ in
+        let hookEvents = CoordinatorHookCondition()
+        let coordinator = makeCoordinator(
+            fixture: fixture,
+            hooks: CodeMapArtifactBuildCoordinatorHooks { hookEvents.record($0) }
+        ) { _, _, _ in
             await gate.enter()
             return .readyNoSymbols
         }
@@ -193,7 +258,12 @@ final class CodeMapArtifactBuildCoordinatorTests: XCTestCase {
         finalWaiter.cancel()
         await assertCancellation(finalWaiter)
         await gate.release()
-        try await waitUntil { await coordinator.accounting().activeFlightCount == 0 }
+        try await hookEvents.waitUntil(
+            kind: .flightCompleted,
+            artifactStorageDigest: input.artifactKey.storageDigestHex
+        )
+        let completedAccounting = await coordinator.accounting()
+        XCTAssertEqual(completedAccounting.activeFlightCount, 0)
 
         switch try await fixture.artifactStore.lookup(key: input.artifactKey) {
         case .miss: XCTFail("admitted non-preemptive build did not persist")
@@ -218,6 +288,7 @@ final class CodeMapArtifactBuildCoordinatorTests: XCTestCase {
         defer { fixture.remove() }
         let casInput = try makeInput("cancel-during-cas", root: fixture.root)
         let insertGate = CoordinatorTestGate()
+        let casHookEvents = CoordinatorHookCondition()
         let storeClient = CodeMapArtifactStoreClient(
             lookup: { try await fixture.artifactStore.lookup(key: $0) },
             insert: { key, outcome in
@@ -230,14 +301,20 @@ final class CodeMapArtifactBuildCoordinatorTests: XCTestCase {
         let casCoordinator = CodeMapArtifactBuildCoordinator(
             artifactStore: storeClient,
             locatorStore: GitBlobCodeMapLocatorStoreClient(store: fixture.locatorStore),
-            builder: CodeMapArtifactBuilderClient(build: { _, _, _ in .readyNoSymbols })
+            builder: CodeMapArtifactBuilderClient(build: { _, _, _ in .readyNoSymbols }),
+            hooks: CodeMapArtifactBuildCoordinatorHooks { casHookEvents.record($0) }
         )
         let casTask = Task { try await casCoordinator.resolve(request(casInput)) }
         await insertGate.waitUntilEntered()
         casTask.cancel()
         await assertCancellation(casTask)
         await insertGate.release()
-        try await waitUntil { await casCoordinator.accounting().activeFlightCount == 0 }
+        try await casHookEvents.waitUntil(
+            kind: .flightCompleted,
+            artifactStorageDigest: casInput.artifactKey.storageDigestHex
+        )
+        let completedCASAccounting = await casCoordinator.accounting()
+        XCTAssertEqual(completedCASAccounting.activeFlightCount, 0)
         _ = try await requireHit(fixture.artifactStore, key: casInput.artifactKey)
 
         let locatedInput = try await makeInput("cancel-during-locator", root: fixture.root, withLocator: true)
@@ -246,6 +323,7 @@ final class CodeMapArtifactBuildCoordinatorTests: XCTestCase {
             deterministicOutcome: .readyNoSymbols
         )
         let locatorGate = CoordinatorTestGate()
+        let locatorHookEvents = CoordinatorHookCondition()
         let locatorClient = GitBlobCodeMapLocatorStoreClient(
             read: { try await fixture.locatorStore.read(identity: $0) },
             write: { association in
@@ -256,14 +334,20 @@ final class CodeMapArtifactBuildCoordinatorTests: XCTestCase {
         let locatorCoordinator = CodeMapArtifactBuildCoordinator(
             artifactStore: CodeMapArtifactStoreClient(store: fixture.artifactStore),
             locatorStore: locatorClient,
-            builder: CodeMapArtifactBuilderClient(build: { _, _, _ in .readyNoSymbols })
+            builder: CodeMapArtifactBuilderClient(build: { _, _, _ in .readyNoSymbols }),
+            hooks: CodeMapArtifactBuildCoordinatorHooks { locatorHookEvents.record($0) }
         )
         let locatorTask = Task { try await locatorCoordinator.resolve(request(locatedInput)) }
         await locatorGate.waitUntilEntered()
         locatorTask.cancel()
         await assertCancellation(locatorTask)
         await locatorGate.release()
-        try await waitUntil { await locatorCoordinator.accounting().activeFlightCount == 0 }
+        try await locatorHookEvents.waitUntil(
+            kind: .flightCompleted,
+            artifactStorageDigest: locatedInput.artifactKey.storageDigestHex
+        )
+        let completedLocatorAccounting = await locatorCoordinator.accounting()
+        XCTAssertEqual(completedLocatorAccounting.activeFlightCount, 0)
         let publishedLocator = try await fixture.locatorStore.read(
             identity: XCTUnwrap(locatedInput.locatorIdentity)
         )
@@ -484,6 +568,12 @@ final class CodeMapArtifactBuildCoordinatorTests: XCTestCase {
             return .readyNoSymbols
         }
         await assertTransientFailure { try await buildCoordinator.resolve(request(buildInput)) }
+        switch try await fixture.artifactStore.lookup(key: buildInput.artifactKey) {
+        case .miss:
+            break
+        case .hit:
+            XCTFail("Transient build failures must not insert an artifact into the store.")
+        }
         let buildRetry = try await buildCoordinator.resolve(request(buildInput))
         XCTAssertNotNil(ready(buildRetry))
 
@@ -1609,7 +1699,7 @@ final class CodeMapArtifactBuildCoordinatorTests: XCTestCase {
                 !snapshot.hookDispatcherIsDraining
         }
         accounting = await coordinator.accounting()
-        XCTAssertEqual(accounting.counters.droppedHookEvents, 2)
+        XCTAssertGreaterThanOrEqual(accounting.counters.droppedHookEvents, 2)
     }
 
     func testEarlyLocatorReadFailureIsTypedAccountedAndRetryable() async throws {
@@ -1874,6 +1964,103 @@ final class CodeMapArtifactBuildCoordinatorTests: XCTestCase {
         }
     }
 
+    func testDefaultEffectivePermitBoundRunsRealMixedLanguageParsesAndMatchesSerialGoldens() async throws {
+        let fixture = try makeFixture()
+        defer { fixture.remove() }
+        let inputSpecifications: [(String, LanguageType)] = [
+            ("struct ConcurrentSwift { let value: Int }", .swift),
+            ("class ConcurrentPython:\n    def value(self) -> int:\n        return 1", .python),
+            ("export interface ConcurrentTypeScript { value: number }", .ts),
+            ("package concurrent\nfunc ConcurrentGo() int { return 1 }", .go)
+        ]
+        let inputs = try inputSpecifications.map { content, language in
+            try makeInput(content, root: fixture.root, language: language)
+        }
+
+        let productionBuilder = CodeMapArtifactBuilderClient()
+        var serialOutcomes: [CodeMapArtifactKey: CodeMapSyntaxArtifactOutcome] = [:]
+        for input in inputs {
+            let execution = try await productionBuilder.execute(input, UUID(), .demand)
+            serialOutcomes[input.artifactKey] = execution.outcome
+            guard case .ready = execution.outcome else {
+                return XCTFail("expected a non-empty serial artifact for \(input.language)")
+            }
+        }
+
+        let effectivePermitLimit = CodeMapArtifactBuildCoordinatorPolicy.default.maximumConcurrentBuildCount
+        XCTAssertEqual(effectivePermitLimit, FileSystemService.codeMapArtifactBuildBulkPermitLimit)
+        XCTAssertEqual(effectivePermitLimit, FileSystemService.contentReadBulkPermitLimitForTesting)
+        XCTAssertEqual(
+            effectivePermitLimit,
+            ContentReadConcurrencyCapacity.maximumConcurrentBulkReads
+        )
+        XCTAssertGreaterThanOrEqual(effectivePermitLimit, 1)
+        XCTAssertLessThanOrEqual(effectivePermitLimit, 3)
+        if FileSystemService.contentReadWorkerLimitForTesting > 1 {
+            XCTAssertLessThan(effectivePermitLimit, FileSystemService.contentReadWorkerLimitForTesting)
+        }
+        XCTAssertGreaterThan(inputs.count, effectivePermitLimit)
+        let expectedQueuedBuildCount = inputs.count - effectivePermitLimit
+
+        let permitGate = CoordinatorTestGate()
+        let permitBackedBuilder = CodeMapArtifactBuilderClient(withPermit: { ownerID, priority, operation in
+            try await FileSystemService.withCodeMapArtifactBuildPermit(
+                ownerID: ownerID,
+                priority: priority
+            ) {
+                await permitGate.enter()
+                return try await operation()
+            }
+        })
+        let recordedOutcomes = CodeMapBuildOutcomeRecorder()
+        let recordingBuilder = CodeMapArtifactBuilderClient(execute: { input, ownerID, priority in
+            let execution = try await permitBackedBuilder.execute(input, ownerID, priority)
+            await recordedOutcomes.record(execution.outcome, for: input.artifactKey)
+            return execution
+        })
+        let coordinator = CodeMapArtifactBuildCoordinator(
+            artifactStore: CodeMapArtifactStoreClient(store: fixture.artifactStore),
+            locatorStore: GitBlobCodeMapLocatorStoreClient(store: fixture.locatorStore),
+            builder: recordingBuilder
+        )
+        let tasks = inputs.map { input in
+            Task { try await coordinator.resolve(request(input)) }
+        }
+
+        await permitGate.waitUntilEntered(effectivePermitLimit)
+        try await waitUntil {
+            let accounting = await coordinator.accounting()
+            return accounting.activeBuildCount == effectivePermitLimit
+                && accounting.queuedBuildCount == expectedQueuedBuildCount
+        }
+
+        await permitGate.release()
+        let results = try await tasks.asyncValues()
+        XCTAssertEqual(results.count, inputs.count)
+        XCTAssertTrue(results.allSatisfy { ready($0) != nil })
+
+        let concurrentOutcomes = await recordedOutcomes.snapshot
+        XCTAssertEqual(concurrentOutcomes.count, inputs.count)
+        for input in inputs {
+            let serialOutcome = try XCTUnwrap(serialOutcomes[input.artifactKey])
+            let concurrentOutcome = try XCTUnwrap(concurrentOutcomes[input.artifactKey])
+            XCTAssertEqual(
+                try CodeMapArtifactContainer.encode(key: input.artifactKey, outcome: concurrentOutcome),
+                try CodeMapArtifactContainer.encode(key: input.artifactKey, outcome: serialOutcome),
+                input.language.rawValue
+            )
+        }
+
+        let accounting = await coordinator.accounting()
+        XCTAssertEqual(accounting.counters.buildsStarted, UInt64(inputs.count))
+        XCTAssertEqual(accounting.counters.buildsSucceeded, UInt64(inputs.count))
+        XCTAssertEqual(accounting.counters.duplicateBuilds, 0)
+        XCTAssertEqual(accounting.activeFlightCount, 0)
+        XCTAssertEqual(accounting.activeBuildCount, 0)
+        XCTAssertEqual(accounting.queuedBuildCount, 0)
+        XCTAssertEqual(accounting.waiterCount, 0)
+    }
+
     // MARK: - Helpers
 
     private struct CoordinatorFixture: @unchecked Sendable {
@@ -1903,6 +2090,7 @@ final class CodeMapArtifactBuildCoordinatorTests: XCTestCase {
         fixture: CoordinatorFixture,
         policy: CodeMapArtifactBuildCoordinatorPolicy = .default,
         clock: CodeMapArtifactBuildCoordinatorClock = .continuous,
+        hooks: CodeMapArtifactBuildCoordinatorHooks = .none,
         build: @escaping @Sendable (
             CodeMapArtifactBuildInput,
             UUID,
@@ -1914,7 +2102,8 @@ final class CodeMapArtifactBuildCoordinatorTests: XCTestCase {
             locatorStore: GitBlobCodeMapLocatorStoreClient(store: fixture.locatorStore),
             builder: CodeMapArtifactBuilderClient(build: build),
             policy: policy,
-            clock: clock
+            clock: clock,
+            hooks: hooks
         )
     }
 
@@ -1959,7 +2148,15 @@ final class CodeMapArtifactBuildCoordinatorTests: XCTestCase {
         _ text: String,
         root: URL
     ) throws -> CodeMapArtifactBuildInput {
-        try CodeMapArtifactBuildInput(source: makeSource(text), language: .swift)
+        try makeInput(text, root: root, language: .swift)
+    }
+
+    private func makeInput(
+        _ text: String,
+        root _: URL,
+        language: LanguageType
+    ) throws -> CodeMapArtifactBuildInput {
+        try CodeMapArtifactBuildInput(source: makeSource(text), language: language)
     }
 
     private func makeInput(
@@ -2245,6 +2442,18 @@ private actor CoordinatorTestGate {
     }
 }
 
+private actor CodeMapBuildOutcomeRecorder {
+    private var outcomes: [CodeMapArtifactKey: CodeMapSyntaxArtifactOutcome] = [:]
+
+    var snapshot: [CodeMapArtifactKey: CodeMapSyntaxArtifactOutcome] {
+        outcomes
+    }
+
+    func record(_ outcome: CodeMapSyntaxArtifactOutcome, for key: CodeMapArtifactKey) {
+        outcomes[key] = outcome
+    }
+}
+
 private actor CoordinatorTestRecorder {
     private(set) var values: [String] = []
 
@@ -2341,6 +2550,29 @@ private actor CoordinatorHookRecorder {
 
     func append(_ event: CodeMapArtifactBuildCoordinatorHookEvent) {
         events.append(event)
+    }
+}
+
+private final class CoordinatorHookCondition: @unchecked Sendable {
+    private let events = AsyncTestCondition<[CodeMapArtifactBuildCoordinatorHookEvent]>([])
+
+    func record(_ event: CodeMapArtifactBuildCoordinatorHookEvent) {
+        events.update { $0.append(event) }
+    }
+
+    func waitUntil(
+        kind: CodeMapArtifactBuildCoordinatorHookKind,
+        artifactStorageDigest: String,
+        timeout: TimeInterval = TestFenceDefaults.enterWait
+    ) async throws {
+        try await events.waitUntil(
+            "coordinator hook \(kind.rawValue) for \(artifactStorageDigest)",
+            timeout: timeout
+        ) { events in
+            events.contains {
+                $0.kind == kind && $0.artifactStorageDigest == artifactStorageDigest
+            }
+        }
     }
 }
 

@@ -1,5 +1,6 @@
 import CryptoKit
 import Foundation
+import RepoPromptCodeMapCore
 
 enum CodeMapRootManifestModelError: Error, Equatable {
     case invalidNamespace
@@ -550,6 +551,28 @@ struct CodeMapRootManifestRecord: Hashable {
         sourceAuthorityGeneration = authority.authorityGeneration
         sourceAuthorityDigest = authority.digest
         self.construction = construction
+    }
+
+    func restampedVerifiedAuthority(
+        namespace: CodeMapRootManifestNamespace,
+        authority: CodeMapRootManifestAuthority
+    ) throws -> Self {
+        guard isVerifiedForPublication else {
+            throw CodeMapRootManifestModelError.corruptRecord
+        }
+        return try Self(
+            namespace: namespace,
+            repositoryRelativePath: repositoryRelativePath,
+            locatorIdentity: locatorIdentity,
+            artifactKey: artifactKey,
+            gitMode: gitMode,
+            outcome: outcome,
+            contributionEnvelope: contributionEnvelope,
+            legacyContributionIdentity: legacyContributionIdentity,
+            authority: authority,
+            bindingGeneration: bindingGeneration,
+            construction: .verifiedAssociation
+        )
     }
 
     fileprivate static func decodeCanonical(

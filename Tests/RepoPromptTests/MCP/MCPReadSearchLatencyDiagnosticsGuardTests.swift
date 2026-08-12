@@ -586,6 +586,7 @@
             XCTAssertTrue(sibling.contains("MCPConnectionCallLane.ordinary.rawValue"))
             XCTAssertTrue(sibling.contains("MCPConnectionCallLane.control.rawValue"))
             XCTAssertTrue(sibling.contains("MCPConnectionCallLane.smallRead.rawValue"))
+            XCTAssertTrue(sibling.contains("MCPConnectionCallLane.fileRead.rawValue"))
             XCTAssertTrue(sibling.contains("MCPConnectionCallLane.gitRead.rawValue"))
             XCTAssertTrue(sibling.contains("MCPConnectionCallLane.fileSearch.rawValue"))
             XCTAssertTrue(sibling.contains("maximum_active_count"))
@@ -1085,10 +1086,11 @@
                 XCTAssertEqual((autoSelection[key] as? NSNumber)?.intValue, 0, key)
             }
             let smallReadLaneLimit = ServerNetworkManager.smallReadCallLaneLimit
+            let fileReadLaneLimit = ServerNetworkManager.fileReadCallLaneLimit
             let controlLaneLimit = ServerNetworkManager.controlCallLaneLimit
             let gitReadLaneLimit = ServerNetworkManager.gitReadCallLaneLimit
             let fileSearchLaneLimit = ServerNetworkManager.fileSearchCallLaneLimit
-            let totalLaneLimit = 1 + controlLaneLimit + smallReadLaneLimit + gitReadLaneLimit + fileSearchLaneLimit
+            let totalLaneLimit = 1 + controlLaneLimit + smallReadLaneLimit + fileReadLaneLimit + gitReadLaneLimit + fileSearchLaneLimit
             let limiter = try XCTUnwrap(runtime["limiter"] as? [String: Any])
             XCTAssertEqual(limiter["found"] as? Bool, true)
             XCTAssertEqual(limiter["connection_id"] as? String, connectionID.uuidString)
@@ -1106,6 +1108,7 @@
                 ("ordinary", 1),
                 ("control", controlLaneLimit),
                 ("small_read", smallReadLaneLimit),
+                ("file_read", fileReadLaneLimit),
                 ("git_read", gitReadLaneLimit),
                 ("file_search", fileSearchLaneLimit)
             ] {
@@ -1415,7 +1418,7 @@
                 EditFlowPerf.Stage.MCPWindowToolCatalog.registrationUpdateWindowToolsEnabledDidSet,
                 EditFlowPerf.Stage.MCPWindowToolCatalog.registrationUpdateAgentBootstrap,
                 EditFlowPerf.Stage.MCPWindowToolCatalog.readinessWarmAccess,
-                EditFlowPerf.Stage.MCPWindowToolCatalog.serviceRegistryToolsPublication,
+                EditFlowPerf.Stage.MCPWindowToolCatalog.domainRegistrationToolsPublication,
                 EditFlowPerf.Stage.MCPWindowToolCatalog.codexTurnMCPServerEnable
             ] {
                 EditFlowPerf.measure(stage) {}
@@ -1435,7 +1438,7 @@
                     "EditFlow.MCPWindowToolCatalog.RegistrationUpdate.WindowToolsEnabledDidSet",
                     "EditFlow.MCPWindowToolCatalog.RegistrationUpdate.AgentBootstrap",
                     "EditFlow.MCPWindowToolCatalog.ReadinessWarmAccess",
-                    "EditFlow.MCPWindowToolCatalog.ServiceRegistryToolsPublication",
+                    "EditFlow.MCPAppToolCatalog.DomainRegistrationToolsPublication",
                     "EditFlow.MCPWindowToolCatalog.CodexTurnMCPServerEnable"
                 ])
             )
@@ -1455,7 +1458,7 @@
                     EditFlowPerf.Dimensions(toolName: "read_file", outcome: outcome)
                 ) {}
                 EditFlowPerf.measure(
-                    EditFlowPerf.Stage.MCPToolCall.legacyTabBindingCompatibility,
+                    EditFlowPerf.Stage.MCPToolCall.presentationContextResolution,
                     EditFlowPerf.Dimensions(toolName: "read_file", outcome: outcome)
                 ) {}
             }
@@ -2118,6 +2121,40 @@
                 10,
                 "Worker body time must fall after MainActor exit and before resume scheduling"
             )
+        }
+
+        func testReadFileRangeHandlesIntMinAndIndexLimitOverflowWithoutTrapping() throws {
+            let prepared = WorkspaceInteractiveReadProcessor.prepare("one\ntwo\nthree")
+
+            let minimumTail = try WorkspaceInteractiveReadProcessor.slice(
+                prepared,
+                startLine1Based: Int.min,
+                lineCount: nil
+            )
+            XCTAssertEqual(minimumTail.content, "one\ntwo\nthree")
+            XCTAssertEqual(minimumTail.firstLine, 1)
+            XCTAssertEqual(minimumTail.lastLine, 3)
+            XCTAssertFalse(minimumTail.startExceededFileLength)
+
+            let overflowingLimit = try WorkspaceInteractiveReadProcessor.slice(
+                prepared,
+                startLine1Based: 2,
+                lineCount: Int.max
+            )
+            XCTAssertEqual(overflowingLimit.content, "two\nthree")
+            XCTAssertEqual(overflowingLimit.firstLine, 2)
+            XCTAssertEqual(overflowingLimit.lastLine, 3)
+            XCTAssertEqual(overflowingLimit.returnedLineCount, 2)
+
+            let overflowingIndex = try WorkspaceInteractiveReadProcessor.slice(
+                prepared,
+                startLine1Based: Int.max,
+                lineCount: nil
+            )
+            XCTAssertEqual(overflowingIndex.content, "")
+            XCTAssertEqual(overflowingIndex.firstLine, Int.max)
+            XCTAssertEqual(overflowingIndex.lastLine, 3)
+            XCTAssertTrue(overflowingIndex.startExceededFileLength)
         }
 
         @MainActor

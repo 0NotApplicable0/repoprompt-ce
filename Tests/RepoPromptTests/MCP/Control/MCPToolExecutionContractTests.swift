@@ -7,6 +7,7 @@ import XCTest
 final class MCPToolExecutionContractTests: XCTestCase {
     func testCentralTimeoutPolicyMatchesProductContract() {
         XCTAssertEqual(MCPTimeoutPolicy.boundedToolExecutionDeadlineSeconds, 30)
+        XCTAssertEqual(MCPTimeoutPolicy.fileActionTrashExecutionDeadlineSeconds, 60)
         XCTAssertEqual(MCPTimeoutPolicy.workspaceFreshnessWaitTimeoutSeconds, 30)
         XCTAssertEqual(MCPTimeoutPolicy.workspaceSwitchToolExecutionDeadlineSeconds, 120)
         XCTAssertEqual(MCPTimeoutPolicy.boundedToolCancellationCleanupGraceSeconds, 5)
@@ -19,12 +20,32 @@ final class MCPToolExecutionContractTests: XCTestCase {
         XCTAssertEqual(MCPTimeoutPolicy.worktreeMergeApprovalTimeoutSeconds, 600)
     }
 
+    func testFileActionsDeleteUsesFinderTrashDeadline() {
+        guard case let .bounded(deadline, cancellationGrace, cleanupDisposition) = MCPToolExecutionContractCatalog.contract(
+            for: MCPWindowToolName.fileActions,
+            arguments: ["action": .string("  DeLeTe  ")]
+        ) else {
+            return XCTFail("Expected bounded Finder Trash contract")
+        }
+        XCTAssertEqual(deadline, MCPTimeoutPolicy.fileActionTrashExecutionDeadline)
+        XCTAssertEqual(cancellationGrace, MCPTimeoutPolicy.boundedToolCancellationCleanupGrace)
+        XCTAssertEqual(cleanupDisposition, .detachAndSettle)
+
+        XCTAssertEqual(
+            MCPToolExecutionContractCatalog.contract(
+                for: MCPWindowToolName.fileActions,
+                arguments: ["action": .string("create")]
+            ),
+            MCPToolExecutionContractCatalog.contract(for: MCPWindowToolName.fileActions)
+        )
+    }
+
     func testAdvertisedToolCatalogMatchesExecutionContractClassificationMatrix() {
         do {
             let caseLabel = "testCatalogCoversEveryAdvertisedGlobalAndWindowToolExactlyOnce"
             XCTAssertEqual(
                 MCPToolExecutionContractCatalog.orderedAdvertisedToolNames,
-                MCPGlobalToolName.orderedToolNames + MCPWindowToolGroup.orderedToolNames,
+                MCPGlobalToolName.orderedToolNames + MCPAppToolGroup.orderedToolNames,
                 caseLabel
             )
             XCTAssertEqual(MCPToolExecutionContractCatalog.orderedAdvertisedToolNames.count, 27, caseLabel)
@@ -62,6 +83,12 @@ final class MCPToolExecutionContractTests: XCTestCase {
                 MCPWindowToolName.history
             ], caseLabel)
 
+            let detachAndSettleToolNames: Set<String> = [
+                MCPWindowToolName.fileActions,
+                MCPWindowToolName.getCodeStructure,
+                MCPWindowToolName.readFile,
+                MCPWindowToolName.getFileTree
+            ]
             for toolName in names(for: .bounded) {
                 guard case let .bounded(deadline, cancellationGrace, cleanupDisposition) = MCPToolExecutionContractCatalog.contract(for: toolName) else {
                     return XCTFail(caseLabel + ": Expected bounded contract for \(toolName)")
@@ -70,7 +97,7 @@ final class MCPToolExecutionContractTests: XCTestCase {
                 XCTAssertEqual(cancellationGrace, MCPTimeoutPolicy.boundedToolCancellationCleanupGrace, caseLabel + ": " + toolName)
                 XCTAssertEqual(
                     cleanupDisposition,
-                    toolName == MCPWindowToolName.getCodeStructure ? .detachAndSettle : .forceDisconnect,
+                    detachAndSettleToolNames.contains(toolName) ? .detachAndSettle : .forceDisconnect,
                     caseLabel + ": " + toolName
                 )
             }

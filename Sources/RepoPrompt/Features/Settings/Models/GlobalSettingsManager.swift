@@ -33,6 +33,10 @@ enum SettingKeys {
 
     /// App-wide UI font scale preset body size.
     static let fontPresetBodySize = "fontPresetBodySize"
+
+    /// Whether Agent Chats includes open Compose tabs without Agent sessions.
+    /// Referenced by Agent Mode Overview and the Agent Chats list.
+    static let agentModeShowComposeTabsWithoutAgentSessions = "agentModeShowComposeTabsWithoutAgentSessions"
 }
 
 extension Notification.Name {
@@ -125,7 +129,7 @@ struct CopyGlobalSettings: Codable {
 
 // MARK: - Chat Global Settings (per workspace)
 
-struct ChatGlobalSettings: Codable {
+struct ChatGlobalSettings: Codable, Equatable {
     var fileTreeOption: FileTreeOption
     var codeMapUsage: CodeMapUsage
     var gitInclusion: GitDiffInclusionMode
@@ -146,25 +150,24 @@ struct ChatGlobalSettings: Codable {
     var lastNonManualChatPresetID: UUID? = nil
     var lastNonManualChatPresetName: String? = nil
 
-    // MARK: - Legacy Context Builder Agent & Model (decode compatibility only)
+    // MARK: - Legacy Context Builder State (decode compatibility only)
 
     var lastUsedDiscoverAgentRaw: String? = nil
     /// Maps agent rawValue to last-used model rawValue for that agent
     var lastUsedDiscoverModelsByAgent: [String: String]? = nil
-    /// Discovery token budget (workspace-scoped)
+    /// Legacy migration input only
     var discoveryTokenBudget: Int? = nil
-    /// Discovery prompt enhancement mode (workspace-scoped) - stores raw value of PromptEnhancementMode enum
+    /// Legacy migration input only
     var discoveryEnhancementMode: String? = nil
-    /// Default auto-plan setting for new/unstored tabs (workspace-scoped fallback).
-    /// Per-tab values live in ComposeTabState.contextBuilder.autoGeneratePlan.
+    /// Legacy migration input only
     var discoveryAutoGeneratePlan: Bool? = nil
-    /// Allow Context Builder to ask clarifying questions mid-run (workspace-scoped, UI-triggered)
+    /// Legacy migration input only
     var discoveryAllowClarifyingQuestions: Bool? = nil
-    /// Allow clarifying questions when discovery is triggered via MCP context_builder (workspace-scoped, defaults false)
+    /// Legacy migration input only
     var discoveryAllowClarifyingQuestionsForMCP: Bool? = nil
-    /// Timeout (in seconds) for clarifying question responses (workspace-scoped, defaults to 300)
+    /// Legacy migration input only
     var discoveryQuestionTimeoutSeconds: TimeInterval? = nil
-    /// Token budget for plan generation (workspace-scoped, defaults to 80k)
+    /// Legacy migration input only
     var discoveryPlanTokenBudget: Int? = nil
 
     // MARK: - Context Builder Model (workspace-scoped)
@@ -340,8 +343,6 @@ class GlobalSettingsStore: ObservableObject {
     private var globalDefaults = GlobalDefaults(discoverAgentRaw: nil, discoverModelsByAgent: nil)
     private var scalarPreferences = GlobalScalarPreferences()
 
-    private static let defaultBackgroundAgentComposeTabHardLimit = 500
-    private static let defaultComposeTabSoftLimit = 50
     private static let defaultAppearanceModeRaw = "System"
     private static let defaultFilePathDisplayOptionRaw = "Full"
     private static let defaultSelectedFilesSortMethodRaw = "nameAscending"
@@ -361,7 +362,6 @@ class GlobalSettingsStore: ObservableObject {
         self.fileStore = fileStore
         self.invalidAgentModelsProfileAssertion = invalidAgentModelsProfileAssertion
         load()
-        ensureFileSystemGlobalIgnoreDefaultsSeeded()
         reconcilePersistenceBlockDismissal()
     }
 
@@ -856,6 +856,42 @@ class GlobalSettingsStore: ObservableObject {
         }
     }
 
+    func contextBuilderBehaviorSettings() -> ContextBuilderBehaviorSettings {
+        let settings = scalarPreferences.contextBuilder
+        return ContextBuilderBehaviorSettings(
+            contextTokenBudget: settings?.contextTokenBudget ?? ContextBuilderDefaults.contextTokenBudget,
+            analysisTokenBudget: settings?.analysisTokenBudget ?? ContextBuilderDefaults.analysisTokenBudget,
+            enhancementMode: settings?.enhancementMode.flatMap(PromptEnhancementMode.init(rawValue:))
+                ?? ContextBuilderDefaults.enhancementMode,
+            questionTimeoutSeconds: settings?.questionTimeoutSeconds ?? ContextBuilderDefaults.questionTimeoutSeconds,
+            allowUIClarifyingQuestions: settings?.allowUIClarifyingQuestions
+                ?? ContextBuilderDefaults.allowUIClarifyingQuestions,
+            allowMCPClarifyingQuestions: settings?.allowMCPClarifyingQuestions
+                ?? ContextBuilderDefaults.allowMCPClarifyingQuestions,
+            followUpAnalysisEnabled: settings?.followUpAnalysisEnabled
+                ?? ContextBuilderDefaults.followUpAnalysisEnabled
+        )
+    }
+
+    func setContextBuilderBehaviorSettings(
+        _ settings: ContextBuilderBehaviorSettings,
+        commit: Bool = true
+    ) {
+        let persisted = GlobalScalarPreferences.ContextBuilderSettings(
+            contextTokenBudget: settings.contextTokenBudget,
+            analysisTokenBudget: settings.analysisTokenBudget,
+            enhancementMode: settings.enhancementMode.rawValue,
+            questionTimeoutSeconds: settings.questionTimeoutSeconds,
+            allowUIClarifyingQuestions: settings.allowUIClarifyingQuestions,
+            allowMCPClarifyingQuestions: settings.allowMCPClarifyingQuestions,
+            followUpAnalysisEnabled: settings.followUpAnalysisEnabled
+        )
+        guard scalarPreferences.contextBuilder != persisted else { return }
+        updateScalarPreferences(commit: commit) { preferences in
+            preferences.contextBuilder = persisted
+        }
+    }
+
     func promptSectionsOrderRaw() -> String {
         scalarPreferences.promptPackaging?.promptSectionsOrder ?? ""
     }
@@ -1243,18 +1279,6 @@ class GlobalSettingsStore: ObservableObject {
         )
     }
 
-    func maxBackgroundAgentComposeTabs() -> Int {
-        let configuredLimit = scalarPreferences.agentMode?.maxBackgroundAgentComposeTabs ?? Self.defaultBackgroundAgentComposeTabHardLimit
-        let rawLimit = configuredLimit > 0 ? configuredLimit : Self.defaultBackgroundAgentComposeTabHardLimit
-        return max(Self.defaultComposeTabSoftLimit, rawLimit)
-    }
-
-    func setMaxBackgroundAgentComposeTabs(_ limit: Int?, commit: Bool = true) {
-        updateAgentModeScalar(commit: commit) { settings in
-            settings.maxBackgroundAgentComposeTabs = limit
-        }
-    }
-
     func showBuiltInWorkflowCleanupGuidance() -> Bool {
         scalarPreferences.agentMode?.showBuiltInWorkflowCleanupGuidance ?? true
     }
@@ -1287,6 +1311,52 @@ class GlobalSettingsStore: ObservableObject {
             settings.codexReasoningSummariesEnabled = enabled
         }
         CodexReasoningSummaries.postDidChangeIfNeeded(previousValue: oldValue, currentValue: codexReasoningSummariesEnabled())
+    }
+
+    func codexMemoriesEnabled() -> Bool {
+        CodexMemories.isEnabled(persistedValue: scalarPreferences.agentMode?.codexMemoriesEnabled)
+    }
+
+    func setCodexMemoriesEnabled(_ enabled: Bool, commit: Bool = true) {
+        updateAgentModeScalar(commit: commit) { settings in
+            settings.codexMemoriesEnabled = enabled
+        }
+    }
+
+    func providerConversationCleanupAction() -> ProviderConversationCleanupAction {
+        guard let raw = scalarPreferences.agentMode?.providerConversationCleanupAction,
+              let action = ProviderConversationCleanupAction(rawValue: raw)
+        else {
+            return .archive
+        }
+        return action
+    }
+
+    func setProviderConversationCleanupAction(_ action: ProviderConversationCleanupAction, commit: Bool = true) {
+        updateAgentModeScalar(commit: commit) { settings in
+            settings.providerConversationCleanupAction = action.rawValue
+        }
+    }
+
+    func agentSessionHandoffInstructions() -> String {
+        scalarPreferences.agentMode?.agentSessionHandoffInstructions ?? ""
+    }
+
+    @discardableResult
+    func setAgentSessionHandoffInstructions(_ instructions: String, commit: Bool = true) -> Bool {
+        guard case .valid = AgentSessionHandoffInstructionsPolicy.validation(of: instructions) else {
+            return false
+        }
+
+        let proposedValue = instructions.isEmpty ? nil : instructions
+        guard scalarPreferences.agentMode?.agentSessionHandoffInstructions != proposedValue else {
+            return true
+        }
+
+        updateAgentModeScalar(commit: commit) { settings in
+            settings.agentSessionHandoffInstructions = proposedValue
+        }
+        return true
     }
 
     #if DEBUG
@@ -2179,20 +2249,24 @@ class GlobalSettingsStore: ObservableObject {
         copySettings = document.copySettings
         let migratedContextBuilderState = Self.migratingLegacyContextBuilderState(
             chatSettings: document.chatSettings,
-            globalDefaults: document.globalDefaults
+            globalDefaults: document.globalDefaults,
+            scalarPreferences: document.scalarPreferences ?? GlobalScalarPreferences()
         )
         chatSettings = migratedContextBuilderState.chatSettings
         agentModelsSettingsByWorkspaceID = document.agentModelsSettings
         globalDefaults = migratedContextBuilderState.globalDefaults
-        scalarPreferences = document.scalarPreferences ?? GlobalScalarPreferences()
+        scalarPreferences = migratedContextBuilderState.scalarPreferences
+        let seededFileSystemDefaults = Self.seedFileSystemGlobalIgnoreDefaults(in: &scalarPreferences)
         let disabledInvalidSync = disableInvalidLoadedAgentModelsSyncState()
         if shouldSyncTelemetryMirror {
             syncTelemetryMirrorFromLoadedSettings(scalarPreferences)
         }
         codeMapsGloballyDisabled = globalDefaults.codeMapsGloballyDisabled ?? false
         persistenceBlockReason = fileStore.blockReason
-        if disabledInvalidSync, loadedExistingDocument != nil, persistenceBlockReason == nil {
-            save()
+        if persistenceBlockReason == nil,
+           migratedContextBuilderState.didChange || seededFileSystemDefaults || disabledInvalidSync
+        {
+            saveStartupMigration(includeModelSelectionRepair: disabledInvalidSync)
         }
         if notifyAgentModelsChanges {
             postInstalledAgentModelsChanges(
@@ -2252,18 +2326,22 @@ class GlobalSettingsStore: ObservableObject {
             copySettings = document.copySettings
             let migratedContextBuilderState = Self.migratingLegacyContextBuilderState(
                 chatSettings: document.chatSettings,
-                globalDefaults: document.globalDefaults
+                globalDefaults: document.globalDefaults,
+                scalarPreferences: document.scalarPreferences ?? GlobalScalarPreferences()
             )
             chatSettings = migratedContextBuilderState.chatSettings
             agentModelsSettingsByWorkspaceID = document.agentModelsSettings
             globalDefaults = migratedContextBuilderState.globalDefaults
-            scalarPreferences = document.scalarPreferences ?? GlobalScalarPreferences()
+            scalarPreferences = migratedContextBuilderState.scalarPreferences
+            let seededFileSystemDefaults = Self.seedFileSystemGlobalIgnoreDefaults(in: &scalarPreferences)
             let disabledInvalidSync = disableInvalidLoadedAgentModelsSyncState()
             syncTelemetryMirrorFromLoadedSettings(scalarPreferences)
             codeMapsGloballyDisabled = globalDefaults.codeMapsGloballyDisabled ?? false
             persistenceBlockReason = fileStore.blockReason
-            if disabledInvalidSync, persistenceBlockReason == nil {
-                save()
+            if persistenceBlockReason == nil,
+               migratedContextBuilderState.didChange || seededFileSystemDefaults || disabledInvalidSync
+            {
+                saveStartupMigration(includeModelSelectionRepair: disabledInvalidSync)
             }
             postInstalledAgentModelsChanges(
                 oldGlobalProfile: oldGlobalProfile,
@@ -2332,18 +2410,26 @@ class GlobalSettingsStore: ObservableObject {
         }
     }
 
-    private func ensureFileSystemGlobalIgnoreDefaultsSeeded() {
+    private static func seedFileSystemGlobalIgnoreDefaults(
+        in scalarPreferences: inout GlobalScalarPreferences
+    ) -> Bool {
         var fileSystemSettings = scalarPreferences.fileSystem ?? GlobalScalarPreferences.FileSystemSettings()
-        guard fileSystemSettings.globalIgnoreDefaults == nil else { return }
+        guard fileSystemSettings.globalIgnoreDefaults == nil else { return false }
         fileSystemSettings.globalIgnoreDefaults = IgnoreSettingsDefaults.canonicalGlobalIgnoreDefaults
         scalarPreferences.fileSystem = fileSystemSettings
-        save()
+        return true
     }
 
     private static func migratingLegacyContextBuilderState(
         chatSettings: [UUID: ChatGlobalSettings],
-        globalDefaults: GlobalDefaults
-    ) -> (chatSettings: [UUID: ChatGlobalSettings], globalDefaults: GlobalDefaults) {
+        globalDefaults: GlobalDefaults,
+        scalarPreferences: GlobalScalarPreferences
+    ) -> (
+        chatSettings: [UUID: ChatGlobalSettings],
+        globalDefaults: GlobalDefaults,
+        scalarPreferences: GlobalScalarPreferences,
+        didChange: Bool
+    ) {
         var migratedGlobalDefaults = globalDefaults
         if migratedGlobalDefaults.discoverAgentRaw == nil,
            let legacySelection = legacyContextBuilderSelection(
@@ -2364,9 +2450,62 @@ class GlobalSettingsStore: ObservableObject {
         }
         migratedGlobalDefaults.contextBuilderAgentRaw = nil
 
+        var migratedScalarPreferences = scalarPreferences
+        if migratedScalarPreferences.contextBuilder == nil {
+            let behavior = legacyContextBuilderBehaviorSettings(chatSettings: chatSettings)
+            migratedScalarPreferences.contextBuilder = GlobalScalarPreferences.ContextBuilderSettings(
+                contextTokenBudget: behavior.contextTokenBudget,
+                analysisTokenBudget: behavior.analysisTokenBudget,
+                enhancementMode: behavior.enhancementMode.rawValue,
+                questionTimeoutSeconds: behavior.questionTimeoutSeconds,
+                allowUIClarifyingQuestions: behavior.allowUIClarifyingQuestions,
+                allowMCPClarifyingQuestions: behavior.allowMCPClarifyingQuestions,
+                followUpAnalysisEnabled: behavior.followUpAnalysisEnabled
+            )
+        }
+
+        let migratedChatSettings = removingLegacyWorkspaceContextBuilderState(from: chatSettings)
         return (
-            removingLegacyWorkspaceContextBuilderState(from: chatSettings),
-            migratedGlobalDefaults
+            migratedChatSettings,
+            migratedGlobalDefaults,
+            migratedScalarPreferences,
+            migratedChatSettings != chatSettings
+                || migratedGlobalDefaults != globalDefaults
+                || migratedScalarPreferences != scalarPreferences
+        )
+    }
+
+    private static func legacyContextBuilderBehaviorSettings(
+        chatSettings: [UUID: ChatGlobalSettings]
+    ) -> ContextBuilderBehaviorSettings {
+        let orderedSettings = chatSettings.sorted { $0.key.uuidString < $1.key.uuidString }
+        let enhancementMode = orderedSettings.lazy.compactMap { entry -> PromptEnhancementMode? in
+            guard let rawValue = entry.value.discoveryEnhancementMode else { return nil }
+            guard let mode = PromptEnhancementMode(rawValue: rawValue) else {
+                print(
+                    "⚠️ Ignoring invalid legacy Context Builder enhancement mode for workspace "
+                        + "\(entry.key.uuidString)"
+                )
+                return nil
+            }
+            return mode
+        }.first
+
+        return ContextBuilderBehaviorSettings(
+            contextTokenBudget: orderedSettings.lazy.compactMap(\.value.discoveryTokenBudget).first
+                ?? ContextBuilderDefaults.contextTokenBudget,
+            analysisTokenBudget: orderedSettings.lazy.compactMap(\.value.discoveryPlanTokenBudget).first
+                ?? ContextBuilderDefaults.analysisTokenBudget,
+            enhancementMode: enhancementMode ?? ContextBuilderDefaults.enhancementMode,
+            questionTimeoutSeconds: orderedSettings.lazy.compactMap(\.value.discoveryQuestionTimeoutSeconds).first
+                ?? ContextBuilderDefaults.questionTimeoutSeconds,
+            allowUIClarifyingQuestions: orderedSettings.lazy.compactMap(\.value.discoveryAllowClarifyingQuestions).first
+                ?? ContextBuilderDefaults.allowUIClarifyingQuestions,
+            allowMCPClarifyingQuestions: orderedSettings.lazy
+                .compactMap(\.value.discoveryAllowClarifyingQuestionsForMCP).first
+                ?? ContextBuilderDefaults.allowMCPClarifyingQuestions,
+            followUpAnalysisEnabled: orderedSettings.lazy.compactMap(\.value.discoveryAutoGeneratePlan).first
+                ?? ContextBuilderDefaults.followUpAnalysisEnabled
         )
     }
 
@@ -2431,6 +2570,13 @@ class GlobalSettingsStore: ObservableObject {
             var settings = settings
             settings.lastUsedDiscoverAgentRaw = nil
             settings.lastUsedDiscoverModelsByAgent = nil
+            settings.discoveryTokenBudget = nil
+            settings.discoveryEnhancementMode = nil
+            settings.discoveryAutoGeneratePlan = nil
+            settings.discoveryAllowClarifyingQuestions = nil
+            settings.discoveryAllowClarifyingQuestionsForMCP = nil
+            settings.discoveryQuestionTimeoutSeconds = nil
+            settings.discoveryPlanTokenBudget = nil
             settings.contextBuilderAgentRaw = nil
             settings.contextBuilderAgentModelRaw = nil
             settings.didUserSetDiscoverAgentDefaults = nil
@@ -2506,9 +2652,23 @@ class GlobalSettingsStore: ObservableObject {
     }
 
     @discardableResult
+    private func saveStartupMigration(includeModelSelectionRepair: Bool) -> Bool {
+        persist {
+            try fileStore.saveStartupMigrationPreservingUnknownFields(
+                makeDocument(),
+                includeModelSelectionRepair: includeModelSelectionRepair
+            )
+        }
+    }
+
+    @discardableResult
     private func save() -> Bool {
+        persist { try fileStore.save(makeDocument()) }
+    }
+
+    private func persist(_ operation: () throws -> Void) -> Bool {
         do {
-            try fileStore.save(makeDocument())
+            try operation()
             if persistenceBlockReason != fileStore.blockReason {
                 persistenceBlockReason = fileStore.blockReason
             }

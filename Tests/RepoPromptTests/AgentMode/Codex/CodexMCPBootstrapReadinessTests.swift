@@ -15,6 +15,11 @@ final class CodexMCPBootstrapReadinessTests: XCTestCase {
     func testThrowingProvisionerAbortsBeforeProcessStartAndThreadRequest() async throws {
         // Both a fresh start (existing == nil → thread/start) and a resume (existing set →
         // thread/resume) must abort at the provisioning gate before any request is sent.
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("CodexMCPBootstrapReadinessTests-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        addTeardownBlock { try? FileManager.default.removeItem(at: directory) }
+        let executableURL = try makeFakeCodexAppServer(in: directory)
         let resumeRef = CodexNativeSessionController.SessionRef(
             conversationID: "existing-thread",
             rolloutPath: nil,
@@ -23,12 +28,21 @@ final class CodexMCPBootstrapReadinessTests: XCTestCase {
         )
         for existing in [nil, resumeRef] {
             let registrar = RecordingExpectedAgentPIDRegistrar()
-            let client = CodexAppServerClient(expectedAgentPIDRegistrar: registrar.registrar)
+            let client = CodexAppServerClient(
+                provisionsRepoPromptMCPOnStart: false,
+                expectedAgentPIDRegistrar: registrar.registrar
+            )
+            await client.updateConfig(.init(
+                commandName: executableURL.path,
+                additionalPathHints: [],
+                requestTimeout: 5,
+                processLaunchDirectory: directory.path
+            ))
             let requests = RecordedRequests()
             let provisionerCalls = CallCounter()
 
             var options = makeAgentModeOptions()
-            options.repoPromptMCPProvisioner = {
+            options.repoPromptMCPProvisioner = { _ in
                 provisionerCalls.increment()
                 throw MCPBootstrapReadinessError.provisioningUnavailable
             }
@@ -38,7 +52,7 @@ final class CodexMCPBootstrapReadinessTests: XCTestCase {
                 runID: UUID(),
                 tabID: UUID(),
                 windowID: 0,
-                workspacePath: "/tmp/codex-mcp-readiness-throwing",
+                workspacePaths: .uniform("/tmp/codex-mcp-readiness-throwing"),
                 options: options,
                 clientShutdownBehavior: .stopOnShutdown,
                 expectedMCPClientName: expectedClientName,
@@ -66,22 +80,36 @@ final class CodexMCPBootstrapReadinessTests: XCTestCase {
     // MARK: - Cancellation cannot cross the launch boundary
 
     func testCancellationDuringProvisioningDoesNotCrossLaunchBoundary() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("CodexMCPBootstrapReadinessTests-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        addTeardownBlock { try? FileManager.default.removeItem(at: directory) }
+        let executableURL = try makeFakeCodexAppServer(in: directory)
         let registrar = RecordingExpectedAgentPIDRegistrar()
-        let client = CodexAppServerClient(expectedAgentPIDRegistrar: registrar.registrar)
+        let client = CodexAppServerClient(
+            provisionsRepoPromptMCPOnStart: false,
+            expectedAgentPIDRegistrar: registrar.registrar
+        )
+        await client.updateConfig(.init(
+            commandName: executableURL.path,
+            additionalPathHints: [],
+            requestTimeout: 5,
+            processLaunchDirectory: directory.path
+        ))
         let requests = RecordedRequests()
         let gate = ProvisionerSuspensionGate()
 
         var options = makeAgentModeOptions()
         // Suspend inside the provisioner so the test can cancel the start while it is parked at the
         // gate — reproducing a cancellation that races provisioning without any sleeps.
-        options.repoPromptMCPProvisioner = { await gate.arriveAndWait() }
+        options.repoPromptMCPProvisioner = { _ in await gate.arriveAndWait() }
 
         let controller = CodexNativeSessionController(
             client: client,
             runID: UUID(),
             tabID: UUID(),
             windowID: 0,
-            workspacePath: "/tmp/codex-mcp-readiness-cancellation",
+            workspacePaths: .uniform("/tmp/codex-mcp-readiness-cancellation"),
             options: options,
             clientShutdownBehavior: .stopOnShutdown,
             expectedMCPClientName: expectedClientName,
@@ -110,6 +138,9 @@ final class CodexMCPBootstrapReadinessTests: XCTestCase {
         XCTAssertFalse(processRunning, "a cancelled start must not launch the app-server process")
         XCTAssertEqual(requests.methods, [], "a cancelled start must send no thread request")
         XCTAssertEqual(registrar.registeredCount, 0, "a cancelled start must register no expected-agent PID")
+        let bindingState = try await controller.test_bindingBufferState()
+        XCTAssertFalse(bindingState.isBinding, "a cancelled start must leave binding mode")
+        XCTAssertEqual(bindingState.bufferedCount, 0, "a cancelled start must discard buffered inbound events")
     }
 
     // MARK: - Successful provisioner proceeds, in order
@@ -120,16 +151,39 @@ final class CodexMCPBootstrapReadinessTests: XCTestCase {
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         addTeardownBlock { try? FileManager.default.removeItem(at: directory) }
 
-        let executableURL = try makeFakeCodexAppServer(in: directory)
+        let environmentURL = directory.appendingPathComponent("child-environment.json")
+        let versionProbeURL = directory.appendingPathComponent("version-probes")
+        let executableURL = try makeFakeCodexAppServer(
+            in: directory,
+            environmentURL: environmentURL,
+            versionProbeURL: versionProbeURL
+        )
 
         let registrar = RecordingExpectedAgentPIDRegistrar()
-        let client = CodexAppServerClient(expectedAgentPIDRegistrar: registrar.registrar)
+        let shellHome = directory.appendingPathComponent("shell-home", isDirectory: true).path
+        let client = CodexAppServerClient(
+            processEnvironmentBuilder: { request in
+                await ProcessEnvironmentBuilder.build(
+                    request,
+                    shellEnvironmentProvider: { _, _ in
+                        CLIEnvironmentSnapshot(
+                            environment: [
+                                "HOME": shellHome,
+                                CodexRuntimeAuthority.externalExecutableOverrideEnvironmentKey: executableURL.path
+                            ],
+                            source: .capturedLoginShell
+                        )
+                    }
+                )
+            },
+            provisionsRepoPromptMCPOnStart: false,
+            expectedAgentPIDRegistrar: registrar.registrar
+        )
         await client.updateConfig(
             CodexAppServerClient.Config(
-                commandName: executableURL.path,
                 additionalPathHints: [],
                 requestTimeout: 5,
-                workingDirectory: directory.path
+                processLaunchDirectory: directory.path
             )
         )
 
@@ -137,17 +191,21 @@ final class CodexMCPBootstrapReadinessTests: XCTestCase {
             "thread": ["id": "fresh-thread", "status": "idle", "turns": []]
         ])
         let gate = ProvisionerSuspensionGate()
+        let provisionedRuntime = ProvisionedRuntimeRecorder()
         var options = makeAgentModeOptions()
         // Park the provisioner so the ordering can be observed: nothing downstream may happen while
         // it is suspended.
-        options.repoPromptMCPProvisioner = { await gate.arriveAndWait() }
+        options.repoPromptMCPProvisioner = { runtime in
+            provisionedRuntime.record(runtime)
+            await gate.arriveAndWait()
+        }
 
         let controller = CodexNativeSessionController(
             client: client,
             runID: UUID(),
             tabID: UUID(),
             windowID: 0,
-            workspacePath: directory.path,
+            workspacePaths: .uniform(directory.path),
             options: options,
             clientShutdownBehavior: .stopOnShutdown,
             expectedMCPClientName: expectedClientName,
@@ -172,13 +230,24 @@ final class CodexMCPBootstrapReadinessTests: XCTestCase {
         XCTAssertTrue(processRunning, "a successful provisioner lets the app-server process start")
         XCTAssertEqual(registrar.registeredClientNames, [expectedClientName], "the launched process registers its expected-agent PID")
         XCTAssertEqual(requests.methods, ["thread/start"], "the only controller request after a successful start is thread/start")
+
+        let runtime = try XCTUnwrap(provisionedRuntime.runtime)
+        XCTAssertEqual(runtime.source, .externalOverride)
+        XCTAssertEqual(runtime.executableURL, executableURL)
+        XCTAssertEqual(try String(contentsOf: versionProbeURL, encoding: .utf8), "probe\n")
+
+        let environmentData = try Data(contentsOf: environmentURL)
+        let childEnvironment = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: environmentData) as? [String: String]
+        )
+        XCTAssertEqual(childEnvironment["CODEX_HOME"], runtime.statePaths.codexHome.path)
+        XCTAssertEqual(childEnvironment["CODEX_SQLITE_HOME"], runtime.statePaths.sqliteHome.path)
     }
 
     // MARK: - Helpers
 
     private func makeAgentModeOptions() -> CodexNativeSessionController.Options {
         .agentModeDefault(
-            forceExperimentalSteering: false,
             approvalPolicyProvider: { .never },
             sandboxModeProvider: { .readOnly },
             approvalReviewerProvider: { .user }
@@ -190,12 +259,33 @@ final class CodexMCPBootstrapReadinessTests: XCTestCase {
     /// without the real `codex` binary. Thread requests are intercepted by the injected request
     /// executor, so the process only has to complete startup; its launch is observed via
     /// `debugIsProcessRunning()`.
-    private func makeFakeCodexAppServer(in directory: URL) throws -> URL {
+    private func makeFakeCodexAppServer(
+        in directory: URL,
+        environmentURL: URL? = nil,
+        versionProbeURL: URL? = nil
+    ) throws -> URL {
         let scriptURL = directory.appendingPathComponent("fake-codex")
+        let environmentPath = environmentURL.map { String(reflecting: $0.path) } ?? "None"
+        let versionProbePath = versionProbeURL.map { String(reflecting: $0.path) } ?? "None"
         let script = """
         #!/usr/bin/env python3
         import json
+        import os
         import sys
+        version_probe_path = \(versionProbePath)
+        if sys.argv[1:] == ["--version"]:
+            if version_probe_path is not None:
+                with open(version_probe_path, "a", encoding="utf-8") as handle:
+                    handle.write("probe\\n")
+            print("codex 0.147.0")
+            raise SystemExit(0)
+        environment_path = \(environmentPath)
+        if environment_path is not None:
+            with open(environment_path, "w", encoding="utf-8") as handle:
+                json.dump({
+                    "CODEX_HOME": os.environ.get("CODEX_HOME", ""),
+                    "CODEX_SQLITE_HOME": os.environ.get("CODEX_SQLITE_HOME", "")
+                }, handle)
         def respond(request_id, result):
             print(json.dumps({"jsonrpc": "2.0", "id": request_id, "result": result}), flush=True)
         for line in sys.stdin:
@@ -214,6 +304,23 @@ final class CodexMCPBootstrapReadinessTests: XCTestCase {
 }
 
 // MARK: - Test doubles
+
+private final class ProvisionedRuntimeRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value: CodexRuntimeAuthority.Runtime?
+
+    func record(_ runtime: CodexRuntimeAuthority.Runtime) {
+        lock.lock()
+        value = runtime
+        lock.unlock()
+    }
+
+    var runtime: CodexRuntimeAuthority.Runtime? {
+        lock.lock()
+        defer { lock.unlock() }
+        return value
+    }
+}
 
 private final class CallCounter: @unchecked Sendable {
     private let lock = NSLock()

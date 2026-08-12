@@ -1,6 +1,7 @@
 import Foundation
 import JSONSchema
 import MCP
+import RepoPromptDomainRuntime
 
 /// Global, non-window-scoped MCP service for allowlisted RepoPrompt app settings.
 ///
@@ -8,6 +9,8 @@ import MCP
 /// keys present in `AppSettingsMCPRegistry.definitions` are visible to MCP clients.
 final class AppSettingsMCPService: Service {
     static let toolName = MCPGlobalToolName.appSettings
+
+    let domainRegistrationID = MCPDomainToolRegistrationID()
 
     private let store: GlobalSettingsStore
     private let notificationCenter: NotificationCenter
@@ -740,9 +743,8 @@ private enum AppSettingsMCPRegistry {
             write: { try $0.setCustomPlanningPrompt(requiredString(from: $1)) }
         ),
 
-        // Context Builder agent/model selection. Uses the legacy persisted
-        // discover-agent slot only; workspace-scoped context builder fields are
-        // intentionally not exposed here.
+        // Context Builder agent/model selection only. Behavioral controls remain
+        // globally owned by the app Settings and panel UI.
         stringEnumSetting(
             key: "context_builder.agent",
             group: "context_builder",
@@ -833,6 +835,21 @@ private enum AppSettingsMCPRegistry {
             description: "Whether Codex Agent Mode app-server threads request Codex model reasoning summaries. Defaults off; when disabled RepoPrompt sends model_reasoning_summary=none in Codex thread/start and thread/resume config. Does not affect Chat/Oracle model preferences, reasoning effort selection, or non-Agent Mode Codex runs.",
             read: { .bool($0.codexReasoningSummariesEnabled()) },
             write: { try $0.setCodexReasoningSummariesEnabled(requiredBool(from: $1)) }
+        ),
+        stringEnumSetting(
+            key: "agent_mode.provider_conversation_cleanup_action",
+            group: "agent_mode",
+            label: "Provider Conversation Cleanup",
+            description: "Controls best-effort provider-side Agent Mode conversation cleanup when deleting supported sessions. Archive is safer and is the default; delete asks supported providers to remove the conversation.",
+            allowedValues: ProviderConversationCleanupAction.allCases.map(\.rawValue),
+            read: { .string($0.providerConversationCleanupAction().rawValue) },
+            write: { store, value in
+                let raw = try requiredString(from: value)
+                guard let action = ProviderConversationCleanupAction(rawValue: raw) else {
+                    throw MCPError.invalidParams("Invalid provider cleanup action '\(raw)'.")
+                }
+                store.setProviderConversationCleanupAction(action)
+            }
         ),
 
         // File-system / ignore preferences. Local .repo_ignore file content remains

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import importlib.util
 import json
 import os
 import plistlib
@@ -17,6 +18,7 @@ import tempfile
 import time
 import unittest
 import zipfile
+from unittest import mock
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
@@ -200,6 +202,70 @@ APP_SIGN_ARGS=(){app_signing_body}
         self.assertNotIn("SUEnableInstallerLauncherService", info_plist)
         self.assertIn("trap 'finish $?' EXIT", package_script)
         self.assertIn('local status="$1" now total', package_script)
+
+    def test_staged_signing_resigns_every_codex_mach_o_before_mcp_and_outer_app(self) -> None:
+        source = (SCRIPT_DIR / "sign_staged_release.sh").read_text(encoding="utf-8")
+
+        self.assertIn('CODEX_MANIFEST="$METADATA_ROOT/Vendor/Codex/manifest.json"', source)
+        self.assertIn('python3 "$SCRIPT_DIR/codex_runtime_artifact.py"', source)
+        self.assertEqual(source.count('--manifest "$CODEX_MANIFEST" verify-bundle'), 2)
+        self.assertEqual(source.count("list-bundle-signing-plan --arch all"), 1)
+        self.assertNotIn("list-bundle-mach-o-paths", source)
+        self.assertEqual(source.count('--signed-team-identifier "$SIGNING_TEAM_ID"'), 1)
+        self.assertNotIn('$TRUSTED_ROOT/Vendor/Codex/manifest.json', source)
+        self.assertIn('CODEX_V8_ENTITLEMENTS="$TRUSTED_ROOT/AppBundle/CodexV8JIT.entitlements"', source)
+        self.assertIn('plutil -lint "$CODEX_V8_ENTITLEMENTS"', source)
+        for line in source.splitlines():
+            if 'sign_path "$CODEX_BUNDLE' in line:
+                self.assertNotIn("--preserve-metadata", line)
+
+        sparkle_sign = source.index('sign_sparkle_framework "$STAGED_SPARKLE_FRAMEWORK"')
+        enumerate_codex = source.index("list-bundle-signing-plan --arch all")
+        codex_sign = source.index('sign_path "$CODEX_BUNDLE/$relative_path" --entitlements "$CODEX_V8_ENTITLEMENTS"')
+        codex_sign_unprofiled = source.index('sign_path "$CODEX_BUNDLE/$relative_path"\n', codex_sign + 1)
+        mcp_sign = source.index('sign_path "$APP_BUNDLE/Contents/MacOS/repoprompt-mcp"')
+        app_sign = source.index('sign_path "$APP_BUNDLE/Contents/MacOS/$APP_NAME"')
+        outer_sign = source.index('sign_path "$APP_BUNDLE" --entitlements "$app_entitlements"')
+        self.assertLess(sparkle_sign, enumerate_codex)
+        self.assertLess(enumerate_codex, codex_sign)
+        self.assertLess(codex_sign, codex_sign_unprofiled)
+        self.assertLess(codex_sign_unprofiled, mcp_sign)
+        self.assertLess(mcp_sign, app_sign)
+        self.assertLess(app_sign, outer_sign)
+        self.assertNotIn('sign_path "$CODEX_BUNDLE"', source)
+
+    def test_codex_v8_entitlement_allowlist_matches_pinned_manifest_policy(self) -> None:
+        v8_profile = {
+            "com.apple.security.cs.allow-jit": True,
+            "com.apple.security.cs.allow-unsigned-executable-memory": True,
+        }
+        plist = plistlib.loads((SCRIPT_DIR.parent / "AppBundle" / "CodexV8JIT.entitlements").read_bytes())
+        self.assertEqual(plist, v8_profile)
+
+        manifest = json.loads(
+            (SCRIPT_DIR.parent / "Vendor" / "Codex" / "manifest.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(manifest["schemaVersion"], 2)
+        self.assertEqual(
+            manifest["releaseSigningEntitlements"],
+            {
+                "bin/codex": v8_profile,
+                "bin/codex-code-mode-host": v8_profile,
+                "codex-path/rg": {},
+                "codex-resources/zsh/bin/zsh": {},
+            },
+        )
+        for policy in manifest["signedExecutables"]:
+            self.assertEqual(policy["entitlements"], v8_profile, policy["path"])
+
+        for release_script_name in (
+            "release.sh",
+            "main_tip_release.sh",
+            "promote_release.sh",
+            "publish_public_update_test.sh",
+        ):
+            release_source = (SCRIPT_DIR / release_script_name).read_text(encoding="utf-8")
+            self.assertIn("--signed-team-identifier", release_source, release_script_name)
 
     def test_release_paths_use_static_validation_in_privileged_contexts_and_token_stripped_local_smoke(self) -> None:
         package_script = (SCRIPT_DIR / "package_app.sh").read_text(encoding="utf-8")
@@ -1003,6 +1069,14 @@ SIGNING_TEAM_ID=648A27MST5
         self.assertIn('[helper, "-e", "windows"]', source)
         self.assertIn('HELPER_REQUEST_TIMEOUT="${REPOPROMPT_PACKAGED_SMOKE_HELPER_TIMEOUT:-30}"', source)
         self.assertIn('timeout=int(helper_timeout)', source)
+        self.assertIn('"MCP_SOCKET_DEBUG": "1"', source)
+        self.assertIn('REPOPROMPT_PACKAGED_SMOKE_DIAGNOSTICS_DIR', source)
+        self.assertIn('sample "$APP_PID" 5 1', source)
+        cleanup = source.split("cleanup() {", 1)[1].split("\n}", 1)[0]
+        self.assertLess(cleanup.index("set +e"), cleanup.index("sample "))
+        self.assertLess(cleanup.index("set +e"), cleanup.index('kill -TERM "$APP_PID"'))
+        self.assertIn('helper-socket-debug.log', source)
+        self.assertIn('except subprocess.TimeoutExpired as error:', source)
         self.assertIn('REPOPROMPT_PACKAGED_SMOKE_HELPER_TIMEOUT must be a positive integer', source)
         self.assertIn('log_phase() {', source)
         self.assertIn('windows-attempt-${attempt}.out', source)
@@ -1010,10 +1084,21 @@ SIGNING_TEAM_ID=648A27MST5
         self.assertIn('CLI windows attempt ${attempt}', source)
         self.assertIn('APP_PID=$!', source)
         self.assertIn('launched-process.json', source)
+        self.assertIn('mkdir -p "$ISOLATED_HOME/Library/Keychains" "$ISOLATED_HOME/Library/Preferences"', source)
+        self.assertIn('SMOKE_KEYCHAIN_PATH="$ISOLATED_HOME/Library/Keychains/repoprompt-packaged-smoke.keychain-db"', source)
+        self.assertIn('isolated_security create-keychain -p "$SMOKE_KEYCHAIN_PASSWORD" "$SMOKE_KEYCHAIN_PATH"', source)
+        self.assertIn('isolated_security unlock-keychain -p "$SMOKE_KEYCHAIN_PASSWORD" "$SMOKE_KEYCHAIN_PATH"', source)
+        self.assertIn('isolated_security list-keychains -d user -s "$SMOKE_KEYCHAIN_PATH"', source)
+        self.assertIn('isolated_security default-keychain -d user -s "$SMOKE_KEYCHAIN_PATH"', source)
+        self.assertIn('isolated_security delete-keychain "$SMOKE_KEYCHAIN_PATH"', cleanup)
+        self.assertLess(source.index('isolated_security create-keychain'), source.index('APP_PID=$!'))
+        self.assertLess(source.index('isolated_security default-keychain'), source.index('APP_PID=$!'))
         self.assertIn('verify_packaged_mcp_socket_owner.py', source)
+        self.assertIn('"$SOCKET_OWNER_HELPER" selftest', source)
         self.assertIn('preflight "$MCP_SOCKET_DIR"', source)
         self.assertIn('find-owner "$MCP_SOCKET_DIR" "$APP_PID" "$APP_EXECUTABLE"', source)
         self.assertIn('verify-owner "$MCP_SOCKET_PATH" "$APP_PID" "$APP_EXECUTABLE"', source)
+        self.assertLess(source.index('"$SOCKET_OWNER_HELPER" selftest'), source.index('preflight "$MCP_SOCKET_DIR"'))
         self.assertLess(source.index('preflight "$MCP_SOCKET_DIR"'), source.index('APP_PID=$!'))
         roundtrip_loop = source.split('while (( $(date +%s) <= deadline )); do', 1)[1]
         self.assertLess(
@@ -1026,27 +1111,57 @@ SIGNING_TEAM_ID=648A27MST5
         self.assertNotIn("pkill", source)
         self.assertNotIn("open -n", source)
 
-    @unittest.skipUnless(sys.platform == "darwin", "macOS UNIX peer PID semantics")
+    @unittest.skipUnless(sys.platform == "darwin", "macOS libproc socket descriptor inspection")
+    def test_packaged_socket_owner_find_treats_startup_snapshot_transition_as_retryable(self) -> None:
+        helper_path = SCRIPT_DIR / "verify_packaged_mcp_socket_owner.py"
+        spec = importlib.util.spec_from_file_location("verify_packaged_mcp_socket_owner_test", helper_path)
+        self.assertIsNotNone(spec)
+        self.assertIsNotNone(spec.loader)
+        helper = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(helper)
+
+        missing_snapshot = (None, {})
+        created_snapshot = ((101, 202), {})
+        with (
+            mock.patch.object(helper, "validate_expected_process") as validate_process,
+            mock.patch.object(helper, "capture_socket_snapshot", side_effect=[missing_snapshot, created_snapshot]),
+            mock.patch.object(helper, "live_release_claims", return_value={}),
+        ):
+            result = helper.find_owner(Path("/tmp/repoprompt-ce-mcp-test"), 123, Path("/tmp/RepoPrompt"))
+
+        self.assertIsNone(result)
+        self.assertEqual(validate_process.call_count, 2)
+
+    @unittest.skipUnless(sys.platform == "darwin", "macOS libproc socket descriptor inspection")
     def test_packaged_socket_owner_helper_rejects_live_preflight_and_accepts_exact_owner(self) -> None:
         temp_dir = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, temp_dir, True)
         socket_directory = temp_dir / "repoprompt-ce-mcp"
         socket_directory.mkdir(mode=0o700)
         socket_path = socket_directory / "repoprompt-ce-7.sock"
-        listener = self.start_unix_listener(socket_path)
+        listener, accepted_connections = self.start_unix_listener(socket_path)
         expected_executable = self.socket_owner_process_path(listener.pid)
+        wrong_pid = os.getpid()
+        wrong_executable = self.socket_owner_process_path(wrong_pid)
 
+        selftest = self.run_socket_owner_helper("selftest")
         preflight = self.run_socket_owner_helper("preflight", socket_directory)
         found = self.run_socket_owner_helper("find-owner", socket_directory, listener.pid, expected_executable)
         verified = self.run_socket_owner_helper("verify-owner", socket_path, listener.pid, expected_executable)
+        wrong_owner = self.run_socket_owner_helper("verify-owner", socket_path, wrong_pid, wrong_executable)
 
+        self.assertEqual(selftest.returncode, 0, selftest.stderr)
         self.assertNotEqual(preflight.returncode, 0)
         self.assertIn("pre-existing live release socket", preflight.stderr)
         self.assertEqual(found.returncode, 0, found.stderr)
         self.assertEqual(Path(found.stdout.strip()), socket_path)
         self.assertEqual(verified.returncode, 0, verified.stderr)
+        self.assertNotEqual(wrong_owner.returncode, 0)
+        self.assertIn(str(listener.pid), wrong_owner.stderr)
+        self.assertIn(f"not exclusively launched pid {wrong_pid}", wrong_owner.stderr)
+        self.assertFalse(accepted_connections.exists(), "ownership inspection must not connect to the release socket")
 
-    @unittest.skipUnless(sys.platform == "darwin", "macOS UNIX peer PID semantics")
+    @unittest.skipUnless(sys.platform == "darwin", "macOS libproc socket descriptor inspection")
     def test_packaged_socket_owner_helper_allows_stale_and_rejects_wrong_or_replaced_owner(self) -> None:
         temp_dir = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, temp_dir, True)
@@ -1060,18 +1175,54 @@ SIGNING_TEAM_ID=648A27MST5
         self.assertEqual(accepted_stale.returncode, 0, accepted_stale.stderr)
 
         socket_path.unlink()
-        first = self.start_unix_listener(socket_path)
+        first, first_accepted_connections = self.start_unix_listener(socket_path)
         first_executable = self.socket_owner_process_path(first.pid)
+
         socket_path.unlink()
-        second = self.start_unix_listener(socket_path)
+        stale_replacement = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        stale_replacement.bind(os.fspath(socket_path))
+        stale_replacement.close()
+        replaced_by_stale = self.run_socket_owner_helper("verify-owner", socket_path, first.pid, first_executable)
+        self.assertNotEqual(replaced_by_stale.returncode, 0)
+        self.assertIn("identity does not match", replaced_by_stale.stderr)
+        self.assertFalse(first_accepted_connections.exists(), "stale-replacement inspection must not connect")
+
+        socket_path.unlink()
+        bound_replacement = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        bound_replacement.bind(os.fspath(socket_path))
+        try:
+            replaced_by_bound = self.run_socket_owner_helper("verify-owner", socket_path, first.pid, first_executable)
+        finally:
+            bound_replacement.close()
+        self.assertNotEqual(replaced_by_bound.returncode, 0)
+        self.assertIn("identity does not match", replaced_by_bound.stderr)
+        self.assertFalse(first_accepted_connections.exists(), "bound-replacement inspection must not connect")
+
+        socket_path.unlink()
+        second, second_accepted_connections = self.start_unix_listener(
+            socket_path,
+            claim_ownership_lock=False,
+        )
         second_executable = self.socket_owner_process_path(second.pid)
 
         replaced = self.run_socket_owner_helper("verify-owner", socket_path, first.pid, first_executable)
-        current = self.run_socket_owner_helper("verify-owner", socket_path, second.pid, second_executable)
+        ambiguous_current = self.run_socket_owner_helper("verify-owner", socket_path, second.pid, second_executable)
 
         self.assertNotEqual(replaced.returncode, 0)
-        self.assertIn(f"belongs to pid {second.pid}", replaced.stderr)
-        self.assertEqual(current.returncode, 0, current.stderr)
+        self.assertIn("not exclusively launched pid", replaced.stderr)
+        self.assertIn(str(first.pid), replaced.stderr)
+        self.assertIn(str(second.pid), replaced.stderr)
+        self.assertNotEqual(ambiguous_current.returncode, 0)
+        self.assertIn("not exclusively launched pid", ambiguous_current.stderr)
+        self.assertFalse(first_accepted_connections.exists(), "replaced-owner inspection must not connect")
+        self.assertFalse(second_accepted_connections.exists(), "current-owner inspection must not connect")
+
+        first.terminate()
+        first.wait(timeout=5)
+        unlocked_current = self.run_socket_owner_helper("verify-owner", socket_path, second.pid, second_executable)
+        self.assertNotEqual(unlocked_current.returncode, 0)
+        self.assertIn("ownership lock is not held", unlocked_current.stderr)
+        self.assertFalse(second_accepted_connections.exists(), "unlocked-owner verification must not connect")
 
         socket_path.unlink()
         socket_path.write_text("not a socket\n", encoding="utf-8")
@@ -1961,6 +2112,44 @@ sys.stdout.write(str(status))
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("OK: staged release payload matches approved source", result.stdout)
 
+    def test_public_app_validation_uses_approved_manifest_from_extracted_stage_layout(self) -> None:
+        for script_name in ("release.sh", "main_tip_release.sh"):
+            with self.subTest(script=script_name):
+                approved, staged, scripts = self.make_staged_release_fixture()
+                self.assertFalse((staged / "Vendor").exists())
+
+                result, capture = self.run_public_app_validation(
+                    approved,
+                    staged,
+                    scripts,
+                    script_name,
+                )
+
+                self.assertEqual(result.returncode, 0, result.stderr)
+                calls = capture.read_text(encoding="utf-8").splitlines()
+                self.assertEqual(len(calls), 1)
+                self.assertIn(str(approved / "Vendor" / "Codex" / "manifest.json"), calls[0])
+                self.assertNotIn(str(staged / "Vendor"), calls[0])
+
+    def test_staged_release_validator_rejects_missing_approved_codex_manifest(self) -> None:
+        approved, staged, scripts = self.make_staged_release_fixture()
+        (approved / "Vendor" / "Codex" / "manifest.json").unlink()
+
+        result = self.run_staged_validation(approved, staged, scripts)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("missing approved Codex manifest", result.stderr)
+
+    def test_staged_release_validator_rejects_missing_embedded_codex_package_target(self) -> None:
+        approved, staged, scripts = self.make_staged_release_fixture()
+        bundle = staged / ".build" / "release" / "RepoPrompt.app" / "Contents" / "Resources" / "BundledRuntimes" / "Codex"
+        shutil.rmtree(bundle / "x86_64-apple-darwin")
+
+        result = self.run_staged_validation(approved, staged, scripts)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("missing embedded Codex package targets", result.stderr)
+
     def test_staged_release_validator_rejects_keyboard_shortcuts_app_root_bundle(self) -> None:
         approved, staged, scripts = self.make_staged_release_fixture()
         app = staged / ".build" / "release" / "RepoPrompt.app"
@@ -2109,7 +2298,7 @@ sys.stdout.write(str(status))
         self.assertNotIn("updaterController.startUpdater()", manager_init)
         self.assertIn("guard sparkleConfigurationValid, !updaterStarted else { return }", sparkle_manager)
         self.assertIn(
-            "guard updaterStarted, sparkleConfigurationValid, activeUserInitiatedChannel == nil else {",
+            "guard updaterStarted, sparkleConfigurationValid, userInitiatedObserverState.activeRequest == nil else {",
             sparkle_manager,
         )
 
@@ -2334,16 +2523,16 @@ shutil.copyfile(os.environ["FAKE_SWIFTFORMAT_ARCHIVE"], output)
             "Sources/CSwiftPCRE2",
             "Sources/RepoPromptC",
             "Sources/RepoPrompt/ThirdParty/SwiftPCRE2",
-            "Sources/RepoPrompt/Infrastructure/AI/Prompts/Workflows/WorkflowPromptSharedFragments.swift",
-            "Sources/RepoPrompt/Infrastructure/AI/Prompts/Workflows/WorkflowPrompt+Build.swift",
-            "Sources/RepoPrompt/Infrastructure/AI/Prompts/Workflows/WorkflowPrompt+DeepPlan.swift",
-            "Sources/RepoPrompt/Infrastructure/AI/Prompts/Workflows/WorkflowPrompt+Investigate.swift",
-            "Sources/RepoPrompt/Infrastructure/AI/Prompts/Workflows/WorkflowPrompt+Optimize.swift",
-            "Sources/RepoPrompt/Infrastructure/AI/Prompts/Workflows/WorkflowPrompt+OracleExport.swift",
-            "Sources/RepoPrompt/Infrastructure/AI/Prompts/Workflows/WorkflowPrompt+Orchestrate.swift",
-            "Sources/RepoPrompt/Infrastructure/AI/Prompts/Workflows/WorkflowPrompt+Refactor.swift",
-            "Sources/RepoPrompt/Infrastructure/AI/Prompts/Workflows/WorkflowPrompt+Reminder.swift",
-            "Sources/RepoPrompt/Infrastructure/AI/Prompts/Workflows/WorkflowPrompt+Review.swift",
+            "Sources/RepoPromptShared/Workflows/WorkflowPromptSharedFragments.swift",
+            "Sources/RepoPromptShared/Workflows/WorkflowPrompt+Build.swift",
+            "Sources/RepoPromptShared/Workflows/WorkflowPrompt+DeepPlan.swift",
+            "Sources/RepoPromptShared/Workflows/WorkflowPrompt+Investigate.swift",
+            "Sources/RepoPromptShared/Workflows/WorkflowPrompt+Optimize.swift",
+            "Sources/RepoPromptShared/Workflows/WorkflowPrompt+OracleExport.swift",
+            "Sources/RepoPromptShared/Workflows/WorkflowPrompt+Orchestrate.swift",
+            "Sources/RepoPromptShared/Workflows/WorkflowPrompt+Refactor.swift",
+            "Sources/RepoPromptShared/Workflows/WorkflowPrompt+Reminder.swift",
+            "Sources/RepoPromptShared/Workflows/WorkflowPrompt+Review.swift",
         ):
             self.assertIn(f"  - {excluded_path}", swiftlint_config)
 
@@ -2364,6 +2553,20 @@ shutil.copyfile(os.environ["FAKE_SWIFTFORMAT_ARCHIVE"], output)
             publish_staged.index("prepare_dist"),
         )
 
+    def test_ci_workflow_cancels_only_superseded_pull_request_runs(self) -> None:
+        ci_workflow = (SCRIPT_DIR.parent / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+        concurrency_block = ci_workflow.split("concurrency:", 1)[1].split("\npermissions:", 1)[0]
+        normalized_concurrency = " ".join(concurrency_block.split())
+
+        self.assertIn(
+            "group: ci-${{ github.event.pull_request.number || github.run_id }}",
+            normalized_concurrency,
+        )
+        self.assertIn(
+            "cancel-in-progress: ${{ github.event_name == 'pull_request' }}",
+            normalized_concurrency,
+        )
+        self.assertNotIn("cancel-in-progress: true", concurrency_block)
 
     def test_main_tip_workflow_keeps_tip_separate_and_uses_hardened_smoke(self) -> None:
         tip_workflow = (SCRIPT_DIR.parent / ".github" / "workflows" / "main-tip.yml").read_text(encoding="utf-8")
@@ -2371,7 +2574,20 @@ shutil.copyfile(os.environ["FAKE_SWIFTFORMAT_ARCHIVE"], output)
         package_script = (SCRIPT_DIR / "package_app.sh").read_text(encoding="utf-8")
 
         self.assertIn("name: Publish Tip", tip_workflow)
-        self.assertIn("group: main-tip-channel", tip_workflow)
+        concurrency_block = tip_workflow.split("concurrency:", 1)[1].split("\npermissions:", 1)[0]
+        normalized_concurrency = " ".join(concurrency_block.split())
+        self.assertIn(
+            "group: >- ${{ (github.event_name == 'workflow_dispatch' || "
+            "github.event.workflow_run.conclusion == 'success') && "
+            "'main-tip-channel' || format('main-tip-skipped-{0}', github.run_id) }}",
+            normalized_concurrency,
+        )
+        self.assertIn(
+            "cancel-in-progress: ${{ github.event_name == 'workflow_dispatch' || "
+            "github.event.workflow_run.conclusion == 'success' }}",
+            normalized_concurrency,
+        )
+        self.assertNotIn("cancel-in-progress: true", concurrency_block)
         self.assertIn("should-publish", tip_workflow)
         self.assertIn("stable-appcast.xml", tip_workflow)
         self.assertIn('build_number="$stable_build_number.$((build_sequence / 100)).$((build_sequence % 100))"', tip_workflow)
@@ -2380,6 +2596,9 @@ shutil.copyfile(os.environ["FAKE_SWIFTFORMAT_ARCHIVE"], output)
         self.assertIn("repoprompt-ce-tip-updates", tip_workflow)
         self.assertIn('REPOPROMPT_PACKAGED_SMOKE_TIMEOUT: "240"', tip_workflow)
         self.assertIn('REPOPROMPT_PACKAGED_SMOKE_HELPER_TIMEOUT: "60"', tip_workflow)
+        self.assertIn('REPOPROMPT_PACKAGED_SMOKE_DIAGNOSTICS_DIR: ${{ runner.temp }}/tip-smoke-diagnostics', tip_workflow)
+        self.assertIn("Upload Tip smoke diagnostics", tip_workflow)
+        self.assertIn("RepoPrompt-CE-tip-smoke-diagnostics", tip_workflow)
         self.assertIn('REPOPROMPT_PACKAGED_SMOKE_TIMEOUT="$REPOPROMPT_PACKAGED_SMOKE_TIMEOUT"', tip_workflow)
         self.assertIn(
             'REPOPROMPT_PACKAGED_SMOKE_HELPER_TIMEOUT="$REPOPROMPT_PACKAGED_SMOKE_HELPER_TIMEOUT"',
@@ -2732,12 +2951,19 @@ sys.stdout.write(str(status))
             ]
         ).stdout.strip()
 
+        expected_title = "Tip build 1.2.3 · v9.8.7 · commit 0123456789ab"
         def write_appcast(
             enclosure_signature: str,
             *,
-            title: str = "Tip build v9.8.7",
-            display_version: str = "Tip build v9.8.7",
+            marketing_version: str = "9.8.7",
+            title: str = expected_title,
+            release_notes_link: str | None = None,
         ) -> None:
+            release_notes_xml = (
+                f"      <sparkle:releaseNotesLink>{release_notes_link}</sparkle:releaseNotesLink>\n"
+                if release_notes_link is not None
+                else ""
+            )
             appcast.write_text(
                 f"""<?xml version="1.0" encoding="utf-8"?>
 <rss xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle">
@@ -2745,8 +2971,8 @@ sys.stdout.write(str(status))
     <item>
       <title>{title}</title>
       <sparkle:version>1.2.3</sparkle:version>
-      <sparkle:shortVersionString>{display_version}</sparkle:shortVersionString>
-      <enclosure url="https://example.invalid/tip/{archive.name}"
+      <sparkle:shortVersionString>{marketing_version}</sparkle:shortVersionString>
+{release_notes_xml}      <enclosure url="https://example.invalid/tip/{archive.name}"
                  length="{archive.stat().st_size}"
                  sparkle:edSignature="{enclosure_signature}" />
     </item>
@@ -2761,7 +2987,8 @@ sys.stdout.write(str(status))
             {
                 "REPOPROMPT_RELEASE_SOURCE_ROOT": str(root),
                 "REPOPROMPT_CONTROL_PLANE_SCRIPTS_DIR": str(SCRIPT_DIR),
-                "TIP_COMMIT": "0" * 40,
+                "TIP_COMMIT": "0123456789abcdef" * 2 + "01234567",
+                "TIP_SHORT_SHA": "0123456789ab",
                 "TIP_BUILD_NUMBER": "1.2.3",
                 "TIP_DOWNLOAD_URL_PREFIX": "https://example.invalid/tip/",
                 "SPARKLE_PRIVATE_KEY": private_key,
@@ -2806,15 +3033,26 @@ validate_generated_tip_appcast""",
             rejected_duplicate_version.stderr,
         )
 
-        write_appcast(signature, title="Version 9.8.7")
-        rejected_title = subprocess.run(command, env=env, text=True, capture_output=True)
-        self.assertNotEqual(rejected_title.returncode, 0)
-        self.assertIn("Tip appcast title mismatch", rejected_title.stderr)
+        write_appcast(signature, marketing_version="9.8.8")
+        wrong_marketing = subprocess.run(command, env=env, text=True, capture_output=True)
+        self.assertNotEqual(wrong_marketing.returncode, 0)
+        self.assertIn(
+            "Tip appcast marketing version mismatch: expected 9.8.7, got 9.8.8",
+            wrong_marketing.stderr,
+        )
 
-        write_appcast(signature, display_version="9.8.7")
-        rejected_display_version = subprocess.run(command, env=env, text=True, capture_output=True)
-        self.assertNotEqual(rejected_display_version.returncode, 0)
-        self.assertIn("Tip appcast display version mismatch", rejected_display_version.stderr)
+        write_appcast(signature, title="Wrong tip title")
+        wrong_title = subprocess.run(command, env=env, text=True, capture_output=True)
+        self.assertNotEqual(wrong_title.returncode, 0)
+        self.assertIn("Tip appcast presentation title mismatch: Wrong tip title", wrong_title.stderr)
+
+        write_appcast(signature, release_notes_link="https://example.invalid/tip/details")
+        embedded_release_page = subprocess.run(command, env=env, text=True, capture_output=True)
+        self.assertNotEqual(embedded_release_page.returncode, 0)
+        self.assertIn(
+            "tip appcast item must not contain sparkle:releaseNotesLink",
+            embedded_release_page.stderr,
+        )
 
         write_appcast("")
         rejected_signature = subprocess.run(command, env=env, text=True, capture_output=True)
@@ -2831,6 +3069,8 @@ validate_generated_tip_appcast""",
   <channel><item><title>Version 9.8.7</title>
     <sparkle:version>29.8.52</sparkle:version>
     <sparkle:shortVersionString>9.8.7</sparkle:shortVersionString>
+    <sparkle:releaseNotesLink>https://github.com/example/release</sparkle:releaseNotesLink>
+    <description>Embedded release content</description>
   </item></channel>
 </rss>
 """,
@@ -2842,6 +3082,8 @@ validate_generated_tip_appcast""",
             """source "$1"
 APPCAST="$2"
 MARKETING_VERSION="9.8.7"
+TIP_BUILD_NUMBER="29.8.52"
+TIP_SHORT_SHA="abc1234def56"
 label_generated_tip_appcast""",
             "tip-appcast-label",
             str(SCRIPT_DIR / "main_tip_release.sh"),
@@ -2855,8 +3097,14 @@ label_generated_tip_appcast""",
         assert item is not None
         sparkle = "http://www.andymatuschak.org/xml-namespaces/sparkle"
         self.assertEqual(item.findtext(f"{{{sparkle}}}version"), "29.8.52")
-        self.assertEqual(item.findtext(f"{{{sparkle}}}shortVersionString"), "Tip build v9.8.7")
-        self.assertEqual(item.findtext("title"), "Tip build v9.8.7")
+        self.assertEqual(item.findtext(f"{{{sparkle}}}shortVersionString"), "9.8.7")
+        self.assertNotEqual(
+            item.findtext(f"{{{sparkle}}}shortVersionString"),
+            item.findtext(f"{{{sparkle}}}version"),
+        )
+        self.assertEqual(item.findtext("title"), "Tip build 29.8.52 · v9.8.7 · commit abc1234def56")
+        self.assertIsNone(item.find(f"{{{sparkle}}}releaseNotesLink"))
+        self.assertIsNone(item.find("description"))
 
     def test_release_sentry_runtime_wiring_uses_protected_dsn_and_stable_resolution(self) -> None:
         root = SCRIPT_DIR.parent
@@ -3008,10 +3256,12 @@ label_generated_tip_appcast""",
         self.assertNotEqual(rejected.returncode, 0)
         self.assertIn("does not verify", rejected.stderr)
 
-    def test_github_tokens_are_scrubbed_before_swiftpm_commands(self) -> None:
+    def test_secret_free_swiftpm_commands_scrub_tokens(self) -> None:
         helper = SCRIPT_DIR / "run_without_github_tokens.sh"
         result = subprocess.run(
             [
+                str(helper),
+                # Re-enter the wrapper to verify nesting remains harmless.
                 str(helper),
                 "bash",
                 "-c",
@@ -3029,8 +3279,33 @@ label_generated_tip_appcast""",
 
         self.assertEqual(result.returncode, 0, result.stderr)
         package_script = (SCRIPT_DIR / "package_app.sh").read_text(encoding="utf-8")
+        universal_builder = (SCRIPT_DIR / "build_swiftpm_release_products.sh").read_text(encoding="utf-8")
         release_script = (SCRIPT_DIR / "release.sh").read_text(encoding="utf-8")
-        self.assertIn('"$RUN_WITHOUT_GITHUB_TOKENS" swift package resolve', release_script)
+        tip_script = (SCRIPT_DIR / "main_tip_release.sh").read_text(encoding="utf-8")
+        workflows_dir = SCRIPT_DIR.parent / ".github" / "workflows"
+        release_workflow = (workflows_dir / "release.yml").read_text(encoding="utf-8")
+        tip_workflow = (workflows_dir / "main-tip.yml").read_text(encoding="utf-8")
+
+        release_stage_job = release_workflow.split("\n  stage:", 1)[1].split("\n  publish:", 1)[0]
+        tip_stage_job = tip_workflow.split("\n  stage:", 1)[1].split("\n  sign:", 1)[0]
+        release_stage_function = release_script.split("stage_publish_release() {", 1)[1].split("\n}", 1)[0]
+        tip_stage_function = tip_script.split("stage_tip() {", 1)[1].split("\n}", 1)[0]
+        release_resolver = release_script.split("resolve_without_lockfile_drift() {", 1)[1].split("\n}", 1)[0]
+        tip_resolver = tip_script.split("resolve_without_lockfile_drift() {", 1)[1].split("\n}", 1)[0]
+
+        self.assertIn("run: ./trusted-control-plane/Scripts/release.sh stage-publish", release_stage_job)
+        self.assertIn("run: ./trusted-control-plane/Scripts/main_tip_release.sh stage", tip_stage_job)
+        self.assertIn("resolve_without_lockfile_drift", release_stage_function)
+        self.assertIn("resolve_without_lockfile_drift", tip_stage_function)
+        self.assertIn('"$RUN_WITHOUT_GITHUB_TOKENS" swift package resolve', release_resolver)
+        self.assertIn('"$RUN_WITHOUT_GITHUB_TOKENS" swift package resolve', tip_resolver)
+        self.assertIn('"$RUN_WITHOUT_GITHUB_TOKENS" env -u SIGN_IDENTITY', release_stage_function)
+        self.assertIn('"$RUN_WITHOUT_GITHUB_TOKENS" env -u SIGN_IDENTITY', tip_stage_function)
+        self.assertIn(
+            'REPOPROMPT_RUN_WITHOUT_GITHUB_TOKENS="$RUN_WITHOUT_GITHUB_TOKENS"',
+            package_script,
+        )
+        self.assertIn('"$RUN_WITHOUT_GITHUB_TOKENS" swift build', universal_builder)
         self.assertEqual(package_script.count('"$RUN_WITHOUT_GITHUB_TOKENS" swift build'), 4)
         self.assertIn(
             '"$RUN_WITHOUT_GITHUB_TOKENS" "$CONTROL_PLANE_SCRIPTS_DIR/smoke_embedded_mcp_helper.sh"',
@@ -3362,25 +3637,48 @@ fi
         (resources_bin / "repoprompt-mcp").symlink_to("../../MacOS/repoprompt-mcp")
         return app
 
-    def start_unix_listener(self, socket_path: Path) -> subprocess.Popen[str]:
+    def start_unix_listener(
+        self,
+        socket_path: Path,
+        *,
+        claim_ownership_lock: bool = True,
+    ) -> tuple[subprocess.Popen[str], Path]:
         ready = socket_path.with_suffix(".ready")
+        accepted_connections = socket_path.with_name(f"{socket_path.name}.{time.monotonic_ns()}.accepted")
         ready.unlink(missing_ok=True)
+        accepted_connections.unlink(missing_ok=True)
         process = subprocess.Popen(
             [
                 sys.executable,
                 "-c",
-                "import socket, sys\n"
+                "import fcntl, os, socket, sys\n"
+                "lock_descriptor = None\n"
+                "if sys.argv[4] == '1':\n"
+                "    lock_descriptor = os.open(sys.argv[1] + '.lock', os.O_RDWR | os.O_CREAT | os.O_CLOEXEC | os.O_NOFOLLOW, 0o600)\n"
+                "    os.fchmod(lock_descriptor, 0o600)\n"
+                "    fcntl.flock(lock_descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)\n"
                 "listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)\n"
                 "listener.bind(sys.argv[1])\n"
+                "if lock_descriptor is not None:\n"
+                "    metadata = os.lstat(sys.argv[1])\n"
+                "    record = f'repoprompt-ce-socket-identity-v1 {metadata.st_dev} {metadata.st_ino}\\n'.encode()\n"
+                "    os.ftruncate(lock_descriptor, 0)\n"
+                "    assert os.write(lock_descriptor, record) == len(record)\n"
+                "    os.fsync(lock_descriptor)\n"
                 "listener.listen(8)\n"
                 "open(sys.argv[2], 'w', encoding='utf-8').close()\n"
                 "while True:\n"
                 "    client, _ = listener.accept()\n"
+                "    with open(sys.argv[3], 'a', encoding='utf-8') as accepted:\n"
+                "        accepted.write('accepted\\n')\n"
+                "        accepted.flush()\n"
                 "    with client:\n"
                 "        while client.recv(4096):\n"
                 "            pass\n",
                 os.fspath(socket_path),
                 os.fspath(ready),
+                os.fspath(accepted_connections),
+                "1" if claim_ownership_lock else "0",
             ],
             text=True,
             stdout=subprocess.DEVNULL,
@@ -3405,7 +3703,7 @@ fi
                 self.fail(f"UNIX listener exited early: {process.stderr.read() if process.stderr else ''}")
             time.sleep(0.02)
         self.assertTrue(ready.exists(), "UNIX listener did not become ready")
-        return process
+        return process, accepted_connections
 
     def socket_owner_process_path(self, pid: int) -> Path:
         result = self.run_socket_owner_helper("process-path", pid)
@@ -3509,12 +3807,15 @@ extension Data {
         app = staged / ".build" / "release" / "RepoPrompt.app"
         for directory in (
             approved / "AppBundle",
+            approved / "Vendor" / "Codex",
             approved / "ThirdPartyLicenses" / "fixture",
             staged / "ThirdPartyLicenses" / "fixture",
             app / "Contents" / "Frameworks" / "Sparkle.framework",
             app / "Contents" / "MacOS",
             app / "Contents" / "Resources" / "bin",
             app / "Contents" / "Resources" / "Legal" / "ThirdPartyLicenses" / "fixture",
+            app / "Contents" / "Resources" / "BundledRuntimes" / "Codex" / "aarch64-apple-darwin",
+            app / "Contents" / "Resources" / "BundledRuntimes" / "Codex" / "x86_64-apple-darwin",
             scripts,
         ):
             directory.mkdir(parents=True, exist_ok=True)
@@ -3526,9 +3827,17 @@ extension Data {
             "validate_packaged_legal.sh",
             "validate_required_swiftpm_resource_bundles.sh",
             "validate_staged_release.sh",
+            "release_sentry_symbols.sh",
+            "release.sh",
+            "main_tip_release.sh",
         ):
             shutil.copy2(SCRIPT_DIR / name, scripts / name)
             scripts.joinpath(name).chmod(0o755)
+        (scripts / "codex_runtime_artifact.py").write_text(
+            "#!/usr/bin/env python3\nimport os\nimport sys\nfrom pathlib import Path\n\nexpected_manifest = Path(os.environ[\"FAKE_CODEX_MANIFEST\"])\nexpected_bundle = Path(os.environ[\"FAKE_CODEX_BUNDLE\"])\nexpected = [\n    \"--manifest\",\n    str(expected_manifest),\n    \"verify-bundle\",\n    \"--arch\",\n    \"all\",\n    \"--bundle\",\n    str(expected_bundle),\n]\nif sys.argv[1:] != expected:\n    print(f\"ERROR: unexpected Codex verifier arguments: {sys.argv[1:]!r}\", file=sys.stderr)\n    raise SystemExit(64)\nif not expected_manifest.is_file():\n    print(f\"ERROR: missing approved Codex manifest: {expected_manifest}\", file=sys.stderr)\n    raise SystemExit(65)\nexpected_targets = {\"aarch64-apple-darwin\", \"x86_64-apple-darwin\"}\nif not expected_bundle.is_dir() or {path.name for path in expected_bundle.iterdir()} != expected_targets:\n    print(f\"ERROR: missing embedded Codex package targets: {expected_bundle}\", file=sys.stderr)\n    raise SystemExit(66)\ncapture = os.environ.get(\"FAKE_CODEX_CAPTURE\")\nif capture:\n    with Path(capture).open(\"a\", encoding=\"utf-8\") as handle:\n        handle.write(\" \".join(sys.argv[1:]) + \"\\n\")\nprint(\"OK: fixture Codex bundle contract.\")\n",
+            encoding="utf-8",
+        )
+        (approved / "Vendor" / "Codex" / "manifest.json").write_text("{}\n", encoding="utf-8")
         metadata = """\
 APP_NAME=RepoPrompt
 DISPLAY_NAME="RepoPrompt CE"
@@ -3630,7 +3939,22 @@ esac
         (resources / "en.lproj" / "Localizable.strings").write_text('"record_shortcut" = "Record Shortcut";\n', encoding="utf-8")
 
     @staticmethod
-    def run_staged_validation(approved: Path, staged: Path, scripts: Path) -> subprocess.CompletedProcess[str]:
+    def codex_fixture_environment(approved: Path, staged: Path) -> dict[str, str]:
+        app = staged / ".build" / "release" / "RepoPrompt.app"
+        return {
+            "FAKE_CODEX_MANIFEST": str(approved / "Vendor" / "Codex" / "manifest.json"),
+            "FAKE_CODEX_BUNDLE": str(
+                app / "Contents" / "Resources" / "BundledRuntimes" / "Codex"
+            ),
+        }
+
+    @classmethod
+    def run_staged_validation(
+        cls,
+        approved: Path,
+        staged: Path,
+        scripts: Path,
+    ) -> subprocess.CompletedProcess[str]:
         env = os.environ.copy()
         env.update(
             {
@@ -3639,6 +3963,7 @@ esac
                 "REPOPROMPT_RELEASE_SOURCE_ROOT": str(staged),
                 "LIPO": str(scripts / "fake-lipo"),
                 "CODESIGN": str(scripts / "fake-codesign"),
+                **cls.codex_fixture_environment(approved, staged),
             }
         )
         return subprocess.run(
@@ -3647,6 +3972,48 @@ esac
             text=True,
             capture_output=True,
         )
+
+    @classmethod
+    def run_public_app_validation(
+        cls,
+        approved: Path,
+        staged: Path,
+        scripts: Path,
+        script_name: str,
+    ) -> tuple[subprocess.CompletedProcess[str], Path]:
+        app = staged / ".build" / "release" / "RepoPrompt.app"
+        artifact_manifest = staged / ".build" / "release" / "RepoPrompt-artifact-manifest.json"
+        capture = staged.parent / f"{script_name}-codex-calls.txt"
+        env = os.environ.copy()
+        env.update(
+            {
+                "RELEASE_COMMIT": "fixture-release-commit",
+                "REPOPROMPT_APPROVED_SOURCE_ROOT": str(approved),
+                "REPOPROMPT_RELEASE_SOURCE_ROOT": str(staged),
+                "REPOPROMPT_CONTROL_PLANE_SCRIPTS_DIR": str(scripts),
+                "TIP_COMMIT": "fixture-release-commit",
+                "TIP_BUILD_NUMBER": "1.1",
+                "LIPO": str(scripts / "fake-lipo"),
+                "CODESIGN": str(scripts / "fake-codesign"),
+                "FAKE_CODEX_CAPTURE": str(capture),
+                **cls.codex_fixture_environment(approved, staged),
+            }
+        )
+        result = subprocess.run(
+            [
+                "bash",
+                "-c",
+                'source "$1"; TMP_DIR="$(mktemp -d)"; validate_public_app "$2" "$3" "Extracted stage fixture"',
+                "bash",
+                str(scripts / script_name),
+                str(app),
+                str(artifact_manifest),
+            ],
+            env=env,
+            text=True,
+            capture_output=True,
+        )
+        return result, capture
 
     def make_git_remote(self) -> tuple[Path, Path]:
         parent = Path(tempfile.mkdtemp())
