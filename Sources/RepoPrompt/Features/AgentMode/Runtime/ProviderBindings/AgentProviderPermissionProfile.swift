@@ -170,7 +170,7 @@ extension AgentProviderPermissionProfile {
         switch agent {
         case .openCode:
             openCodeSessionModeID
-        case .cursor, .grokBuild, .antigravity, .devin:
+        case .cursor, .grokBuild, .antigravity, .devin, .omp:
             nil
         case .claudeCode, .claudeCodeGLM, .kimiCode, .customClaudeCompatible, .codexExec:
             nil

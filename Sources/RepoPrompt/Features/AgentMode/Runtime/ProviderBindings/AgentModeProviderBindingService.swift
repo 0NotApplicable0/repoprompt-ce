@@ -239,6 +239,9 @@ final class AgentModeProviderBindingService {
                         updateActiveBindings(session)
                     }
                 }
+            case .omp:
+                // OMP owns its internal tool permissions; RepoPrompt exposes no mutable provider preference.
+                break
             case .grokBuild, .devin:
                 // These providers take their permission level as a launch-time CLI flag
                 // (`--always-approve` / `--permission-mode`); it applies to newly launched
