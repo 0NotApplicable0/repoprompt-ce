@@ -3235,7 +3235,7 @@ class OracleViewModel: ObservableObject {
                     )
                 }
                 if !oracleTransientImages.isEmpty {
-                    aiMessage = aiMessage.replacingTransientImages(oracleTransientImages)
+                    aiMessage.transientImages = oracleTransientImages
                 }
                 guard await shouldContinueStreaming() else {
                     throw CancellationError()
