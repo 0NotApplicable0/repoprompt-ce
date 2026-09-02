@@ -193,8 +193,8 @@ final class AgentProviderPermissionsSettingsViewModel: ObservableObject {
             GrokBuildAgentToolPreferences.setPermissionLevel(level, defaults: defaults, secureStore: securePermissions)
         case let .devin(level):
             DevinAgentToolPreferences.setPermissionLevel(level, defaults: defaults, secureStore: securePermissions)
-        case .omp:
-            break
+        case let .omp(level):
+            OMPAgentToolPreferences.setPermissionLevel(level, defaults: defaults)
         }
     }
 

@@ -90,7 +90,8 @@ struct AgentProviderPermissionLevelSection: View {
         case .openCode, .antigravity: "ACP Session Mode"
         case .cursor: "ACP Auto-Approve"
         case .grokBuild: "Always-Approve Launch"
-        case .devin, .omp: "Permission Mode"
+        case .devin: "Permission Mode"
+        case .omp: "ACP Session Mode"
         }
     }
 }
