@@ -54,6 +54,7 @@ final class AutoRecommendationEngine {
                 claudeCodeCLI: .notConfigured,
                 codexCLI: .notConfigured,
                 cursorCLI: .notConfigured,
+                grokBuildCLI: .notConfigured,
                 openAI: .notConfigured
             )
         }
@@ -358,6 +359,7 @@ final class AutoRecommendationEngine {
             claudeCodeCLI: availability.claudeCodeAvailable ? .ready : .notConfigured,
             codexCLI: availability.codexAvailable ? .ready : .notConfigured,
             cursorCLI: availability.cursorAvailable ? .ready : .notConfigured,
+            grokBuildCLI: availability.grokBuildAvailable ? .ready : .notConfigured,
             openAI: .notConfigured
         ).filtered(to: enabledRecommendationProviders)
         if let recommendation = contextBuilderRecommendation(status: status) {
@@ -376,7 +378,7 @@ final class AutoRecommendationEngine {
                 enabledRecommendationProviders.contains(.codex)
             case .cursor:
                 enabledRecommendationProviders.contains(.cursor)
-            case .openCode, .claudeCodeGLM, .kimiCode, .customClaudeCompatible, .antigravity, .grok:
+            case .openCode, .claudeCodeGLM, .kimiCode, .customClaudeCompatible, .antigravity, .grok, .grokBuild:
                 true
             }
         }) else {

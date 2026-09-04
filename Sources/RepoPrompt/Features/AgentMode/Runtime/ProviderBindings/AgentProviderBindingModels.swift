@@ -20,6 +20,7 @@ enum AgentProviderPermissionLevelID: Hashable {
     case cursor(CursorAgentToolPreferences.PermissionLevel)
     case antigravity(AntigravityAgentToolPreferences.PermissionLevel)
     case grok(GrokAgentToolPreferences.PermissionLevel)
+    case grokBuild(GrokBuildAgentToolPreferences.PermissionLevel)
 
     var providerID: AgentProviderBindingID {
         switch self {
@@ -35,6 +36,8 @@ enum AgentProviderPermissionLevelID: Hashable {
             .antigravity
         case .grok:
             .grok
+        case .grokBuild:
+            .grokBuild
         }
     }
 
@@ -52,6 +55,8 @@ enum AgentProviderPermissionLevelID: Hashable {
             .antigravity(.managedDefault)
         case .grok:
             .grok(.managedDefault)
+        case .grokBuild:
+            .grokBuild(.managedDefault)
         }
     }
 
@@ -69,6 +74,8 @@ enum AgentProviderPermissionLevelID: Hashable {
             AntigravityAgentToolPreferences.PermissionLevel.allCases.map(AgentProviderPermissionLevelID.antigravity)
         case .grok:
             GrokAgentToolPreferences.PermissionLevel.allCases.map(AgentProviderPermissionLevelID.grok)
+        case .grokBuild:
+            GrokBuildAgentToolPreferences.PermissionLevel.allCases.map(AgentProviderPermissionLevelID.grokBuild)
         }
     }
 
@@ -95,6 +102,9 @@ enum AgentProviderPermissionLevelID: Hashable {
         case .grok:
             guard let level = GrokAgentToolPreferences.PermissionLevel(rawValue: raw) else { return nil }
             self = .grok(level)
+        case .grokBuild:
+            guard let level = GrokBuildAgentToolPreferences.PermissionLevel(rawValue: raw) else { return nil }
+            self = .grokBuild(level)
         }
     }
 
@@ -111,6 +121,8 @@ enum AgentProviderPermissionLevelID: Hashable {
         case let .antigravity(level):
             level.rawValue
         case let .grok(level):
+            level.rawValue
+        case let .grokBuild(level):
             level.rawValue
         }
     }
@@ -129,6 +141,8 @@ enum AgentProviderPermissionLevelID: Hashable {
             level.displayName
         case let .grok(level):
             level.displayName
+        case let .grokBuild(level):
+            level.displayName
         }
     }
 
@@ -145,6 +159,8 @@ enum AgentProviderPermissionLevelID: Hashable {
         case let .antigravity(level):
             level.iconName
         case let .grok(level):
+            level.iconName
+        case let .grokBuild(level):
             level.iconName
         }
     }
@@ -163,6 +179,8 @@ enum AgentProviderPermissionLevelID: Hashable {
             level.detailText
         case let .grok(level):
             level.detailText
+        case let .grokBuild(level):
+            level.detailText
         }
     }
 
@@ -179,6 +197,8 @@ enum AgentProviderPermissionLevelID: Hashable {
         case let .antigravity(level):
             level.isWarning
         case let .grok(level):
+            level.isWarning
+        case let .grokBuild(level):
             level.isWarning
         }
     }
@@ -254,6 +274,10 @@ enum CodexToolSettingMutation: Equatable {
     case goalSupport(enabled: Bool)
     case reasoningSummaries(enabled: Bool)
     case memories(enabled: Bool)
+    case apps(enabled: Bool)
+    case plugins(enabled: Bool)
+    case mcpElicitation(enabled: Bool)
+    case toolSuggestions(enabled: Bool)
     case mcpServer(normalizedName: String, enabled: Bool)
 }
 
@@ -278,6 +302,10 @@ struct CodexToolSettingsBinding: Equatable {
     let reasoningSummariesEnabled: Bool
     /// Controls Codex local memory generation and reuse across app-server threads.
     let memoriesEnabled: Bool
+    let appsEnabled: Bool
+    let pluginsEnabled: Bool
+    let mcpElicitationEnabled: Bool
+    let toolSuggestionsEnabled: Bool
     let mcpServerEntries: [MCPIntegrationHelper.CodexServerEntry]
     /// Keys are lowercased/trimmed toggle keys derived from each entry's normalized name,
     /// matching the current AgentInputBar lookup convention.

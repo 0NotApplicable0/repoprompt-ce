@@ -47,4 +47,8 @@ extension Notification.Name {
     /// Posted when the cached Grok (`grok`) live model list changes.
     /// Drives an Agent Mode model-picker refresh; carries no userInfo.
     static let grokModelsChanged = Notification.Name("grokModelsChanged")
+
+    /// Posted when Grok Build CLI connection status changes
+    /// userInfo mirrors `claudeCodeConnectionChanged`
+    static let grokBuildConnectionChanged = Notification.Name("grokBuildConnectionChanged")
 }

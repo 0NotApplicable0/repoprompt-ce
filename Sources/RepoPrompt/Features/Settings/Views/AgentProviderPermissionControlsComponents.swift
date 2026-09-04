@@ -91,6 +91,7 @@ struct AgentProviderPermissionLevelSection: View {
         case .cursor: "ACP Auto-Approve"
         case .antigravity: "Permission Level"
         case .grok: "Permission Level"
+        case .grokBuild: "Always-Approve Launch"
         }
     }
 }
@@ -142,6 +143,7 @@ struct AgentProviderToolsRuntimeDisclosure: View {
         case .codex: binding.codexTools != nil
         case .claude: binding.claudeTools != nil
         case .openCode, .cursor, .antigravity, .grok: false
+        case .openCode, .cursor, .grokBuild: false
         }
     }
 }
@@ -169,7 +171,7 @@ struct AgentProviderToolsRuntimeControls: View {
                         onApplyMutation: onApplyClaudeToolSettingMutation
                     )
                 }
-            case .openCode, .cursor, .antigravity, .grok:
+            case .openCode, .cursor, .antigravity, .grok, .grokBuild:
                 EmptyView()
             }
         }
@@ -225,6 +227,36 @@ struct CodexProviderToolsRuntimeSection: View {
                 onChange: { onApplyMutation(.memories(enabled: $0)) }
             )
             .hoverTooltip("Controls Codex memory generation and use for app-server launch and thread start/resume. Off by default.")
+
+            ProviderRuntimeSubsection(title: "Optional Codex Features") {
+                ProviderRuntimeToggleRow(
+                    title: "Apps",
+                    description: "Allow Codex to use connected apps.",
+                    isOn: tools.appsEnabled,
+                    onChange: { onApplyMutation(.apps(enabled: $0)) }
+                )
+
+                ProviderRuntimeToggleRow(
+                    title: "Plugins",
+                    description: "Allow Codex to load installed plugins.",
+                    isOn: tools.pluginsEnabled,
+                    onChange: { onApplyMutation(.plugins(enabled: $0)) }
+                )
+
+                ProviderRuntimeToggleRow(
+                    title: "MCP Elicitation",
+                    description: "Allow MCP servers to request additional input during a run.",
+                    isOn: tools.mcpElicitationEnabled,
+                    onChange: { onApplyMutation(.mcpElicitation(enabled: $0)) }
+                )
+
+                ProviderRuntimeToggleRow(
+                    title: "Tool Suggestions",
+                    description: "Allow Codex to suggest apps or plugins to install or enable.",
+                    isOn: tools.toolSuggestionsEnabled,
+                    onChange: { onApplyMutation(.toolSuggestions(enabled: $0)) }
+                )
+            }
 
             ProviderRuntimeSubsection(
                 title: "MCP servers",

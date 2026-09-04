@@ -311,6 +311,11 @@ public class APISettingsViewModel: ObservableObject {
     // Grok CLI (`grok`) — Pattern 1 auth (user pre-authenticates by running `grok login` once).
     @Published var isGrokConnected: Bool = UserDefaults.standard.bool(forKey: "GrokCLIConnected")
     @Published var grokError: String? = nil
+    // Grok Build CLI / ACP
+    @Published var isGrokBuildConnected: Bool = UserDefaults.standard.bool(forKey: "GrokBuildCLIConnected")
+    @Published var grokBuildError: String? = nil
+    @Published private(set) var availableGrokBuildModelOptions: [AgentModelOption] = []
+    private var grokBuildLogCollector: CLIProcessLogCollector?
 
     /// CLI connection flags are persisted configuration hints, not proof that the provider is
     /// usable in the current process. Context Builder restoration waits for this validation pass
@@ -360,6 +365,7 @@ public class APISettingsViewModel: ObservableObject {
     private var codexModelsTask: Task<Void, Never>?
     private var openCodeModelsTask: Task<Void, Never>?
     private var cursorModelsTask: Task<Void, Never>?
+    private var grokBuildModelsTask: Task<Void, Never>?
     private var openRouterModelsTask: Task<Void, Never>?
     private var customModelsTask: Task<Void, Never>?
     private var initialLoadTask: Task<Void, Never>?
@@ -394,6 +400,7 @@ public class APISettingsViewModel: ObservableObject {
             cursorAvailable: isCursorConnected,
             antigravityAvailable: isAntigravityConnected,
             grokAvailable: isGrokConnected,
+            grokBuildAvailable: isGrokBuildConnected,
             zaiConfigured: compatibleBackendIsActive(.glmZAI),
             kimiConfigured: compatibleBackendIsActive(.kimi),
             customClaudeCompatibleConfigured: compatibleBackendIsActive(.custom)
@@ -426,6 +433,7 @@ public class APISettingsViewModel: ObservableObject {
             $isCursorConnected.map { _ in () }.eraseToAnyPublisher(),
             $isAntigravityConnected.map { _ in () }.eraseToAnyPublisher(),
             $isGrokConnected.map { _ in () }.eraseToAnyPublisher(),
+            $isGrokBuildConnected.map { _ in () }.eraseToAnyPublisher(),
             $claudeCodeCLIStatus.map { _ in () }.eraseToAnyPublisher(),
             $compatibleBackendConfigs.map { _ in () }.eraseToAnyPublisher(),
             $compatibleBackendSecretPresence.map { _ in () }.eraseToAnyPublisher()
@@ -448,6 +456,7 @@ public class APISettingsViewModel: ObservableObject {
             cursorAvailable: isVerifiedContextBuilderProvider(.cursor) && isCursorConnected,
             antigravityAvailable: isVerifiedContextBuilderProvider(.antigravity) && isAntigravityConnected,
             grokAvailable: isVerifiedContextBuilderProvider(.grok) && isGrokConnected,
+            grokBuildAvailable: isVerifiedContextBuilderProvider(.grokBuild) && isGrokBuildConnected,
             zaiConfigured: compatibleBackendIsActive(.glmZAI),
             kimiConfigured: compatibleBackendIsActive(.kimi),
             customClaudeCompatibleConfigured: compatibleBackendIsActive(.custom)
@@ -459,6 +468,7 @@ public class APISettingsViewModel: ObservableObject {
             claudeCodeCLI: recommendationAvailability(isConnected: isClaudeCodeConnected, provider: .claudeCode),
             codexCLI: recommendationAvailability(isConnected: isCodexConnected, provider: .codexExec),
             cursorCLI: recommendationAvailability(isConnected: isCursorConnected, provider: .cursor),
+            grokBuildCLI: recommendationAvailability(isConnected: isGrokBuildConnected, provider: .grokBuild),
             openAI: isOpenAIKeyValid ? .ready : (!openAIApiKey.isEmpty ? .configured : .notConfigured)
         )
     }
@@ -504,6 +514,8 @@ public class APISettingsViewModel: ObservableObject {
             isAntigravityConnected
         case .grok:
             isGrokConnected
+        case .grokBuild:
+            isGrokBuildConnected
         case .claudeCodeGLM, .kimiCode, .customClaudeCompatible:
             false
         }
@@ -551,7 +563,8 @@ public class APISettingsViewModel: ObservableObject {
             notificationCenter.publisher(for: .claudeCodeConnectionChanged).map { _ in AgentProviderKind.claudeCode },
             notificationCenter.publisher(for: .codexConnectionChanged).map { _ in AgentProviderKind.codexExec },
             notificationCenter.publisher(for: .openCodeConnectionChanged).map { _ in AgentProviderKind.openCode },
-            notificationCenter.publisher(for: .cursorConnectionChanged).map { _ in AgentProviderKind.cursor }
+            notificationCenter.publisher(for: .cursorConnectionChanged).map { _ in AgentProviderKind.cursor },
+            notificationCenter.publisher(for: .grokBuildConnectionChanged).map { _ in AgentProviderKind.grokBuild }
         ])
         .receive(on: DispatchQueue.main)
         .sink { [weak self] provider in
@@ -627,6 +640,7 @@ public class APISettingsViewModel: ObservableObject {
 
     private func reloadCLIConnectionFlagsFromDefaults() {
         let wasCursorConnected = isCursorConnected
+        let wasGrokBuildConnected = isGrokBuildConnected
         isClaudeCodeConnected = UserDefaults.standard.bool(forKey: "ClaudeCodeConnected")
         if isClaudeCodeConnected {
             claudeCodeCLIStatus = .binaryPresent
@@ -637,13 +651,22 @@ public class APISettingsViewModel: ObservableObject {
         }
         isOpenCodeConnected = UserDefaults.standard.bool(forKey: "OpenCodeCLIConnected")
         isCursorConnected = UserDefaults.standard.bool(forKey: "CursorCLIConnected")
-        guard wasCursorConnected != isCursorConnected else { return }
-        if isCursorConnected {
-            startCursorModelsSubscriptionIfNeeded(workspacePath: nil)
-        } else {
-            stopCursorModelsSubscription(clearModels: true)
+        isGrokBuildConnected = UserDefaults.standard.bool(forKey: "GrokBuildCLIConnected")
+        if wasGrokBuildConnected != isGrokBuildConnected {
+            if isGrokBuildConnected {
+                startGrokBuildModelsSubscriptionIfNeeded(workspacePath: nil)
+            } else {
+                stopGrokBuildModelsSubscription(clearModels: true)
+            }
         }
-        Task { await updateAvailableModels() }
+        if wasCursorConnected != isCursorConnected {
+            if isCursorConnected {
+                startCursorModelsSubscriptionIfNeeded(workspacePath: nil)
+            } else {
+                stopCursorModelsSubscription(clearModels: true)
+            }
+            Task { await updateAvailableModels() }
+        }
     }
 
     private func refreshClaudeCodeGLMAvailability() {
@@ -1272,6 +1295,8 @@ public class APISettingsViewModel: ObservableObject {
         // disconnected and becomes true only after this bounded validation succeeds.
         let antigravityValidationSnapshot = await antigravityConnectionCoordinator.captureStartupValidation()
         let shouldValidateAntigravity = antigravityValidationSnapshot.persistedConnectionHint
+        let shouldValidateGrok = isGrokConnected
+        let shouldValidateGrokBuild = isGrokBuildConnected
 
         let task = Task { @MainActor [weak self] in
             guard let self, !Task.isCancelled, !hasPreparedForWindowClose else { return }
@@ -1284,12 +1309,16 @@ public class APISettingsViewModel: ObservableObject {
             async let openCodeReady = probeCachedOpenCodeConnection(ifNeeded: shouldValidateOpenCode)
             async let cursorReady = probeCachedCursorConnection(ifNeeded: shouldValidateCursor)
             async let antigravityProbe = probeCachedAntigravityConnection(ifNeeded: shouldValidateAntigravity)
+            async let grokReady = probeCachedGrokConnection(ifNeeded: shouldValidateGrok)
+            async let grokBuildReady = probeCachedGrokBuildConnection(ifNeeded: shouldValidateGrokBuild)
             let readiness = await (
                 claudeReady,
                 codexReady,
                 openCodeReady,
                 cursorReady,
-                antigravityProbe
+                antigravityProbe,
+                grokReady,
+                grokBuildReady
             )
             guard !Task.isCancelled, !hasPreparedForWindowClose else { return }
             applyContextBuilderProviderValidationResult(readiness.0, provider: .claudeCode)
@@ -1347,6 +1376,8 @@ public class APISettingsViewModel: ObservableObject {
                     applyAntigravityConnectionProjection(projection)
                 }
             }
+            applyContextBuilderProviderValidationResult(readiness.5, provider: .grok)
+            applyContextBuilderProviderValidationResult(readiness.6, provider: .grokBuild)
             if codexPublicationAllowed,
                isCodexConnected,
                isVerifiedContextBuilderProvider(.codexExec)
@@ -1548,6 +1579,48 @@ public class APISettingsViewModel: ObservableObject {
         } else {
             await applyLatestAntigravityConnectionProjection()
         }
+    }
+
+    /// Bounded startup validation for headless Grok CLI. Non-mutating: resolve `grok` and
+    /// confirm `grok --version` exits successfully.
+    private func probeCachedGrokConnection(ifNeeded: Bool) async -> Bool {
+        guard ifNeeded else { return false }
+        let environmentResult = await ProcessEnvironmentBuilder.build(
+            ProcessEnvironmentRequest(purpose: .cliRunner)
+        )
+        guard !Task.isCancelled else { return false }
+        let profile = CLILaunchProfiles.grok
+        let resolvedCommand = CommandPathResolver.resolve(
+            profile.commandName,
+            environment: environmentResult.environment,
+            additionalPaths: profile.supplementalSearchPaths,
+            preferredBasenames: profile.preferredBasenames
+        )
+        switch CommandPathResolver.launchability(of: resolvedCommand) {
+        case .launchable, .bareCommandFallback:
+            break
+        case .missingPath, .directory, .notExecutable:
+            return false
+        }
+        do {
+            let exitStatus = try await runGrokVersionProbe(
+                executable: resolvedCommand,
+                environment: environmentResult.environment
+            )
+            return !Task.isCancelled && exitStatus == 0
+        } catch {
+            return false
+        }
+    }
+
+    private func probeCachedGrokBuildConnection(ifNeeded: Bool) async -> Bool {
+        guard ifNeeded else { return false }
+        if let latest = await GrokBuildACPModelPollingService.shared.latestSnapshot(),
+           latest.isLiveDiscovery
+        {
+            return true
+        }
+        return await GrokBuildACPModelPollingService.shared.refreshNow(workspacePath: nil)
     }
 
     private func diagnosticReason(for error: Error) -> APIKeychainAccessDiagnostic.Reason {
@@ -1776,6 +1849,7 @@ public class APISettingsViewModel: ObservableObject {
         }
         if isOpenCodeConnected { startOpenCodeModelsSubscriptionIfNeeded(workspacePath: nil) } else { stopOpenCodeModelsSubscription(clearModels: true) }
         if isCursorConnected { startCursorModelsSubscriptionIfNeeded(workspacePath: nil) } else { stopCursorModelsSubscription(clearModels: true) }
+        if isGrokBuildConnected { startGrokBuildModelsSubscriptionIfNeeded(workspacePath: nil) } else { stopGrokBuildModelsSubscription(clearModels: true) }
         if isOpenRouterKeyValid { openRouterModelsTask = Task { await self.fetchOpenRouterModels() } }
         if isCustomProviderValid { customModelsTask = Task { await self.fetchCustomModels() } }
 
@@ -2057,6 +2131,10 @@ public class APISettingsViewModel: ObservableObject {
             modelSet.formUnion(AIModel.modelsForProvider(.cursor))
         }
 
+        if isGrokBuildConnected {
+            modelSet.formUnion(AIModel.modelsForProvider(.grokBuild))
+        }
+
         // ── Custom provider (OpenAI compatible) ────────────────────────────────
         if isCustomProviderValid,
            let config = try? CustomProviderConfiguration.load()
@@ -2121,6 +2199,7 @@ public class APISettingsViewModel: ObservableObject {
         case .customProvider: "custom"
         case .azure: "azure"
         case .cursor: "cursor"
+        case .grokBuild: "grok_build"
         case .ollama: "ollama"
         case .claudeCode: "claude_code"
         case .codex: "codex"
@@ -2199,6 +2278,8 @@ public class APISettingsViewModel: ObservableObject {
                 break
             case .cursor:
                 break
+            case .grokBuild:
+                break
             }
 
             await updateAvailableModels()
@@ -2258,6 +2339,8 @@ public class APISettingsViewModel: ObservableObject {
         case .openCode:
             break
         case .cursor:
+            break
+        case .grokBuild:
             break
         }
         await updateAvailableModels()
@@ -4244,6 +4327,156 @@ public class APISettingsViewModel: ObservableObject {
         cursorModelsTask = nil
         if clearModels {
             availableCursorModelOptions = []
+        }
+    }
+
+    // MARK: - Grok Build CLI / ACP
+
+    func testGrokBuildConnection() async throws -> Bool {
+        let collector = CLIProcessLogCollector()
+        collector.append("Grok Build CLI connection test started")
+        grokBuildLogCollector = collector
+
+        collector.append("Refreshing login-shell environment cache")
+        await CLIEnvironmentCache.shared.invalidate()
+        collector.append("Starting Grok Build ACP model discovery preflight")
+
+        do {
+            let snapshot = try await GrokBuildACPModelPollingService.shared.discoverOnce(workspacePath: nil)
+            let grokOptions = AgentModelCatalog.options(
+                for: .grokBuild,
+                availability: AgentModelCatalog.AvailabilityContext(grokBuildAvailable: true)
+            )
+            if let snapshot {
+                collector.append("Discovered \(snapshot.models.options.count) Grok Build model option(s)")
+                availableGrokBuildModelOptions = grokOptions
+            } else {
+                collector.append("Grok Build ACP preflight completed without dynamic model metadata; using Default")
+                availableGrokBuildModelOptions = grokOptions
+            }
+            isGrokBuildConnected = true
+            setContextBuilderProviderVerified(.grokBuild, verified: true)
+            grokBuildError = nil
+            UserDefaults.standard.set(true, forKey: "GrokBuildCLIConnected")
+            startGrokBuildModelsSubscriptionIfNeeded(workspacePath: nil)
+            await updateAvailableModels()
+            collector.append("Grok Build CLI marked as connected")
+            grokBuildLogCollector = nil
+            NotificationCenter.default.post(
+                name: .grokBuildConnectionChanged,
+                object: nil,
+                userInfo: ["windowID": 0]
+            )
+            return true
+        } catch {
+            collector.append("Connection test threw error: \(error.localizedDescription)")
+            isGrokBuildConnected = false
+            setContextBuilderProviderVerified(.grokBuild, verified: false)
+            grokBuildError = friendlyGrokBuildMessage(for: error)
+            UserDefaults.standard.set(false, forKey: "GrokBuildCLIConnected")
+            stopGrokBuildModelsSubscription(clearModels: true)
+            await updateAvailableModels()
+            let finalMessage = grokBuildError ?? error.localizedDescription
+            collector.append("User guidance: \(finalMessage)")
+            NotificationCenter.default.post(
+                name: .grokBuildConnectionChanged,
+                object: nil,
+                userInfo: ["windowID": 0]
+            )
+            throw error
+        }
+    }
+
+    func disconnectGrokBuild() {
+        isGrokBuildConnected = false
+        setContextBuilderProviderVerified(.grokBuild, verified: false)
+        grokBuildError = nil
+        UserDefaults.standard.set(false, forKey: "GrokBuildCLIConnected")
+        stopGrokBuildModelsSubscription(clearModels: true)
+        Task {
+            await updateAvailableModels()
+        }
+        NotificationCenter.default.post(
+            name: .grokBuildConnectionChanged,
+            object: nil,
+            userInfo: ["windowID": 0]
+        )
+    }
+
+    private func friendlyGrokBuildMessage(for error: Error) -> String {
+        if let providerError = error as? AIProviderError {
+            switch providerError {
+            case let .invalidConfiguration(detail):
+                return detail
+            case let .apiError(source):
+                return source?.localizedDescription ?? "Unknown Grok Build CLI error"
+            default:
+                return error.localizedDescription
+            }
+        }
+        let message = error.localizedDescription
+        let lowered = message.lowercased()
+        if lowered.contains("not installed") || lowered.contains("no such file") || lowered.contains("command not found") || lowered.contains("not found") {
+            return "Grok Build CLI was not found. Install it (`npm i -g @xai-official/grok` or https://x.ai/cli/install.sh) and ensure `grok agent stdio` is available."
+        }
+        if lowered.contains("permission denied") {
+            return "Permission denied. Ensure the `grok` executable is accessible."
+        }
+        if lowered.contains("unauthorized") || lowered.contains("not authenticated") || lowered.contains("login") {
+            return "Grok Build is not authenticated. Run `grok login` or set `XAI_API_KEY`."
+        }
+        if lowered.contains("stdio") {
+            return "Installed Grok Build CLI does not advertise the ACP stdio subcommand. Update Grok Build and ensure `grok agent --help` lists `stdio`."
+        }
+        return message
+    }
+
+    func hasGrokBuildTrace() -> Bool {
+        grokBuildLogCollector?.isEmpty == false
+    }
+
+    func dumpGrokBuildTrace() throws -> URL {
+        guard let collector = grokBuildLogCollector else {
+            throw CLIProcessLogCollectorError.noEntries
+        }
+        collector.append("Exporting trace to Downloads folder")
+        let exportDate = Date()
+        let url = try collector.writeMarkdownToDownloads(
+            baseFilename: "RepoPrompt-GrokBuildTrace",
+            title: "Grok Build CLI Connection Trace",
+            timestamp: exportDate
+        )
+        collector.append("Trace exported to \(url.lastPathComponent)")
+        return url
+    }
+
+    private func startGrokBuildModelsSubscriptionIfNeeded(workspacePath: String?) {
+        guard !hasPreparedForWindowClose else { return }
+        guard grokBuildModelsTask == nil else { return }
+        grokBuildModelsTask = Task { [weak self, workspacePath] in
+            let stream = await GrokBuildACPModelPollingService.shared.subscribe(workspacePath: workspacePath)
+            for await snapshot in stream {
+                guard !Task.isCancelled else { return }
+                await MainActor.run { [weak self] in
+                    guard let self else { return }
+                    availableGrokBuildModelOptions = AgentModelCatalog.options(
+                        for: .grokBuild,
+                        availability: AgentModelCatalog.AvailabilityContext(grokBuildAvailable: true)
+                    )
+                    if snapshot.isLiveDiscovery {
+                        setContextBuilderProviderVerified(.grokBuild, verified: true)
+                    }
+                }
+                await self?.updateAvailableModels()
+            }
+        }
+    }
+
+    private func stopGrokBuildModelsSubscription(clearModels: Bool = false) {
+        grokBuildModelsTask?.cancel()
+        grokBuildModelsTask = nil
+        if clearModels {
+            availableGrokBuildModelOptions = []
         }
     }
 

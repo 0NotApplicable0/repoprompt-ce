@@ -34,6 +34,7 @@ enum SecureStorageAccount: CaseIterable, Hashable, Identifiable {
     case agentPermissionCursorDocument
     case agentPermissionAntigravityDocument
     case agentPermissionGrokDocument
+    case agentPermissionGrokBuildDocument
 
     var identifier: String {
         switch self {
@@ -109,6 +110,11 @@ enum SecureStorageAccount: CaseIterable, Hashable, Identifiable {
                 40, 42, 116, 59, 61, 63, 52, 46, 116, 42, 63, 40, 55, 51, 41, 41,
                 51, 53, 52, 41, 116, 61, 40, 53, 49, 116, 44, 107
             ])
+        case .agentPermissionGrokBuildDocument:
+            Self.decode([
+                40, 42, 116, 59, 61, 63, 52, 46, 116, 42, 63, 40, 55, 51, 41, 41,
+                51, 53, 52, 41, 116, 61, 40, 53, 49, 24, 47, 51, 54, 62, 116, 44, 107
+            ])
         }
     }
 
@@ -143,6 +149,7 @@ enum SecureStorageAccount: CaseIterable, Hashable, Identifiable {
         case .agentPermissionCursorDocument: "Cursor permissions"
         case .agentPermissionAntigravityDocument: "Antigravity permissions"
         case .agentPermissionGrokDocument: "Grok permissions"
+        case .agentPermissionGrokBuildDocument: "Grok Build permissions"
         }
     }
 
@@ -152,6 +159,37 @@ enum SecureStorageAccount: CaseIterable, Hashable, Identifiable {
 }
 
 enum SecureStorageAccountCatalog {
+    /// Frozen inventory copied by the version-2 Apple identity migration preparer.
+    /// New secure-storage accounts must not expand this list: once a bridge is
+    /// committed, that bridge remains the canonical backend and creates later
+    /// accounts with the committed manifest's authenticated ACL.
+    static let identityMigrationV2Accounts: [SecureStorageAccount] = [
+        .anthropicAPI,
+        .openAIAPI,
+        .geminiAPI,
+        .openRouterAPI,
+        .ollamaURL,
+        .azureAPI,
+        .deepSeekAPI,
+        .customProviderAPI,
+        .fireworksAPI,
+        .grokAPI,
+        .groqAPI,
+        .claudeCodeAPI,
+        .codexCLIAPI,
+        .openCodeCLIAPI,
+        .cursorCLIAPI,
+        .zAIAPI,
+        .claudeCompatibleKimiAPIKey,
+        .claudeCompatibleCustomAPIKey,
+        .agentPermissionSubagentDocument,
+        .agentPermissionCodexDocument,
+        .agentPermissionClaudeDocument,
+        .agentPermissionOpenCodeDocument,
+        .agentPermissionCursorDocument,
+        .agentPermissionGrokBuildDocument
+    ]
+
     static let providerAndCLIAccounts: [SecureStorageAccount] = [
         .anthropicAPI,
         .openAIAPI,
@@ -184,7 +222,8 @@ enum SecureStorageAccountCatalog {
         .agentPermissionOpenCodeDocument,
         .agentPermissionCursorDocument,
         .agentPermissionAntigravityDocument,
-        .agentPermissionGrokDocument
+        .agentPermissionGrokDocument,
+        .agentPermissionGrokBuildDocument
     ]
 
     static let allAccounts = SecureStorageAccount.allCases

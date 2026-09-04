@@ -52,6 +52,11 @@ enum AgentModeMCPToolPolicy {
 
     static let antigravityGrantedTools: Set<String> = MCPToolCapabilities.toolNames(for: antigravityGrantedCapabilities)
 
+    static let grokBuildGrantedCapabilities = MCPClientToolPolicyCatalog
+        .classification(for: .agentModeGrokBuildEngineer)
+        .grantedCapabilities
+    static let grokBuildGrantedTools = MCPToolCapabilities.toolNames(for: grokBuildGrantedCapabilities)
+
     static func grantedTools(forAgent agent: AgentProviderKind) -> Set<String> {
         switch agent {
         case .codexExec:
@@ -66,6 +71,8 @@ enum AgentModeMCPToolPolicy {
             antigravityGrantedTools
         case .grok:
             grokGrantedTools
+        case .grokBuild:
+            grokBuildGrantedTools
         }
     }
 }

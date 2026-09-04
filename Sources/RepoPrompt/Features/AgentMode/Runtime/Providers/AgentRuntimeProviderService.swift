@@ -42,6 +42,7 @@ enum AgentProviderKind: String, CaseIterable, Hashable {
     case cursor
     case antigravity
     case grok
+    case grokBuild
     case claudeCodeGLM
     case kimiCode
     case customClaudeCompatible
@@ -52,6 +53,12 @@ enum AgentProviderKind: String, CaseIterable, Hashable {
     static let cursorMCPClientID = "cursor"
     static let antigravityMCPClientID = "antigravity-client"
     static let grokMCPClientID = "grok-client"
+    /// Grok Build presents `grok-shell-<injected server name>` (e.g. `grok-shell-RepoPromptCE`)
+    /// to MCP servers. The hint must equal that exact registered name: the pending run-scoped
+    /// tab-context store keys are raw client names (no family canonicalization), so a
+    /// family-only hint would never bind the run's frozen tab context. The canonical
+    /// `grok-shell` family in `MCPClientIdentity` still covers family-level matching.
+    static let grokBuildMCPClientID = "grok-shell-\(RepoPromptMCPServerConfiguration.defaultServerName)"
 
     var commandName: String {
         switch self {
@@ -65,7 +72,7 @@ enum AgentProviderKind: String, CaseIterable, Hashable {
             "cursor-agent"
         case .antigravity:
             "agy"
-        case .grok:
+        case .grok, .grokBuild:
             "grok"
         }
     }
@@ -84,6 +91,8 @@ enum AgentProviderKind: String, CaseIterable, Hashable {
             "Antigravity CLI"
         case .grok:
             "Grok CLI"
+        case .grokBuild:
+            "Grok Build"
         case .claudeCodeGLM:
             ClaudeCodeCompatibleBackendStore.shared.config(for: .glmZAI).normalizedDisplayName
         case .kimiCode:
@@ -107,6 +116,8 @@ enum AgentProviderKind: String, CaseIterable, Hashable {
             Self.antigravityMCPClientID
         case .grok:
             Self.grokMCPClientID
+        case .grokBuild:
+            Self.grokBuildMCPClientID
         }
     }
 
@@ -116,6 +127,8 @@ enum AgentProviderKind: String, CaseIterable, Hashable {
             .openCode
         case .cursor:
             .cursor
+        case .grokBuild:
+            .grokBuild
         case .claudeCode, .codexExec, .claudeCodeGLM, .kimiCode, .customClaudeCompatible, .antigravity, .grok:
             nil
         }
@@ -125,7 +138,7 @@ enum AgentProviderKind: String, CaseIterable, Hashable {
         switch self {
         case .claudeCode, .claudeCodeGLM, .kimiCode, .customClaudeCompatible:
             true
-        case .codexExec, .openCode, .cursor, .antigravity, .grok:
+        case .codexExec, .openCode, .cursor, .antigravity, .grok, .grokBuild:
             false
         }
     }
@@ -136,14 +149,14 @@ enum AgentProviderKind: String, CaseIterable, Hashable {
 
     var requiresExpectedPIDOwnedAgentModeMCPRouting: Bool {
         switch self {
-        case .claudeCode, .codexExec, .openCode, .cursor, .claudeCodeGLM, .kimiCode, .customClaudeCompatible, .antigravity, .grok:
+        case .claudeCode, .codexExec, .openCode, .cursor, .claudeCodeGLM, .kimiCode, .customClaudeCompatible, .antigravity, .grok, .grokBuild:
             true
         }
     }
 
     var requiresPrePromptAgentModeMCPRouting: Bool {
         switch self {
-        case .cursor:
+        case .cursor, .grokBuild:
             false
         case .claudeCode, .codexExec, .openCode, .claudeCodeGLM, .kimiCode, .customClaudeCompatible, .antigravity, .grok:
             true
@@ -165,6 +178,8 @@ enum AgentProviderKind: String, CaseIterable, Hashable {
             return "Google's Antigravity CLI (agy), a Gemini-powered terminal coding agent. Runs headless one-shot prompts and uses RepoPrompt MCP tools."
         case .grok:
             return "xAI's Grok CLI (grok), a Grok-powered terminal coding agent. Runs headless one-shot prompts and uses RepoPrompt MCP tools."
+        case .grokBuild:
+            return "xAI Grok Build ACP agent. Uses Grok Build's ACP runtime (`grok agent stdio`) and injects RepoPrompt MCP tools through ACP session configuration."
         case .claudeCodeGLM:
             let config = ClaudeCodeCompatibleBackendStore.shared.config(for: .glmZAI)
             if case let .claudeSlotMapping(mapping) = config.modelBehavior {
@@ -201,6 +216,8 @@ enum AgentProviderKind: String, CaseIterable, Hashable {
             "antigravity_native"
         case .grok:
             "grok_native"
+        case .grokBuild:
+            "grok_build_acp"
         }
     }
 
@@ -214,7 +231,7 @@ enum AgentProviderKind: String, CaseIterable, Hashable {
             .kimi
         case .customClaudeCompatible:
             .customCompatible
-        case .codexExec, .openCode, .cursor, .antigravity, .grok:
+        case .codexExec, .openCode, .cursor, .antigravity, .grok, .grokBuild:
             nil
         }
     }
@@ -359,6 +376,16 @@ final class AgentRuntimeProviderService {
                 Self.logger.debug("Created GrokAgentProvider")
             }
             return GrokAgentProvider(runner: runner, config: config, workspacePath: workspacePath)
+        case .grokBuild:
+            let config = GrokBuildAgentConfig(
+                enableDebugLogging: Self.enableDebugLogging,
+                modelString: modelString,
+                alwaysApproveTools: GrokBuildAgentToolPreferences.permissionLevel() == .fullAccess
+            )
+            if Self.enableDebugLogging {
+                Self.logger.debug("Created GrokBuildACPHeadlessAgentProvider")
+            }
+            return GrokBuildACPHeadlessAgentProvider(config: config, workspacePath: workspacePath)
         }
     }
 }

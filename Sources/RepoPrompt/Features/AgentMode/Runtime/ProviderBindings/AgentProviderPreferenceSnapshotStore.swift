@@ -147,6 +147,14 @@ final class AgentProviderPreferenceSnapshotStore {
                 acceptsPendingACPApprovalWhenActivated: false,
                 grokPermissionLevel: effectiveGrokPermissionLevel(profile: profile)
             )
+        case .grokBuild:
+            let level = effectiveGrokBuildPermissionLevel(profile: profile)
+            // For Grok this flag becomes a launch-time `--always-approve` argument in the
+            // provider; the controller never auto-selects ACP permission options for it.
+            return AgentProviderRuntimePermissionBinding(
+                autoApproveAllACPToolPermissions: level.launchesWithAlwaysApprove,
+                acceptsPendingACPApprovalWhenActivated: level.launchesWithAlwaysApprove
+            )
         }
     }
 
@@ -165,6 +173,8 @@ final class AgentProviderPreferenceSnapshotStore {
             AntigravityAgentToolPreferences.setPermissionLevel(level, defaults: defaults, secureStore: securePermissions)
         case let .grok(level):
             GrokAgentToolPreferences.setPermissionLevel(level, defaults: defaults, secureStore: securePermissions)
+        case let .grokBuild(level):
+            GrokBuildAgentToolPreferences.setPermissionLevel(level, defaults: defaults, secureStore: securePermissions)
         }
         bumpRevision(for: id.providerID)
         return id.providerID
@@ -183,6 +193,14 @@ final class AgentProviderPreferenceSnapshotStore {
             CodexAgentModeBooleanPreference.reasoningSummaries.setEnabled(enabled, defaults: defaults)
         case let .memories(enabled):
             CodexAgentModeBooleanPreference.memories.setEnabled(enabled, defaults: defaults)
+        case let .apps(enabled):
+            CodexAgentModeBooleanPreference.apps.setEnabled(enabled, defaults: defaults)
+        case let .plugins(enabled):
+            CodexAgentModeBooleanPreference.plugins.setEnabled(enabled, defaults: defaults)
+        case let .mcpElicitation(enabled):
+            CodexAgentModeBooleanPreference.mcpElicitation.setEnabled(enabled, defaults: defaults)
+        case let .toolSuggestions(enabled):
+            CodexAgentModeBooleanPreference.toolSuggestions.setEnabled(enabled, defaults: defaults)
         case let .mcpServer(normalizedName, enabled):
             CodexAgentToolPreferences.setMCPServerEnabled(
                 normalizedName: normalizedName,
@@ -213,6 +231,22 @@ final class AgentProviderPreferenceSnapshotStore {
 
     func setCodexMemoriesEnabled(_ enabled: Bool) {
         applyCodexToolSettingMutation(.memories(enabled: enabled))
+    }
+
+    func setCodexAppsEnabled(_ enabled: Bool) {
+        applyCodexToolSettingMutation(.apps(enabled: enabled))
+    }
+
+    func setCodexPluginsEnabled(_ enabled: Bool) {
+        applyCodexToolSettingMutation(.plugins(enabled: enabled))
+    }
+
+    func setCodexMCPElicitationEnabled(_ enabled: Bool) {
+        applyCodexToolSettingMutation(.mcpElicitation(enabled: enabled))
+    }
+
+    func setCodexToolSuggestionsEnabled(_ enabled: Bool) {
+        applyCodexToolSettingMutation(.toolSuggestions(enabled: enabled))
     }
 
     func setCodexMCPServerEnabled(normalizedName: String, enabled: Bool) {
@@ -406,6 +440,26 @@ final class AgentProviderPreferenceSnapshotStore {
                     )
                 }
             )
+        case .grokBuild:
+            let effective = effectiveGrokBuildPermissionLevel(profile: profile)
+            return AgentPermissionChromeBinding(
+                providerID: providerID,
+                displayName: effective.displayName,
+                iconName: effective.iconName,
+                isWarning: effective.isWarning,
+                externallyManagedReason: externallyManagedReason,
+                options: GrokBuildAgentToolPreferences.PermissionLevel.allCases.map { level in
+                    AgentPermissionOptionBinding(
+                        id: .grokBuild(level),
+                        title: level.displayName,
+                        iconName: level.iconName,
+                        detailText: level.detailText,
+                        isWarning: level.isWarning,
+                        isSelected: level == effective,
+                        isEnabled: externallyManagedReason == nil
+                    )
+                }
+            )
         }
     }
 
@@ -434,6 +488,10 @@ final class AgentProviderPreferenceSnapshotStore {
                 goalSupportEnabled: codexGoalSupportEnabled(),
                 reasoningSummariesEnabled: codexReasoningSummariesEnabled(),
                 memoriesEnabled: codexMemoriesEnabled(),
+                appsEnabled: codexAppsEnabled(),
+                pluginsEnabled: codexPluginsEnabled(),
+                mcpElicitationEnabled: codexMCPElicitationEnabled(),
+                toolSuggestionsEnabled: codexToolSuggestionsEnabled(),
                 mcpServerEntries: entries,
                 mcpServerStatesByNormalizedName: states
             )
@@ -450,6 +508,10 @@ final class AgentProviderPreferenceSnapshotStore {
                 goalSupportEnabled: codexGoalSupportEnabled(),
                 reasoningSummariesEnabled: codexReasoningSummariesEnabled(),
                 memoriesEnabled: codexMemoriesEnabled(),
+                appsEnabled: codexAppsEnabled(),
+                pluginsEnabled: codexPluginsEnabled(),
+                mcpElicitationEnabled: codexMCPElicitationEnabled(),
+                toolSuggestionsEnabled: codexToolSuggestionsEnabled(),
                 mcpServerEntries: entries,
                 mcpServerStatesByNormalizedName: states
             )
@@ -499,6 +561,22 @@ final class AgentProviderPreferenceSnapshotStore {
 
     private func codexMemoriesEnabled() -> Bool {
         CodexAgentModeBooleanPreference.memories.isEnabled(defaults: defaults)
+    }
+
+    private func codexAppsEnabled() -> Bool {
+        CodexAgentModeBooleanPreference.apps.isEnabled(defaults: defaults)
+    }
+
+    private func codexPluginsEnabled() -> Bool {
+        CodexAgentModeBooleanPreference.plugins.isEnabled(defaults: defaults)
+    }
+
+    private func codexMCPElicitationEnabled() -> Bool {
+        CodexAgentModeBooleanPreference.mcpElicitation.isEnabled(defaults: defaults)
+    }
+
+    private func codexToolSuggestionsEnabled() -> Bool {
+        CodexAgentModeBooleanPreference.toolSuggestions.isEnabled(defaults: defaults)
     }
 
     private func claudeEffortLevel(
@@ -605,6 +683,21 @@ final class AgentProviderPreferenceSnapshotStore {
         }
     }
 
+    private func effectiveGrokBuildPermissionLevel(
+        profile: AgentProviderPermissionProfile
+    ) -> GrokBuildAgentToolPreferences.PermissionLevel {
+        switch profile {
+        case .userConfigured:
+            GrokBuildAgentToolPreferences.permissionLevel(defaults: defaults, secureStore: securePermissions)
+        case .mcpSafeDefaults:
+            .managedDefault
+        case let .providerOverride(.grokBuild(level)):
+            level
+        case .providerOverride:
+            .managedDefault
+        }
+    }
+
     private static func representativeAgent(for providerID: AgentProviderBindingID) -> AgentProviderKind {
         switch providerID {
         case .codex: .codexExec
@@ -613,6 +706,7 @@ final class AgentProviderPreferenceSnapshotStore {
         case .cursor: .cursor
         case .antigravity: .antigravity
         case .grok: .grok
+        case .grokBuild: .grokBuild
         }
     }
 
