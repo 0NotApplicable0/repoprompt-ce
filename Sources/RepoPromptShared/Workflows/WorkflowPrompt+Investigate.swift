@@ -74,7 +74,7 @@ rpce-cli -w <window_id> -e 'agent_run op=start model_id=explore session_name="<k
 ```
 """))
 
-> ⚠️ **Detached agents may block on permission approvals.** Use `op=wait` with the default timeout when there is no useful independent work; it returns when approval is needed so you can keep them unblocked. This applies to every detached agent in this workflow.
+> ⚠️ **Detached agents may block on permission approvals.** Use `op=wait` with the configured subagent wait when there is no useful independent work; it returns when approval is needed so you can keep them unblocked. This applies to every detached agent in this workflow.
 
 ### Phase 2: Broad Context Gathering (via \(builderName) — REQUIRED)
 

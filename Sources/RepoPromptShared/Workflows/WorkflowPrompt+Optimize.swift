@@ -130,7 +130,7 @@ rpce-cli -w <window_id> -e 'agent_run op=wait session_ids=["<id1>","<id2>","<id3
 ```
 """))
 
-> ⚠️ **Detached agents may block on permission approvals.** Use `op=wait` with the default timeout when there is no useful independent work; it returns when approval is needed so you can keep them unblocked.
+> ⚠️ **Detached agents may block on permission approvals.** Use `op=wait` with the configured subagent wait when there is no useful independent work; it returns when approval is needed so you can keep them unblocked.
 
 If the bottleneck-candidates explore returns thin or generic results ("nothing obviously expensive"), that's a signal — either the area is genuinely well-tuned and the user's complaint is elsewhere, or the explore needed broader radius. Either way, **re-dispatch one targeted explore** with a wider radius (e.g., "look two call levels up") rather than reading the code yourself.
 

@@ -172,7 +172,7 @@ rpce-cli -w <window_id> -e 'agent_run op=wait session_ids=["<id1>","<id2>"]'
 ```
 """))
 
-> ⚠️ **Detached agents may block on permission approvals.** Use `op=wait` with the default timeout when there is no useful independent work; it returns when approval is needed so you can keep them unblocked.
+> ⚠️ **Detached agents may block on permission approvals.** Use `op=wait` with the configured subagent wait when there is no useful independent work; it returns when approval is needed so you can keep them unblocked.
 
 Skip lanes that don't apply. **Don't dispatch external research just because you can** — the relevance trigger is "the plan depends on facts I can't see in this workspace."
 
