@@ -131,7 +131,7 @@ If dispatching independent items as fresh agents concurrently, **each agent's br
 
 **Use `detach: true`** when dispatching concurrent items — otherwise the orchestrator blocks on the first agent and can't start the second.
 
-Then pass `session_ids` (array) to `agent_run op=wait` to block until the **first** session finishes or needs input. The response tells you which session won and which are still pending. When there is no useful independent work, use wait rather than repeated polling. Omit the timeout to use the default unless the user requests otherwise. Completion, questions, and parent steering can end the wait early.
+Then pass `session_ids` (array) to `agent_run op=wait` to block until the **first** session finishes or needs input. The response tells you which session won and which are still pending. For routine idle monitoring, omit the timeout to use the default wait. Completion, questions, and parent steering can end the wait early. Deliberate status checks with `poll` and shorter waits remain appropriate when a concrete coordination need requires them; avoid repeated checks solely to rediscover unchanged status.
 
 \(example(variant,
 	mcp: """
@@ -161,7 +161,7 @@ rpce-cli -w <window_id> -e 'agent_run op=poll session_ids=["<uuid1>","<uuid2>"]'
 ```
 """))
 
-Handle the finished agent, then wait again on the remaining `pending_session_ids`. While waiting, summarize completed work or prepare the next brief — be a pipeline, not a sequential loop.
+Handle the finished agent and summarize completed work. Do useful independent work, such as preparing the next brief, before blocking again on the remaining `pending_session_ids` — be a pipeline, not a sequential loop.
 """
 	}
 
