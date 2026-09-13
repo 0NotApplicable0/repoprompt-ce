@@ -7,7 +7,7 @@ import XCTest
 @MainActor
 final class AgentLifecycleExecutionContractTests: XCTestCase {
     func testAgentRunLifecycleWaitDefaultsAndExplicitOverrides() throws {
-        let expected = MCPTimeoutPolicy.agentLifecycleDefaultWaitSeconds
+        let expected: TimeInterval = 300
         XCTAssertEqual(AgentRunMCPToolService.defaultWaitTimeoutSeconds, expected)
         XCTAssertEqual(try AgentRunMCPToolService.resolvedStartTimeoutSeconds(nil), expected)
         XCTAssertEqual(try AgentRunMCPToolService.resolvedWaitTimeoutSeconds(nil), expected)

@@ -132,7 +132,7 @@ public enum MCPTimeoutPolicy {
 
     /// Maximum otherwise-quiet RP-managed subagent lifecycle wait (start post-launch,
     /// wait, steer-and-wait). Not a startup, execution, or notification interval.
-    public static let agentLifecycleDefaultWaitSeconds: TimeInterval = 3600
+    public static let agentLifecycleDefaultWaitSeconds: TimeInterval = 300
     public static let askUserDefaultTimeoutSeconds: TimeInterval = 300
     public static let nextUserInstructionDefaultWaitSeconds: TimeInterval = 600
     public static let applyEditsApprovalTimeoutSeconds: TimeInterval = 300

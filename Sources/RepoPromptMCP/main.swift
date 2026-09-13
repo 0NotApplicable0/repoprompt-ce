@@ -3119,10 +3119,10 @@ func printUsage() {
           agent_run op=respond session_id="<uuid>" interaction_id="<id>" response="accept"
           agent_run op=cancel session_id="<uuid>"      Cancel run
           Operations: start, poll, wait, cancel, steer, respond
-          wait accepts optional timeout (seconds, fractional OK). For routine
-          idle monitoring, omit it to use the default. Use poll or a shorter
-          wait for a concrete coordination need. timeout=0 returns the current
-          snapshot immediately.
+          wait accepts optional timeout (seconds, fractional OK). Omit it for
+          the default; use shorter waits for closer supervision or longer waits
+          for well-scoped independent work. timeout=0 returns the current snapshot
+          immediately.
           session_ids is accepted only for wait/poll and is mutually exclusive
           with session_id. Multi-wait returns the winning snapshot plus wait
           metadata (mode, result, winner_session_id, pending_session_ids).
