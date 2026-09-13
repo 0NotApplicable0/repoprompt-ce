@@ -130,7 +130,9 @@ public enum MCPTimeoutPolicy {
     /// and transport delivery before the CLI cancels the request.
     public static let cliSemanticWaitResponseMarginSeconds: TimeInterval = .init(responseSendDeadlineSeconds)
 
-    public static let agentLifecycleDefaultWaitSeconds: TimeInterval = 120
+    /// Maximum otherwise-quiet RP-managed subagent lifecycle wait (start post-launch,
+    /// wait, steer-and-wait). Not a startup, execution, or notification interval.
+    public static let agentLifecycleDefaultWaitSeconds: TimeInterval = 3600
     public static let askUserDefaultTimeoutSeconds: TimeInterval = 300
     public static let nextUserInstructionDefaultWaitSeconds: TimeInterval = 600
     public static let applyEditsApprovalTimeoutSeconds: TimeInterval = 300

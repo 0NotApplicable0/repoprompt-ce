@@ -1471,7 +1471,7 @@ actor InteractiveMCPClientSession {
             if MCPTimeoutPolicy.cliDefaultUnboundedToolNames.contains(toolName) {
                 return nil
             }
-            if let semanticWaitSeconds = Self.explicitSemanticWaitSeconds(
+            if let semanticWaitSeconds = Self.semanticWaitSeconds(
                 toolName: toolName,
                 arguments: arguments
             ) {
@@ -1489,32 +1489,97 @@ actor InteractiveMCPClientSession {
         }
     }
 
-    private static func explicitSemanticWaitSeconds(
+    private static func semanticWaitSeconds(
         toolName: String,
         arguments: [String: Value]
     ) -> TimeInterval? {
-        let timeoutKey: String
         switch toolName {
         case "agent_run", "agent_explore":
-            let operation = arguments["op"]?.stringValue?
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-                .lowercased()
-            switch operation {
-            case "start", "wait":
-                timeoutKey = "timeout"
-            case "steer" where toolName == "agent_run":
-                guard arguments["wait"]?.boolValue != false else { return nil }
-                timeoutKey = "timeout_seconds"
-            default:
-                return nil
-            }
+            agentLifecycleSemanticWaitSeconds(toolName: toolName, arguments: arguments)
         case "ask_user", "wait_for_next_user_instruction":
-            timeoutKey = "timeout_seconds"
+            explicitOnlySemanticWaitSeconds(arguments: arguments, timeoutKey: "timeout_seconds")
+        default:
+            nil
+        }
+    }
+
+    private static func agentLifecycleSemanticWaitSeconds(
+        toolName: String,
+        arguments: [String: Value]
+    ) -> TimeInterval? {
+        let operation = arguments["op"]?.stringValue?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+
+        if operation == nil {
+            guard toolName == "agent_run" else { return nil }
+            return resolvedLifecycleSemanticWaitDuration(
+                timeoutKey: "timeout",
+                arguments: arguments,
+                implicitWhenAbsent: MCPTimeoutPolicy.agentLifecycleDefaultWaitSeconds
+            )
+        }
+
+        switch operation {
+        case "wait":
+            return resolvedLifecycleSemanticWaitDuration(
+                timeoutKey: "timeout",
+                arguments: arguments,
+                implicitWhenAbsent: MCPTimeoutPolicy.agentLifecycleDefaultWaitSeconds
+            )
+        case "start":
+            if parseBool(arguments["detach"]) == true {
+                return explicitOnlySemanticWaitSeconds(arguments: arguments, timeoutKey: "timeout")
+            }
+            return resolvedLifecycleSemanticWaitDuration(
+                timeoutKey: "timeout",
+                arguments: arguments,
+                implicitWhenAbsent: MCPTimeoutPolicy.agentLifecycleDefaultWaitSeconds
+            )
+        case "steer":
+            guard toolName == "agent_run" else { return nil }
+            let shouldWait: Bool = if let explicit = parseBool(arguments["wait"]) {
+                explicit
+            } else if arguments["timeout_seconds"] != nil {
+                true
+            } else {
+                false
+            }
+            guard shouldWait else { return nil }
+            return resolvedLifecycleSemanticWaitDuration(
+                timeoutKey: "timeout_seconds",
+                arguments: arguments,
+                implicitWhenAbsent: MCPTimeoutPolicy.agentLifecycleDefaultWaitSeconds
+            )
         default:
             return nil
         }
+    }
 
+    private static func explicitOnlySemanticWaitSeconds(
+        arguments: [String: Value],
+        timeoutKey: String
+    ) -> TimeInterval? {
         guard let value = arguments[timeoutKey] else { return nil }
+        return parsedNonNegativeFiniteSeconds(value)
+    }
+
+    private static func resolvedLifecycleSemanticWaitDuration(
+        timeoutKey: String,
+        arguments: [String: Value],
+        implicitWhenAbsent: TimeInterval
+    ) -> TimeInterval? {
+        guard let value = arguments[timeoutKey] else {
+            return implicitWhenAbsent
+        }
+        if case .null = value {
+            return implicitWhenAbsent
+        }
+        guard let seconds = parsedNonNegativeFiniteSeconds(value) else { return nil }
+        return seconds
+    }
+
+    private static func parsedNonNegativeFiniteSeconds(_ value: Value) -> TimeInterval? {
         let seconds: TimeInterval? = switch value {
         case let .int(value):
             TimeInterval(value)
@@ -1527,6 +1592,30 @@ actor InteractiveMCPClientSession {
         }
         guard let seconds, seconds.isFinite, seconds >= 0 else { return nil }
         return seconds
+    }
+
+    private static func parseBool(_ value: Value?) -> Bool? {
+        switch value {
+        case let .bool(boolValue):
+            boolValue
+        case let .string(stringValue):
+            switch stringValue.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+            case "true", "1", "yes":
+                true
+            case "false", "0", "no":
+                false
+            default:
+                nil
+            }
+        case let .int(intValue):
+            intValue != 0
+        case let .double(doubleValue):
+            doubleValue != 0
+        case .null, .array, .object:
+            nil
+        default:
+            nil
+        }
     }
 
     #if DEBUG

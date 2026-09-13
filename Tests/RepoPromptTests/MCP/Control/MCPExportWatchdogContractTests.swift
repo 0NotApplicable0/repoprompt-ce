@@ -550,6 +550,66 @@ import XCTest
             }
         }
 
+        func testAgentLifecycleImplicitClientDeadlinesMatchBlockingIntent() async {
+            let session = makeUnconnectedSession()
+            let implicitHourDeadline = max(
+                MCPTimeoutPolicy.cliDefaultToolCallTimeoutSeconds,
+                MCPTimeoutPolicy.agentLifecycleDefaultWaitSeconds
+                    + MCPTimeoutPolicy.cliSemanticWaitResponseMarginSeconds
+            )
+            let ordinaryDeadline = MCPTimeoutPolicy.cliDefaultToolCallTimeoutSeconds
+            let cases: [(label: String, toolName: String, arguments: [String: Value], expected: TimeInterval?)] = [
+                ("agent_run wait absent timeout", "agent_run", ["op": .string("wait")], implicitHourDeadline),
+                ("agent_run wait null timeout", "agent_run", ["op": .string("wait"), "timeout": .null], implicitHourDeadline),
+                ("agent_run omitted op", "agent_run", [:], implicitHourDeadline),
+                ("agent_explore wait", "agent_explore", ["op": .string("wait")], implicitHourDeadline),
+                ("agent_run start", "agent_run", ["op": .string("start"), "message": .string("x")], implicitHourDeadline),
+                ("agent_run start detach false", "agent_run", ["op": .string("start"), "detach": .bool(false), "message": .string("x")], implicitHourDeadline),
+                ("agent_run start detach true", "agent_run", ["op": .string("start"), "detach": .bool(true), "message": .string("x")], ordinaryDeadline),
+                ("agent_run poll", "agent_run", ["op": .string("poll"), "session_id": .string("x")], ordinaryDeadline),
+                ("agent_run cancel", "agent_run", ["op": .string("cancel"), "session_id": .string("x")], ordinaryDeadline),
+                ("agent_run respond", "agent_run", ["op": .string("respond"), "session_id": .string("x")], ordinaryDeadline),
+                ("agent_run steer wait true", "agent_run", ["op": .string("steer"), "session_id": .string("x"), "message": .string("x"), "wait": .bool(true)], implicitHourDeadline),
+                ("agent_run steer timeout_seconds null", "agent_run", ["op": .string("steer"), "session_id": .string("x"), "message": .string("x"), "timeout_seconds": .null], implicitHourDeadline),
+                ("agent_run steer wait false", "agent_run", ["op": .string("steer"), "session_id": .string("x"), "message": .string("x"), "wait": .bool(false), "timeout_seconds": .int(60)], ordinaryDeadline),
+                ("agent_run steer wait string false", "agent_run", ["op": .string("steer"), "session_id": .string("x"), "message": .string("x"), "wait": .string("false"), "timeout_seconds": .int(60)], ordinaryDeadline),
+                ("agent_explore missing op", "agent_explore", [:], ordinaryDeadline)
+            ]
+
+            for testCase in cases {
+                let timeout = await session.test_resolvedToolCallTimeout(
+                    toolName: testCase.toolName,
+                    arguments: testCase.arguments
+                )
+                XCTAssertEqual(timeout, testCase.expected, testCase.label)
+            }
+        }
+
+        func testAgentLifecycleExplicitClientDeadlinesPreserveOverrides() async {
+            let session = makeUnconnectedSession()
+            let ordinaryDeadline = MCPTimeoutPolicy.cliDefaultToolCallTimeoutSeconds
+            let cases: [(label: String, policy: ToolCallTimeoutPolicy, toolName: String, arguments: [String: Value], expected: TimeInterval?)] = [
+                ("short explicit wait", .default, "agent_run", ["op": .string("wait"), "timeout": .int(30)], ordinaryDeadline),
+                ("longer explicit wait", .default, "agent_run", ["op": .string("wait"), "timeout": .int(600)], 630),
+                ("explicit zero wait", .default, "agent_run", ["op": .string("wait"), "timeout": .int(0)], nil),
+                ("detached start explicit timeout", .default, "agent_run", ["op": .string("start"), "detach": .bool(true), "timeout": .int(600), "message": .string("x")], 630),
+                ("invalid explicit wait", .default, "agent_run", ["op": .string("wait"), "timeout": .string("nope")], ordinaryDeadline),
+                ("explicit client finite policy", .seconds(90), "agent_run", ["op": .string("wait")], 90),
+                ("explicit client unbounded policy", .none, "agent_run", ["op": .string("wait")], nil),
+                ("ask_user explicit timeout", .default, "ask_user", ["timeout_seconds": .int(120)], ordinaryDeadline),
+                ("ordinary export tool", .default, "prompt", ["op": .string("export")], ordinaryDeadline)
+            ]
+
+            for testCase in cases {
+                let timeout = await session.test_resolvedToolCallTimeout(
+                    testCase.policy,
+                    toolName: testCase.toolName,
+                    arguments: testCase.arguments
+                )
+                XCTAssertEqual(timeout, testCase.expected, testCase.label)
+            }
+        }
+
         func testPromptContextExportsRetain300SecondClientDeadline() async {
             let session = makeUnconnectedSession()
             let cases: [(toolName: String, operation: String)] = [

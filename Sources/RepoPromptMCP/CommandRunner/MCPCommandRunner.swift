@@ -823,8 +823,8 @@ actor MCPCommandRunner {
           agent_run op=start message="Investigate the auth flow" model_id=engineer
           builder "Implement the plan" --response-type plan --export
           agent_run op=start message="Read the plan at prompt-exports/oracle-plan.md with read_file first. Implement item 1." workflow_name=orchestrate detach=true
-          agent_run op=wait session_id="<session-uuid>" timeout=30
-          agent_run op=wait session_ids=["<uuid1>","<uuid2>"] timeout=60
+          agent_run op=wait session_id="<session-uuid>"
+          agent_run op=wait session_ids=["<uuid1>","<uuid2>"]
           agent_run op=poll session_ids=["<uuid1>","<uuid2>","<uuid3>"]
           agent_run op=steer session_id="<uuid>" message="Now fix it" wait=true
           agent_run op=respond session_id="<session-uuid>" interaction_id="<id>" response="accept"
