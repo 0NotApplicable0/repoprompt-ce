@@ -29,7 +29,7 @@ final class ContextBuilderOracleFailedPrimaryResultTests: XCTestCase {
             error: nil
         )
         let groupResult = try OracleGroupResult(
-            groupID: OracleGroupID(),
+            groupID: OracleGroupID(rawValue: UUID()),
             status: .failed,
             oracleResults: [primary, auxiliary]
         )
