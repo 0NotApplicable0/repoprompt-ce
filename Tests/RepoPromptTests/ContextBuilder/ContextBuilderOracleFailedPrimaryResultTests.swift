@@ -37,11 +37,11 @@ final class ContextBuilderOracleFailedPrimaryResultTests: XCTestCase {
 
         XCTAssertNil(try group.requiredCompletedPrimaryResponse())
 
-        let reply = ChatSendReply(
+        let reply = try ChatSendReply(
             chatId: UUID(),
             shortId: primary.chatID,
             mode: "review",
-            response: try group.requiredCompletedPrimaryResponse(),
+            response: group.requiredCompletedPrimaryResponse(),
             errors: ["Oracle failed: primary stopped"],
             oracleGroup: group
         )
