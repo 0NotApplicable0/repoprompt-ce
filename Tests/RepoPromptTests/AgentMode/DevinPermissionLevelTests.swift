@@ -304,6 +304,36 @@ final class DevinPermissionLevelTests: XCTestCase {
         XCTAssertEqual(launch.arguments, ["--permission-mode", "auto", "acp"])
     }
 
+    func testConcurrentProbeDoesNotInvalidateAResolvedBareCommandLaunch() async throws {
+        let directory = try makeTestDirectory(name: "DevinConcurrentBareCommandLaunch")
+        let executable = directory.appendingPathComponent("devin")
+        try "#!/bin/sh\necho 'Run as an ACP server over stdio'\n".write(
+            to: executable,
+            atomically: true,
+            encoding: .utf8
+        )
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: executable.path)
+        let gate = DevinProbeEnvironmentGate(environment: ["PATH": directory.path])
+        let resolver = DevinACPLaunchResolver(launchEnvironmentProvider: { _ in
+            await gate.nextEnvironment()
+        })
+        let config = DevinAgentConfig(commandName: "devin", includeRepoPromptMCPServer: false)
+
+        let initialSupport = try await resolver.probeSupport(for: config)
+        XCTAssertEqual(initialSupport, .supported)
+        let secondProbe = Task { try await resolver.probeSupport(for: config) }
+        await gate.waitForSecondCall()
+        let resolved = Result { try resolver.resolvedLaunch(for: config) }
+        await gate.releaseSecondCall()
+        let secondSupport = try await secondProbe.value
+        XCTAssertEqual(secondSupport, .supported)
+
+        XCTAssertEqual(
+            try resolved.get().command,
+            try ExecutableFileIdentity.captureForTrustedPathLaunch(atPath: executable.path).canonicalPath
+        )
+    }
+
     func testRoutineInfoStderrIsHiddenWhileActionableOutputRemainsVisible() throws {
         let (provider, _) = try makeProvider()
 
@@ -316,6 +346,12 @@ final class DevinPermissionLevelTests: XCTestCase {
         XCTAssertTrue(provider.shouldEmitStderrLine("2026-09-14T09:52:20Z ERROR chisel: startup failed"))
         XCTAssertFalse(provider.shouldEmitStderrLine(
             "2026-09-15T11:10:05.047288Z  WARN message_forest: MessageChain tree duplication: system prefix changed"
+        ))
+        XCTAssertFalse(provider.shouldEmitStderrLine(
+            "2026-09-17T09:10:27.520189Z  WARN windsurf_api_client::remote_config: remote config revalidation failed, keeping last-good value: error sending request for url (https://unleash.codeium.com/api/client/features): operation timed out"
+        ))
+        XCTAssertFalse(provider.shouldEmitStderrLine(
+            "2026-09-17T09:11:36Z WARN windsurf_api_client::remote_config: remote config revalidation failed, keeping last-good value: error decoding response body"
         ))
         XCTAssertTrue(provider.shouldEmitStderrLine("2026-09-14T09:52:20Z  WARN chisel: retrying"))
         XCTAssertTrue(provider.shouldEmitStderrLine("permission denied while reading config"))
@@ -488,6 +524,42 @@ final class DevinPermissionLevelTests: XCTestCase {
     }
 }
 
+private actor DevinProbeEnvironmentGate {
+    private let environment: [String: String]
+    private var callCount = 0
+    private var secondCallWaiters: [CheckedContinuation<Void, Never>] = []
+    private var releaseSecondCallContinuation: CheckedContinuation<Void, Never>?
+
+    init(environment: [String: String]) {
+        self.environment = environment
+    }
+
+    func nextEnvironment() async -> ACPLaunchEnvironment {
+        callCount += 1
+        if callCount == 2 {
+            let waiters = secondCallWaiters
+            secondCallWaiters.removeAll()
+            waiters.forEach { $0.resume() }
+            await withCheckedContinuation { continuation in
+                releaseSecondCallContinuation = continuation
+            }
+        }
+        return ACPLaunchEnvironment(environment: environment)
+    }
+
+    func waitForSecondCall() async {
+        guard callCount < 2 else { return }
+        await withCheckedContinuation { continuation in
+            secondCallWaiters.append(continuation)
+        }
+    }
+
+    func releaseSecondCall() {
+        releaseSecondCallContinuation?.resume()
+        releaseSecondCallContinuation = nil
+    }
+}
+
 final class DevinIntegrationConfigurationTests: XCTestCase {
     func testOverlayPreservesXDGEntriesAndDevinWritesThroughCleanup() throws {
         let sourceRoot = try makeTestDirectory(name: "DevinIntegrationSource")
@@ -572,6 +644,66 @@ final class DevinIntegrationConfigurationTests: XCTestCase {
             try JSONSerialization.data(withJSONObject: sourceMCP)
         )
         XCTAssertFalse(FileManager.default.fileExists(atPath: overlayRoot.path))
+    }
+
+    func testCleanupPreservesNewerNativeConfigAndRetainsRecoveryOverlay() throws {
+        let sourceRoot = try makeTestDirectory(name: "DevinIntegrationConcurrentNativeWrite")
+        let devinSource = sourceRoot.appendingPathComponent("devin", isDirectory: true)
+        try FileManager.default.createDirectory(at: devinSource, withIntermediateDirectories: true)
+        let nativeConfig = devinSource.appendingPathComponent("config.json")
+        try "original".write(to: nativeConfig, atomically: true, encoding: .utf8)
+
+        let prepared = try DevinIntegrationConfiguration.prepare(
+            workingDirectory: sourceRoot.path,
+            mcpServers: .disableAll,
+            sourceEnvironment: ["XDG_CONFIG_HOME": sourceRoot.path, "HOME": sourceRoot.path]
+        )
+        let overlayRoot = try XCTUnwrap(prepared.environment["XDG_CONFIG_HOME"]).asFileURL
+        let overlayConfig = overlayRoot
+            .appendingPathComponent("devin", isDirectory: true)
+            .appendingPathComponent("config.json")
+        try FileManager.default.removeItem(at: overlayConfig)
+        try "overlay update".write(to: overlayConfig, atomically: true, encoding: .utf8)
+        try "newer native update".write(to: nativeConfig, atomically: true, encoding: .utf8)
+
+        XCTAssertThrowsError(try DevinIntegrationConfiguration.cleanup(artifact: prepared.cleanupArtifact)) { error in
+            XCTAssertTrue(error.localizedDescription.contains("Recovery data remains at \(overlayRoot.path)"))
+        }
+        XCTAssertEqual(try String(contentsOf: nativeConfig, encoding: .utf8), "newer native update")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: overlayRoot.path))
+        try? FileManager.default.removeItem(at: overlayRoot)
+    }
+
+    func testCleanupRestoresNativeConfigWhenItChangesDuringPublication() throws {
+        let sourceRoot = try makeTestDirectory(name: "DevinIntegrationPublicationRace")
+        let devinSource = sourceRoot.appendingPathComponent("devin", isDirectory: true)
+        try FileManager.default.createDirectory(at: devinSource, withIntermediateDirectories: true)
+        let nativeConfig = devinSource.appendingPathComponent("config.json")
+        try "original".write(to: nativeConfig, atomically: true, encoding: .utf8)
+
+        let prepared = try DevinIntegrationConfiguration.prepare(
+            workingDirectory: sourceRoot.path,
+            mcpServers: .disableAll,
+            sourceEnvironment: ["XDG_CONFIG_HOME": sourceRoot.path, "HOME": sourceRoot.path]
+        )
+        let overlayRoot = try XCTUnwrap(prepared.environment["XDG_CONFIG_HOME"]).asFileURL
+        let overlayConfig = overlayRoot
+            .appendingPathComponent("devin", isDirectory: true)
+            .appendingPathComponent("config.json")
+        try FileManager.default.removeItem(at: overlayConfig)
+        try "overlay update".write(to: overlayConfig, atomically: true, encoding: .utf8)
+
+        XCTAssertThrowsError(try DevinIntegrationConfiguration.cleanup(
+            artifact: prepared.cleanupArtifact,
+            beforeReplacing: { sourceEntry in
+                try "newer native update".write(to: sourceEntry, atomically: true, encoding: .utf8)
+            }
+        )) { error in
+            XCTAssertTrue(error.localizedDescription.contains("Recovery data remains at \(overlayRoot.path)"))
+        }
+        XCTAssertEqual(try String(contentsOf: nativeConfig, encoding: .utf8), "newer native update")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: overlayRoot.path))
+        try? FileManager.default.removeItem(at: overlayRoot)
     }
 
     func testDisableAllMCPOverlayPreservesConfigWithoutNativeServers() throws {

@@ -333,7 +333,10 @@ struct SecureDevinPermissionDocument: Codable, Equatable {
     }
 
     static func failClosedDocument(now: Date = Date()) -> SecureDevinPermissionDocument {
-        SecureDevinPermissionDocument(updatedAt: now)
+        SecureDevinPermissionDocument(
+            updatedAt: now,
+            permissionLevelRaw: DevinAgentToolPreferences.PermissionLevel.normal.rawValue
+        )
     }
 
     func permissionLevel() -> DevinAgentToolPreferences.PermissionLevel {
@@ -768,6 +771,7 @@ final class AgentPermissionSecureStore {
         loadLocked(
             domain: .devin,
             cache: &devinCache,
+            missingDocument: SecureDevinPermissionDocument(updatedAt: now()),
             failClosedDocument: SecureDevinPermissionDocument.failClosedDocument(now: now()),
             normalize: normalizeDevin,
             deferred: &effects

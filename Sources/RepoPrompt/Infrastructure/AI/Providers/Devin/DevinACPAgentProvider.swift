@@ -130,7 +130,7 @@ struct DevinACPAgentProvider: ACPAgentProvider {
     }
 
     func shouldEmitStderrLine(_ line: String) -> Bool {
-        let suppressedPattern = #"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z\s+(?:INFO\s+|WARN\s+message_forest:\s+MessageChain tree duplication:)"#
+        let suppressedPattern = #"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z\s+(?:INFO\s+|WARN\s+(?:message_forest:\s+MessageChain tree duplication:|windsurf_api_client::remote_config:\s+remote config revalidation failed,\s+keeping last-good value:))"#
         return line.range(of: suppressedPattern, options: .regularExpression) == nil
     }
 

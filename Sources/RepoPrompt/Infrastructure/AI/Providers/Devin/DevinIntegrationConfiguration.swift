@@ -1,9 +1,31 @@
+import Darwin
 import Foundation
 
 enum DevinIntegrationConfiguration {
     static let cleanupArtifactKind = "devinIsolatedMCPConfiguration"
     private static let directoryPrefix = "RepoPromptDevinACP-"
     private static let sourceDevinPathMarkerName = ".repoprompt-source-devin-path"
+    private static let sourceDevinSnapshotMarkerName = ".repoprompt-source-devin-snapshot.json"
+
+    private struct SourceEntryFingerprint: Codable, Equatable {
+        let deviceID: UInt64
+        let fileNumber: UInt64
+        let byteSize: Int64
+        let kind: UInt32
+        let modificationSeconds: Int64
+        let modificationNanoseconds: Int64
+        let statusChangeSeconds: Int64
+        let statusChangeNanoseconds: Int64
+
+        func matchesContentIdentity(of other: SourceEntryFingerprint) -> Bool {
+            deviceID == other.deviceID
+                && fileNumber == other.fileNumber
+                && byteSize == other.byteSize
+                && kind == other.kind
+                && modificationSeconds == other.modificationSeconds
+                && modificationNanoseconds == other.modificationNanoseconds
+        }
+    }
 
     struct PreparedConfiguration {
         let environment: [String: String]
@@ -67,6 +89,10 @@ enum DevinIntegrationConfiguration {
                 atomically: true,
                 encoding: .utf8
             )
+            try JSONEncoder().encode(sourceEntryFingerprints(in: sourceDevinDirectory)).write(
+                to: root.appendingPathComponent(sourceDevinSnapshotMarkerName),
+                options: .atomic
+            )
 
             let sourceMCPURL = sourceDevinDirectory.appendingPathComponent("mcp_config.json")
             var rootObject = try existingMCPRootObject(at: sourceMCPURL)
@@ -126,7 +152,10 @@ enum DevinIntegrationConfiguration {
         )
     }
 
-    static func cleanup(artifact: ACPLaunchCleanupArtifact) throws {
+    static func cleanup(
+        artifact: ACPLaunchCleanupArtifact,
+        beforeReplacing: ((URL) throws -> Void)? = nil
+    ) throws {
         guard artifact.providerID == .devin,
               artifact.kind == cleanupArtifactKind
         else {
@@ -134,7 +163,7 @@ enum DevinIntegrationConfiguration {
         }
         let root = configurationRoot(id: artifact.id)
         do {
-            try preserveDevinWrites(in: root)
+            try preserveDevinWrites(in: root, beforeReplacing: beforeReplacing)
             try FileManager.default.removeItem(at: root)
         } catch {
             throw AIProviderError.invalidConfiguration(
@@ -181,11 +210,18 @@ enum DevinIntegrationConfiguration {
         }
     }
 
-    private static func preserveDevinWrites(in root: URL) throws {
+    private static func preserveDevinWrites(
+        in root: URL,
+        beforeReplacing: ((URL) throws -> Void)?
+    ) throws {
         let marker = root.appendingPathComponent(sourceDevinPathMarkerName)
         let sourcePath = try String(contentsOf: marker, encoding: .utf8)
         let sourceDirectory = URL(fileURLWithPath: sourcePath, isDirectory: true).standardizedFileURL
         let overlayDirectory = root.appendingPathComponent("devin", isDirectory: true)
+        let snapshots = try JSONDecoder().decode(
+            [String: SourceEntryFingerprint].self,
+            from: Data(contentsOf: root.appendingPathComponent(sourceDevinSnapshotMarkerName))
+        )
         try FileManager.default.createDirectory(
             at: sourceDirectory,
             withIntermediateDirectories: true,
@@ -201,21 +237,122 @@ enum DevinIntegrationConfiguration {
             {
                 continue
             }
+            let originalFingerprint = snapshots[entry.lastPathComponent]
+            let currentFingerprint = try sourceEntryFingerprint(at: sourceEntry)
+            guard currentFingerprint == originalFingerprint,
+                  originalFingerprint?.kind != UInt32(S_IFDIR)
+            else {
+                throw AIProviderError.invalidConfiguration(
+                    detail: "Native Devin configuration changed during the run: \(sourceEntry.path)"
+                )
+            }
             let replacement = sourceDirectory.appendingPathComponent(
                 ".\(entry.lastPathComponent).repoprompt-\(UUID().uuidString)"
             )
             try FileManager.default.copyItem(at: entry, to: replacement)
             do {
-                if FileManager.default.fileExists(atPath: sourceEntry.path) {
-                    _ = try FileManager.default.replaceItemAt(sourceEntry, withItemAt: replacement)
-                } else {
-                    try FileManager.default.moveItem(at: replacement, to: sourceEntry)
-                }
+                try beforeReplacing?(sourceEntry)
             } catch {
                 try? FileManager.default.removeItem(at: replacement)
                 throw error
             }
+            try publishReplacement(
+                replacement,
+                at: sourceEntry,
+                expectedFingerprint: originalFingerprint
+            )
         }
+    }
+
+    private static func sourceEntryFingerprints(in directory: URL) throws -> [String: SourceEntryFingerprint] {
+        guard FileManager.default.fileExists(atPath: directory.path) else { return [:] }
+        return try Dictionary(
+            uniqueKeysWithValues: FileManager.default.contentsOfDirectory(
+                at: directory,
+                includingPropertiesForKeys: nil
+            )
+            .filter { $0.lastPathComponent != "mcp_config.json" }
+            .map { entry in
+                guard let fingerprint = try sourceEntryFingerprint(at: entry) else {
+                    throw CocoaError(.fileNoSuchFile)
+                }
+                return (entry.lastPathComponent, fingerprint)
+            }
+        )
+    }
+
+    private static func sourceEntryFingerprint(at url: URL) throws -> SourceEntryFingerprint? {
+        var info = stat()
+        guard lstat(url.path, &info) == 0 else {
+            if errno == ENOENT || errno == ENOTDIR { return nil }
+            throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno))
+        }
+        return SourceEntryFingerprint(
+            deviceID: UInt64(bitPattern: Int64(info.st_dev)),
+            fileNumber: UInt64(info.st_ino),
+            byteSize: Int64(info.st_size),
+            kind: UInt32(info.st_mode & mode_t(S_IFMT)),
+            modificationSeconds: Int64(info.st_mtimespec.tv_sec),
+            modificationNanoseconds: Int64(info.st_mtimespec.tv_nsec),
+            statusChangeSeconds: Int64(info.st_ctimespec.tv_sec),
+            statusChangeNanoseconds: Int64(info.st_ctimespec.tv_nsec)
+        )
+    }
+
+    private static func publishReplacement(
+        _ replacement: URL,
+        at source: URL,
+        expectedFingerprint: SourceEntryFingerprint?
+    ) throws {
+        guard let expectedFingerprint else {
+            guard renamex_np(replacement.path, source.path, UInt32(RENAME_EXCL)) == 0 else {
+                let errorNumber = errno
+                try? FileManager.default.removeItem(at: replacement)
+                throw NSError(domain: NSPOSIXErrorDomain, code: Int(errorNumber))
+            }
+            return
+        }
+
+        guard renamex_np(replacement.path, source.path, UInt32(RENAME_SWAP)) == 0 else {
+            let errorNumber = errno
+            try? FileManager.default.removeItem(at: replacement)
+            throw NSError(domain: NSPOSIXErrorDomain, code: Int(errorNumber))
+        }
+
+        let displacedFingerprint: SourceEntryFingerprint
+        do {
+            guard let fingerprint = try sourceEntryFingerprint(at: replacement) else {
+                throw CocoaError(.fileNoSuchFile)
+            }
+            displacedFingerprint = fingerprint
+        } catch {
+            try restoreSource(replacement: replacement, source: source)
+            throw error
+        }
+        guard displacedFingerprint.matchesContentIdentity(of: expectedFingerprint) else {
+            try restoreSource(replacement: replacement, source: source)
+            throw AIProviderError.invalidConfiguration(
+                detail: "Native Devin configuration changed during publication: \(source.path)"
+            )
+        }
+
+        do {
+            try FileManager.default.removeItem(at: replacement)
+        } catch {
+            try restoreSource(replacement: replacement, source: source)
+            throw error
+        }
+    }
+
+    private static func restoreSource(replacement: URL, source: URL) throws {
+        guard renamex_np(replacement.path, source.path, UInt32(RENAME_SWAP)) == 0 else {
+            throw NSError(
+                domain: NSPOSIXErrorDomain,
+                code: Int(errno),
+                userInfo: [NSFilePathErrorKey: replacement.path]
+            )
+        }
+        try? FileManager.default.removeItem(at: replacement)
     }
 
     private static func existingMCPRootObject(at url: URL) throws -> [String: Any] {

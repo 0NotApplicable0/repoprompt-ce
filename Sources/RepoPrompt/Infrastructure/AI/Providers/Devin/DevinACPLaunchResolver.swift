@@ -103,7 +103,6 @@ final class DevinACPLaunchResolver: @unchecked Sendable {
 
     private func probeSupportSerially(for config: DevinAgentConfig) async throws -> ACPSupportResult {
         let key = cacheKey(for: config)
-        invalidate(key: key)
         do {
             // Resolve from the current effective environment on every support check. The cache only
             // bridges this successful probe to the immediately following launch configuration.
@@ -142,10 +141,8 @@ final class DevinACPLaunchResolver: @unchecked Sendable {
             cache(launch, key: key)
             return .supported
         } catch is CancellationError {
-            invalidate(key: key)
             throw CancellationError()
         } catch {
-            invalidate(key: key)
             return .unsupported(reason: error.localizedDescription)
         }
     }
