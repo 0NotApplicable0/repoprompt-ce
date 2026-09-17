@@ -37,24 +37,22 @@ struct DevinACPAgentProvider: ACPAgentProvider {
         let permissionLevel = DevinAgentToolPreferences.PermissionLevel.from(
             cliPermissionMode: request.launchPermissionMode
         )
-        let integration: DevinIntegrationConfiguration.PreparedConfiguration? = if config.includeRepoPromptMCPServer {
-            try DevinIntegrationConfiguration.prepare(
-                workingDirectory: workingDirectory,
-                repoPromptMCPConfiguration: repoPromptMCPConfiguration,
-                sourceEnvironment: resolvedLaunch.environment
-            )
-        } else {
-            nil
-        }
+        let integration = try DevinIntegrationConfiguration.prepare(
+            workingDirectory: workingDirectory,
+            mcpServers: config.includeRepoPromptMCPServer
+                ? .mergeRepoPrompt(repoPromptMCPConfiguration)
+                : .disableAll,
+            sourceEnvironment: resolvedLaunch.environment
+        )
         return ACPLaunchConfiguration(
             providerID: providerID,
             command: resolvedLaunch.command,
             arguments: permissionLevel.launchArguments + resolvedLaunch.arguments,
-            environment: resolvedLaunch.environment.merging(integration?.environment ?? [:]) { _, overlay in overlay },
+            environment: resolvedLaunch.environment.merging(integration.environment) { _, overlay in overlay },
             workingDirectory: workingDirectory,
             additionalPathHints: resolvedLaunch.additionalPathHints,
             enableDebugLogging: config.enableDebugLogging,
-            cleanupArtifact: integration?.cleanupArtifact,
+            cleanupArtifact: integration.cleanupArtifact,
             expectedExecutableIdentity: resolvedLaunch.executableIdentity
         )
     }
@@ -121,12 +119,7 @@ struct DevinACPAgentProvider: ACPAgentProvider {
 
     func cleanupLaunchArtifacts(for configuration: ACPLaunchConfiguration) async {
         guard let artifact = configuration.cleanupArtifact else { return }
-        do {
-            try DevinIntegrationConfiguration.cleanup(artifact: artifact)
-        } catch {
-            let message = "[ACP][devin] \(error.localizedDescription)\n"
-            FileHandle.standardError.write(Data(message.utf8))
-        }
+        DevinIntegrationConfiguration.cleanupReportingFailures(artifact: artifact)
     }
 
     func shouldEmitStderrLine(_ line: String) -> Bool {

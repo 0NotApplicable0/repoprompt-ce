@@ -504,7 +504,9 @@ public class APISettingsViewModel: ObservableObject {
             isGrokBuildConnected
         case .antigravity:
             AntigravityRuntimeManager.installedRuntimeSync() != nil
-        case .claudeCodeGLM, .kimiCode, .customClaudeCompatible, .devin:
+        case .devin:
+            DevinRuntimeLocator.isInstalledSync()
+        case .claudeCodeGLM, .kimiCode, .customClaudeCompatible:
             false
         }
     }

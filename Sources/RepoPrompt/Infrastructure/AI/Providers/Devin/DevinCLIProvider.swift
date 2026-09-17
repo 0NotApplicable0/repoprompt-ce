@@ -112,7 +112,7 @@ final class DevinCLIProvider: AIProvider {
             mcpServers: .disableAll,
             sourceEnvironment: launch.environment
         )
-        defer { try? DevinIntegrationConfiguration.cleanup(artifact: integration.cleanupArtifact) }
+        defer { DevinIntegrationConfiguration.cleanupReportingFailures(artifact: integration.cleanupArtifact) }
 
         let promptURL = directory.appendingPathComponent("prompt.md")
         try prompt.write(to: promptURL, atomically: true, encoding: .utf8)

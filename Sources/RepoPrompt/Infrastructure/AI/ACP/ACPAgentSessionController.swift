@@ -396,6 +396,13 @@ actor ACPAgentSessionController {
         // A provider-native launch-time permission flag (Devin `--permission-mode`) is baked
         // into the running process's argv; compare its normalized launched value so later
         // request-carrier changes cannot drift the reuse key from the process.
+        if provider.providerID == .devin {
+            guard DevinAgentToolPreferences.PermissionLevel.isRecognizedCLIPermissionMode(
+                request.launchPermissionMode
+            ) else {
+                return false
+            }
+        }
         guard launchedPermissionMode == Self.normalizedLaunchPermissionMode(
             request.launchPermissionMode,
             providerID: provider.providerID

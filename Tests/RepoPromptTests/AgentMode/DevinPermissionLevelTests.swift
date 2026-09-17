@@ -302,6 +302,19 @@ final class DevinPermissionLevelTests: XCTestCase {
             try ExecutableFileIdentity.captureForTrustedPathLaunch(atPath: executable.path).canonicalPath
         )
         XCTAssertEqual(launch.arguments, ["--permission-mode", "auto", "acp"])
+        let overlayRoot = try XCTUnwrap(launch.environment["XDG_CONFIG_HOME"])
+        let overlayMCP = try XCTUnwrap(
+            JSONSerialization.jsonObject(
+                with: Data(
+                    contentsOf: URL(fileURLWithPath: overlayRoot)
+                        .appendingPathComponent("devin/mcp_config.json")
+                )
+            ) as? [String: Any]
+        )
+        XCTAssertEqual((overlayMCP["mcpServers"] as? [String: Any])?.count, 0)
+        DevinIntegrationConfiguration.cleanupReportingFailures(
+            artifact: try XCTUnwrap(launch.cleanupArtifact)
+        )
     }
 
     func testConcurrentProbeDoesNotInvalidateAResolvedBareCommandLaunch() async throws {
@@ -466,13 +479,40 @@ final class DevinPermissionLevelTests: XCTestCase {
 
         XCTAssertTrue(sameMode)
         XCTAssertFalse(changedMode, "a launch-time permission mode change must build a fresh Devin process")
-        XCTAssertTrue(
+        XCTAssertFalse(
             unrecognizedMode,
-            "controller compatibility is not the launch-carrier validation boundary"
+            "an unrecognized Devin permission carrier must not reuse a Provider Default process"
         )
         XCTAssertTrue(changedModel, "Devin model switching stays live; it must not recycle the controller")
 
         await controller.shutdown()
+    }
+
+    func testCancelledDiscoveryDoesNotCacheFailure() async throws {
+        final class RunCounter: @unchecked Sendable {
+            var value = 0
+        }
+        let runs = RunCounter()
+        let service = DevinModelDiscoveryService(
+            isInstalled: { true },
+            runSession: { _ in
+                runs.value += 1
+                try await Task.sleep(for: .seconds(30))
+                return 1
+            }
+        )
+
+        let first = Task { await service.discoverIfNeeded() }
+        try await Task.sleep(for: .milliseconds(80))
+        first.cancel()
+        _ = await first.value
+
+        let second = Task { await service.discoverIfNeeded() }
+        try await Task.sleep(for: .milliseconds(80))
+        second.cancel()
+        _ = await second.value
+
+        XCTAssertEqual(runs.value, 2)
     }
 
     // MARK: - Helpers
@@ -616,6 +656,8 @@ final class DevinIntegrationConfigurationTests: XCTestCase {
         let mergedServers = try XCTUnwrap(mergedRoot["mcpServers"] as? [String: Any])
         XCTAssertNotNil(mergedServers["Existing"])
         XCTAssertNotNil(mergedServers[RepoPromptMCPServerConfiguration.defaultServerName])
+        let existing = try XCTUnwrap(mergedServers["Existing"] as? [String: Any])
+        XCTAssertEqual((existing["env"] as? [String: String])?["XDG_CONFIG_HOME"], sourceRoot.path)
 
         let replacedConfig = overlayDevin.appendingPathComponent("config.json")
         try FileManager.default.removeItem(at: replacedConfig)
@@ -702,6 +744,84 @@ final class DevinIntegrationConfigurationTests: XCTestCase {
             XCTAssertTrue(error.localizedDescription.contains("Recovery data remains at \(overlayRoot.path)"))
         }
         XCTAssertEqual(try String(contentsOf: nativeConfig, encoding: .utf8), "newer native update")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: overlayRoot.path))
+        try? FileManager.default.removeItem(at: overlayRoot)
+    }
+
+    func testOverlayRestoresNativeXDGForCommandOnlyStdioEntries() throws {
+        let sourceRoot = try makeTestDirectory(name: "DevinIntegrationCommandOnlyStdio")
+        let devinSource = sourceRoot.appendingPathComponent("devin", isDirectory: true)
+        try FileManager.default.createDirectory(at: devinSource, withIntermediateDirectories: true)
+        let executable = sourceRoot.appendingPathComponent("repoprompt-mcp")
+        try "#!/bin/sh\nexit 0\n".write(to: executable, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: executable.path)
+        try JSONSerialization.data(withJSONObject: [
+            "mcpServers": [
+                "CommandOnly": ["command": "existing", "args": []],
+                "HTTP": ["url": "https://example.invalid"]
+            ]
+        ]).write(to: devinSource.appendingPathComponent("mcp_config.json"))
+
+        let prepared = try DevinIntegrationConfiguration.prepare(
+            workingDirectory: sourceRoot.path,
+            repoPromptMCPConfiguration: RepoPromptMCPServerConfiguration(command: executable.path),
+            sourceEnvironment: ["XDG_CONFIG_HOME": sourceRoot.path, "HOME": sourceRoot.path]
+        )
+        let overlayRoot = try XCTUnwrap(prepared.environment["XDG_CONFIG_HOME"]).asFileURL
+        let overlayMCP = try XCTUnwrap(
+            JSONSerialization.jsonObject(
+                with: Data(
+                    contentsOf: overlayRoot
+                        .appendingPathComponent("devin")
+                        .appendingPathComponent("mcp_config.json")
+                )
+            ) as? [String: Any]
+        )
+        let servers = try XCTUnwrap(overlayMCP["mcpServers"] as? [String: Any])
+        let commandOnly = try XCTUnwrap(servers["CommandOnly"] as? [String: Any])
+        XCTAssertEqual((commandOnly["env"] as? [String: String])?["XDG_CONFIG_HOME"], sourceRoot.path)
+        let http = try XCTUnwrap(servers["HTTP"] as? [String: Any])
+        XCTAssertNil(http["env"])
+
+        try DevinIntegrationConfiguration.cleanup(artifact: prepared.cleanupArtifact)
+    }
+
+    func testCleanupRejectsPermissionOnlyNativeChange() throws {
+        let sourceRoot = try makeTestDirectory(name: "DevinIntegrationPermissionOnlyNativeWrite")
+        let devinSource = sourceRoot.appendingPathComponent("devin", isDirectory: true)
+        try FileManager.default.createDirectory(at: devinSource, withIntermediateDirectories: true)
+        let nativeConfig = devinSource.appendingPathComponent("config.json")
+        try "original".write(to: nativeConfig, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o644], ofItemAtPath: nativeConfig.path)
+
+        let prepared = try DevinIntegrationConfiguration.prepare(
+            workingDirectory: sourceRoot.path,
+            mcpServers: .disableAll,
+            sourceEnvironment: ["XDG_CONFIG_HOME": sourceRoot.path, "HOME": sourceRoot.path]
+        )
+        let overlayRoot = try XCTUnwrap(prepared.environment["XDG_CONFIG_HOME"]).asFileURL
+        let overlayConfig = overlayRoot
+            .appendingPathComponent("devin", isDirectory: true)
+            .appendingPathComponent("config.json")
+        try FileManager.default.removeItem(at: overlayConfig)
+        try "overlay update".write(to: overlayConfig, atomically: true, encoding: .utf8)
+
+        XCTAssertThrowsError(try DevinIntegrationConfiguration.cleanup(
+            artifact: prepared.cleanupArtifact,
+            beforeReplacing: { sourceEntry in
+                try FileManager.default.setAttributes(
+                    [.posixPermissions: 0o600],
+                    ofItemAtPath: sourceEntry.path
+                )
+            }
+        )) { error in
+            XCTAssertTrue(error.localizedDescription.contains("Recovery data remains at \(overlayRoot.path)"))
+        }
+        XCTAssertEqual(try String(contentsOf: nativeConfig, encoding: .utf8), "original")
+        let mode = try XCTUnwrap(
+            FileManager.default.attributesOfItem(atPath: nativeConfig.path)[.posixPermissions] as? NSNumber
+        )
+        XCTAssertEqual(mode.uint16Value, 0o600)
         XCTAssertTrue(FileManager.default.fileExists(atPath: overlayRoot.path))
         try? FileManager.default.removeItem(at: overlayRoot)
     }

@@ -14,14 +14,16 @@ enum DevinIntegrationConfiguration {
         let kind: UInt32
         let modificationSeconds: Int64
         let modificationNanoseconds: Int64
+        let permissionBits: UInt16
         let statusChangeSeconds: Int64
         let statusChangeNanoseconds: Int64
 
-        func matchesContentIdentity(of other: SourceEntryFingerprint) -> Bool {
+        func matchesNativeIdentity(of other: SourceEntryFingerprint) -> Bool {
             deviceID == other.deviceID
                 && fileNumber == other.fileNumber
                 && byteSize == other.byteSize
                 && kind == other.kind
+                && permissionBits == other.permissionBits
                 && modificationSeconds == other.modificationSeconds
                 && modificationNanoseconds == other.modificationNanoseconds
         }
@@ -112,7 +114,7 @@ enum DevinIntegrationConfiguration {
                 // config root for known stdio entries without overriding explicit server env.
                 for (name, value) in servers {
                     guard var child = value as? [String: Any],
-                          child["transport"] as? String == "stdio",
+                          usesStdioTransport(child),
                           child["env"] == nil || child["env"] is [String: String]
                     else { continue }
                     var environment = child["env"] as? [String: String] ?? [:]
@@ -150,6 +152,15 @@ enum DevinIntegrationConfiguration {
                 kind: cleanupArtifactKind
             )
         )
+    }
+
+    static func cleanupReportingFailures(artifact: ACPLaunchCleanupArtifact) {
+        do {
+            try cleanup(artifact: artifact)
+        } catch {
+            let message = "[ACP][devin] \(error.localizedDescription)\n"
+            FileHandle.standardError.write(Data(message.utf8))
+        }
     }
 
     static func cleanup(
@@ -294,6 +305,7 @@ enum DevinIntegrationConfiguration {
             kind: UInt32(info.st_mode & mode_t(S_IFMT)),
             modificationSeconds: Int64(info.st_mtimespec.tv_sec),
             modificationNanoseconds: Int64(info.st_mtimespec.tv_nsec),
+            permissionBits: UInt16(UInt32(info.st_mode) & 0o7777),
             statusChangeSeconds: Int64(info.st_ctimespec.tv_sec),
             statusChangeNanoseconds: Int64(info.st_ctimespec.tv_nsec)
         )
@@ -313,6 +325,10 @@ enum DevinIntegrationConfiguration {
             return
         }
 
+        guard let publishedFingerprint = try sourceEntryFingerprint(at: replacement) else {
+            throw CocoaError(.fileNoSuchFile)
+        }
+
         guard renamex_np(replacement.path, source.path, UInt32(RENAME_SWAP)) == 0 else {
             let errorNumber = errno
             try? FileManager.default.removeItem(at: replacement)
@@ -326,11 +342,19 @@ enum DevinIntegrationConfiguration {
             }
             displacedFingerprint = fingerprint
         } catch {
-            try restoreSource(replacement: replacement, source: source)
+            try restoreSource(
+                replacement: replacement,
+                source: source,
+                publishedFingerprint: publishedFingerprint
+            )
             throw error
         }
-        guard displacedFingerprint.matchesContentIdentity(of: expectedFingerprint) else {
-            try restoreSource(replacement: replacement, source: source)
+        guard displacedFingerprint.matchesNativeIdentity(of: expectedFingerprint) else {
+            try restoreSource(
+                replacement: replacement,
+                source: source,
+                publishedFingerprint: publishedFingerprint
+            )
             throw AIProviderError.invalidConfiguration(
                 detail: "Native Devin configuration changed during publication: \(source.path)"
             )
@@ -339,12 +363,25 @@ enum DevinIntegrationConfiguration {
         do {
             try FileManager.default.removeItem(at: replacement)
         } catch {
-            try restoreSource(replacement: replacement, source: source)
+            try restoreSource(
+                replacement: replacement,
+                source: source,
+                publishedFingerprint: publishedFingerprint
+            )
             throw error
         }
     }
 
-    private static func restoreSource(replacement: URL, source: URL) throws {
+    private static func restoreSource(
+        replacement: URL,
+        source: URL,
+        publishedFingerprint: SourceEntryFingerprint
+    ) throws {
+        let current = try sourceEntryFingerprint(at: source)
+        guard let current, current.matchesNativeIdentity(of: publishedFingerprint) else {
+            try? FileManager.default.removeItem(at: replacement)
+            return
+        }
         guard renamex_np(replacement.path, source.path, UInt32(RENAME_SWAP)) == 0 else {
             throw NSError(
                 domain: NSPOSIXErrorDomain,
@@ -353,6 +390,13 @@ enum DevinIntegrationConfiguration {
             )
         }
         try? FileManager.default.removeItem(at: replacement)
+    }
+
+    private static func usesStdioTransport(_ child: [String: Any]) -> Bool {
+        if let transport = child["transport"] as? String {
+            return transport == "stdio"
+        }
+        return child["command"] is String
     }
 
     private static func existingMCPRootObject(at url: URL) throws -> [String: Any] {
