@@ -312,9 +312,8 @@ final class DevinPermissionLevelTests: XCTestCase {
             ) as? [String: Any]
         )
         XCTAssertEqual((overlayMCP["mcpServers"] as? [String: Any])?.count, 0)
-        DevinIntegrationConfiguration.cleanupReportingFailures(
-            artifact: try XCTUnwrap(launch.cleanupArtifact)
-        )
+        let cleanupArtifact = try XCTUnwrap(launch.cleanupArtifact)
+        DevinIntegrationConfiguration.cleanupReportingFailures(artifact: cleanupArtifact)
     }
 
     func testConcurrentProbeDoesNotInvalidateAResolvedBareCommandLaunch() async throws {
