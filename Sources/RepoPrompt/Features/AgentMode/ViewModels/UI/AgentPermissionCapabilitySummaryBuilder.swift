@@ -257,7 +257,8 @@ struct AgentPermissionCapabilitySummaryBuilder {
         case .cursor: availability.cursorAvailable
         case .grokBuild: availability.grokBuildAvailable
         case .antigravity: availability.antigravityAvailable
-        case .devin, .omp: availability.devinAvailable
+        case .devin: availability.devinAvailable
+        case .omp: availability.ompAvailable
         }
     }
 

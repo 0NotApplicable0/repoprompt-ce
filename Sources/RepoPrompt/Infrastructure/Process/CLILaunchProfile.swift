@@ -75,6 +75,8 @@ enum CLILaunchProfiles {
         commandName: "devin",
         preferredBasenames: ["devin"],
         supplementalSearchPaths: providerSpecificPathsSupplementedWithNativeDefaults(devinProviderSpecificPaths)
+    )
+
     static let omp = CLILaunchProfile(
         commandName: "omp",
         preferredBasenames: ["omp"],
