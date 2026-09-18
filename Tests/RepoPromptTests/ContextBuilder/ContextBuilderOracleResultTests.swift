@@ -189,6 +189,45 @@ final class ContextBuilderOracleResultTests: XCTestCase {
                 XCTAssertNil(reply.response, "A secondary answer must never become the primary response")
                 XCTAssertEqual(reply.oracleGroup?.result, result)
                 XCTAssertEqual(reply.errors, ["Oracle \(primaryStatus.rawValue): primary stopped"])
+
+                let fields = try XCTUnwrap(reply.toMCPValue().objectValue)
+                XCTAssertNil(fields["response"])
+                XCTAssertEqual(fields["chat_id"]?.stringValue, "chat-0")
+                XCTAssertEqual(fields["status"]?.stringValue, "failed")
+                XCTAssertEqual(fields["oracle_count"]?.intValue, 3)
+                let serializedLanes = try XCTUnwrap(fields["oracle_results"]?.arrayValue)
+                XCTAssertEqual(
+                    serializedLanes.map { $0.objectValue?["lane_index"]?.intValue },
+                    [0, 1, 2]
+                )
+                XCTAssertEqual(
+                    serializedLanes.map { $0.objectValue?["chat_id"]?.stringValue },
+                    ["chat-0", "chat-1", "chat-2"]
+                )
+                XCTAssertEqual(
+                    serializedLanes.map { $0.objectValue?["status"]?.stringValue },
+                    [primaryStatus.rawValue, "completed", "completed"]
+                )
+                let serializedPrimary = try XCTUnwrap(serializedLanes[0].objectValue)
+                XCTAssertNil(serializedPrimary["response"])
+                XCTAssertEqual(
+                    serializedPrimary["error"]?.objectValue?["code"]?.stringValue,
+                    "primary_stopped"
+                )
+                XCTAssertEqual(
+                    serializedPrimary["error"]?.objectValue?["message"]?.stringValue,
+                    "primary stopped"
+                )
+                XCTAssertEqual(
+                    serializedPrimary["error"]?.objectValue?["partial_response"]?.stringValue,
+                    "primary partial"
+                )
+                XCTAssertEqual(
+                    serializedLanes[1].objectValue?["response"]?.stringValue,
+                    "Error: is legitimate answer text"
+                )
+                XCTAssertEqual(serializedLanes[2].objectValue?["response"]?.stringValue, "third answer")
+
                 XCTAssertFalse(session.isBackgroundPlanGenerating)
                 XCTAssertEqual(session.backgroundPlanResponseText, "primary partial")
                 guard case let .error(message) = session.planStatus else {
