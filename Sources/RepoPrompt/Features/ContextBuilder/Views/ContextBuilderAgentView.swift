@@ -254,6 +254,11 @@ struct ContextBuilderAgentView: View {
             // Line 3: Plan actions (only when plan is ready)
             if case let .ready(route, previewText) = status {
                 planReadyActions(route: route, previewText: previewText)
+            } else if let route = viewModel.failedAnswerRoute(for: subjectTabID) {
+                Button("View in Chat", systemImage: "bubble.left.and.bubble.right") {
+                    viewGeneratedPlan(route: route)
+                }
+                .hoverTooltip(ContextBuilderGeneratedAnswerActionText.viewInChatTooltip)
             }
         }
         .padding(10)
@@ -339,6 +344,14 @@ struct ContextBuilderAgentView: View {
         return selectedFollowUpType.buttonLabel.lowercased()
     }
 
+    private var currentOracleGroupStreamingLabel: String? {
+        guard let tabID = subjectTabID, let session = viewModel.sessions[tabID] else { return nil }
+        return ContextBuilderOracleGroupProgressProjection.streamingLabel(
+            members: session.followUpOracleGroupState.members,
+            streamingSessionIDs: oracleViewModel.streamingSessions
+        )
+    }
+
     @ViewBuilder
     private var planStatusIndicator: some View {
         let status = viewModel.planStatus(for: subjectTabID)
@@ -348,7 +361,7 @@ struct ContextBuilderAgentView: View {
             HStack(spacing: 8) {
                 ProgressView()
                     .scaleEffect(0.7)
-                Text("Generating \(currentFollowUpLabel)...")
+                Text(currentOracleGroupStreamingLabel ?? "Generating \(currentFollowUpLabel)...")
                     .font(.callout)
                     .foregroundColor(.secondary)
                     .lineLimit(1)
@@ -842,6 +855,33 @@ struct ContextBuilderAgentView: View {
                 }
                 .disabled(isContextBuilderRunningForTab)
                 .hoverTooltip("Select agent and model for Context Builder")
+
+                if let providerID = viewModel.selectedAgent.acpProviderID {
+                    let expectedModelRaw = viewModel.selectedModelRaw
+                    let expectedScope = viewModel.contextBuilderEditingScope
+                    ACPModelParameterProbeView(
+                        modelRaw: expectedModelRaw,
+                        providerID: providerID,
+                        probeContext: .resolved(viewModel.chooserProbeWorkspacePath),
+                        pinnedValueRaw: viewModel.contextBuilderThinkingParameterValueRaw,
+                        isEnabled: !isContextBuilderRunningForTab
+                    ) { configID, value in
+                        // Guarded write: re-check the live run permission, then re-check the
+                        // captured provider/model against live state inside the setter.
+                        guard !isContextBuilderRunningForTab else { return }
+                        viewModel.setContextBuilderModelParameter(
+                            ACPModelParameterSelection.thinkingPin(
+                                configID: configID,
+                                valueRaw: value,
+                                providerID: providerID,
+                                modelRaw: expectedModelRaw
+                            ),
+                            expectedProviderID: providerID,
+                            expectedModelRaw: expectedModelRaw,
+                            expectedScope: expectedScope
+                        )
+                    }
+                }
 
                 // Context Builder Prompts button
                 ContextBuilderPromptsButton(
