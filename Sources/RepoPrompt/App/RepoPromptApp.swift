@@ -183,6 +183,28 @@ struct RepoPromptSwiftUIApp: App {
 @MainActor
 public enum RepoPromptApplication {
     public static func main() {
+        let defaultsReport = BundleIdentityDefaultsMigration.migrateIfNeeded()
+        let defaultsOutcome: IdentityTransitionDiagnosticEvent.Outcome = switch defaultsReport.outcome {
+        case .skipped: .skipped
+        case .alreadyCompleted: .alreadyCompleted
+        case .migrated: .succeeded
+        case .verificationFailed: .failed
+        }
+        IdentityTransitionDiagnostics.shared.record(
+            subsystem: .defaultsMigration,
+            stage: "pre-bootstrap",
+            outcome: defaultsOutcome,
+            recordStateCounts: [
+                "copied": defaultsReport.copiedKeyCount,
+                "preserved": defaultsReport.preservedKeyCount
+            ]
+        )
+
+        // Capture after the defaults migration attempt because it may copy a persisted Codex
+        // selection, but before bootstrap can create Settings or provider clients.
+        CodexRuntimeAuthority.initializeLaunchSnapshot()
+
+        SecureStorageIdentityMigrationBootstrap.prepareIfConfigured()
         RepoPromptSwiftUIApp.main()
     }
 }

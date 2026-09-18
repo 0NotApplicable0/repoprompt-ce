@@ -239,6 +239,11 @@ final class WorkspaceActivityCoordinator {
     private var workspaceManagersByOwnerID: [UUID: WeakWorkspaceManager] = [:]
     private var activationWorkspaceIDByLeaseID: [UUID: UUID] = [:]
     private var deletionLeaseIDByWorkspaceID: [UUID: UUID] = [:]
+    private let confirmedDeletionTimeout: Duration
+
+    init(confirmedDeletionTimeout: Duration = .seconds(15)) {
+        self.confirmedDeletionTimeout = confirmedDeletionTimeout
+    }
 
     func register(ownerID: UUID, workspaceManager: WorkspaceManagerViewModel) {
         workspaceManagersByOwnerID[ownerID] = WeakWorkspaceManager(workspaceManager)
@@ -295,6 +300,195 @@ final class WorkspaceActivityCoordinator {
         }
     }
 
+    /// A confirmed user deletion owns the targets before closing their presentations.
+    /// Automatic cleanup continues to use the non-disruptive claim above.
+    func claimConfirmedDeletion(workspaceIDs: Set<UUID>) async -> DeletionClaim {
+        pruneReleasedWorkspaceManagers()
+        let leaseID = UUID()
+        var claimed = Set<UUID>()
+        var failures: [UUID: String] = [:]
+        let timeoutReason = "The workspace did not finish preparing for deletion before the timeout. Try deleting it again."
+        let busyReason = "Workspace switch is in progress. Wait for it to finish and try deleting this workspace again."
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: confirmedDeletionTimeout)
+        for workspaceID in workspaceIDs {
+            if deletionLeaseIDByWorkspaceID[workspaceID] != nil {
+                failures[workspaceID] = "Workspace deletion is already in progress."
+            } else {
+                deletionLeaseIDByWorkspaceID[workspaceID] = leaseID
+                claimed.insert(workspaceID)
+            }
+        }
+        var cancellationTokensByWorkspaceID: [UUID: WorkspaceDeletionCancellationToken] = [:]
+        for workspaceID in claimed {
+            cancellationTokensByWorkspaceID[workspaceID] = WorkspaceDeletionCancellationToken(
+                workspaceID: workspaceID
+            )
+        }
+        defer {
+            for cancellationToken in cancellationTokensByWorkspaceID.values {
+                cancellationToken.cancel()
+            }
+        }
+        let managers = workspaceManagersByOwnerID.values.compactMap(\.value)
+        for manager in managers {
+            for workspaceID in claimed.sorted(by: { $0.uuidString < $1.uuidString }) {
+                guard failures[workspaceID] == nil else { continue }
+                guard !Task.isCancelled, clock.now < deadline else {
+                    failures[workspaceID] = timeoutReason
+                    continue
+                }
+                if manager.activeWorkspaceSwitch?.targetWorkspaceID == workspaceID
+                    || (manager.activeWorkspaceID == workspaceID && manager.isSwitchingWorkspace)
+                {
+                    failures[workspaceID] = busyReason
+                    continue
+                }
+                guard let cancellationToken = cancellationTokensByWorkspaceID[workspaceID] else {
+                    failures[workspaceID] = timeoutReason
+                    continue
+                }
+                let outcome = await awaitBoundedDeletionOperation(
+                    until: deadline,
+                    cancellationToken: cancellationToken
+                ) {
+                    await manager.finishWorkspaceCreation(workspaceIDs: [workspaceID])
+                    guard cancellationToken.isActive else { return }
+                }
+                if case .timedOut = outcome {
+                    failures[workspaceID] = timeoutReason
+                } else if manager.activeWorkspaceSwitch?.targetWorkspaceID == workspaceID
+                    || (manager.activeWorkspaceID == workspaceID && manager.isSwitchingWorkspace)
+                {
+                    failures[workspaceID] = busyReason
+                }
+            }
+        }
+        // A switch can begin after preparation completes but before the activation wait. Recheck
+        // the exact target before waiting so confirmed deletion never takes over that user action.
+        for manager in managers {
+            for workspaceID in claimed where failures[workspaceID] == nil {
+                if manager.activeWorkspaceSwitch?.targetWorkspaceID == workspaceID
+                    || (manager.activeWorkspaceID == workspaceID && manager.isSwitchingWorkspace)
+                {
+                    failures[workspaceID] = busyReason
+                }
+            }
+        }
+        // Existing activations must relinquish their leases before records can be removed.
+        let pendingActivationWorkspaceIDs = Set(claimed.filter { failures[$0] == nil })
+        while !pendingActivationWorkspaceIDs.isDisjoint(with: activationWorkspaceIDByLeaseID.values),
+              !Task.isCancelled, clock.now < deadline
+        {
+            let remaining = clock.now.duration(to: deadline)
+            guard remaining > .zero else { break }
+            try? await Task.sleep(for: min(remaining, .milliseconds(20)))
+        }
+        for workspaceID in pendingActivationWorkspaceIDs.intersection(activationWorkspaceIDByLeaseID.values) {
+            failures[workspaceID] = "The workspace did not finish cancelling its open operation. Try deleting it again."
+        }
+        if Task.isCancelled || clock.now >= deadline {
+            for workspaceID in claimed where failures[workspaceID] == nil {
+                failures[workspaceID] = timeoutReason
+            }
+        }
+        for manager in managers {
+            guard let workspaceID = manager.activeWorkspaceID,
+                  claimed.contains(workspaceID), failures[workspaceID] == nil
+            else { continue }
+            guard !Task.isCancelled, clock.now < deadline else {
+                failures[workspaceID] = timeoutReason
+                continue
+            }
+            guard let cancellationToken = cancellationTokensByWorkspaceID[workspaceID] else {
+                failures[workspaceID] = timeoutReason
+                continue
+            }
+            let outcome = await awaitBoundedDeletionOperation(
+                until: deadline,
+                cancellationToken: cancellationToken
+            ) {
+                await manager.closeForConfirmedWorkspaceDeletion(
+                    workspaceID: workspaceID,
+                    deletionToken: cancellationToken
+                )
+            }
+            if case let .completed(error) = outcome, let error {
+                failures[workspaceID] = error
+            } else if case .timedOut = outcome {
+                failures[workspaceID] = timeoutReason
+            }
+        }
+        if Task.isCancelled || clock.now >= deadline {
+            for workspaceID in claimed where failures[workspaceID] == nil {
+                failures[workspaceID] = timeoutReason
+            }
+        }
+        for workspaceID in failures.keys {
+            cancellationTokensByWorkspaceID[workspaceID]?.cancel()
+        }
+        for workspaceID in failures.keys where claimed.remove(workspaceID) != nil {
+            deletionLeaseIDByWorkspaceID.removeValue(forKey: workspaceID)
+        }
+        return DeletionClaim(
+            lease: DeletionLease(id: leaseID, workspaceIDs: claimed),
+            blockedReasonsByWorkspaceID: failures
+        )
+    }
+
+    private enum BoundedDeletionOperationResult<Value: Sendable> {
+        case completed(Value)
+        case timedOut
+    }
+
+    /// Runs one potentially uncooperative teardown step without allowing its late
+    /// completion to continue the confirmed-delete sequence after the lease expires.
+    private func awaitBoundedDeletionOperation<Value: Sendable>(
+        until deadline: ContinuousClock.Instant,
+        cancellationToken: WorkspaceDeletionCancellationToken,
+        operation: @escaping @MainActor @Sendable () async -> Value
+    ) async -> BoundedDeletionOperationResult<Value> {
+        let clock = ContinuousClock()
+        let remaining = clock.now.duration(to: deadline)
+        guard !Task.isCancelled, remaining > .zero else {
+            cancellationToken.cancel()
+            return .timedOut
+        }
+
+        let (stream, continuation) = AsyncStream<BoundedDeletionOperationResult<Value>>.makeStream()
+        let operationTask = Task { @MainActor in
+            await continuation.yield(.completed(operation()))
+            continuation.finish()
+        }
+        let outcome = await withTaskGroup(of: BoundedDeletionOperationResult<Value>.self) { group in
+            group.addTask {
+                var iterator = stream.makeAsyncIterator()
+                return await iterator.next() ?? .timedOut
+            }
+            group.addTask {
+                do {
+                    try await Task.sleep(for: remaining)
+                } catch {
+                    return .timedOut
+                }
+                return .timedOut
+            }
+            let first = await group.next() ?? .timedOut
+            group.cancelAll()
+            return first
+        }
+        continuation.finish()
+
+        switch outcome {
+        case .completed:
+            operationTask.cancel()
+        case .timedOut:
+            cancellationToken.cancel()
+            operationTask.cancel()
+        }
+        return outcome
+    }
+
     private func pruneReleasedWorkspaceManagers() {
         workspaceManagersByOwnerID = workspaceManagersByOwnerID.filter { $0.value.value != nil }
     }
@@ -304,6 +498,14 @@ final class WorkspaceActivityCoordinator {
 /// find the "latest" one or broadcast to all windows if needed.
 @MainActor
 class WindowStatesManager: ObservableObject {
+    private final class WeakWindowState {
+        weak var value: WindowState?
+
+        init(_ value: WindowState) {
+            self.value = value
+        }
+    }
+
     /// 🚀 Single, shared instance for the entire app
     static let shared = WindowStatesManager()
 
@@ -392,9 +594,67 @@ class WindowStatesManager: ObservableObject {
         fileURL: WindowSessionStore.sessionFileURL()
     )
     private var explicitlyClosingWindowIDs: Set<Int> = []
+    /// A closing window may leave `allWindows` before app termination starts. Weak retention
+    /// lets termination join any still-live teardown without extending the window's lifetime.
+    private var closingWindowReferences: [WeakWindowState] = []
+    // AppKit can unregister and release windows before the asynchronous termination task starts.
+    // Capture participants at the synchronous termination fence so their process owners survive
+    // until Context Builder and Agent Mode teardown have both joined.
+    private var terminationWindowSnapshot: [WindowState] = []
     private var restoreQueue: [WindowSessionEntry] = []
     private var hasLoadedRestoreSession = false
     private var restorePersistenceGate = WindowSessionRestorePersistenceGate()
+
+    /// Why the restore gate became idle, published for automatic oversight restoration.
+    ///
+    /// The gate itself is unchanged; this only *explains* its idle edge. "All entries consumed" means
+    /// the expected window topology was actually observed, so a saved session that is nowhere to be
+    /// found is genuinely gone. "Leftovers abandoned" means windows never came back, and absence
+    /// proves nothing — an oversight intent in that state must survive rather than be deleted.
+    private(set) var agentSessionOversightRestoreTopologyState: AgentSessionOversightRestoreTopologyState = .pending
+    /// How many restore entries the grace valve gave up on. Non-zero makes absence uncertain.
+    private var abandonedRestoreEntryCount = 0
+    private var didBootstrapAgentSessionOversightIntentStore = false
+
+    /// Installs the durable oversight store for this launch.
+    ///
+    /// Deliberately independent of `loadWindowRestoreSessionIfNeeded()` and its
+    /// `autoRestoreWorkspacesEnabled` early return: turning window restoration off must leave saved
+    /// oversight dormant, not unread and therefore at risk of being overwritten by the next explicit
+    /// Add. Suppressed launches construct the store too — it refuses every filesystem call itself,
+    /// which is a stronger guarantee than each call site remembering to check a flag.
+    func bootstrapAgentSessionOversightIntentStoreIfNeeded() {
+        guard !didBootstrapAgentSessionOversightIntentStore else { return }
+        didBootstrapAgentSessionOversightIntentStore = true
+        let mode = AppLaunchConfiguration.current.agentSessionOversightPersistenceMode(
+            autoRestoreWorkspacesEnabled: autoRestoreWorkspacesEnabled
+        )
+        let store = AgentSessionOversightIntentStore.production(mode: mode)
+        Task { @MainActor in
+            await AgentSessionLinkRuntimeBridge.shared.bootstrapIntentStore(store)
+        }
+    }
+
+    /// Recomputes and republishes the reason-aware topology state.
+    private func updateAgentSessionOversightTopologyState() {
+        let state = computeAgentSessionOversightTopologyState()
+        guard state != agentSessionOversightRestoreTopologyState else {
+            notifyAgentSessionLinkTopologyChanged()
+            return
+        }
+        agentSessionOversightRestoreTopologyState = state
+        notifyAgentSessionLinkTopologyChanged()
+    }
+
+    private func computeAgentSessionOversightTopologyState() -> AgentSessionOversightRestoreTopologyState {
+        if AppLaunchConfiguration.current.suppressesAgentSessionOversightPersistence { return .suppressed }
+        guard autoRestoreWorkspacesEnabled else { return .dormantAutoRestoreDisabled }
+        guard hasLoadedRestoreSession, !restorePersistenceGate.isRestoreInProgress else { return .pending }
+        guard abandonedRestoreEntryCount == 0 else {
+            return .incompleteLeftoversAbandoned(count: abandonedRestoreEntryCount)
+        }
+        return .completeAllEntriesConsumed
+    }
 
     func claimInitialRefreshDeferralForNewWindow() -> WindowInitialRefreshDeferral? {
         guard !pendingInitialRefreshDeferrals.isEmpty else { return nil }
@@ -443,6 +703,7 @@ class WindowStatesManager: ObservableObject {
             #if DEBUG
                 WorkspaceRestorePerfLog.log("restore.session skipped reason=autoRestoreDisabled registeredWindows=\(allWindows.count)")
             #endif
+            updateAgentSessionOversightTopologyState()
             return
         }
 
@@ -477,6 +738,7 @@ class WindowStatesManager: ObservableObject {
                 }
                 self.flushDeferredWindowSessionPersistIfRestoreIdle()
                 self.scheduleLeftoverRestoreEntryGraceReleaseIfNeeded()
+                self.updateAgentSessionOversightTopologyState()
                 #if DEBUG
                     if let applyStartMS {
                         WorkspaceRestorePerfLog.log(
@@ -515,17 +777,6 @@ class WindowStatesManager: ObservableObject {
         // Set "next" counters just past the highest restored instance
         for (wsID, maxNumber) in maxByWorkspace {
             nextInstanceNumberByWorkspace[wsID] = maxNumber + 1
-        }
-    }
-
-    /// Finds a window that's showing a workspace containing a specific folder
-    func findWindowState(forFolderPath path: String) -> WindowState? {
-        allWindows.first { ws in
-            guard let activeWS = ws.workspaceManager.activeWorkspace else { return false }
-            return activeWS.repoPaths.contains { repoPath in
-                let expanded = (repoPath as NSString).expandingTildeInPath
-                return expanded == (path as NSString).expandingTildeInPath
-            }
         }
     }
 
@@ -705,6 +956,7 @@ class WindowStatesManager: ObservableObject {
             guard let self else { return }
             restorePersistenceGate.finishRestoringWindow(windowID)
             flushDeferredWindowSessionPersistIfRestoreIdle()
+            updateAgentSessionOversightTopologyState()
         }
     }
 
@@ -717,6 +969,11 @@ class WindowStatesManager: ObservableObject {
     }
 
     func registerWindowState(_ state: WindowState) {
+        guard !isTerminating else {
+            state.beginClose()
+            return
+        }
+        closingWindowReferences.removeAll { $0.value == nil || $0.value === state }
         // Prevent duplicate registration
         guard !allWindows.contains(where: { $0 === state }) else { return }
 
@@ -776,6 +1033,12 @@ class WindowStatesManager: ObservableObject {
         }
 
         updateKeyboardShortcutsState()
+        // Idempotent: the process-wide oversight-link bridge resolves endpoints through this manager.
+        attachAgentSessionLinkBridge()
+        // Bootstrapped after the bridge has a host, so the launch load's presentation and worklist
+        // land on a manager that can already broadcast and enumerate.
+        bootstrapAgentSessionOversightIntentStoreIfNeeded()
+        updateAgentSessionOversightTopologyState()
         persistWindowSession(reason: "registerWindow")
         #if DEBUG
             if let registerStartMS {
@@ -790,13 +1053,19 @@ class WindowStatesManager: ObservableObject {
         state.beginClose()
         if let idx = allWindows.firstIndex(where: { $0 === state }) {
             allWindows.remove(at: idx)
+            closingWindowReferences.removeAll { $0.value == nil || $0.value === state }
+            closingWindowReferences.append(WeakWindowState(state))
         }
+        // Eager revocation for both endpoints of every link this window held. Operation-time identity
+        // revalidation still catches a missed hook, but the surviving endpoint should learn now.
+        invalidateAgentSessionLinks(forClosedWindowID: state.windowID)
         explicitlyClosingWindowIDs.remove(state.windowID)
         // A window that closes mid-restore must not leave the persistence gate held.
         restorePersistenceGate.finishRestoringWindow(state.windowID)
 
         // Skip notifications and updates during termination to prevent observation crashes
         guard !isTerminating else { return }
+        updateAgentSessionOversightTopologyState()
 
         // Notify that window count changed
         NotificationCenter.default.post(name: .windowCountDidChange, object: nil)
@@ -884,8 +1153,10 @@ class WindowStatesManager: ObservableObject {
                 "restore.persist leftoverEntriesReleased pendingEntries=\(restorePersistenceGate.pendingRestoreEntryCount) remainingQueue=\(restoreQueue.count)"
             )
         #endif
+        abandonedRestoreEntryCount = max(abandonedRestoreEntryCount, restorePersistenceGate.pendingRestoreEntryCount)
         restorePersistenceGate.abandonPendingRestoreEntries()
         flushDeferredWindowSessionPersistIfRestoreIdle()
+        updateAgentSessionOversightTopologyState()
     }
 
     private func captureCurrentSession() -> WindowSessionSnapshot {
@@ -895,6 +1166,13 @@ class WindowStatesManager: ObservableObject {
             }
             guard !workspace.isEphemeral else {
                 return WindowSessionCaptureCandidate(windowID: window.windowID, entry: nil)
+            }
+            // A window whose restore target could not be resolved sits on the system Default
+            // workspace. Persisting that observed state would overwrite the snapshot with a
+            // layout the user never chose, so re-emit the entry we failed to restore. Any
+            // later switch to a real workspace clears the flag and captures normally.
+            if let unresolved = window.unresolvedRestoreEntry, workspace.isSystemWorkspace {
+                return WindowSessionCaptureCandidate(windowID: window.windowID, entry: unresolved)
             }
 
             let primaryPath = workspace.repoPaths.first.map { repoPath in
@@ -986,11 +1264,26 @@ class WindowStatesManager: ObservableObject {
         // Use MainActor.assumeIsolated since this is called from applicationWillTerminate
         // which runs on the main thread, but Swift doesn't know that statically.
         MainActor.assumeIsolated {
+            self.closingWindowReferences.removeAll { $0.value == nil }
+            self.terminationWindowSnapshot = self.deduplicatedWindows(
+                self.terminationWindowSnapshot +
+                    self.allWindows +
+                    self.closingWindowReferences.compactMap(\.value)
+            )
             self.isTerminating = true
             // Cancel any pending focus/workspace change notifications that might trigger updates
             self.cancellablesDuringTermination()
         }
     }
+
+    #if DEBUG
+        func setTerminatingForTesting(_ isTerminating: Bool) {
+            self.isTerminating = isTerminating
+            if !isTerminating {
+                terminationWindowSnapshot.removeAll()
+            }
+        }
+    #endif
 
     /// Cancels Combine subscriptions and clears state that could trigger updates during shutdown.
     private func cancellablesDuringTermination() {
@@ -1032,23 +1325,41 @@ class WindowStatesManager: ObservableObject {
 
     /// Shuts down all agent processes (Claude CLI, Codex app-server) across every window.
     /// Called during app termination to prevent orphaned child processes.
-    /// Safe to call after `signalTermination()` — only performs cancellation and process teardown,
-    /// no UI-observed state mutations.
+    /// Safe to call after `signalTermination()` — fences new work and joins provider/process
+    /// teardown before MCP servers stop.
     func shutdownAllAgentSessions() async {
-        let windowIDs = allWindows.map(\.windowID)
+        closingWindowReferences.removeAll { $0.value == nil }
+        let windows = deduplicatedWindows(
+            terminationWindowSnapshot + allWindows + closingWindowReferences.compactMap(\.value)
+        )
+        defer { terminationWindowSnapshot.removeAll() }
+        let participatingWindowIdentities = Set(windows.map(ObjectIdentifier.init))
+
+        // The strong snapshot owns every participant until both shutdown paths have joined.
         await withTaskGroup(of: Void.self) { group in
-            for windowID in windowIDs {
-                group.addTask { @MainActor [weak self] in
-                    guard let self, let ws = window(withID: windowID) else { return }
-                    await ws.agentModeViewModel.prepareForWindowClose()
+            for window in windows {
+                group.addTask { @MainActor [window] in
+                    await window.contextBuilderAgentViewModel.shutdownForAppTermination()
+                    await window.agentModeViewModel.prepareForWindowClose()
                 }
             }
+        }
+        closingWindowReferences.removeAll { reference in
+            guard let window = reference.value else { return true }
+            return participatingWindowIdentities.contains(ObjectIdentifier(window))
         }
         // Stop dedicated CLI model polling so background refreshes cannot race shutdown.
         await CodexModelPollingService.shared.shutdown()
         await OpenCodeACPModelPollingService.shared.shutdown()
         await CursorACPModelPollingService.shared.shutdown()
         await GrokBuildACPModelPollingService.shared.shutdown()
+    }
+
+    private func deduplicatedWindows(_ windows: [WindowState]) -> [WindowState] {
+        var seenWindowIdentities: Set<ObjectIdentifier> = []
+        return windows.filter { window in
+            seenWindowIdentities.insert(ObjectIdentifier(window)).inserted
+        }
     }
 
     // MARK: - Instance Number Management
@@ -1066,6 +1377,11 @@ class WindowStatesManager: ObservableObject {
             perWS[prev.workspaceID] = prev.number
             windowWorkspaceNumberHistory[windowID] = perWS
             assignedInstanceByWindowID.removeValue(forKey: windowID)
+            // Switching away ends this window's live bindings for the previous workspace. Scope the
+            // revocation to this window so another window still on that workspace keeps its links.
+            if prev.workspaceID != workspace?.id {
+                invalidateAgentSessionLinks(forWindowID: windowID, leavingWorkspaceID: prev.workspaceID)
+            }
         }
 
         guard let ws = workspace else {

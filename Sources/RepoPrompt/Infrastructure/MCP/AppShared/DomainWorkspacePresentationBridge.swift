@@ -11,14 +11,52 @@ struct DomainWorkspaceSaveOperationIDs {
     }
 }
 
+struct DomainWorkspaceFailClosedSaveOutcome {
+    let working: DomainCommandOutcome?
+    let saved: DomainCommandOutcome?
+
+    var finalOutcome: DomainCommandOutcome? {
+        saved ?? working
+    }
+
+    var workingCommitted: Bool {
+        working?.isSuccessfulDomainMutation == true
+    }
+}
+
+private enum DomainWorkspaceModelEncoder {
+    static func encode(_ workspace: WorkspaceModel) throws -> Data {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = .sortedKeys
+        return try encoder.encode(workspace)
+    }
+}
+
 /// Revisioned app-process client for the runtime-owned workspace/context authority.
 /// It is the only production persistence dependency injected into a workspace manager.
 struct DomainWorkspaceAuthorityClient {
     let store: DomainWorkspaceStore
     let windowID: Int
 
+    #if DEBUG
+        /// Per-client suspension only: the real envelope and authority execution remain unchanged.
+        var commandWillExecuteForTesting: (@Sendable (DomainWorkspaceCommandEnvelope) async -> Void)?
+    #endif
+
     func snapshot() async -> DomainWorkspaceCatalogSnapshot {
         await store.snapshot()
+    }
+
+    func activationSnapshot(workspaceID: UUID, fileURL: URL) async -> DomainWorkspaceActivationSnapshot {
+        await store.activationSnapshot(workspaceID: workspaceID, fileURL: fileURL)
+    }
+
+    func exactRootSelection(canonicalRootPath: String) async throws -> DomainExactRootSelection {
+        try await store.exactRootSelection(canonicalRootPath: canonicalRootPath)
+    }
+
+    func workspaceSnapshot(_ workspaceID: UUID) async -> DomainWorkspaceSnapshot? {
+        await store.workspaceSnapshot(workspaceID)
     }
 
     func canonicalWorkspaceSnapshot(_ workspaceID: UUID) async -> DomainWorkspaceSnapshot? {
@@ -37,18 +75,20 @@ struct DomainWorkspaceAuthorityClient {
     func create(
         _ workspace: WorkspaceModel,
         fileURL: URL,
+        expectedCatalogRevision: UInt64? = nil,
         operationID: UUID = UUID()
     ) async throws -> DomainCommandOutcome {
         let document = try document(for: workspace, fileURL: fileURL)
         let envelope = DomainWorkspaceCommandEnvelope(
             operationID: operationID,
-            expectedCatalogRevision: nil,
+            expectedCatalogRevision: expectedCatalogRevision,
             expectedWorkspaceRevision: 0,
             origin: .appPresentation(windowID: windowID),
             command: .createWorkspace(document)
         )
         let first = await executeStable(envelope)
-        guard first.disposition == .conflict,
+        guard expectedCatalogRevision == nil,
+              first.disposition == .conflict,
               first.errorCode == .stateConflict,
               first.diagnostic == "durable_create_conflict"
               || first.diagnostic == "catalog_revision_mismatch",
@@ -57,6 +97,24 @@ struct DomainWorkspaceAuthorityClient {
         // The authority refreshes its durable catalog before returning a catalog-only conflict.
         // Retry the identical envelope once so the operation ID remains idempotent while work is bounded.
         return await executeStable(envelope)
+    }
+
+    func resolveOrCreatePersistentWorkspace(
+        _ workspace: WorkspaceModel,
+        fileURL: URL,
+        canonicalRootPath: String,
+        operationID: UUID = UUID()
+    ) async throws -> DomainCommandOutcome {
+        let document = try document(for: workspace, fileURL: fileURL)
+        return await executeStable(.init(
+            operationID: operationID,
+            expectedWorkspaceRevision: 0,
+            origin: .appPresentation(windowID: windowID),
+            command: .resolveOrCreateWorkspaceForExactRoot(
+                document: document,
+                canonicalRootPath: canonicalRootPath
+            )
+        ))
     }
 
     func replaceWorking(
@@ -102,6 +160,50 @@ struct DomainWorkspaceAuthorityClient {
         ))
     }
 
+    /// Saves one exact captured document without replaying or rebasing it after any durable or
+    /// external conflict. Used by operations whose preflight authority must remain their authority.
+    func saveFailClosed(
+        _ workspace: WorkspaceModel,
+        fileURL: URL,
+        expectedWorkspaceRevision: UInt64,
+        expectedContentDigest: String,
+        operationIDs: DomainWorkspaceSaveOperationIDs = .init()
+    ) async throws -> DomainWorkspaceFailClosedSaveOutcome {
+        let document = try document(for: workspace, fileURL: fileURL)
+        var saveRevision = expectedWorkspaceRevision
+        var workingOutcome: DomainCommandOutcome?
+        if document.contentDigest != expectedContentDigest {
+            let working = await executeStable(.init(
+                operationID: operationIDs.working,
+                expectedWorkspaceRevision: expectedWorkspaceRevision,
+                conflictRecoveryPolicy: .failClosed,
+                origin: .appPresentation(windowID: windowID),
+                command: .replaceWorkingDocument(document)
+            ))
+            workingOutcome = working
+            guard working.isSuccessfulDomainMutation else {
+                return DomainWorkspaceFailClosedSaveOutcome(
+                    working: working,
+                    saved: nil
+                )
+            }
+            saveRevision = working.after?.workingRevision
+                ?? working.workspace?.revisions.workingRevision
+                ?? saveRevision
+        }
+        let saved = await executeStable(.init(
+            operationID: operationIDs.saved,
+            expectedWorkspaceRevision: saveRevision,
+            conflictRecoveryPolicy: .failClosed,
+            origin: .appPresentation(windowID: windowID),
+            command: .saveWorkspaceDocument(workspaceID: workspace.id)
+        ))
+        return DomainWorkspaceFailClosedSaveOutcome(
+            working: workingOutcome,
+            saved: saved
+        )
+    }
+
     func delete(
         workspaceID: UUID,
         expectedCatalogRevision: UInt64?,
@@ -123,7 +225,7 @@ struct DomainWorkspaceAuthorityClient {
     }
 
     private func document(for workspace: WorkspaceModel, fileURL: URL) throws -> DomainWorkspaceDocument {
-        let bytes = try JSONEncoder().encode(workspace)
+        let bytes = try DomainWorkspaceModelEncoder.encode(workspace)
         return try DomainWorkspaceDocument.decode(documentBytes: bytes, fileURL: fileURL)
     }
 
@@ -132,6 +234,9 @@ struct DomainWorkspaceAuthorityClient {
     private func executeStable(
         _ envelope: DomainWorkspaceCommandEnvelope
     ) async -> DomainCommandOutcome {
+        #if DEBUG
+            await commandWillExecuteForTesting?(envelope)
+        #endif
         let first = await store.execute(envelope)
         guard first.disposition == .failed,
               first.errorCode == .lockTimedOut || first.errorCode == .cancelled
@@ -178,6 +283,13 @@ final class DomainWorkspacePresentationBridge {
     }
 
     #if DEBUG
+        /// Cancellation alone does not join a suspended projection into a fixture-owned manager.
+        func stopAndJoinForTesting() async {
+            let task = subscriptionTask
+            stop()
+            await task?.value
+        }
+
         var hasActiveSubscriptionForTesting: Bool {
             subscriptionTask != nil
         }
@@ -197,6 +309,10 @@ final class DomainWorkspacePresentationBridge {
                 }
             } while clock.now < deadline
             return lastPublicationSequence >= publicationSequence
+        }
+
+        func suppressSelfEchoForTesting(_ event: DomainWorkspaceEvent) async -> Bool {
+            await suppressSelfEcho(for: event)
         }
     #endif
 
@@ -265,10 +381,15 @@ final class DomainWorkspacePresentationBridge {
               let workspaceID = event.workspaceID,
               projectedModels[workspaceID] != nil
         else { return false }
-        guard let workspace = await client.store.workspaceSnapshot(workspaceID),
+        guard let workspace = await client.canonicalWorkspaceSnapshot(workspaceID),
               workspace.health.acceptsMutations,
               let model = workspaceManager?.workspace(withID: workspaceID)
         else { return false }
+        // A same-window commit can be accepted just before a newer local edit is captured. Keep the
+        // local model in both the manager and bridge cache: advancing the baseline below lets the
+        // newer edit commit from the accepted revision, and explicit failed-save reconciliation
+        // remains responsible for authoritative replacement when a two-phase cleanup save does not
+        // complete. The outcome does not depend on re-encoding the model to compare digests.
         projectedModels[workspaceID] = model
         projectedDigests[workspaceID] = workspace.document.contentDigest
         projectedHealth[workspaceID] = workspace.health
@@ -348,6 +469,9 @@ final class DomainWorkspacePresentationBridge {
         lastPublicationSequence = snapshot.publicationSequence
         workspaceManager?.applyDomainWorkspaceProjection(
             decoded,
+            canonicalRepoPathsByWorkspaceID: Dictionary(uniqueKeysWithValues: snapshot.workspaces.map {
+                ($0.document.workspaceID, $0.document.metadata.repoPaths)
+            }),
             fileURLsByWorkspaceID: Dictionary(uniqueKeysWithValues: snapshot.workspaces.map {
                 ($0.document.workspaceID, $0.document.fileURL)
             }),

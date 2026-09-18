@@ -129,6 +129,17 @@ final class AgentProviderPreferenceSnapshotStore {
                 acpSessionModeID: level.sessionModeID,
                 acceptsPendingACPApprovalWhenActivated: level.acceptsPendingApprovalWhenActivated
             )
+        case .antigravity:
+            let level = effectiveAntigravityPermissionLevel(profile: profile)
+            let modeID = switch level {
+            case .default: "default"
+            case .autoEdit: "auto_edit"
+            case .yolo: "yolo"
+            }
+            return AgentProviderRuntimePermissionBinding(
+                acpSessionModeID: modeID,
+                acceptsPendingACPApprovalWhenActivated: level == .yolo
+            )
         case .cursor:
             let level = effectiveCursorPermissionLevel(profile: profile)
             return AgentProviderRuntimePermissionBinding(
@@ -155,6 +166,8 @@ final class AgentProviderPreferenceSnapshotStore {
             ClaudeAgentToolPreferences.setPermissionLevel(level, defaults: defaults, secureStore: securePermissions)
         case let .openCode(level):
             OpenCodeAgentToolPreferences.setPermissionLevel(level, defaults: defaults, secureStore: securePermissions)
+        case let .antigravity(level):
+            AntigravityAgentToolPreferences.setPermissionLevel(level, defaults: defaults, secureStore: securePermissions)
         case let .cursor(level):
             CursorAgentToolPreferences.setPermissionLevel(level, defaults: defaults, secureStore: securePermissions)
         case let .grokBuild(level):
@@ -177,6 +190,14 @@ final class AgentProviderPreferenceSnapshotStore {
             CodexAgentModeBooleanPreference.reasoningSummaries.setEnabled(enabled, defaults: defaults)
         case let .memories(enabled):
             CodexAgentModeBooleanPreference.memories.setEnabled(enabled, defaults: defaults)
+        case let .apps(enabled):
+            CodexAgentModeBooleanPreference.apps.setEnabled(enabled, defaults: defaults)
+        case let .plugins(enabled):
+            CodexAgentModeBooleanPreference.plugins.setEnabled(enabled, defaults: defaults)
+        case let .mcpElicitation(enabled):
+            CodexAgentModeBooleanPreference.mcpElicitation.setEnabled(enabled, defaults: defaults)
+        case let .toolSuggestions(enabled):
+            CodexAgentModeBooleanPreference.toolSuggestions.setEnabled(enabled, defaults: defaults)
         case let .mcpServer(normalizedName, enabled):
             CodexAgentToolPreferences.setMCPServerEnabled(
                 normalizedName: normalizedName,
@@ -207,6 +228,22 @@ final class AgentProviderPreferenceSnapshotStore {
 
     func setCodexMemoriesEnabled(_ enabled: Bool) {
         applyCodexToolSettingMutation(.memories(enabled: enabled))
+    }
+
+    func setCodexAppsEnabled(_ enabled: Bool) {
+        applyCodexToolSettingMutation(.apps(enabled: enabled))
+    }
+
+    func setCodexPluginsEnabled(_ enabled: Bool) {
+        applyCodexToolSettingMutation(.plugins(enabled: enabled))
+    }
+
+    func setCodexMCPElicitationEnabled(_ enabled: Bool) {
+        applyCodexToolSettingMutation(.mcpElicitation(enabled: enabled))
+    }
+
+    func setCodexToolSuggestionsEnabled(_ enabled: Bool) {
+        applyCodexToolSettingMutation(.toolSuggestions(enabled: enabled))
     }
 
     func setCodexMCPServerEnabled(normalizedName: String, enabled: Bool) {
@@ -340,6 +377,26 @@ final class AgentProviderPreferenceSnapshotStore {
                     )
                 }
             )
+        case .antigravity:
+            let effective = effectiveAntigravityPermissionLevel(profile: profile)
+            return AgentPermissionChromeBinding(
+                providerID: providerID,
+                displayName: effective.displayName,
+                iconName: effective.iconName,
+                isWarning: effective.isWarning,
+                externallyManagedReason: externallyManagedReason,
+                options: AntigravityAgentToolPreferences.PermissionLevel.allCases.map { level in
+                    AgentPermissionOptionBinding(
+                        id: .antigravity(level),
+                        title: level.displayName,
+                        iconName: level.iconName,
+                        detailText: level.detailText,
+                        isWarning: level.isWarning,
+                        isSelected: level == effective,
+                        isEnabled: externallyManagedReason == nil
+                    )
+                }
+            )
         case .cursor:
             let effective = effectiveCursorPermissionLevel(profile: profile)
             return AgentPermissionChromeBinding(
@@ -408,6 +465,10 @@ final class AgentProviderPreferenceSnapshotStore {
                 goalSupportEnabled: codexGoalSupportEnabled(),
                 reasoningSummariesEnabled: codexReasoningSummariesEnabled(),
                 memoriesEnabled: codexMemoriesEnabled(),
+                appsEnabled: codexAppsEnabled(),
+                pluginsEnabled: codexPluginsEnabled(),
+                mcpElicitationEnabled: codexMCPElicitationEnabled(),
+                toolSuggestionsEnabled: codexToolSuggestionsEnabled(),
                 mcpServerEntries: entries,
                 mcpServerStatesByNormalizedName: states
             )
@@ -424,6 +485,10 @@ final class AgentProviderPreferenceSnapshotStore {
                 goalSupportEnabled: codexGoalSupportEnabled(),
                 reasoningSummariesEnabled: codexReasoningSummariesEnabled(),
                 memoriesEnabled: codexMemoriesEnabled(),
+                appsEnabled: codexAppsEnabled(),
+                pluginsEnabled: codexPluginsEnabled(),
+                mcpElicitationEnabled: codexMCPElicitationEnabled(),
+                toolSuggestionsEnabled: codexToolSuggestionsEnabled(),
                 mcpServerEntries: entries,
                 mcpServerStatesByNormalizedName: states
             )
@@ -473,6 +538,22 @@ final class AgentProviderPreferenceSnapshotStore {
 
     private func codexMemoriesEnabled() -> Bool {
         CodexAgentModeBooleanPreference.memories.isEnabled(defaults: defaults)
+    }
+
+    private func codexAppsEnabled() -> Bool {
+        CodexAgentModeBooleanPreference.apps.isEnabled(defaults: defaults)
+    }
+
+    private func codexPluginsEnabled() -> Bool {
+        CodexAgentModeBooleanPreference.plugins.isEnabled(defaults: defaults)
+    }
+
+    private func codexMCPElicitationEnabled() -> Bool {
+        CodexAgentModeBooleanPreference.mcpElicitation.isEnabled(defaults: defaults)
+    }
+
+    private func codexToolSuggestionsEnabled() -> Bool {
+        CodexAgentModeBooleanPreference.toolSuggestions.isEnabled(defaults: defaults)
     }
 
     private func claudeEffortLevel(
@@ -534,6 +615,21 @@ final class AgentProviderPreferenceSnapshotStore {
         }
     }
 
+    private func effectiveAntigravityPermissionLevel(
+        profile: AgentProviderPermissionProfile
+    ) -> AntigravityAgentToolPreferences.PermissionLevel {
+        switch profile {
+        case .userConfigured:
+            AntigravityAgentToolPreferences.permissionLevel(defaults: defaults, secureStore: securePermissions)
+        case .mcpSafeDefaults:
+            .autoEdit
+        case let .providerOverride(.antigravity(level)):
+            level
+        case .providerOverride:
+            .autoEdit
+        }
+    }
+
     private func effectiveCursorPermissionLevel(
         profile: AgentProviderPermissionProfile
     ) -> CursorAgentToolPreferences.PermissionLevel {
@@ -571,6 +667,7 @@ final class AgentProviderPreferenceSnapshotStore {
         case .openCode: .openCode
         case .cursor: .cursor
         case .grokBuild: .grokBuild
+        case .antigravity: .antigravity
         }
     }
 

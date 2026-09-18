@@ -73,12 +73,11 @@ authoritative.
 ```bash
 make xcode                  # generate and open
 make xcode-generate         # generate without opening
-make xcode-generator-test   # deterministic generator contract tests (default CI)
 make xcode-validate         # explicit full validation with xcodebuild -list
 make xcode-clean            # remove generated workspace metadata
 ```
 
-Default CI runs `make xcode-generator-test`; full `make xcode-validate` is explicit and runs through local `pr-ready` for Xcode workspace boundary changes or the dedicated `Xcode Workspace Validation` workflow.
+`make xcode-validate` is the canonical generated-workspace check and runs through local `pr-ready` for Xcode workspace boundary changes or the dedicated `Xcode Workspace Validation` workflow.
 
 Xcode 26.3 exposes the native `RepoPrompt` and `repoprompt-mcp` product schemes.
 Use `RepoPrompt CE App` and `RepoPrompt CE MCP` for conductor-coordinated debug
@@ -215,7 +214,7 @@ These do not claim daemon lanes or lifecycle supersession, so when multiple agen
 
 ## Source placement rules
 
-See `docs/architecture/source-layout.md` for the full ownership map and documented exceptions, and `docs/architecture/provider-plugins.md` for the Agent Mode provider plugin seam (Claude-compatible package, bridge/adapter layout, "add a new provider" recipe). In short:
+See `docs/architecture/source-layout.md` for the full ownership map and documented exceptions, and `docs/architecture/provider-plugins.md` for the Agent Mode provider plugin seam (Claude-compatible package, bridge/adapter layout, "add a new provider" recipe). Before changing Agent Mode cross-session oversight, read [`docs/architecture/agent-session-oversight-auto-wake.md`](docs/architecture/agent-session-oversight-auto-wake.md): it records the four disjoint owners, why a snooze suppresses admission but never delivery, and why the `.cancelledBeforeDispatch` tombstone is a transport fence whose dependency lives in a different file. In short:
 
 - The shipped `RepoPrompt` executable target lives under `Sources/RepoPromptExecutable` and must remain a one-file entry shell over the internal `RepoPromptApp` target; do not add implementation code there.
 - Product-flow code goes under `Sources/RepoPrompt/Features/<FeatureName>`.

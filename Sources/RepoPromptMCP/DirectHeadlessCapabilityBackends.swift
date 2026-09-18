@@ -18,14 +18,14 @@ actor DirectHeadlessFilesystemBackend: DomainFilesystemMutationBackend {
         else {
             throw MCPError.invalidParams("file_actions requires action and path")
         }
-        guard ["create", "move", "delete"].contains(action) else {
+        guard ["create", "move", "rename", "delete"].contains(action) else {
             throw MCPError.invalidParams("unknown file_actions action: \(action)")
         }
         let allowMissing = action == "create"
         let source = try context.resolvePath(rawPath, roots: snapshot.roots, allowMissingLeaf: allowMissing)
         var targets = [source.path]
         var destination: URL?
-        if action == "move" {
+        if ["move", "rename"].contains(action) {
             guard let rawDestination = args["new_path"]?.stringValue else {
                 throw MCPError.invalidParams("move requires new_path")
             }
@@ -39,7 +39,7 @@ actor DirectHeadlessFilesystemBackend: DomainFilesystemMutationBackend {
             if manager.fileExists(atPath: source.path), args["if_exists"]?.stringValue != "overwrite" {
                 throw MCPError.invalidParams("path already exists: \(source.path)")
             }
-        case "move":
+        case "move", "rename":
             guard let destination else { throw MCPError.invalidParams("move requires new_path") }
             guard manager.fileExists(atPath: source.path) else { throw MCPError.invalidParams("path does not exist") }
             guard !manager.fileExists(atPath: destination.path) else { throw MCPError.invalidParams("destination exists") }
@@ -49,25 +49,36 @@ actor DirectHeadlessFilesystemBackend: DomainFilesystemMutationBackend {
             preconditionFailure("file_actions operation was validated above")
         }
         try await admit(targets, roots: snapshot.roots)
-        try await MCPDomainMutationCommitContext.willCommit()
+        guard let capability = try await MCPDomainMutationCommitContext.physicalMutationCapability() else {
+            throw DomainMutationPhysicalCapabilityError.scopeUnavailable
+        }
+        let overwrites = args["if_exists"]?.stringValue == "overwrite"
         switch action {
         case "create":
-            let exists = manager.fileExists(atPath: source.path)
-            if exists, args["if_exists"]?.stringValue != "overwrite" {
-                throw MCPError.invalidParams("path already exists: \(source.path)")
+            guard let data = (args["content"]?.stringValue ?? "").data(using: .utf8) else {
+                throw MCPError.invalidParams("content must be UTF-8")
             }
-            try manager.createDirectory(at: source.deletingLastPathComponent(), withIntermediateDirectories: true)
-            try (args["content"]?.stringValue ?? "").write(to: source, atomically: true, encoding: .utf8)
-        case "move":
+            try capability.validateWriteTarget(
+                at: source.path,
+                overwrite: overwrites,
+                expectedContentDigest: nil,
+                requireExisting: false
+            )
+            try await MCPDomainMutationCommitContext.willCommit()
+            try capability.writeFile(
+                at: source.path,
+                data: data,
+                overwrite: overwrites,
+                expectedContentDigest: nil,
+                requireExisting: false
+            )
+        case "move", "rename":
             guard let destination else { throw MCPError.invalidParams("move requires new_path") }
-            guard manager.fileExists(atPath: source.path) else { throw MCPError.invalidParams("path does not exist") }
-            guard !manager.fileExists(atPath: destination.path) else { throw MCPError.invalidParams("destination exists") }
-            try manager.createDirectory(at: destination.deletingLastPathComponent(), withIntermediateDirectories: true)
-            try manager.moveItem(at: source, to: destination)
+            try capability.validateNoReplaceMove(from: source.path, to: destination.path)
+            try await MCPDomainMutationCommitContext.willCommit()
+            try capability.moveFile(from: source.path, to: destination.path)
         case "delete":
-            guard manager.fileExists(atPath: source.path) else { throw MCPError.invalidParams("path does not exist") }
-            var resultingURL: NSURL?
-            try manager.trashItem(at: source, resultingItemURL: &resultingURL)
+            throw DomainMutationPhysicalCapabilityError.unsupportedOperation("file_actions.delete")
         default:
             throw MCPError.invalidParams("unknown file_actions action: \(action)")
         }
@@ -189,28 +200,29 @@ private actor DirectHeadlessFileEditHost: FileEditHost {
             [target.path],
             rootMappings: rootMappings
         )
-        let manager = FileManager.default
-        try validateCurrentRevision(manager: manager, overwrite: overwrite)
-        try await MCPDomainMutationCommitContext.willCommit()
-        // Recheck synchronously after the durable boundary and immediately before atomic replacement.
-        try validateCurrentRevision(manager: manager, overwrite: overwrite)
-        try manager.createDirectory(at: target.deletingLastPathComponent(), withIntermediateDirectories: true)
-        try content.write(to: target, atomically: true, encoding: .utf8)
-    }
-
-    private func validateCurrentRevision(manager: FileManager, overwrite: Bool) throws {
-        if overwrite {
-            guard let expectedDigest,
-                  let current = try? Data(contentsOf: target),
-                  DomainContentDigest.sha256(current) == expectedDigest
-            else {
-                throw MCPError.internalError("apply_edits revision conflict: file changed after preview")
-            }
-        } else {
-            guard expectedMissing, !manager.fileExists(atPath: target.path) else {
-                throw MCPError.internalError("apply_edits revision conflict: file was created concurrently")
-            }
+        guard let capability = try await MCPDomainMutationCommitContext.physicalMutationCapability() else {
+            throw DomainMutationPhysicalCapabilityError.scopeUnavailable
         }
+        if overwrite, expectedDigest == nil {
+            throw MCPError.internalError("apply_edits revision conflict: file was not read before overwrite")
+        }
+        try capability.validateWriteTarget(
+            at: target.path,
+            overwrite: overwrite,
+            expectedContentDigest: expectedDigest,
+            requireExisting: !expectedMissing
+        )
+        guard let data = content.data(using: .utf8) else {
+            throw MCPError.invalidParams("apply_edits requires UTF-8 output")
+        }
+        try await MCPDomainMutationCommitContext.willCommit()
+        try capability.writeFile(
+            at: target.path,
+            data: data,
+            overwrite: overwrite,
+            expectedContentDigest: expectedDigest,
+            requireExisting: !expectedMissing
+        )
     }
 }
 
@@ -674,16 +686,21 @@ actor DirectHeadlessVersionControlBackend: DomainVersionControlCapabilityBackend
 }
 
 actor DirectHeadlessConversationBackend: DomainConversationCapabilityBackend {
-    private let coordinator: DirectHeadlessProviderCoordinator
+    private let providerCoordinator: DirectHeadlessProviderCoordinator
+    private let oracleAdapter: DirectHeadlessOracleAdapter
 
-    init(coordinator: DirectHeadlessProviderCoordinator) {
-        self.coordinator = coordinator
+    init(
+        providerCoordinator: DirectHeadlessProviderCoordinator,
+        oracleAdapter: DirectHeadlessOracleAdapter
+    ) {
+        self.providerCoordinator = providerCoordinator
+        self.oracleAdapter = oracleAdapter
     }
 
     func accessOracleUtilities(_ request: DomainPhysicalToolRequest) async throws -> DomainPhysicalToolResult {
         let args = try request.mcpArguments()
         let op = args["op"]?.stringValue ?? "models"
-        let providers = await coordinator.providerCatalog().map(\.value)
+        let providers = await providerCoordinator.providerCatalog().map(\.value)
         return try .object([
             "op": .string(op),
             "models": .array(providers),
@@ -697,66 +714,117 @@ actor DirectHeadlessConversationBackend: DomainConversationCapabilityBackend {
         guard let message = args["message"]?.stringValue, !message.isEmpty else {
             throw MCPError.invalidParams("ask_oracle requires message")
         }
-        let (id, response) = try await coordinator.createConversation(
-            providerID: args["provider"]?.stringValue,
-            message: message,
-            model: args["model"]?.stringValue,
-            request: request
-        )
-        return try .object([
-            "chat_id": .string(id.uuidString),
-            "response": .string(response),
-            "backend": .string("headless")
-        ])
+        switch try await oracleAdapter.consumePreparedRoute(request: request) {
+        case .group:
+            return try await .mcp(oracleAdapter.start(arguments: args, request: request))
+        case let .direct(modelID, _):
+            let (id, response) = try await providerCoordinator.createConversation(
+                providerID: args["provider"]?.stringValue,
+                message: message,
+                model: modelID,
+                request: request
+            )
+            return try .object([
+                "chat_id": .string(id.uuidString),
+                "response": .string(response),
+                "backend": .string("headless")
+            ])
+        }
     }
 
     func continueOracleConversation(_ request: DomainPhysicalToolRequest) async throws -> DomainPhysicalToolResult {
         let args = try request.mcpArguments()
-        guard let rawID = args["chat_id"]?.stringValue,
-              let id = UUID(uuidString: rawID),
-              let message = args["message"]?.stringValue,
-              !message.isEmpty
-        else {
-            throw MCPError.invalidParams("oracle_send requires chat_id and message")
+        guard let message = args["message"]?.stringValue, !message.isEmpty else {
+            throw MCPError.invalidParams("oracle_send requires message")
         }
-        let response = try await coordinator.continueConversation(
-            id: id,
-            message: message,
-            model: args["model"]?.stringValue,
-            request: request
-        )
-        return try .object([
-            "chat_id": .string(id.uuidString),
-            "response": .string(response),
-            "backend": .string("headless")
-        ])
+        switch try await oracleAdapter.consumePreparedRoute(request: request) {
+        case .group:
+            return try await .mcp(oracleAdapter.continue(arguments: args, request: request))
+        case let .direct(modelID, implicitConversationID):
+            let result: (id: UUID, response: String)
+            if args["new_chat"]?.boolValue == true {
+                result = try await providerCoordinator.createConversation(
+                    providerID: nil,
+                    message: message,
+                    model: modelID,
+                    request: request
+                )
+            } else if let chatID = args["chat_id"]?.stringValue?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            {
+                guard let id = UUID(uuidString: chatID) else {
+                    throw MCPError.invalidParams("oracle_send requires a valid chat_id")
+                }
+                result = try await (
+                    id,
+                    providerCoordinator.continueConversation(
+                        id: id,
+                        message: message,
+                        request: request
+                    )
+                )
+            } else if let implicitConversationID {
+                result = try await (
+                    implicitConversationID,
+                    providerCoordinator.continueConversation(
+                        id: implicitConversationID,
+                        message: message,
+                        request: request
+                    )
+                )
+            } else {
+                result = try await providerCoordinator.createConversation(
+                    providerID: nil,
+                    message: message,
+                    model: modelID,
+                    request: request
+                )
+            }
+            return try .object([
+                "chat_id": .string(result.id.uuidString),
+                "response": .string(result.response),
+                "backend": .string("headless")
+            ])
+        }
     }
 
     func readOracleLog(_ request: DomainPhysicalReadRequest) async throws -> DomainPhysicalToolResult {
         let args = try request.request.mcpArguments()
-        let id = args["chat_id"]?.stringValue.flatMap(UUID.init(uuidString:))
-        return try await .mcp(coordinator.conversationLog(
-            id: id,
-            limit: args["limit"]?.intValue ?? 8
-        ))
+        let chatID = args["chat_id"]?.stringValue
+        let limit = args["limit"]?.intValue ?? 8
+        if let chatID {
+            if try await oracleAdapter.isGroupChat(chatID: chatID) {
+                return try await .mcp(oracleAdapter.log(chatID: chatID, limit: limit))
+            }
+            guard let id = UUID(uuidString: chatID) else {
+                throw MCPError.invalidParams("unknown chat_id")
+            }
+            return try await .mcp(providerCoordinator.conversationLog(id: id, limit: limit))
+        }
+        return try await .mcp(oracleAdapter.log(chatID: nil, limit: limit))
     }
 
     func buildContext(_ request: DomainPhysicalToolRequest) async throws -> DomainPhysicalToolResult {
         let args = try request.mcpArguments()
-        guard let instructions = args["instructions"]?.stringValue, !instructions.isEmpty else {
-            throw MCPError.invalidParams("context_builder requires instructions")
+        switch try await oracleAdapter.consumePreparedRoute(request: request) {
+        case .group:
+            return try await .mcp(oracleAdapter.buildContext(arguments: args, request: request))
+        case let .direct(modelID, _):
+            guard let instructions = args["instructions"]?.stringValue, !instructions.isEmpty else {
+                throw MCPError.invalidParams("context_builder requires instructions")
+            }
+            let (id, response) = try await providerCoordinator.createConversation(
+                providerID: args["provider"]?.stringValue,
+                message: instructions,
+                model: modelID,
+                request: request
+            )
+            return try .object([
+                "chat_id": .string(id.uuidString),
+                "response": .string(response),
+                "backend": .string("headless")
+            ])
         }
-        let (id, response) = try await coordinator.createConversation(
-            providerID: args["provider"]?.stringValue,
-            message: instructions,
-            model: args["model"]?.stringValue,
-            request: request
-        )
-        return try .object([
-            "chat_id": .string(id.uuidString),
-            "response": .string(response),
-            "backend": .string("headless")
-        ])
     }
 
     func requestUserInput(_ request: DomainPhysicalToolRequest) async throws -> DomainPhysicalToolResult {
@@ -813,6 +881,16 @@ actor DirectHeadlessAgentBackend: DomainAgentCapabilityBackend {
         default:
             throw MCPError.invalidRequest("unsupported standalone agent_manage op: \(op)")
         }
+    }
+
+    /// Oversight links are grants between two live top-level Agent sessions in open RepoPrompt
+    /// windows. A headless composition has neither, so every operation fails closed rather than
+    /// inventing an endpoint.
+    func monitorSessionLink(_ request: DomainPhysicalToolRequest) async throws -> DomainPhysicalToolResult {
+        throw MCPError.invalidRequest(
+            "agent_session_link requires two live RepoPrompt window sessions and a user-granted "
+                + "oversight link; it is unavailable in headless mode."
+        )
     }
 
     func shareThoughts(_ request: DomainPhysicalToolRequest) async throws -> DomainPhysicalToolResult {
@@ -1033,7 +1111,11 @@ enum DirectProcess {
         DomainChildLaunchCarrier.credentialEnvelopeEnvironmentKey,
         DomainChildLaunchCarrier.clientPrincipalEnvironmentKey,
         DomainChildLaunchCarrier.providerIdentifierEnvironmentKey,
-        DomainChildLaunchCarrier.runIDEnvironmentKey
+        DomainChildLaunchCarrier.runIDEnvironmentKey,
+        DomainChildLaunchCarrier.launchIDEnvironmentKey,
+        DomainChildLaunchCarrier.oracleGroupIDEnvironmentKey,
+        DomainChildLaunchCarrier.oracleLaneIDEnvironmentKey,
+        DomainChildLaunchCarrier.oracleGroupClaimIDEnvironmentKey
     ]
 
     /// Removes private launch-carrier values from a stored parent environment before

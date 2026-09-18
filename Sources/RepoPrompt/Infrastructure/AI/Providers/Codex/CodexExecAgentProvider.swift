@@ -11,6 +11,8 @@ final class CodexExecAgentProvider: HeadlessAgentProvider {
 
     private var runner: CLIProcessRunner?
     private let config: CodexExecAgentConfig
+    private let launchSnapshot: CodexRuntimeAuthority.LaunchSnapshot
+    private let runtimeStatePreparer: @Sendable (CodexRuntimeAuthority.Runtime) throws -> Void
     private let configService = MCPConfigExportService.shared
     private let toolTracking = AgentToolTrackingController()
     private var streamTask: Task<Void, Never>?
@@ -20,8 +22,16 @@ final class CodexExecAgentProvider: HeadlessAgentProvider {
         config.enableDebugLogging
     }
 
-    init(config: CodexExecAgentConfig) {
+    init(
+        config: CodexExecAgentConfig,
+        launchSnapshot: CodexRuntimeAuthority.LaunchSnapshot = CodexRuntimeAuthority.currentLaunchSnapshot(),
+        runtimeStatePreparer: @escaping @Sendable (CodexRuntimeAuthority.Runtime) throws -> Void = {
+            try $0.prepareState()
+        }
+    ) {
         self.config = config
+        self.launchSnapshot = launchSnapshot
+        self.runtimeStatePreparer = runtimeStatePreparer
         if enableDebugLogging {
             print("[DEBUG] CodexExec: Initialized provider with model: \(config.modelString ?? "default")")
         }
@@ -108,7 +118,8 @@ final class CodexExecAgentProvider: HeadlessAgentProvider {
         let resolution = await CodexProviderHelpers.preflightCodexExecutable(
             commandName: config.commandName,
             additionalPathHints: config.additionalPathHints,
-            enableDebugLogging: enableDebugLogging
+            enableDebugLogging: enableDebugLogging,
+            launchSnapshot: launchSnapshot
         )
         if enableDebugLogging {
             print("[DEBUG] CodexExec: \(resolution.debugMessage)")
@@ -119,10 +130,10 @@ final class CodexExecAgentProvider: HeadlessAgentProvider {
             throw AIProviderError.invalidConfiguration(detail: resolution.userMessage)
         }
         do {
-            try runtime.prepareState()
+            try runtimeStatePreparer(runtime)
         } catch {
             throw AIProviderError.invalidConfiguration(
-                detail: "RepoPrompt could not start Codex: unable to prepare its isolated state directories (\(error.localizedDescription))."
+                detail: "RepoPrompt could not start Codex: unable to prepare its isolated Codex state (\(error.localizedDescription))."
             )
         }
 

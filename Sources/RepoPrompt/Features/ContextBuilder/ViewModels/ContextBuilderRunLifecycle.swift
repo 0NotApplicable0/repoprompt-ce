@@ -126,6 +126,20 @@ enum ContextBuilderChildConnectionFinalizer {
     }
 }
 
+enum ContextBuilderGeneratedResponseAuthority {
+    case contextOnly
+    case generate(mode: HeadlessMode, execution: ResolvedOracleExecution)
+
+    var execution: ResolvedOracleExecution? {
+        guard case let .generate(_, execution) = self else { return nil }
+        return execution
+    }
+
+    var planningModelName: String? {
+        execution?.models.map(\.displayName).joined(separator: ", ")
+    }
+}
+
 struct ContextBuilderResolvedRunAuthority {
     let configuration: ContextBuilderMCPRunConfiguration
     let agentKind: AgentProviderKind
@@ -187,7 +201,7 @@ struct ContextBuilderMCPRunConfiguration {
     let providerWorkspacePath: String
     let runBehavior: ContextBuilderRunBehavior
     let responseType: String?
-    let planningModelRaw: String?
+    let generatedResponseAuthority: ContextBuilderGeneratedResponseAuthority
     let isSystemWorkspace: Bool
 
     var effectiveTokenBudget: Int {
@@ -237,6 +251,7 @@ final class ContextBuilderRunRecord {
     private(set) var teardownFinishedAt: Date?
     private(set) var providerDisposalFinished = false
     private(set) var executionTaskFinished = false
+    private var teardownSettlementWaiters: [CheckedContinuation<Void, Never>] = []
     private var didBeginProviderStreamProgress = false
     private var didReportRoutingConfirmed = false
     private var didObserveProviderEventAfterRouting = false
@@ -434,9 +449,23 @@ final class ContextBuilderRunRecord {
         finishTeardownIfReady()
     }
 
+    func awaitTeardownSettlement() async {
+        if teardownFinishedAt != nil { return }
+        await withCheckedContinuation { continuation in
+            if teardownFinishedAt != nil {
+                continuation.resume()
+            } else {
+                teardownSettlementWaiters.append(continuation)
+            }
+        }
+    }
+
     private func finishTeardownIfReady() {
         guard providerDisposalFinished, executionTaskFinished, teardownFinishedAt == nil else { return }
         teardownFinishedAt = Date()
+        let waiters = teardownSettlementWaiters
+        teardownSettlementWaiters.removeAll()
+        waiters.forEach { $0.resume() }
     }
 }
 
@@ -468,6 +497,10 @@ final class ContextBuilderRunRegistry {
 
     func records(tabID: UUID) -> [ContextBuilderRunRecord] {
         recordsByRunID.values.filter { $0.tabID == tabID }
+    }
+
+    func retainedRecordsSnapshot() -> [ContextBuilderRunRecord] {
+        Array(recordsByRunID.values)
     }
 
     func acceptsEvents(from record: ContextBuilderRunRecord, currentSession: ContextBuilderAgentViewModel.TabSession?) -> Bool {

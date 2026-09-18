@@ -570,7 +570,7 @@ final class MCPServerViewModel: ObservableObject {
                         return try await override(args, promptVM, tabContext)
                     }
                 #endif
-                return try await oracleVM.tool_chatSend(
+                return try await oracleVM.tool_chatSendWithConfiguredRoster(
                     args: args,
                     promptVM: promptVM,
                     tabContext: tabContext
@@ -914,6 +914,31 @@ final class MCPServerViewModel: ObservableObject {
         )
     }
 
+    private var agentSessionLinkToolService: AgentSessionLinkMCPToolService {
+        AgentSessionLinkMCPToolService(
+            toolName: MCPWindowToolName.agentSessionLink,
+            captureRequestMetadata: { [self] in await captureRequestMetadata() },
+            requireTargetWindow: { [self] in try requireTargetWindow() },
+            // Exact run-installed/handover/pending-run routing only: the observing endpoint can never
+            // be supplied, hinted, or explicitly bound by the caller.
+            resolveObserverEndpoint: { [self] metadata, targetWindow in
+                await resolveAgentSessionLinkObserverEndpoint(
+                    metadata: metadata,
+                    targetWindow: targetWindow
+                )
+            },
+            withHeartbeat: { [self] connectionID, tool, stage, message, operation in
+                try await withHeartbeat(
+                    connectionID: connectionID,
+                    tool: tool,
+                    stage: stage,
+                    message: message,
+                    operation: operation
+                )
+            }
+        )
+    }
+
     @Published private(set) var isRunning = false // overall status
     @Published private(set) var pendingClientID: String? // approval state
     @Published private(set) var diagnostics: MCPDiagnostics = .init(
@@ -1109,6 +1134,12 @@ final class MCPServerViewModel: ObservableObject {
             guard let self else { throw MCPError.internalError("Window deallocated while executing agent_manage") }
             return try await agentManageToolService.execute(args: args)
         },
+        executeAgentSessionLink: { [weak self] args in
+            guard let self else {
+                throw MCPError.internalError("Window deallocated while executing agent_session_link")
+            }
+            return try await agentSessionLinkToolService.execute(args: args)
+        },
         requireTargetWindow: { [weak self] in
             guard let self else { throw MCPError.internalError("Window deallocated while resolving target window") }
             return try requireTargetWindow()
@@ -1216,7 +1247,7 @@ final class MCPServerViewModel: ObservableObject {
                 _ = authorization
             #endif
         },
-        runMCPPlanOrQuestion: { [weak self] contextBuilderVM, identity, agentModeSessionID, agentModeRunID, mode, prompt, selection, lookupContext, reviewGitContext, finalReviewAuthorization, progressReporter, activityReporter in
+        runMCPPlanOrQuestion: { [weak self] contextBuilderVM, identity, agentModeSessionID, agentModeRunID, mode, execution, prompt, selection, lookupContext, reviewGitContext, finalReviewAuthorization, progressReporter, activityReporter in
             guard let self else { throw MCPError.internalError("Window deallocated while generating context_builder response") }
             #if DEBUG
                 if let override = contextBuilderFollowUpOverrideForTesting {
@@ -1226,6 +1257,7 @@ final class MCPServerViewModel: ObservableObject {
                         agentModeSessionID,
                         agentModeRunID,
                         mode,
+                        execution,
                         prompt,
                         selection,
                         lookupContext,
@@ -1242,6 +1274,7 @@ final class MCPServerViewModel: ObservableObject {
                 agentModeSessionID: agentModeSessionID,
                 agentModeRunID: agentModeRunID,
                 mode: mode,
+                execution: execution,
                 prompt: prompt,
                 selection: selection,
                 lookupContext: lookupContext,
@@ -1841,13 +1874,14 @@ final class MCPServerViewModel: ObservableObject {
             return await applyReadFileAutoSelectionBatch(batch, for: key)
         },
         applyMirror: { [weak self] key in
-            await self?.applyReadFileAutoSelectionMirror(for: key)
+            guard let self else { return .invalidated }
+            return await applyReadFileAutoSelectionMirror(for: key)
         }
     )
     @MainActor
     private func applyReadFileAutoSelectionMirror(
         for key: MCPReadFileAutoSelectionCoordinator.TabMirrorKey
-    ) async {
+    ) async -> WorkspaceSelectionCoordinator.SelectionMirrorOutcome {
         #if DEBUG
             await readFileAutoSelectionMirrorGateForTesting?()
         #endif
@@ -1865,9 +1899,10 @@ final class MCPServerViewModel: ObservableObject {
             )?.selection {
                 workspaceManager?.updateComposeTabSelectionPresentation(selection, forTabID: key.tabID)
             }
-            return
+            return .converged
         }
-        await workspaceManager?.applyStoredSelectionMirrorForReadFileAutoSelection(tabID: key.tabID)
+        guard let workspaceManager else { return .invalidated }
+        return await workspaceManager.applyStoredSelectionMirrorForReadFileAutoSelection(tabID: key.tabID)
     }
 
     /// Presentation snapshot cache. Domain routing remains the only routing authority.
@@ -3978,15 +4013,19 @@ final class MCPServerViewModel: ObservableObject {
                 guard let workspaceID = context.workspaceID,
                       let workspace = targetWindow.workspaceManager.workspaces.first(where: { $0.id == workspaceID })
                 else {
-                    throw MCPError.invalidParams("context_builder could not resolve the invoking Agent Mode workspace.")
+                    throw MCPError.invalidParams(ContextBuilderWorkspaceContextError.readiness(
+                        WorkspaceRootReadinessFailure(reason: .workspaceUnavailable, expectedCount: 0, loadedCount: 0, missingCount: 0)
+                    ).localizedDescription)
                 }
                 do {
                     workspaceContext = try await ContextBuilderWorkspaceContext.resolve(
                         from: context,
                         workspaceRepoPaths: workspace.repoPaths,
                         workspaceDirectoryPath: targetWindow.workspaceManager.workspaceDirectory(for: workspace).path,
-                        store: targetWindow.promptManager.workspaceFileContextStore
+                        workspaceManager: targetWindow.workspaceManager
                     )
+                } catch is CancellationError {
+                    throw CancellationError()
                 } catch {
                     throw MCPError.invalidParams(error.localizedDescription)
                 }
@@ -6181,6 +6220,32 @@ final class MCPServerViewModel: ObservableObject {
         }
     }
 
+    static func resolveReadFileRequestAfterFreshness(
+        _ input: WorkspaceExactFileInput,
+        readableService: WorkspaceReadableFileService,
+        rootScope: WorkspaceLookupRootScope,
+        rootRefs: [WorkspaceRootRef],
+        namespace: WorkspaceExactFileNamespace,
+        timeout: Duration = MCPTimeoutPolicy.workspaceFreshnessWaitTimeout
+    ) async throws -> WorkspaceReadableFileResolution {
+        try await readableService.awaitFreshnessForExplicitRequest(
+            input,
+            namespace: namespace,
+            timeout: timeout
+        )
+        try Task.checkCancellation()
+        let resolution = try await EditFlowPerf.measure(EditFlowPerf.Stage.ReadFile.resolveReadableFile) {
+            try await readableService.resolveReadFileRequest(
+                input,
+                rootScope: rootScope,
+                rootRefs: rootRefs,
+                namespace: namespace
+            )
+        }
+        try Task.checkCancellation()
+        return resolution
+    }
+
     private func readFileBody(
         input: WorkspaceExactFileInput,
         startLine1Based: Int? = nil,
@@ -6193,27 +6258,13 @@ final class MCPServerViewModel: ObservableObject {
         let roots = await store.rootRefs(scope: lookupContext.rootScope)
         let namespace = lookupContext.exactFileNamespace(storeRoots: roots)
         let requestedPath = input.renderedPath
-        let freshnessPath = switch input {
-        case let .absolute(path): lookupContext.translateInputPath(path)
-        case .explicitRoot, .relative: requestedPath
-        }
-
-        try await readableService.awaitFreshnessForExplicitRequest(
-            freshnessPath,
+        let resolution = try await Self.resolveReadFileRequestAfterFreshness(
+            input,
+            readableService: readableService,
+            rootScope: lookupContext.rootScope,
             rootRefs: roots,
-            timeout: MCPTimeoutPolicy.workspaceFreshnessWaitTimeout
+            namespace: namespace
         )
-        try Task.checkCancellation()
-
-        let resolution = try await EditFlowPerf.measure(EditFlowPerf.Stage.ReadFile.resolveReadableFile) {
-            try await readableService.resolveReadFileRequest(
-                input,
-                rootScope: lookupContext.rootScope,
-                rootRefs: roots,
-                namespace: namespace
-            )
-        }
-        try Task.checkCancellation()
 
         let readableFile: WorkspaceReadableFileHandle
         let displayPath: String
@@ -6240,10 +6291,8 @@ final class MCPServerViewModel: ObservableObject {
         let cacheHit: Bool
         switch readableFile {
         case let .workspace(file):
-            guard let snapshot = try await EditFlowPerf.measure(
-                EditFlowPerf.Stage.ReadFile.workspaceContentLoad,
-                operation: { try await store.interactiveReadSnapshot(for: file) }
-            ) else { throw MCPError.internalError("content unavailable") }
+            guard let snapshot = try await Self.workspaceContentLoad(store: store, file: file)
+            else { throw MCPError.internalError("content unavailable") }
             preparedContent = snapshot.preparedContent
             cacheHit = snapshot.cacheHit
         case let .external(externalFile):
@@ -6285,6 +6334,42 @@ final class MCPServerViewModel: ObservableObject {
             return .nonSelecting(reply: preparedReply.reply)
         }
     }
+
+    private static func workspaceContentLoad(
+        store: WorkspaceFileContextStore,
+        file: WorkspaceFileRecord
+    ) async throws -> WorkspaceInteractiveReadSnapshot? {
+        EditFlowPerf.lifecycleEvent(EditFlowPerf.Lifecycle.ReadFile.contentLoadBegan)
+        do {
+            let snapshot = try await EditFlowPerf.measure(
+                EditFlowPerf.Stage.ReadFile.workspaceContentLoad,
+                operation: { try await store.interactiveReadSnapshot(for: file) }
+            )
+            EditFlowPerf.lifecycleEvent(
+                EditFlowPerf.Lifecycle.ReadFile.contentLoadEnded,
+                EditFlowPerf.Dimensions(
+                    outcome: snapshot == nil ? "unavailable" : "returned",
+                    cacheHit: snapshot?.cacheHit
+                )
+            )
+            return snapshot
+        } catch {
+            EditFlowPerf.lifecycleEvent(
+                EditFlowPerf.Lifecycle.ReadFile.contentLoadEnded,
+                EditFlowPerf.Dimensions(outcome: error is CancellationError ? "cancelled" : "error")
+            )
+            throw error
+        }
+    }
+
+    #if DEBUG
+        static func workspaceContentLoadForTesting(
+            store: WorkspaceFileContextStore,
+            file: WorkspaceFileRecord
+        ) async throws -> WorkspaceInteractiveReadSnapshot? {
+            try await workspaceContentLoad(store: store, file: file)
+        }
+    #endif
 
     /// Performs a file action (create, delete, or move/rename)
     private func performFileAction(
@@ -6489,6 +6574,10 @@ final class MCPServerViewModel: ObservableObject {
             try await host.writeText(path: path, content: content, overwrite: overwrite)
         } catch is CancellationError {
             throw CancellationError()
+        } catch FileSystemError.fileAlreadyExists {
+            throw MCPError.invalidParams("path already exists: \(path)")
+        } catch FileSystemError.isDirectory {
+            throw MCPError.invalidParams("path resolves to a directory: \(path)")
         } catch let fmErr as FileManagerError {
             throw await mapFileManagerErrorToMCP(fmErr, action: "create", path: path)
         } catch let mcpErr as MCPError {
@@ -6647,7 +6736,7 @@ final class MCPServerViewModel: ObservableObject {
         )
     }
 
-    /// Writes prompt export content, allowing absolute paths outside the workspace.
+    /// Writes prompt export content inside an admitted workspace root; external destinations fail closed.
     private func writePromptExportFile(
         path rawPath: String,
         content: String,
@@ -6686,27 +6775,9 @@ final class MCPServerViewModel: ObservableObject {
             return resolvedPath
         }
 
-        let url = URL(fileURLWithPath: resolvedPath)
-        let fm = FileManager.default
-        if fm.fileExists(atPath: url.path) {
-            throw MCPError.invalidParams("path already exists: \(resolvedPath).")
-        }
-        do {
-            try await MCPDomainMutationCommitContext.admitPhysicalTargets(
-                [url.standardizedFileURL.path],
-                rootMappings: mutationRootMappings
-            )
-            try await MCPDomainMutationCommitContext.willCommit()
-            let physicalMutationGuard = try await MCPDomainMutationCommitContext.physicalMutationGuard()
-            try physicalMutationGuard?.revalidate()
-            try fm.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true, attributes: nil)
-            try physicalMutationGuard?.revalidate()
-            try content.write(to: url, atomically: true, encoding: .utf8)
-        } catch {
-            throw MCPError.invalidParams("File creation failed for '\(resolvedPath)': \(error.localizedDescription)")
-        }
-
-        return resolvedPath
+        throw MCPError.invalidParams(
+            "Protected prompt export outside a loaded workspace root is unsupported."
+        )
     }
 
     private func renameFile(

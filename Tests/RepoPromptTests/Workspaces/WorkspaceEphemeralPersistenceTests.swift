@@ -36,31 +36,104 @@ import XCTest
             try await super.tearDown()
         }
 
-        func testDirtyEphemeralWorkspaceSkipsEverySaveSideEffect() async {
-            let manager = makeManager(windowID: -761)
+        func testLibraryRecencyIgnoresBackgroundSavesAndGroupsTemporaryWork() throws {
+            let manager = makeManager(windowID: -799)
+            let recent = WorkspaceModel(dateModified: .distantPast, name: "Recent project", repoPaths: ["/projects/recent"], lastUsed: Date(timeIntervalSince1970: 200))
+            let background = WorkspaceModel(dateModified: .distantFuture, name: "Background save", repoPaths: ["/projects/background"], lastUsed: Date(timeIntervalSince1970: 100))
+            let automation = WorkspaceModel(name: "Agent review", repoPaths: ["/projects/recent"], isSavedWorkspace: false)
+            let scratch = WorkspaceModel(name: "Old scratch", repoPaths: ["/tmp/review-checkout"])
+            let deliberatelySaved = WorkspaceModel(name: "Saved scratch", repoPaths: ["/tmp/my-project"], lastUsed: .distantPast, isSavedWorkspace: true)
+            manager.workspaces = [background, automation, scratch, deliberatelySaved, recent]
+            XCTAssertEqual(manager.workspacesForMenu().map(\.id), [recent.id, background.id, deliberatelySaved.id])
+            XCTAssertEqual(Set(manager.workspacesForMenu(.init(includeTemporary: true)).map(\.id)), Set(manager.workspaces.map(\.id)))
+            let decoded = try JSONDecoder().decode(WorkspaceModel.self, from: JSONEncoder().encode(deliberatelySaved))
+            XCTAssertEqual(decoded.isSavedWorkspace, true)
+            XCTAssertFalse(decoded.isTemporaryWorkspace)
+            XCTAssertNil(scratch.isSavedWorkspace, "Legacy grouping must not rewrite provenance")
+        }
+
+        func testLegacyLastUsedDecodeUsesPersistedModificationDateDeterministically() throws {
+            let workspaceID = UUID()
+            var object: [String: Any] = [
+                "id": workspaceID.uuidString,
+                "name": "Legacy",
+                "repoPaths": [],
+                "dateModified": 0
+            ]
+
+            var decoded = try decodeWorkspace(object)
+            XCTAssertEqual(decoded.lastUsed, Date(timeIntervalSinceReferenceDate: 0))
+
+            object["dateModified"] = 1
+            object["lastUsed"] = true
+            decoded = try decodeWorkspace(object)
+            XCTAssertEqual(decoded.lastUsed, Date(timeIntervalSinceReferenceDate: 1))
+
+            object["lastUsed"] = 0
+            decoded = try decodeWorkspace(object)
+            XCTAssertEqual(decoded.lastUsed, Date(timeIntervalSinceReferenceDate: 0))
+
+            object["dateModified"] = "invalid"
+            object["lastUsed"] = "invalid"
+            decoded = try decodeWorkspace(object)
+            XCTAssertEqual(decoded.lastUsed, .distantPast)
+        }
+
+        private func decodeWorkspace(_ object: [String: Any]) throws -> WorkspaceModel {
+            let data = try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])
+            return try JSONDecoder().decode(WorkspaceModel.self, from: data)
+        }
+
+        func testNewWorkspaceWaitsForItsOwnSaveWithoutBlockingOtherOpens() async throws {
+            let runtime = MCPDomainRuntime(configuration: .init(
+                mode: .app,
+                profileIdentifier: "workspace-creation-ordering-\(UUID().uuidString)",
+                storageDirectory: storageRoot.appendingPathComponent("runtime-state", isDirectory: true),
+                workspaceStorageDirectory: storageRoot,
+                eventDirectory: storageRoot.appendingPathComponent("events", isDirectory: true),
+                temporaryDirectory: storageRoot.appendingPathComponent("tmp", isDirectory: true),
+                externalReloadInterval: nil
+            ))
+            try await runtime.start()
+            defer { Task { _ = await runtime.shutdown() } }
+            let manager = makeManager(
+                windowID: -796,
+                domainWorkspaceAuthorityClient: DomainWorkspaceAuthorityClient(store: runtime.workspaceStore, windowID: -796)
+            )
             await manager.awaitInitialized()
-            let workspace = manager.createEphemeralWorkspace(name: "Temporary", repoPaths: [])
-            XCTAssertTrue(workspace.isEphemeral)
-            XCTAssertTrue(manager.workspace(withID: workspace.id)?.isEphemeral == true)
+            let savePrepared = expectation(description: "creation save prepared")
+            let gate = WorkspaceDeleteSuspensionGate()
+            manager.setWorkspaceSavePreparationDidFinishHandlerForTesting { _, _, _ in
+                savePrepared.fulfill()
+                await gate.wait()
+            }
+            let created = manager.createWorkspace(name: "New saved project", repoPaths: [])
+            await fulfillment(of: [savePrepared], timeout: 3)
+            let opening = Task { await manager.switchWorkspace(to: created, saveState: false) }
+            await Task.yield()
+            XCTAssertFalse(manager.isSwitchingWorkspace, "A pending creation must not own the window's switch")
+            let temporary = manager.createEphemeralWorkspace(name: "Other workspace", repoPaths: [])
+            let otherOpen = await manager.switchWorkspace(to: temporary, saveState: false)
+            XCTAssertTrue(otherOpen.didSwitch)
+            manager.setWorkspaceSavePreparationDidFinishHandlerForTesting(nil)
+            await gate.open()
+            let opened = await opening.value
+            XCTAssertTrue(opened.didSwitch)
+            XCTAssertTrue(FileManager.default.fileExists(atPath: manager.workspaceFileURL(for: created).path))
+        }
 
-            let switched = await manager.switchWorkspace(to: workspace, saveState: false)
-            XCTAssertTrue(switched.didSwitch)
-            manager.markWorkspaceDirty()
-
-            let outcome = await manager.pollAndSaveStateWithOutcomeAsync(workspaceID: workspace.id)
-            XCTAssertEqual(outcome, .notRequired(workspaceID: workspace.id))
-
-            let workspaceFile = manager.workspaceFileURL(for: workspace)
-            XCTAssertFalse(FileManager.default.fileExists(atPath: workspaceFile.path))
-            XCTAssertFalse(
-                FileManager.default.fileExists(
-                    atPath: storageRoot.appendingPathComponent("workspacesIndex.json").path
-                )
-            )
-            XCTAssertFalse(
-                FileManager.default.fileExists(atPath: workspaceFile.deletingLastPathComponent().path),
-                "Skipping persistence must not create an empty workspace directory."
-            )
+        func testExplicitLibraryChoicePersistsAcrossReload() async throws {
+            let workspace = WorkspaceModel(name: "Automation project", repoPaths: [], isSavedWorkspace: false)
+            try writeWorkspace(workspace)
+            try writeLegacyIndex([workspace])
+            let manager = makeManager(windowID: -798)
+            await manager.awaitInitialized()
+            await manager.setWorkspaceLibraryMembership(workspace, saved: true)
+            let url = manager.workspaceFileURL(for: workspace)
+            await WorkspaceManagerViewModel.WorkspaceDiskWriter.shared.flush(url: url)
+            let saved = try JSONDecoder().decode(WorkspaceModel.self, from: Data(contentsOf: url))
+            XCTAssertEqual(saved.isSavedWorkspace, true)
+            XCTAssertFalse(saved.isTemporaryWorkspace)
         }
 
         func testExplicitSaveAPIsRejectEphemeralWorkspaceWithoutSideEffects() async throws {
@@ -100,51 +173,6 @@ import XCTest
                 FileManager.default.fileExists(atPath: workspaceFile.deletingLastPathComponent().path)
             )
             XCTAssertFalse(FileManager.default.fileExists(atPath: alternateRoot.path))
-        }
-
-        func testAutosaveBecomingEphemeralMidSaveReturnsNotRequiredWithoutAuthorityIssue() async throws {
-            let workspace = WorkspaceModel(
-                name: "Becomes Temporary During Save",
-                repoPaths: ["/tmp/becomes-temporary"]
-            )
-            try writeWorkspace(workspace)
-            try writeLegacyIndex([workspace])
-
-            let runtime = MCPDomainRuntime(configuration: .init(
-                mode: .app,
-                profileIdentifier: "mid-save-ephemeral-\(UUID().uuidString)",
-                storageDirectory: storageRoot.appendingPathComponent("runtime-state", isDirectory: true),
-                workspaceStorageDirectory: storageRoot,
-                eventDirectory: storageRoot.appendingPathComponent("events", isDirectory: true),
-                temporaryDirectory: storageRoot.appendingPathComponent("tmp", isDirectory: true),
-                externalReloadInterval: nil
-            ))
-            try await runtime.start()
-            defer { Task { _ = await runtime.shutdown() } }
-
-            let manager = makeManager(
-                windowID: -774,
-                domainWorkspaceAuthorityClient: DomainWorkspaceAuthorityClient(
-                    store: runtime.workspaceStore,
-                    windowID: -774
-                )
-            )
-            await manager.awaitInitialized()
-            let switchResult = await manager.switchWorkspace(to: workspace, saveState: false)
-            XCTAssertTrue(switchResult.didSwitch)
-            manager.markWorkspaceDirty()
-            manager.setWorkspaceSavePreparationDidFinishHandlerForTesting { workspaceID, _, _ in
-                await MainActor.run {
-                    manager.setWorkspaceEphemeral(workspaceID, true)
-                }
-            }
-
-            let outcome = await manager.pollAndSaveStateWithOutcomeAsync(workspaceID: workspace.id)
-            manager.setWorkspaceSavePreparationDidFinishHandlerForTesting(nil)
-
-            XCTAssertEqual(outcome, .notRequired(workspaceID: workspace.id))
-            XCTAssertNil(manager.domainWorkspaceAuthorityIssue)
-            XCTAssertTrue(manager.workspace(withID: workspace.id)?.isEphemeral == true)
         }
 
         func testBulkAndSingleDeleteRemoveLocalEphemeralWorkspacesMissingFromRuntimeCatalog() async throws {
@@ -276,217 +304,12 @@ import XCTest
             XCTAssertTrue(FileManager.default.fileExists(atPath: indexURL.path))
         }
 
-        func testLeakedFixtureIdentityMatchesProductionShapeAndRejectsNearMatches() {
-            let fixtureUUID = UUID().uuidString
-            let validPath = "/private/var/folders/fixture/AgentModeChatSwitchActivationTests-\(fixtureUUID)/repo"
-
-            XCTAssertTrue(WorkspaceLeakedTestFixtureIdentity.matches(
-                isEphemeral: true,
-                name: "Agent Mode Chat Switch 1A2B3C4D",
-                repoPaths: [validPath]
-            ))
-
-            let invalidNames = [
-                "Agent Mode Chat Switch 1A2B3C4",
-                "Agent Mode Chat Switch 1A2B3C4D5",
-                "Agent Mode Chat Switch 1A2B3C4G",
-                "Agent Mode Chat Switch 1a2B3C4D",
-                "Agent Mode Chat Switch \(UUID().uuidString)"
-            ]
-            for name in invalidNames {
-                XCTAssertFalse(WorkspaceLeakedTestFixtureIdentity.matches(
-                    isEphemeral: true,
-                    name: name,
-                    repoPaths: [validPath]
-                ), name)
-            }
-            XCTAssertFalse(WorkspaceLeakedTestFixtureIdentity.matches(
-                isEphemeral: false,
-                name: "Agent Mode Chat Switch 1A2B3C4D",
-                repoPaths: [validPath]
-            ))
-            XCTAssertFalse(WorkspaceLeakedTestFixtureIdentity.matches(
-                isEphemeral: true,
-                name: "Agent Mode Chat Switch 1A2B3C4D",
-                repoPaths: [validPath.replacingOccurrences(of: fixtureUUID, with: fixtureUUID + "-extra")]
-            ))
-            XCTAssertFalse(WorkspaceLeakedTestFixtureIdentity.matches(
-                isEphemeral: true,
-                name: "Agent Mode Chat Switch 1A2B3C4D",
-                repoPaths: [validPath.replacingOccurrences(of: fixtureUUID, with: fixtureUUID.lowercased())]
-            ))
-        }
-
-        func testPersistentReadFixtureIdentityMatchesProductionShapeAndRejectsNearMatches() {
-            let fixtureUUID = UUID().uuidString
-            let validPath = "/private/var/folders/fixture/PersistentAgentModeMCPReadFileConnectionTests/\(fixtureUUID)"
-
-            let match = WorkspaceLeakedTestFixtureIdentity.match(
-                isEphemeral: true,
-                name: "Persistent Agent Mode MCP Read",
-                repoPaths: [validPath]
-            )
-            XCTAssertEqual(match, .persistentRead)
-            XCTAssertEqual(match?.evidence, [
-                "ephemeralFlag=true",
-                "name is Persistent Agent Mode MCP Read",
-                "repo path contains PersistentAgentModeMCPReadFileConnectionTests/<UUID>"
-            ])
-
-            XCTAssertFalse(WorkspaceLeakedTestFixtureIdentity.matches(
-                isEphemeral: false,
-                name: "Persistent Agent Mode MCP Read",
-                repoPaths: [validPath]
-            ))
-            XCTAssertFalse(WorkspaceLeakedTestFixtureIdentity.matches(
-                isEphemeral: true,
-                name: "Persistent Agent Mode MCP Read Extra",
-                repoPaths: [validPath]
-            ))
-            XCTAssertFalse(WorkspaceLeakedTestFixtureIdentity.matches(
-                isEphemeral: true,
-                name: "Persistent Agent Mode MCP Read",
-                repoPaths: [validPath.replacingOccurrences(of: fixtureUUID, with: fixtureUUID.lowercased())]
-            ))
-            XCTAssertFalse(WorkspaceLeakedTestFixtureIdentity.matches(
-                isEphemeral: true,
-                name: "Persistent Agent Mode MCP Read",
-                repoPaths: [validPath.replacingOccurrences(
-                    of: "PersistentAgentModeMCPReadFileConnectionTests",
-                    with: "PersistentAgentModeMCPReadFileConnectionTests-Auxiliary"
-                )]
-            ))
-            XCTAssertFalse(WorkspaceLeakedTestFixtureIdentity.matches(
-                isEphemeral: true,
-                name: "Persistent Agent Mode MCP Read",
-                repoPaths: [validPath.replacingOccurrences(of: fixtureUUID, with: fixtureUUID + "-extra")]
-            ))
-        }
-
-        func testRuntimeCatalogCleanupFindsLegacyInventoryOmissionsAndAppliesIdempotently() async throws {
-            let normal = WorkspaceModel(name: "User Workspace", repoPaths: ["/Users/example/project"])
-            let removableLeak = leakedFixtureWorkspace()
-            let persistentReadLeak = persistentReadFixtureWorkspace()
-            let protectedLeak = leakedFixtureWorkspace()
-            let unrelatedEphemeral = WorkspaceModel(
-                name: "Temporary User Session",
-                repoPaths: ["/tmp/user-session"],
-                ephemeralFlag: true
-            )
-            let allWorkspaces = [normal, removableLeak, persistentReadLeak, protectedLeak, unrelatedEphemeral]
-            for workspace in allWorkspaces {
-                try writeWorkspace(workspace)
-            }
-            try writeLegacyIndex(allWorkspaces)
-
-            let runtime = MCPDomainRuntime(configuration: .init(
-                mode: .app,
-                profileIdentifier: "workspace-leak-cleanup-\(UUID().uuidString)",
-                storageDirectory: storageRoot.appendingPathComponent("runtime-state", isDirectory: true),
-                workspaceStorageDirectory: storageRoot,
-                eventDirectory: storageRoot.appendingPathComponent("events", isDirectory: true),
-                temporaryDirectory: storageRoot.appendingPathComponent("tmp", isDirectory: true),
-                externalReloadInterval: nil
-            ))
-            try await runtime.start()
-            defer { Task { _ = await runtime.shutdown() } }
-            let authoritativeBefore = await runtime.workspaceStore.snapshot()
-            XCTAssertEqual(
-                Set(authoritativeBefore.workspaces.map(\.document.workspaceID)),
-                Set(allWorkspaces.map(\.id))
-            )
-
-            // Reproduce the production split: the runtime catalog retains the fixtures while the
-            // legacy inventory consulted by manage_workspaces lists only the ordinary workspace.
-            try writeLegacyIndex([normal])
-            let composition = WindowStateCompositionFactory.make(
-                windowID: -763,
-                deferredInitialAgentSystemWorkspaceRefresh: true,
-                sharedMCPService: MCPService(),
-                domainRuntime: runtime,
-                workspaceFileContextStore: WorkspaceFileContextStore()
-            )
-            let manager = composition.workspaceManager
-            managers.append(manager)
-            await manager.awaitInitialized()
-            let bridge = try XCTUnwrap(composition.domainWorkspacePresentationBridge)
-            let projected = await bridge.waitUntilProjected(through: authoritativeBefore.publicationSequence)
-            XCTAssertTrue(projected)
-
-            let legacyInventory = await manager.loadWorkspaceSnapshotFromDisk()
-            XCTAssertEqual(legacyInventory.map(\.id), [normal.id])
-            XCTAssertFalse(manager.workspaces.contains { $0.id == removableLeak.id })
-            XCTAssertFalse(manager.workspaces.contains { $0.id == persistentReadLeak.id })
-            XCTAssertTrue(manager.workspaces.contains { $0.id == normal.id })
-
-            let oversized = await manager.deleteWorkspacesAsync(
-                workspaceIDs: Set((0 ... WorkspaceBulkDeletePolicy.maximumWorkspaceCount).map { _ in UUID() })
-            )
-            XCTAssertNotNil(oversized.requestFailureReason)
-            XCTAssertTrue(oversized.failedReasonsByWorkspaceID.isEmpty)
-            XCTAssertTrue(oversized.deletedWorkspaceIDs.isEmpty)
-
-            try FileManager.default.createDirectory(
-                at: URL(fileURLWithPath: protectedLeak.repoPaths[0]),
-                withIntermediateDirectories: true
-            )
-            let protector = makeManager(windowID: -764)
-            await protector.awaitInitialized()
-            let protectedSwitch = await protector.switchWorkspace(to: protectedLeak, saveState: false)
-            XCTAssertTrue(protectedSwitch.didSwitch)
-
-            let protectedIDs: Set<UUID> = [normal.id, protectedLeak.id]
-            let preview = await manager.previewLeakedTestWorkspaces(protectedWorkspaceIDs: protectedIDs)
-            XCTAssertEqual(
-                Set(preview.records.map(\.id)),
-                [removableLeak.id, persistentReadLeak.id, protectedLeak.id]
-            )
-            XCTAssertTrue(preview.records.first(where: { $0.id == removableLeak.id })?.isDeletable == true)
-            XCTAssertEqual(
-                preview.records.first(where: { $0.id == persistentReadLeak.id })?.evidence,
-                [
-                    "ephemeralFlag=true",
-                    "name is Persistent Agent Mode MCP Read",
-                    "repo path contains PersistentAgentModeMCPReadFileConnectionTests/<UUID>"
-                ]
-            )
-            XCTAssertEqual(
-                preview.records.first(where: { $0.id == protectedLeak.id })?.deletionBlockReason,
-                "Workspace is active in an open window."
-            )
-            XCTAssertFalse(preview.records.contains { $0.id == unrelatedEphemeral.id })
-
-            let firstApply = await manager.deleteWorkspacesAsync(
-                workspaceIDs: [removableLeak.id, persistentReadLeak.id, protectedLeak.id],
-                leakedTestFixtureWorkspaceIDs: [removableLeak.id, persistentReadLeak.id, protectedLeak.id]
-            )
-            XCTAssertEqual(Set(firstApply.deletedWorkspaceIDs), [removableLeak.id, persistentReadLeak.id])
-            XCTAssertEqual(Set(firstApply.skippedReasonsByWorkspaceID.keys), [protectedLeak.id])
-            XCTAssertTrue(firstApply.failedReasonsByWorkspaceID.isEmpty)
-            XCTAssertFalse(FileManager.default.fileExists(atPath: workspaceFileURL(for: removableLeak).path))
-            XCTAssertFalse(FileManager.default.fileExists(atPath: workspaceFileURL(for: persistentReadLeak).path))
-
-            let authoritativeAfter = await runtime.workspaceStore.snapshot()
-            let survivingIDs = Set(authoritativeAfter.workspaces.map(\.document.workspaceID))
-            XCTAssertFalse(survivingIDs.contains(removableLeak.id))
-            XCTAssertFalse(survivingIDs.contains(persistentReadLeak.id))
-            XCTAssertTrue(survivingIDs.isSuperset(of: [normal.id, protectedLeak.id, unrelatedEphemeral.id]))
-
-            let repeatedApply = await manager.deleteWorkspacesAsync(
-                workspaceIDs: [removableLeak.id],
-                leakedTestFixtureWorkspaceIDs: [removableLeak.id]
-            )
-            XCTAssertEqual(repeatedApply.alreadyAbsentWorkspaceIDs, [removableLeak.id])
-            XCTAssertTrue(repeatedApply.deletedWorkspaceIDs.isEmpty)
-            XCTAssertTrue(repeatedApply.failedReasonsByWorkspaceID.isEmpty)
-        }
-
-        func testSingleDeleteRejectsCanonicalPinnedAgentClaim() async throws {
+        func testExplicitDeleteAllowsSavedSessionReferencesAndPinnedTabs() async throws {
             let pinnedWorkspace = WorkspaceModel(
                 name: "Pinned Agent Workspace",
                 repoPaths: [storageRoot.appendingPathComponent("pinned-repo").path],
                 stashedTabs: [
-                    StashedTab(tab: ComposeTabState(name: "Pinned", isPinned: true))
+                    StashedTab(tab: ComposeTabState(name: "Pinned", isPinned: true, activeAgentSessionID: UUID()))
                 ]
             )
             try writeWorkspace(pinnedWorkspace)
@@ -514,11 +337,462 @@ import XCTest
             await manager.awaitInitialized()
 
             let didDelete = await manager.deleteWorkspaceAsync(pinnedWorkspace)
-            XCTAssertFalse(didDelete)
+            XCTAssertTrue(didDelete)
             let authoritativeAfter = await runtime.workspaceStore.snapshot()
-            XCTAssertTrue(authoritativeAfter.workspaces.contains {
+            XCTAssertFalse(authoritativeAfter.workspaces.contains {
                 $0.document.workspaceID == pinnedWorkspace.id
             })
+        }
+
+        func testConfirmedDeleteClosesAnOpenWorkspaceAndKeepsProjectFiles() async throws {
+            let pinnedWorkspace = WorkspaceModel(
+                name: "Pinned Agent Workspace",
+                repoPaths: [storageRoot.appendingPathComponent("pinned-repo").path],
+                stashedTabs: [
+                    StashedTab(tab: ComposeTabState(name: "Pinned", isPinned: true, activeAgentSessionID: UUID()))
+                ]
+            )
+            let projectURL = URL(fileURLWithPath: pinnedWorkspace.repoPaths[0])
+            try FileManager.default.createDirectory(at: projectURL, withIntermediateDirectories: true)
+            let projectFile = projectURL.appendingPathComponent("keep.txt")
+            try Data("user project".utf8).write(to: projectFile)
+            try writeWorkspace(pinnedWorkspace)
+            try writeLegacyIndex([pinnedWorkspace])
+
+            let runtime = MCPDomainRuntime(configuration: .init(
+                mode: .app,
+                profileIdentifier: "workspace-single-delete-protection-\(UUID().uuidString)",
+                storageDirectory: storageRoot.appendingPathComponent("runtime-state", isDirectory: true),
+                workspaceStorageDirectory: storageRoot,
+                eventDirectory: storageRoot.appendingPathComponent("events", isDirectory: true),
+                temporaryDirectory: storageRoot.appendingPathComponent("tmp", isDirectory: true),
+                externalReloadInterval: nil
+            ))
+            try await runtime.start()
+            defer { Task { _ = await runtime.shutdown() } }
+
+            let manager = makeManager(
+                windowID: -767,
+                domainWorkspaceAuthorityClient: DomainWorkspaceAuthorityClient(
+                    store: runtime.workspaceStore,
+                    windowID: -767
+                )
+            )
+            await manager.awaitInitialized()
+
+            let activation = await manager.switchWorkspace(to: pinnedWorkspace, saveState: false)
+            XCTAssertTrue(activation.didSwitch)
+            let sessions = DeletionSessionProvider()
+            manager.registerSwitchSessionProvider(sessions)
+            let pendingSaveURL = manager.workspaceFileURL(for: pinnedWorkspace)
+            manager.setWorkspaceDeleteWillExecuteHandlerForTesting { workspaceID in
+                guard workspaceID == pinnedWorkspace.id else { return }
+                var finalSave = pinnedWorkspace
+                finalSave.name = "Final background save"
+                let client = DomainWorkspaceAuthorityClient(store: runtime.workspaceStore, windowID: -767)
+                do {
+                    let saved = try await client.replaceWorking(
+                        finalSave,
+                        fileURL: pendingSaveURL,
+                        expectedWorkspaceRevision: nil
+                    )
+                    XCTAssertEqual(saved.disposition, .applied)
+                } catch {
+                    XCTFail("Could not publish the pending workspace save: \(error)")
+                }
+            }
+            let deletion = await manager.deleteWorkspacesAsync(
+                workspaceIDs: [pinnedWorkspace.id], closeOpenWorkspaces: true
+            )
+            manager.setWorkspaceDeleteWillExecuteHandlerForTesting(nil)
+            XCTAssertEqual(deletion.deletedWorkspaceIDs, [pinnedWorkspace.id], "\(deletion)")
+            XCTAssertTrue(manager.activeWorkspace?.isSystemWorkspace == true)
+            XCTAssertTrue(sessions.wasCancelled)
+            XCTAssertFalse(manager.hasPendingSwitchConfirmation)
+            XCTAssertEqual(try String(contentsOf: projectFile, encoding: .utf8), "user project")
+            let authoritativeAfter = await runtime.workspaceStore.snapshot()
+            XCTAssertFalse(authoritativeAfter.workspaces.contains {
+                $0.document.workspaceID == pinnedWorkspace.id
+            })
+        }
+
+        func testConfirmedDeleteBoundsPendingWorkspaceCreationAndReleasesLease() async throws {
+            let runtime = try await makeRuntime(profileIdentifier: "workspace-delete-creation-timeout")
+            defer { Task { _ = await runtime.shutdown() } }
+
+            let coordinator = WorkspaceActivityCoordinator(confirmedDeletionTimeout: .milliseconds(100))
+            let manager = makeManager(
+                windowID: -764,
+                domainWorkspaceAuthorityClient: DomainWorkspaceAuthorityClient(
+                    store: runtime.workspaceStore,
+                    windowID: -764
+                ),
+                workspaceActivityCoordinator: coordinator
+            )
+            await manager.awaitInitialized()
+
+            let created = manager.createWorkspace(name: "Pending deletion", repoPaths: [])
+            let createdID = created.id
+            let savePrepared = expectation(description: "creation save prepared")
+            let gate = WorkspaceDeleteSuspensionGate()
+            manager.setWorkspaceSavePreparationDidFinishHandlerForTesting { workspaceID, _, _ in
+                guard workspaceID == createdID else { return }
+                savePrepared.fulfill()
+                await gate.wait()
+            }
+            await fulfillment(of: [savePrepared], timeout: 2)
+
+            let deletionFinished = expectation(description: "confirmed deletion returns after timeout")
+            let deletionTask = Task {
+                defer { deletionFinished.fulfill() }
+                return await manager.deleteWorkspacesAsync(
+                    workspaceIDs: [created.id],
+                    closeOpenWorkspaces: true
+                )
+            }
+            await fulfillment(of: [deletionFinished], timeout: 2)
+            await gate.open()
+            let deletion = await deletionTask.value
+            manager.setWorkspaceSavePreparationDidFinishHandlerForTesting(nil)
+
+            XCTAssertTrue(deletion.deletedWorkspaceIDs.isEmpty, "A timed-out creation must not be deleted")
+            XCTAssertTrue(
+                deletion.skippedReasonsByWorkspaceID[created.id]?.contains("timeout") == true,
+                "Expected a bounded deletion failure, got \(deletion)"
+            )
+
+            await manager.finishWorkspaceCreation(workspaceIDs: [created.id])
+            let authoritativeAfterCreation = await runtime.workspaceStore.snapshot()
+            XCTAssertTrue(authoritativeAfterCreation.workspaces.contains {
+                $0.document.workspaceID == created.id
+            })
+            let retry = await manager.deleteWorkspacesAsync(
+                workspaceIDs: [created.id],
+                closeOpenWorkspaces: true
+            )
+            XCTAssertEqual(retry.deletedWorkspaceIDs, [created.id], "The timed-out claim must permit a confirmed retry")
+        }
+
+        func testConfirmedDeleteTimeoutCannotCloseAWorkspaceAfterLateSessionCancellation() async throws {
+            let target = WorkspaceModel(
+                name: "Gated deletion target",
+                repoPaths: [storageRoot.appendingPathComponent("gated-repo").path]
+            )
+            try writeWorkspace(target)
+            try writeLegacyIndex([target])
+
+            let runtime = try await makeRuntime(profileIdentifier: "workspace-delete-session-timeout")
+            defer { Task { _ = await runtime.shutdown() } }
+
+            let coordinator = WorkspaceActivityCoordinator(confirmedDeletionTimeout: .milliseconds(100))
+            let manager = makeManager(
+                windowID: -763,
+                domainWorkspaceAuthorityClient: DomainWorkspaceAuthorityClient(
+                    store: runtime.workspaceStore,
+                    windowID: -763
+                ),
+                workspaceActivityCoordinator: coordinator
+            )
+            await manager.awaitInitialized()
+            let targetInManager = try XCTUnwrap(manager.workspace(withID: target.id))
+            let activation = await manager.switchWorkspace(to: targetInManager, saveState: false)
+            XCTAssertTrue(activation.didSwitch, "Expected the deletion target to be active")
+
+            let gate = WorkspaceDeleteSuspensionGate()
+            let sessions = GatedDeletionSessionProvider(gate: gate)
+            manager.registerSwitchSessionProvider(sessions)
+
+            let deletionFinished = expectation(description: "confirmed deletion returns while provider is gated")
+            let deletionTask = Task {
+                defer { deletionFinished.fulfill() }
+                return await manager.deleteWorkspacesAsync(
+                    workspaceIDs: [target.id],
+                    closeOpenWorkspaces: true
+                )
+            }
+            await fulfillment(of: [sessions.cancellationStarted], timeout: 2)
+            await fulfillment(of: [deletionFinished], timeout: 2)
+            XCTAssertFalse(sessions.wasCancelled, "The gated provider must still be suspended at timeout")
+
+            let unrelated = manager.createEphemeralWorkspace(name: "Unrelated workspace", repoPaths: [])
+            let unrelatedSwitch = await manager.switchWorkspace(to: unrelated, saveState: false)
+            XCTAssertTrue(unrelatedSwitch.didSwitch, "The timed-out delete must release the window for a new switch")
+
+            let retry = await manager.deleteWorkspacesAsync(
+                workspaceIDs: [target.id],
+                closeOpenWorkspaces: true
+            )
+            XCTAssertEqual(retry.deletedWorkspaceIDs, [target.id])
+
+            await gate.open()
+            let deletion = await deletionTask.value
+            XCTAssertTrue(deletion.deletedWorkspaceIDs.isEmpty)
+            XCTAssertTrue(deletion.skippedReasonsByWorkspaceID[target.id]?.contains("timeout") == true)
+            await fulfillment(of: [sessions.cancellationFinished], timeout: 2)
+            XCTAssertEqual(manager.activeWorkspaceID, unrelated.id)
+            let authoritativeAfter = await runtime.workspaceStore.snapshot()
+            XCTAssertFalse(authoritativeAfter.workspaces.contains {
+                $0.document.workspaceID == target.id
+            })
+        }
+
+        func testConfirmedDeleteTimeoutCannotPublishALateFallbackWorkspace() async throws {
+            let target = WorkspaceModel(
+                name: "Late fallback target",
+                repoPaths: [storageRoot.appendingPathComponent("late-fallback-repo").path]
+            )
+            try writeWorkspace(target)
+            try writeLegacyIndex([target])
+
+            let runtime = try await makeRuntime(profileIdentifier: "workspace-delete-late-fallback")
+            defer { Task { _ = await runtime.shutdown() } }
+
+            let coordinator = WorkspaceActivityCoordinator(confirmedDeletionTimeout: .milliseconds(100))
+            let manager = makeManager(
+                windowID: -760,
+                domainWorkspaceAuthorityClient: DomainWorkspaceAuthorityClient(
+                    store: runtime.workspaceStore,
+                    windowID: -760
+                ),
+                workspaceActivityCoordinator: coordinator
+            )
+            await manager.awaitInitialized()
+            let targetInManager = try XCTUnwrap(manager.workspace(withID: target.id))
+            let activation = await manager.switchWorkspace(to: targetInManager, saveState: false)
+            XCTAssertTrue(activation.didSwitch, "Expected the deletion target to be active")
+            let fallback = manager.getOrCreateSystemWorkspace()
+
+            var publishedWorkspaceIDs: [UUID] = []
+            let listenerToken = manager.addWorkspaceDidSwitchListener(label: "late-fallback-test") { workspace in
+                if let workspace {
+                    publishedWorkspaceIDs.append(workspace.id)
+                }
+            }
+            defer { manager.removeWorkspaceDidSwitchListener(listenerToken) }
+
+            let fallbackLoadStarted = expectation(description: "fallback reached publication gate")
+            let fallbackSwitchFinished = expectation(description: "late fallback operation finished")
+            let gate = WorkspaceDeleteSuspensionGate()
+            manager.setWorkspaceSwitchBeforeActiveWorkspacePublicationHandlerForTesting { workspaceID in
+                guard workspaceID == fallback.id else { return }
+                fallbackLoadStarted.fulfill()
+                await gate.wait()
+            }
+            manager.setWorkspaceSwitchDidFinishHandlerForTesting { _ in
+                fallbackSwitchFinished.fulfill()
+            }
+
+            let deletionFinished = expectation(description: "confirmed deletion returns after fallback timeout")
+            let deletionTask = Task {
+                defer { deletionFinished.fulfill() }
+                return await manager.deleteWorkspacesAsync(
+                    workspaceIDs: [target.id],
+                    closeOpenWorkspaces: true
+                )
+            }
+            await fulfillment(of: [fallbackLoadStarted, deletionFinished], timeout: 2)
+            let deletion = await deletionTask.value
+            XCTAssertTrue(deletion.deletedWorkspaceIDs.isEmpty, "\(deletion)")
+            XCTAssertTrue(
+                deletion.skippedReasonsByWorkspaceID[target.id]?.contains("timeout") == true,
+                "Expected the fallback switch to time out, got \(deletion)"
+            )
+            XCTAssertEqual(manager.activeWorkspaceID, target.id)
+
+            await gate.open()
+            await fulfillment(of: [fallbackSwitchFinished], timeout: 2)
+            manager.setWorkspaceSwitchBeforeActiveWorkspacePublicationHandlerForTesting(nil)
+            manager.setWorkspaceSwitchDidFinishHandlerForTesting(nil)
+
+            XCTAssertEqual(manager.activeWorkspaceID, target.id)
+            XCTAssertFalse(
+                publishedWorkspaceIDs.contains(fallback.id),
+                "A timed-out deletion must not publish a late fallback activation"
+            )
+            let authoritativeAfter = await runtime.workspaceStore.snapshot()
+            XCTAssertTrue(authoritativeAfter.workspaces.contains {
+                $0.document.workspaceID == target.id
+            })
+        }
+
+        func testConfirmedDeleteReturnsRetryableBusyForAnAlreadyRunningSwitch() async throws {
+            let previous = WorkspaceModel(
+                name: "Previous workspace",
+                repoPaths: [storageRoot.appendingPathComponent("previous-repo").path]
+            )
+            let target = WorkspaceModel(
+                name: "Cancelled switch target",
+                repoPaths: [storageRoot.appendingPathComponent("cancelled-switch-repo").path]
+            )
+            try writeWorkspace(previous)
+            try writeWorkspace(target)
+            try writeLegacyIndex([previous, target])
+
+            let runtime = try await makeRuntime(profileIdentifier: "workspace-delete-cancelled-switch")
+            defer { Task { _ = await runtime.shutdown() } }
+
+            let coordinator = WorkspaceActivityCoordinator(confirmedDeletionTimeout: .milliseconds(100))
+            let manager = makeManager(
+                windowID: -759,
+                domainWorkspaceAuthorityClient: DomainWorkspaceAuthorityClient(
+                    store: runtime.workspaceStore,
+                    windowID: -759
+                ),
+                workspaceActivityCoordinator: coordinator
+            )
+            await manager.awaitInitialized()
+            let previousInManager = try XCTUnwrap(manager.workspace(withID: previous.id))
+            let targetInManager = try XCTUnwrap(manager.workspace(withID: target.id))
+            let previousActivation = await manager.switchWorkspace(to: previousInManager, saveState: false)
+            XCTAssertTrue(previousActivation.didSwitch, "Expected the previous workspace to be active")
+
+            let targetPublicationStarted = expectation(description: "target switch reached publication gate")
+            let targetPublicationGate = WorkspaceDeleteSuspensionGate()
+            manager.setWorkspaceSwitchBeforeActiveWorkspacePublicationHandlerForTesting { workspaceID in
+                guard workspaceID == target.id else { return }
+                targetPublicationStarted.fulfill()
+                await targetPublicationGate.wait()
+            }
+
+            let switchTask = Task {
+                await manager.switchWorkspace(to: targetInManager, saveState: false)
+            }
+            await fulfillment(of: [targetPublicationStarted], timeout: 2)
+
+            let deletionFinished = expectation(description: "deletion returns while switch is active")
+            let deletionTask = Task {
+                defer { deletionFinished.fulfill() }
+                return await manager.deleteWorkspacesAsync(
+                    workspaceIDs: [target.id],
+                    closeOpenWorkspaces: true
+                )
+            }
+            await fulfillment(of: [deletionFinished], timeout: 2)
+            let deletion = await deletionTask.value
+            XCTAssertTrue(deletion.deletedWorkspaceIDs.isEmpty, "\(deletion)")
+            XCTAssertTrue(
+                deletion.skippedReasonsByWorkspaceID[target.id]?.contains("in progress") == true,
+                "Expected a retryable busy result, got \(deletion)"
+            )
+            XCTAssertEqual(manager.activeWorkspaceID, previous.id)
+            XCTAssertEqual(manager.activeWorkspaceSwitch?.targetWorkspaceID, target.id)
+
+            await targetPublicationGate.open()
+            let switchResult = await switchTask.value
+            manager.setWorkspaceSwitchBeforeActiveWorkspacePublicationHandlerForTesting(nil)
+
+            XCTAssertTrue(switchResult.didSwitch, "Deletion must not cancel the user's switch")
+            XCTAssertEqual(manager.activeWorkspaceID, target.id)
+            let authoritativeAfter = await runtime.workspaceStore.snapshot()
+            XCTAssertTrue(authoritativeAfter.workspaces.contains {
+                $0.document.workspaceID == target.id
+            })
+        }
+
+        func testDirectSaveRejectsDeletionObservedAfterAuthoritySnapshot() async throws {
+            let target = WorkspaceModel(
+                name: "Stale rename target",
+                repoPaths: [storageRoot.appendingPathComponent("stale-rename-repo").path]
+            )
+            try writeWorkspace(target)
+            try writeLegacyIndex([target])
+
+            let runtime = try await makeRuntime(profileIdentifier: "workspace-stale-direct-save")
+            defer { Task { _ = await runtime.shutdown() } }
+
+            let manager = makeManager(
+                windowID: -761,
+                domainWorkspaceAuthorityClient: DomainWorkspaceAuthorityClient(
+                    store: runtime.workspaceStore,
+                    windowID: -761
+                )
+            )
+            await manager.awaitInitialized()
+            let targetInManager = try XCTUnwrap(manager.workspace(withID: target.id))
+            var staleRename = targetInManager
+            staleRename.name = "Stale rename after deletion"
+
+            let snapshotCaptured = expectation(description: "direct save observed the authority snapshot")
+            let gate = WorkspaceDeleteSuspensionGate()
+            manager.setWorkspaceSaveAfterAuthoritySnapshotHandlerForTesting { workspaceID in
+                guard workspaceID == target.id else { return }
+                snapshotCaptured.fulfill()
+                await gate.wait()
+            }
+            let saveTask = Task {
+                () -> (
+                    succeeded: Bool,
+                    authorityOutcome: DomainCommandOutcome?,
+                    workingCommitted: Bool,
+                    localProjectionPresentAtFailure: Bool,
+                    errorDescription: String?
+                ) in
+                do {
+                    _ = try await manager.saveWorkspaceToFileAsync(
+                        staleRename,
+                        source: .renameWorkspace
+                    )
+                    return (true, nil, false, false, nil)
+                } catch let error as DomainWorkspaceAuthorityOperationError {
+                    return (
+                        false,
+                        error.outcome,
+                        error.workingCommitted,
+                        manager.workspace(withID: target.id) != nil,
+                        nil
+                    )
+                } catch {
+                    return (
+                        false,
+                        nil,
+                        false,
+                        manager.workspace(withID: target.id) != nil,
+                        error.localizedDescription
+                    )
+                }
+            }
+            await fulfillment(of: [snapshotCaptured], timeout: 2)
+            XCTAssertNotNil(
+                manager.workspace(withID: target.id),
+                "The save must retain its local projection while the authority snapshot is suspended."
+            )
+
+            let deletion = await manager.deleteWorkspacesAsync(workspaceIDs: [target.id])
+            XCTAssertEqual(deletion.deletedWorkspaceIDs, [target.id])
+
+            await gate.open()
+            let saveResult = await saveTask.value
+            manager.setWorkspaceSaveAfterAuthoritySnapshotHandlerForTesting(nil)
+            XCTAssertFalse(
+                saveResult.succeeded,
+                "The stale direct save unexpectedly succeeded after confirmed deletion."
+            )
+            if let saveOutcome = saveResult.authorityOutcome {
+                XCTAssertEqual(saveOutcome.disposition, .invalid)
+                XCTAssertEqual(saveOutcome.errorCode, .workspaceUnavailable)
+                XCTAssertFalse(saveResult.workingCommitted)
+                XCTAssertEqual(
+                    WorkspacePersistenceFailureCategory.classify(domainErrorCode: saveOutcome.errorCode),
+                    .workspaceChanged
+                )
+            } else {
+                // WorkspaceDirectWriteError is file-private; its exact localized error is the
+                // only observable signal for the local-projection guard.
+                XCTAssertFalse(
+                    saveResult.localProjectionPresentAtFailure,
+                    "A local unavailable error must follow removal of the manager projection."
+                )
+                XCTAssertEqual(
+                    saveResult.errorDescription,
+                    "The workspace is no longer available for persistence."
+                )
+            }
+
+            let authoritativeAfter = await runtime.workspaceStore.snapshot()
+            XCTAssertFalse(authoritativeAfter.workspaces.contains {
+                $0.document.workspaceID == target.id
+            })
+            XCTAssertFalse(FileManager.default.fileExists(atPath: manager.workspaceFileURL(for: staleRename).path))
         }
 
         func testActivationLeaseBlocksDeletionClaimUntilSwitchCompletes() async throws {
@@ -754,6 +1028,20 @@ import XCTest
             )
         }
 
+        private func makeRuntime(profileIdentifier: String) async throws -> MCPDomainRuntime {
+            let runtime = MCPDomainRuntime(configuration: .init(
+                mode: .app,
+                profileIdentifier: "\(profileIdentifier)-\(UUID().uuidString)",
+                storageDirectory: storageRoot.appendingPathComponent("runtime-state", isDirectory: true),
+                workspaceStorageDirectory: storageRoot,
+                eventDirectory: storageRoot.appendingPathComponent("events", isDirectory: true),
+                temporaryDirectory: storageRoot.appendingPathComponent("tmp", isDirectory: true),
+                externalReloadInterval: nil
+            ))
+            try await runtime.start()
+            return runtime
+        }
+
         private func writeWorkspace(_ workspace: WorkspaceModel) throws {
             let fileURL = workspaceFileURL(for: workspace)
             try FileManager.default.createDirectory(
@@ -819,6 +1107,43 @@ import XCTest
             )
             managers.append(manager)
             return manager
+        }
+    }
+
+    @MainActor
+    private final class DeletionSessionProvider: WorkspaceSwitchSessionProvider {
+        var wasCancelled = false
+        func switchSessionItems() -> [WorkspaceSwitchSessionItem] {
+            wasCancelled ? [] : [.init(id: "test-agent", count: 1, singularLabel: "agent", pluralLabel: "agents")]
+        }
+
+        func cancelSwitchSessions() async {
+            wasCancelled = true
+        }
+    }
+
+    @MainActor
+    private final class GatedDeletionSessionProvider: WorkspaceSwitchSessionProvider {
+        let cancellationStarted = XCTestExpectation(description: "session cancellation started")
+        let cancellationFinished = XCTestExpectation(description: "session cancellation finished")
+        private let gate: WorkspaceDeleteSuspensionGate
+        private(set) var wasCancelled = false
+
+        init(gate: WorkspaceDeleteSuspensionGate) {
+            self.gate = gate
+        }
+
+        func switchSessionItems() -> [WorkspaceSwitchSessionItem] {
+            wasCancelled
+                ? []
+                : [.init(id: "gated-agent", count: 1, singularLabel: "agent", pluralLabel: "agents")]
+        }
+
+        func cancelSwitchSessions() async {
+            cancellationStarted.fulfill()
+            await gate.wait()
+            wasCancelled = true
+            cancellationFinished.fulfill()
         }
     }
 

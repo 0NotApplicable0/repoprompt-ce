@@ -75,7 +75,6 @@ BUILD_CACHE_ENV_KEYS = (
     "ONLY_ACTIVE_ARCH",
     "OTHER_SWIFT_FLAGS",
     "REPOPROMPT_ENABLE_SENTRY",
-    "RPCE_ENABLE_BENCHMARK_TESTS",
     "SDKROOT",
     "SWIFT_EXEC",
     "SWIFTFLAGS",
@@ -3118,17 +3117,8 @@ class OperationRegistry:
         "HOMEBREW_CACHE",
     ]
     TEST_ENV_KEYS = [
-        "RPCE_ENABLE_BENCHMARK_TESTS",
         "RPCE_RUN_CODEMAP_E2E",
         "RPCE_RUN_SCALE_TESTS",
-        "RP_RUN_SWIFT_CODEMAP_PIPELINE_BENCHMARK",
-        "RP_RUN_TYPESCRIPT_CODEMAP_REFERENCE",
-        "RP_TYPESCRIPT_CODEMAP_REFERENCE_MODE",
-        "RP_TYPESCRIPT_CODEMAP_TS_REFERENCE_PATH",
-        "RP_TYPESCRIPT_CODEMAP_TSX_REFERENCE_PATH",
-        "RP_SWIFT_CODEMAP_ALLOWED_REMOVED_CAPTURES",
-        "RP_SWIFT_CODEMAP_REFERENCE_MODE",
-        "RP_SWIFT_CODEMAP_REFERENCE_PATH",
     ]
     CONDUCTOR_ENV_KEYS = [
         "REPOPROMPT_DEV_HEAVY_SLOTS",
@@ -3242,7 +3232,7 @@ class OperationRegistry:
             lanes = ["build", "debugArtifact"] + (["release"] if config == "release" else [])
             return [script("package_app.sh"), config], lanes, cwd, env, effective_timeout
         if operation == "test":
-            argv = ["swift", "test"]
+            argv = [sys.executable, script("ci_app_test_runner.py"), "--local"]
             if args.get("testProduct"):
                 argv.extend(["--test-product", str(args["testProduct"])])
             if args.get("filter"):
