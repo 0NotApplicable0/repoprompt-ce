@@ -285,7 +285,7 @@ frames = [
 payload = "".join(json.dumps(frame, separators=(",", ":")) + "\n" for frame in frames)
 try:
     completed = subprocess.run(
-        [helper],
+        [helper, "--backend", "app"],
         env=environment,
         input=payload,
         text=True,
