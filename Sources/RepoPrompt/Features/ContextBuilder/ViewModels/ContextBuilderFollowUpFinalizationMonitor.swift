@@ -4,27 +4,11 @@ struct ContextBuilderFollowUpFinalizationConfiguration: Equatable {
     let overallTimeout: TimeInterval
     let inactivityTimeout: TimeInterval
     let checkInterval: TimeInterval
-    let streamingInactivityTimeout: TimeInterval
-
-    init(
-        overallTimeout: TimeInterval,
-        inactivityTimeout: TimeInterval,
-        checkInterval: TimeInterval,
-        streamingInactivityTimeout: TimeInterval? = nil
-    ) {
-        self.overallTimeout = overallTimeout
-        self.inactivityTimeout = inactivityTimeout
-        self.checkInterval = checkInterval
-        self.streamingInactivityTimeout = streamingInactivityTimeout ?? inactivityTimeout
-    }
 
     static let production = ContextBuilderFollowUpFinalizationConfiguration(
         overallTimeout: 4 * 60 * 60,
         inactivityTimeout: 10 * 60,
-        checkInterval: 5,
-        // Silent reasoning can legitimately exceed ten minutes. Keep finalization
-        // bounded separately; do not manufacture activity or extend the overall cap.
-        streamingInactivityTimeout: 60 * 60
+        checkInterval: 5
     )
 }
 
@@ -118,10 +102,7 @@ actor ContextBuilderFollowUpFinalizationState {
                 lastEvent: lastEvent
             )
         }
-        let inactivityTimeout = hasEnteredFinalization
-            ? configuration.inactivityTimeout
-            : configuration.streamingInactivityTimeout
-        if inactiveFor >= inactivityTimeout {
+        if inactiveFor >= configuration.inactivityTimeout {
             return ContextBuilderFollowUpTimeoutSnapshot(
                 kind: .inactivity,
                 elapsed: elapsed,
