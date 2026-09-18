@@ -104,8 +104,7 @@ final class ContextBuilderWatchdogStabilityTests: XCTestCase {
                 )
                 return "unexpected success"
             } catch let error as ChatToolError {
-                if case let .internalError(message) = error { return message }
-                return "unexpected ChatToolError: \(error)"
+                return error.message
             } catch {
                 return "unexpected error: \(error)"
             }
@@ -190,7 +189,9 @@ private final class FollowUpWatchdogClock: @unchecked Sendable {
     private let lock = NSLock()
     private var value: TimeInterval = 0
 
-    var now: TimeInterval { lock.withLock { value } }
+    var now: TimeInterval {
+        lock.withLock { value }
+    }
 
     func advance(to time: TimeInterval) {
         lock.withLock { value = time }
@@ -210,7 +211,9 @@ private actor FollowUpWatchdogGate {
         isOpen = true
         let pending = waiters
         waiters.removeAll()
-        for waiter in pending { waiter.resume() }
+        for waiter in pending {
+            waiter.resume()
+        }
     }
 }
 

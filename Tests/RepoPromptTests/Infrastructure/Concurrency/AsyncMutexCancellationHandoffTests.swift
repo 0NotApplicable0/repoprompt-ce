@@ -229,7 +229,9 @@ private actor MutexHandoffGate {
         isOpen = true
         let pending = waiters
         waiters.removeAll()
-        for waiter in pending { waiter.resume() }
+        for waiter in pending {
+            waiter.resume()
+        }
     }
 }
 
@@ -237,8 +239,13 @@ private actor MutexHandoffLog {
     private(set) var bodies: [String] = []
     private(set) var cancellations = 0
 
-    func enter(_ label: String) { bodies.append(label) }
-    func recordCancellation() { cancellations += 1 }
+    func enter(_ label: String) {
+        bodies.append(label)
+    }
+
+    func recordCancellation() {
+        cancellations += 1
+    }
 }
 
 private enum MutexHandoffFailure: Error {

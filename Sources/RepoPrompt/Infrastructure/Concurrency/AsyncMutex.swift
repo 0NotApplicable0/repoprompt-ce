@@ -74,7 +74,9 @@ actor AsyncMutex {
     #if DEBUG
         private var willResumeNextWaiterForTesting: (@Sendable () -> Void)?
 
-        var queuedWaiterCountForTesting: Int { waiters.count }
+        var queuedWaiterCountForTesting: Int {
+            waiters.count
+        }
 
         func setWillResumeNextWaiterForTesting(_ action: @escaping @Sendable () -> Void) {
             willResumeNextWaiterForTesting = action
