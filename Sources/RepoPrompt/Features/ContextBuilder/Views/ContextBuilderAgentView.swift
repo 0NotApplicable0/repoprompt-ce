@@ -890,7 +890,7 @@ struct ContextBuilderAgentView: View {
                     set: { viewModel.questionTimeoutSeconds = $0 }
                 ),
                 analysisTokenBudget: Binding(
-                    get: { min(max(viewModel.analysisTokenBudget, 40000), 200_000) },
+                    get: { ContextBuilderDefaults.normalizedAnalysisTokenBudget(viewModel.analysisTokenBudget) },
                     set: { viewModel.analysisTokenBudget = $0 }
                 ),
                 followUpAnalysisEnabled: Binding(
@@ -1546,7 +1546,8 @@ private struct ContextBuilderSettingsPopover: View {
                                 SettingsBudgetSliderRow(
                                     label: "Target size",
                                     value: $analysisTokenBudget,
-                                    range: 40000 ... 200_000,
+                                    range: Double(ContextBuilderDefaults.analysisTokenBudgetRange.lowerBound)
+                                        ... Double(ContextBuilderDefaults.analysisTokenBudgetRange.upperBound),
                                     isDisabled: isDisabled
                                 )
                             }
