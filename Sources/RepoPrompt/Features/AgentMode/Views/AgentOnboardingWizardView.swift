@@ -1127,16 +1127,29 @@ private struct ProvidersStepView: View {
                 )
 
                 CompactProviderRow(
-                    name: "Grok Build",
-                    icon: "bolt.circle.fill",
-                    description: "xAI Grok Build ACP runtime — Agent Mode and Context Builder via `grok agent stdio`",
-                    isConnected: viewModel.grokBuildConnected,
-                    isLoading: viewModel.isLoadingGrokBuild,
-                    errorText: viewModel.grokBuildError,
-                    setupHint: "Install Grok Build and run 'grok login'",
+                    name: "Antigravity CLI",
+                    icon: "sparkles",
+                    description: "Google's Antigravity (`agy`) CLI — headless one-shot Agent Mode runs with RepoPrompt MCP integration",
+                    isConnected: viewModel.antigravityConnected,
+                    isLoading: viewModel.isLoadingAntigravity,
+                    errorText: viewModel.antigravityError,
+                    setupHint: "Run 'agy' once in terminal",
                     isRecommended: false,
                     requiresPro: false,
-                    onTest: { viewModel.testGrokBuild() }
+                    onTest: { viewModel.testAntigravity() }
+                )
+
+                CompactProviderRow(
+                    name: "Grok CLI",
+                    icon: "bolt.circle.fill",
+                    description: "xAI's Grok (`grok`) CLI — headless one-shot Agent Mode runs with RepoPrompt MCP tools",
+                    isConnected: viewModel.grokConnected,
+                    isLoading: viewModel.isLoadingGrok,
+                    errorText: viewModel.grokError,
+                    setupHint: "Run 'grok login' in terminal",
+                    isRecommended: false,
+                    requiresPro: false,
+                    onTest: { viewModel.testGrok() }
                 )
             }
         }
