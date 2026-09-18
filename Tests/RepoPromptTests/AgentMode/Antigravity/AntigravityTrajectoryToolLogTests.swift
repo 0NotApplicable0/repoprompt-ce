@@ -30,6 +30,33 @@ private actor AntigravityFinalDrainRetryRecorder {
     }
 }
 
+private final class AntigravityTrajectoryTestSignal: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value: Bool
+
+    init(_ value: Bool) {
+        self.value = value
+    }
+
+    func set() {
+        lock.lock()
+        value = true
+        lock.unlock()
+    }
+
+    func snapshot() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return value
+    }
+
+    func waitUntil(_ description: String) async throws {
+        try await AsyncTestWait.waitUntil(description) {
+            self.snapshot()
+        }
+    }
+}
+
 private actor AntigravityLateContextLossWriter {
     private let path: String
     private var appended = false
@@ -390,14 +417,14 @@ final class AntigravityTrajectoryToolLogTests: XCTestCase {
 
         let (stream, continuation) = AsyncThrowingStream<AIStreamResult, Error>.makeStream()
         let (pollGate, pollGateContinuation) = AsyncStream<Void>.makeStream()
-        let firstPoll = AsyncTestCondition(false)
+        let firstPoll = AntigravityTrajectoryTestSignal(false)
         let databaseURL = URL(fileURLWithPath: path)
         let tailTask = Task {
             await AntigravityTrajectoryToolLogStream.tail(
                 into: continuation,
                 locate: { databaseURL },
                 waitBetweenPolls: { _ in
-                    firstPoll.update { $0 = true }
+                    firstPoll.set()
                     var iterator = pollGate.makeAsyncIterator()
                     _ = await iterator.next()
                 }
@@ -408,7 +435,7 @@ final class AntigravityTrajectoryToolLogTests: XCTestCase {
             pollGateContinuation.finish()
             continuation.finish()
         }
-        try await firstPoll.waitUntil("initial trajectory poll") { $0 }
+        try await firstPoll.waitUntil("initial trajectory poll")
 
         // Commit the terminal transition after the first poll. The closed test gate prevents an
         // ordinary second poll, so cancellation itself is the only possible flush signal.
@@ -445,13 +472,13 @@ final class AntigravityTrajectoryToolLogTests: XCTestCase {
         let writer = AntigravityLateContextLossWriter(path: databaseURL.path)
         let (_, continuation) = AsyncThrowingStream<AIStreamResult, Error>.makeStream()
         let (pollGate, pollGateContinuation) = AsyncStream<Void>.makeStream()
-        let firstPoll = AsyncTestCondition(false)
+        let firstPoll = AntigravityTrajectoryTestSignal(false)
         let tailTask = Task {
             await AntigravityTrajectoryToolLogStream.tail(
                 into: continuation,
                 locate: { log.locate() },
                 waitBetweenPolls: { _ in
-                    firstPoll.update { $0 = true }
+                    firstPoll.set()
                     var iterator = pollGate.makeAsyncIterator()
                     _ = await iterator.next()
                 }
@@ -463,7 +490,7 @@ final class AntigravityTrajectoryToolLogTests: XCTestCase {
             continuation.finish()
         }
 
-        try await firstPoll.waitUntil("initial trajectory poll") { $0 }
+        try await firstPoll.waitUntil("initial trajectory poll")
         let didAppend = await writer.appendOnce()
         XCTAssertTrue(didAppend)
         tailTask.cancel()
@@ -481,14 +508,14 @@ final class AntigravityTrajectoryToolLogTests: XCTestCase {
 
         let (stream, continuation) = AsyncThrowingStream<AIStreamResult, Error>.makeStream()
         let (pollGate, pollGateContinuation) = AsyncStream<Void>.makeStream()
-        let didPoll = AsyncTestCondition(false)
+        let didPoll = AntigravityTrajectoryTestSignal(false)
         let databaseURL = URL(fileURLWithPath: path)
         let tailTask = Task {
             await AntigravityTrajectoryToolLogStream.tail(
                 into: continuation,
                 locate: { databaseURL },
                 waitBetweenPolls: { _ in
-                    didPoll.update { $0 = true }
+                    didPoll.set()
                     var iterator = pollGate.makeAsyncIterator()
                     _ = await iterator.next()
                 }
@@ -502,7 +529,7 @@ final class AntigravityTrajectoryToolLogTests: XCTestCase {
 
         // Wait until the ordinary poll has observed the empty DB, then commit a backlog requiring
         // two 500-row pages entirely behind the cancellation synchronization edge.
-        try await didPoll.waitUntil("initial empty trajectory poll") { $0 }
+        try await didPoll.waitUntil("initial empty trajectory poll")
         try insertTerminalTrajectorySteps(at: path, count: 501)
         tailTask.cancel()
         _ = await tailTask.value
@@ -526,13 +553,13 @@ final class AntigravityTrajectoryToolLogTests: XCTestCase {
         let fakeURL = URL(fileURLWithPath: "/tmp/agy-transient-final.db")
         let (stream, continuation) = AsyncThrowingStream<AIStreamResult, Error>.makeStream()
         let (pollGate, pollGateContinuation) = AsyncStream<Void>.makeStream()
-        let firstPoll = AsyncTestCondition(false)
+        let firstPoll = AntigravityTrajectoryTestSignal(false)
         let tailTask = Task {
             await AntigravityTrajectoryToolLogStream.tail(
                 into: continuation,
                 locate: { fakeURL },
                 waitBetweenPolls: { _ in
-                    firstPoll.update { $0 = true }
+                    firstPoll.set()
                     var iterator = pollGate.makeAsyncIterator()
                     _ = await iterator.next()
                 },
@@ -548,7 +575,7 @@ final class AntigravityTrajectoryToolLogTests: XCTestCase {
             continuation.finish()
         }
 
-        try await firstPoll.waitUntil("initial transient trajectory poll") { $0 }
+        try await firstPoll.waitUntil("initial transient trajectory poll")
         tailTask.cancel()
         _ = await tailTask.value
         pollGateContinuation.finish()

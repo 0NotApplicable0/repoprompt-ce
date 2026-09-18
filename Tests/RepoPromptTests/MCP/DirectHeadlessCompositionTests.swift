@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 import MCP
 import RepoPromptDomainRuntime
@@ -6,6 +7,45 @@ import RepoPromptShared
 import XCTest
 
 final class DirectHeadlessCompositionTests: XCTestCase {
+    func testCanonicalDefinitionsMatchReadableGeneratedReviewSnapshot() throws {
+        let root = try RepoRoot.url()
+        let snapshotURL = root.appendingPathComponent("docs/spec/mcp-domain-canonical-tool-definitions.generated.json")
+        let updateMarker = root.appendingPathComponent(".build/update-mcp-domain-schema-review-snapshot")
+        let generated = try MCPDomainCanonicalToolDefinitions.reviewSnapshotData()
+        if FileManager.default.fileExists(atPath: updateMarker.path) {
+            try generated.write(to: snapshotURL, options: .atomic)
+            try FileManager.default.removeItem(at: updateMarker)
+        }
+        XCTAssertEqual(try Data(contentsOf: snapshotURL), generated)
+    }
+
+    func testCanonicalAgentSchemasAdvertiseCursorModelParameterInputs() throws {
+        for toolName in ["agent_run", "agent_manage"] {
+            let definition = try XCTUnwrap(MCPDomainCanonicalToolDefinitions.definition(named: toolName))
+            let schema = try XCTUnwrap(definition.inputSchema.objectValue)
+            let properties = try XCTUnwrap(schema["properties"]?.objectValue)
+            let parameters = try XCTUnwrap(properties["model_parameters"]?.objectValue, toolName)
+            XCTAssertEqual(parameters["type"], .string("array"))
+            let items = try XCTUnwrap(parameters["items"]?.objectValue)
+            XCTAssertEqual(items["required"], .array([.string("config_id"), .string("value")]))
+            let itemProperties = try XCTUnwrap(items["properties"]?.objectValue)
+            XCTAssertEqual(itemProperties["config_id"]?.objectValue?["type"], .string("string"))
+            XCTAssertEqual(itemProperties["value"]?.objectValue?["type"], .string("string"))
+            XCTAssertTrue(definition.description.contains("model_parameters"), toolName)
+        }
+    }
+
+    func testHeadlessLaunchRejectsUnsupportedModelParametersBeforeProviderStartup() throws {
+        XCTAssertThrowsError(try DirectHeadlessProviderCoordinator.resolvedLaunchMessage(args: [
+            "message": .string("Reply OK"),
+            "model_parameters": .array([
+                .object(["config_id": .string("effort"), "value": .string("low")])
+            ])
+        ])) { error in
+            XCTAssertTrue(error.localizedDescription.contains("app-backed Cursor"))
+        }
+    }
+
     func testHeadlessAgentManageSchemaAdvertisesListWorkflows() throws {
         let definition = try XCTUnwrap(MCPDomainCanonicalToolDefinitions.definition(named: "agent_manage"))
         let encoded = try JSONEncoder().encode(definition.inputSchema)
@@ -61,13 +101,93 @@ final class DirectHeadlessCompositionTests: XCTestCase {
     }
 
     func testHeadlessCodexExecUsesWorkspaceWriteWithoutRemovedFullAutoFlag() {
-        let arguments = DirectHeadlessProviderCoordinator.codexExecArguments(model: nil)
+        let arguments = DirectHeadlessProviderCoordinator.codexExecArguments(model: nil, purpose: .agent)
 
         XCTAssertFalse(arguments.contains("--full-auto"))
         XCTAssertEqual(
             Array(arguments.suffix(5)),
             ["--skip-git-repo-check", "--sandbox", "workspace-write", "--json", "-"]
         )
+    }
+
+    func testDirectHeadlessOracleCodexExecUsesWorkspaceWriteSandbox() {
+        let arguments = DirectHeadlessProviderCoordinator.codexExecArguments(model: nil, purpose: .directOracle)
+
+        XCTAssertEqual(
+            Array(arguments.suffix(5)),
+            ["--skip-git-repo-check", "--sandbox", "workspace-write", "--json", "-"]
+        )
+    }
+
+    func testGroupedHeadlessOracleCodexExecUsesReadOnlySandbox() {
+        let arguments = DirectHeadlessProviderCoordinator.codexExecArguments(model: nil, purpose: .oracleGroup)
+
+        XCTAssertEqual(
+            Array(arguments.suffix(5)),
+            ["--skip-git-repo-check", "--sandbox", "read-only", "--json", "-"]
+        )
+    }
+
+    func testGroupedOracleChildPolicyIsStrictlyReadOnly() {
+        let groupID = OracleGroupID()
+        let restricted = DirectHeadlessMCPService.childRestrictedToolNames(
+            base: [],
+            oracleGroupID: groupID
+        )
+        let visible = Set(MCPDomainToolCatalog.orderedToolNames).subtracting(restricted)
+
+        XCTAssertEqual(visible, DirectHeadlessMCPService.oracleGroupChildAllowedToolNames)
+        let allowedCapabilities = Set(visible.compactMap { MCPDomainToolCatalog.entry(named: $0)?.capability })
+        XCTAssertEqual(
+            allowedCapabilities,
+            [.structuralExplore, .fileRead, .fileSearch, .gitRead]
+        )
+        XCTAssertEqual(MCPDomainToolCatalog.entry(named: MCPWindowToolName.git)?.capability, .gitRead)
+        XCTAssertTrue(restricted.contains(MCPGlobalToolName.appSettings))
+        XCTAssertTrue(restricted.contains(MCPWindowToolName.agentExplore))
+        XCTAssertTrue(restricted.contains(MCPWindowToolName.agentRun))
+        XCTAssertTrue(restricted.contains(MCPWindowToolName.contextBuilder))
+        XCTAssertTrue(restricted.contains(MCPWindowToolName.applyEdits))
+        XCTAssertTrue(restricted.contains(MCPWindowToolName.fileActions))
+        XCTAssertTrue(restricted.contains(MCPWindowToolName.manageWorktree))
+
+        let inherited = Set([MCPWindowToolName.readFile])
+        XCTAssertTrue(DirectHeadlessMCPService.childRestrictedToolNames(
+            base: inherited,
+            oracleGroupID: groupID
+        ).contains(MCPWindowToolName.readFile))
+        XCTAssertEqual(
+            DirectHeadlessMCPService.childRestrictedToolNames(
+                base: inherited,
+                oracleGroupID: nil
+            ),
+            inherited
+        )
+    }
+
+    func testChildBridgeWriteTimeoutIsBoundedWhenDestinationStalls() throws {
+        var descriptors = [Int32](repeating: -1, count: 2)
+        XCTAssertEqual(Darwin.pipe(&descriptors), 0)
+        defer {
+            if descriptors[0] >= 0 { Darwin.close(descriptors[0]) }
+            if descriptors[1] >= 0 { Darwin.close(descriptors[1]) }
+        }
+
+        let payload = Data(repeating: 0x41, count: 1_000_000)
+        let clock = ContinuousClock()
+        let started = clock.now
+        XCTAssertThrowsError(
+            try DirectHeadlessChildBridge.writeAll(
+                payload,
+                to: descriptors[1],
+                stallTimeout: 0.05
+            )
+        ) { error in
+            guard case DirectHeadlessChildBridge.BridgeError.writeTimeout = error else {
+                return XCTFail("Expected writeTimeout, got \(error)")
+            }
+        }
+        XCTAssertTrue(started.duration(to: clock.now) < .seconds(2))
     }
 
     func testManageWorktreeFencesAbsoluteSelectorsToBoundWorkspaceRoots() throws {
@@ -85,6 +205,50 @@ final class DirectHeadlessCompositionTests: XCTestCase {
         ) { error in
             XCTAssertTrue(error.localizedDescription.contains("outside the bound workspace roots"), error.localizedDescription)
         }
+    }
+
+    func testHeadlessResolverRejectsEscapedJSONNULWithoutWritingPrefix() throws {
+        let fileManager = FileManager.default
+        let container = fileManager.temporaryDirectory
+            .appendingPathComponent("rp-headless-nul-\(UUID().uuidString)", isDirectory: true)
+        let root = container.appendingPathComponent("authorized-root", isDirectory: true)
+        let outside = container.appendingPathComponent("outside", isDirectory: true)
+        let prefix = root.appendingPathComponent("prefix")
+        let original = Data("original bytes\n".utf8)
+        try fileManager.createDirectory(at: root, withIntermediateDirectories: true)
+        try fileManager.createDirectory(at: outside, withIntermediateDirectories: true)
+        try original.write(to: prefix)
+        defer { try? fileManager.removeItem(at: container) }
+
+        let rawPath = "prefix\0/created.txt"
+        let encoded = try JSONEncoder().encode([
+            "action": Value.string("create"),
+            "path": Value.string(rawPath),
+            "content": Value.string("must not be written")
+        ])
+        let decoded = try JSONDecoder().decode([String: Value].self, from: encoded)
+        let decodedPath = try XCTUnwrap(decoded["path"]?.stringValue)
+        XCTAssertTrue(String(data: encoded, encoding: .utf8)?.contains("\\u0000") == true)
+        XCTAssertEqual(
+            try DirectHeadlessDomainContext.resolvePath("prefix", roots: [root]).path,
+            prefix.path
+        )
+
+        do {
+            let resolved = try DirectHeadlessDomainContext.resolvePath(
+                decodedPath,
+                roots: [root],
+                allowMissingLeaf: true
+            )
+            try Data("must not be written".utf8).write(to: resolved)
+            XCTFail("embedded NUL path must be rejected before any write")
+        } catch {
+            XCTAssertTrue(error.localizedDescription.contains("outside the bound workspace roots"), String(describing: error))
+        }
+
+        XCTAssertEqual(try Data(contentsOf: prefix), original)
+        XCTAssertFalse(fileManager.fileExists(atPath: root.appendingPathComponent("created.txt").path))
+        XCTAssertFalse(fileManager.fileExists(atPath: outside.appendingPathComponent("created.txt").path))
     }
 
     func testHeadlessMergeMutationRejectsPreviewEndpointMovedOutsideViaSymlink() throws {

@@ -224,6 +224,19 @@ struct AgentPermissionCapabilitySummaryBuilder {
             )
         case .grok:
             let level = grokPermissionLevel(profile: profile)
+            if level == .storedPermissionUnavailable {
+                return AgentPermissionCapabilitySummary(
+                    providerID: providerID,
+                    providerName: providerID.displayName,
+                    isAvailable: false,
+                    fileMutation: "Unavailable: stored permissions unsupported",
+                    shell: "Not launched",
+                    externalMCP: "Not launched",
+                    search: "Not launched",
+                    approvalModeDescription: "Reset permissions before running Grok",
+                    warnings: [level.detailText]
+                )
+            }
             let warnings = level.useSandbox
                 ? ["Grok auto-approves every native and configured MCP tool request. Its workspace sandbox does not contain external MCP side effects."]
                 : ["Grok auto-approves every native and configured MCP tool request with no sandbox."]

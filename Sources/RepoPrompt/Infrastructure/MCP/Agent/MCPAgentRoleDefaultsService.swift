@@ -71,7 +71,7 @@ enum MCPAgentRoleDefaultsService {
             case .none:
                 nil
             case .unavailable:
-                "Saved pin unavailable; using recommended default."
+                "Saved pin unavailable; choose another model or clear the pin before running."
             case let .custom(recommendedDisplayName):
                 "Recommended: \(recommendedDisplayName)"
             case .pinnedToRecommended:
@@ -270,11 +270,16 @@ enum MCPAgentRoleDefaultsService {
         codexDynamicModels: [CodexAppServerClient.RemoteModel]?
     ) -> RoleDefaultResolution? {
         guard let taskLabel = AgentModelCatalog.taskLabel(for: kind) else { return nil }
+        let storedSelection = overrides?[kind.rawValue].flatMap(AgentModelSelectionID.parse).flatMap { parsed in
+            AgentProviderKind(rawValue: parsed.agentRaw).map {
+                AgentModelCatalog.NormalizedAgentSelection(agent: $0, modelRaw: parsed.modelRaw)
+            }
+        }
         guard let recommended = resolvedRecommendedSelection(
             for: kind,
             recommendedAvailability: recommendedAvailability,
             fallbackAvailability: availability
-        ) else {
+        ) ?? storedSelection else {
             return nil
         }
 
@@ -299,7 +304,7 @@ enum MCPAgentRoleDefaultsService {
                 effective = sel
                 hasCustomOverride = (sel != recommended)
             } else {
-                effective = recommended
+                effective = AgentModelCatalog.NormalizedAgentSelection(agent: agent, modelRaw: parsed.modelRaw)
                 hasCustomOverride = true
                 overrideUnavailable = true
             }

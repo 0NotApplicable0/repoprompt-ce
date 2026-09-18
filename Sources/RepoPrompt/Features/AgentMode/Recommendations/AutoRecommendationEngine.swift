@@ -333,8 +333,7 @@ final class AutoRecommendationEngine {
         return nil
     }
 
-    /// Restores a saved Context Builder selection only when both provider and model are currently usable.
-    /// Invalid or unavailable persisted values fall back through the same recommendation ranking as the wizard.
+    /// Restored CLI identities are preserved for explicit execution validation, not silently replaced.
     static func resolveContextBuilderSelection(
         persistedAgentRaw: String?,
         persistedModelRaw: String?,
@@ -342,16 +341,29 @@ final class AutoRecommendationEngine {
         enabledRecommendationProviders: Set<RecommendationProviderKind> = Set(RecommendationProviderKind.allCases)
     ) -> AgentModelCatalog.NormalizedAgentSelection? {
         if let agentRaw = persistedAgentRaw?.trimmingCharacters(in: .whitespacesAndNewlines),
+           let agent = AgentProviderKind(rawValue: agentRaw),
+           agent.preservesSavedSelection
+        {
+            return AgentModelCatalog.normalizePersistedSelection(
+                agentRaw: agentRaw,
+                modelRaw: persistedModelRaw,
+                availability: availability,
+                surface: .headless
+            )
+        }
+        if let agentRaw = persistedAgentRaw?.trimmingCharacters(in: .whitespacesAndNewlines),
            let modelRaw = persistedModelRaw?.trimmingCharacters(in: .whitespacesAndNewlines),
            let agent = AgentProviderKind(rawValue: agentRaw),
            !modelRaw.isEmpty,
+           AgentModelCatalog.AgentSelectionSurface.headless.allows(agent),
            AgentModelCatalog.isAgentAvailable(agent, availability: availability),
            isValidPersistedContextBuilderModel(modelRaw, for: agent, availability: availability)
         {
             return AgentModelCatalog.normalizeSelection(
                 agentRaw: agent.rawValue,
                 modelRaw: modelRaw,
-                availability: availability
+                availability: availability,
+                surface: .headless
             )
         }
 
@@ -366,11 +378,15 @@ final class AutoRecommendationEngine {
             return AgentModelCatalog.normalizeSelection(
                 agentRaw: recommendation.recommendedAgent.rawValue,
                 modelRaw: recommendation.recommendedModel.rawValue,
-                availability: availability
+                availability: availability,
+                surface: .headless
             )
         }
 
-        guard let availableAgent = AgentModelCatalog.selectableAgents(availability: availability).first(where: {
+        guard let availableAgent = AgentModelCatalog.selectableAgents(
+            availability: availability,
+            surface: .headless
+        ).first(where: {
             switch $0 {
             case .claudeCode:
                 enabledRecommendationProviders.contains(.claudeCode)
@@ -378,8 +394,10 @@ final class AutoRecommendationEngine {
                 enabledRecommendationProviders.contains(.codex)
             case .cursor:
                 enabledRecommendationProviders.contains(.cursor)
-            case .openCode, .claudeCodeGLM, .kimiCode, .customClaudeCompatible, .antigravity, .grok, .grokBuild:
+            case .openCode, .claudeCodeGLM, .kimiCode, .customClaudeCompatible, .antigravity, .grok:
                 true
+            case .grokBuild:
+                false
             }
         }) else {
             return nil

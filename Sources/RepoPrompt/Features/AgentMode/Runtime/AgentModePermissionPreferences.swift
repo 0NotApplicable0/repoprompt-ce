@@ -60,6 +60,7 @@ enum AgentModePermissionPreferences {
         defaults: UserDefaults = .standard,
         secureStore: AgentPermissionSecureStore? = nil
     ) {
+        if case .grok(.storedPermissionUnavailable) = level { return }
         let normalizedLevel: AgentProviderPermissionLevelID = if level.providerID != providerID {
             AgentProviderPermissionLevelID.subagentDefault(for: providerID)
         } else if case .antigravity(.safeManagedUnavailable) = level {
@@ -117,6 +118,11 @@ enum AgentModePermissionPreferences {
            let level = AgentProviderPermissionLevelID(providerID: providerID, subagentRawValue: raw)
         {
             return level
+        }
+        if providerID == .grok,
+           defaults.object(forKey: providerPermissionLevelKey(for: providerID)) != nil
+        {
+            return .grok(.storedPermissionUnavailable)
         }
         return AgentProviderPermissionLevelID.subagentDefault(for: providerID)
     }

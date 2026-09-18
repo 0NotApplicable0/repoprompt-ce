@@ -6,6 +6,7 @@ struct CLIProvidersSettingsView: View {
     @ObservedObject var promptViewModel: PromptViewModel
     @ObservedObject private var codexSessionFence = CodexManagedSessionFence.shared
     let windowID: Int
+    private let codexRuntimeActiveSelection: CodexRuntimePreferences.Selection
     var onAPIKeyUpdated: (() -> Void)?
     var closeAction: (() -> Void)?
     /// Optional navigation callback so provider cards can deep-link into Agent Permissions
@@ -28,6 +29,7 @@ struct CLIProvidersSettingsView: View {
         self.viewModel = viewModel
         self.promptViewModel = promptViewModel
         self.windowID = windowID
+        codexRuntimeActiveSelection = CodexRuntimePreferences.activeSelection
         self.onAPIKeyUpdated = onAPIKeyUpdated
         self.closeAction = closeAction
         self.onNavigate = onNavigate
@@ -65,6 +67,10 @@ struct CLIProvidersSettingsView: View {
     @State private var isKimiCodeExpanded: Bool = false
     @State private var isCustomCompatibleExpanded: Bool = false
     @State private var isCodexExpanded: Bool = false
+    @State private var isCodexRuntimeAdvancedExpanded: Bool = false
+    @State private var codexRuntimePendingSelection = CodexRuntimePreferences.selection()
+    @State private var codexRuntimePreflight: CodexProviderHelpers.CodexRuntimeSettingsPreflight?
+    @State private var isLoadingCodexRuntimePreflight = false
     @State private var isOpenCodeExpanded: Bool = false
     @State private var isCursorExpanded: Bool = false
     @State private var isAntigravityExpanded = false
@@ -1564,6 +1570,254 @@ struct CLIProvidersSettingsView: View {
         .fixedSize(horizontal: false, vertical: true)
     }
 
+    private var codexRuntimeSelectionControl: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(alignment: .top, spacing: 8) {
+                Image(systemName: "shippingbox.fill")
+                    .foregroundColor(.secondary)
+
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Included with RepoPrompt")
+                        .font(.subheadline)
+                        .fontWeight(.semibold)
+                    Text("Codex \(CodexRuntimeAuthority.bundledVersion.description)")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                }
+
+                Spacer()
+
+                if isLoadingCodexRuntimePreflight {
+                    ProgressView()
+                        .controlSize(.small)
+                } else if codexRuntimePreflight?.bundledResolution.status == .available {
+                    Label("Ready", systemImage: "checkmark.circle.fill")
+                        .font(.caption)
+                        .foregroundColor(.green)
+                } else {
+                    Label("Unavailable", systemImage: "exclamationmark.triangle.fill")
+                        .font(.caption)
+                        .foregroundColor(.red)
+                }
+            }
+
+            if !isLoadingCodexRuntimePreflight,
+               let bundledResolution = codexRuntimePreflight?.bundledResolution,
+               bundledResolution.status != .available
+            {
+                Text(bundledResolution.userMessage)
+                    .font(.caption)
+                    .foregroundColor(.red)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            if !isLoadingCodexRuntimePreflight, let preflight = codexRuntimePreflight {
+                VStack(alignment: .leading, spacing: 4) {
+                    Label(
+                        "Active now: \(codexRuntimeChoiceDescription(codexRuntimeActiveSelection, resolution: preflight.activeResolution))",
+                        systemImage: "play.circle.fill"
+                    )
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+
+                    if codexRuntimeProjection.changesAfterRelaunch {
+                        Label(
+                            "After relaunch: \(codexRuntimeChoiceDescription(codexRuntimePendingSelection, resolution: preflight.pendingResolution))",
+                            systemImage: "arrow.forward.circle.fill"
+                        )
+                        .font(.caption)
+                        .foregroundColor(.orange)
+                    }
+                }
+
+                if codexRuntimeSelectionIsCustom(codexRuntimeActiveSelection),
+                   preflight.activeResolution.status != .available
+                {
+                    Text("Active runtime: \(preflight.activeResolution.userMessage)")
+                        .font(.caption)
+                        .foregroundColor(.red)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+
+                if codexRuntimeProjection.changesAfterRelaunch,
+                   preflight.pendingResolution.status != .available
+                {
+                    Text("After relaunch: \(preflight.pendingResolution.userMessage)")
+                        .font(.caption)
+                        .foregroundColor(.red)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+
+            if codexRuntimePreflight?.ignoredLegacyEnvironmentOverride == true {
+                Text("RepoPrompt ignored the legacy \(CodexRuntimeAuthority.externalExecutableOverrideEnvironmentKey) override. Choose a custom executable under Advanced if you still need it.")
+                    .font(.caption)
+                    .foregroundColor(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            Button {
+                withAnimation(.easeInOut(duration: 0.2)) {
+                    isCodexRuntimeAdvancedExpanded.toggle()
+                }
+            } label: {
+                HStack(spacing: 4) {
+                    Image(systemName: "chevron.right")
+                        .font(.system(size: 9, weight: .semibold))
+                        .foregroundColor(.secondary)
+                        .rotationEffect(.degrees(isCodexRuntimeAdvancedExpanded ? 90 : 0))
+                    Text("Advanced")
+                        .font(.subheadline)
+                        .foregroundColor(.secondary)
+                }
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(PlainButtonStyle())
+
+            if isCodexRuntimeAdvancedExpanded {
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("Custom Codex executables are not verified or managed by RepoPrompt and may be incompatible with its app-server integration. Use the included runtime unless you need an explicit compatibility escape hatch.")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+
+                    if codexRuntimeProjection.changesAfterRelaunch,
+                       let activePath = codexRuntimeExecutablePath(codexRuntimeActiveSelection)
+                    {
+                        Text("Active path: \(activePath)")
+                            .font(.caption.monospaced())
+                            .foregroundColor(.secondary)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                            .hoverTooltip(activePath)
+                    }
+
+                    if let pendingPath = codexRuntimeExecutablePath(codexRuntimePendingSelection) {
+                        Text("\(codexRuntimeProjection.changesAfterRelaunch ? "After relaunch path" : "Selected path"): \(pendingPath)")
+                            .font(.caption.monospaced())
+                            .foregroundColor(.secondary)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                            .hoverTooltip(pendingPath)
+                    }
+
+                    if codexCustomRuntimeIsConfigured,
+                       let resolution = codexRuntimePreflight?.pendingResolution,
+                       resolution.status == .available,
+                       let description = resolution.displayDescription
+                    {
+                        Text(
+                            codexRuntimeProjection.changesAfterRelaunch
+                                ? "After relaunch selection: \(description)"
+                                : "Selected: \(description)"
+                        )
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                    }
+
+                    HStack(spacing: 8) {
+                        Button("Choose Custom Executable…", action: chooseLocalCodexExecutable)
+                            .buttonStyle(CustomButtonStyle())
+
+                        if codexCustomRuntimeIsConfigured {
+                            Button("Restore Included Runtime") {
+                                setCodexRuntimeSelection(.bundled)
+                            }
+                            .buttonStyle(CustomButtonStyle())
+                        }
+                    }
+
+                    Text("Runtime changes apply after the next RepoPrompt launch and then refresh the model list. Existing saved model selections are not changed.")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                .padding(.top, 2)
+                .transition(.opacity.combined(with: .move(edge: .top)))
+            }
+        }
+        .task(id: codexRuntimeSelectionTaskID) {
+            await refreshCodexRuntimePreflight()
+        }
+    }
+
+    private var codexRuntimeProjection: CodexRuntimePreferences.RuntimeSelectionProjection {
+        CodexRuntimePreferences.runtimeSelectionProjection(
+            active: codexRuntimeActiveSelection,
+            pending: codexRuntimePendingSelection
+        )
+    }
+
+    private var codexCustomRuntimeIsConfigured: Bool {
+        codexRuntimeSelectionIsCustom(codexRuntimePendingSelection)
+    }
+
+    private func codexRuntimeSelectionIsCustom(_ selection: CodexRuntimePreferences.Selection) -> Bool {
+        switch selection {
+        case .external, .invalidExternalPreference:
+            true
+        case .inherited, .bundled:
+            false
+        }
+    }
+
+    private func codexRuntimeExecutablePath(_ selection: CodexRuntimePreferences.Selection) -> String? {
+        switch selection {
+        case let .external(path):
+            path
+        case .inherited, .bundled, .invalidExternalPreference:
+            nil
+        }
+    }
+
+    private func codexRuntimeChoiceDescription(
+        _ selection: CodexRuntimePreferences.Selection,
+        resolution: CodexProviderHelpers.CodexExecutableResolution
+    ) -> String {
+        switch selection {
+        case .inherited, .bundled:
+            "Included Codex \(CodexRuntimeAuthority.bundledVersion)"
+        case let .external(path):
+            if let runtime = resolution.runtime {
+                "Custom Codex \(runtime.version) (\(runtime.executableURL.lastPathComponent))"
+            } else {
+                "Custom Codex (\(URL(fileURLWithPath: path).lastPathComponent))"
+            }
+        case .invalidExternalPreference:
+            "Invalid custom executable preference"
+        }
+    }
+
+    private var codexRuntimeSelectionTaskID: String {
+        switch codexRuntimePendingSelection {
+        case .inherited:
+            "inherited"
+        case .bundled:
+            "bundled"
+        case let .external(path):
+            "external:\(path)"
+        case .invalidExternalPreference:
+            "invalid-external"
+        }
+    }
+
+    private func setCodexRuntimeSelection(_ selection: CodexRuntimePreferences.Selection) {
+        CodexRuntimePreferences.setSelection(selection)
+        codexRuntimePendingSelection = CodexRuntimePreferences.selection()
+    }
+
+    private func refreshCodexRuntimePreflight() async {
+        let pendingSelection = codexRuntimePendingSelection
+        isLoadingCodexRuntimePreflight = true
+        let preflight = await CodexProviderHelpers.preflightCodexRuntimeSettings(
+            activeSelection: codexRuntimeActiveSelection,
+            pendingSelection: pendingSelection
+        )
+        guard !Task.isCancelled, codexRuntimePendingSelection == pendingSelection else { return }
+        codexRuntimePreflight = preflight
+        isLoadingCodexRuntimePreflight = false
+    }
+
     private var codexCard: some View {
         providerCard(
             title: "Codex CLI",
@@ -1585,6 +1839,9 @@ struct CLIProvidersSettingsView: View {
                     }
                     .buttonStyle(PlainButtonStyle())
                 }
+
+                Divider()
+                codexRuntimeSelectionControl
 
                 if viewModel.isCodexConnected {
                     Divider()
@@ -1730,7 +1987,7 @@ struct CLIProvidersSettingsView: View {
                             .foregroundColor(.red)
                             .fixedSize(horizontal: false, vertical: true)
                         if viewModel.isCodexExecutableUnavailable {
-                            Text("Reinstall RepoPrompt CE, or fix/remove REPOPROMPT_CODEX_EXECUTABLE, then click Connect to check again.")
+                            Text("Choose another custom executable under Advanced or restore the included runtime, then relaunch RepoPrompt. After relaunch, click Connect to check again.")
                                 .font(.caption)
                                 .foregroundColor(.secondary)
                                 .fixedSize(horizontal: false, vertical: true)
@@ -1833,12 +2090,12 @@ struct CLIProvidersSettingsView: View {
         return count == 1 ? "1 model discovered." : "\(count) models discovered."
     }
 
-    // MARK: - Cursor Card
+    // MARK: - Grok Build Chat/Oracle Card
 
     private var grokBuildCard: some View {
         providerCard(
             title: "Grok Build",
-            subtitle: "Uses xAI's Grok Build ACP runtime (`grok agent stdio`) for Agent Mode and headless tasks. RepoPrompt MCP tools are added through the ACP session.",
+            subtitle: "Chat/Oracle only, using prompt-only Grok Build requests without RepoPrompt tools. Agent Mode is retired; use the separate Grok CLI provider for agent tasks. Testing sends a minimal text request to verify authentication.",
             infoURL: "https://docs.x.ai/build/overview",
             isConnected: viewModel.isGrokBuildConnected,
             isExpanded: $isGrokBuildExpanded
@@ -1872,7 +2129,6 @@ struct CLIProvidersSettingsView: View {
                         .foregroundColor(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
 
-                    directProviderInlineControls(for: .grokBuild)
                 } else {
                     HStack(spacing: 10) {
                         Button(action: { testGrokBuildConnection() }) {
@@ -1907,9 +2163,9 @@ struct CLIProvidersSettingsView: View {
         let options = viewModel.availableGrokBuildModelOptions
         let count = options.count
         if count <= 1 {
-            return "Using Grok's configured default model; dynamic model discovery will refresh in the background."
+            return "Using Grok's configured default model for Chat/Oracle. Custom and previously stored models remain available; no background model discovery runs."
         }
-        return count == 1 ? "1 model available." : "\(count) models available (including Default)."
+        return "\(count) stored Chat/Oracle model options available (including Default)."
     }
 
     // MARK: - Cursor CLI / ACP card
@@ -2403,6 +2659,22 @@ struct CLIProvidersSettingsView: View {
         }
     }
 
+    private func chooseLocalCodexExecutable() {
+        let panel = NSOpenPanel()
+        panel.title = "Choose Codex Executable"
+        panel.message = "Select an installed Codex CLI executable. RepoPrompt validates its version before use."
+        panel.prompt = "Choose"
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = false
+        panel.resolvesAliases = false
+        if let pendingPath = codexRuntimeExecutablePath(codexRuntimePendingSelection) {
+            panel.directoryURL = URL(fileURLWithPath: pendingPath).deletingLastPathComponent()
+        }
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        setCodexRuntimeSelection(.external(path: url.path))
+    }
+
     private func startCodexManagedChatgptLogin() {
         guard activeCodexManagedLoginFlow != .browser else { return }
         let operationID = UUID()
@@ -2651,7 +2923,7 @@ struct CLIProvidersSettingsView: View {
                 await MainActor.run {
                     isLoadingGrokBuild = false
                     if ok {
-                        alertMessage = "Grok Build connected. \(grokBuildModelSummary.lowercased())"
+                        alertMessage = "Grok Build Chat/Oracle connection verified. \(grokBuildModelSummary)"
                         showGrokBuildTraceDump = false
                     }
                     showAlert = true

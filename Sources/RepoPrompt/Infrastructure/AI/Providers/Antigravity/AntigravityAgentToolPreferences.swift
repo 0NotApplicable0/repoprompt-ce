@@ -1,7 +1,7 @@
 import Foundation
 
 enum AntigravityAgentToolPreferences {
-    enum PermissionLevel: String, CaseIterable {
+    enum PermissionLevel: String, CaseIterable, Hashable {
         case managedDefault
         case sandboxedAutoApprove
         case fullAccess
@@ -75,10 +75,14 @@ enum AntigravityAgentToolPreferences {
         }
 
         static func from(rawValue: String?) -> PermissionLevel {
+            headlessLevel(from: rawValue) ?? .managedDefault
+        }
+
+        static func headlessLevel(from rawValue: String?) -> PermissionLevel? {
             guard let raw = rawValue?.trimmingCharacters(in: .whitespacesAndNewlines),
                   !raw.isEmpty
             else {
-                return .managedDefault
+                return nil
             }
             switch raw.lowercased() {
             case PermissionLevel.fullAccess.rawValue.lowercased():
@@ -88,8 +92,15 @@ enum AntigravityAgentToolPreferences {
             case PermissionLevel.managedDefault.rawValue.lowercased():
                 return .managedDefault
             default:
-                return .managedDefault
+                return nil
             }
+        }
+
+        static func isRetiredACPRawValue(_ rawValue: String?) -> Bool {
+            guard let raw = rawValue?.trimmingCharacters(in: .whitespacesAndNewlines) else {
+                return false
+            }
+            return ["default", "auto_edit", "yolo"].contains(raw.lowercased())
         }
     }
 
@@ -102,17 +113,22 @@ enum AntigravityAgentToolPreferences {
         if let secureStore = resolvedSecureStore(defaults: defaults, secureStore: secureStore) {
             let hasLegacyLevel = defaults.object(forKey: permissionLevelKey) != nil
             let legacyLevel = hasLegacyLevel
-                ? PermissionLevel.from(rawValue: defaults.string(forKey: permissionLevelKey))
+                ? PermissionLevel.headlessLevel(from: defaults.string(forKey: permissionLevelKey))
                 : nil
-            if secureStore.migrateLegacyAntigravityPermissionLevelIfNeeded(legacyLevel),
-               hasLegacyLevel,
-               secureStore.persistsValuesAcrossLaunches
+            if secureStore.migrateLegacyAntigravityPermissionLevelIfNeeded(
+                legacyLevel,
+                legacyValueWasPresent: hasLegacyLevel
+            ),
+                hasLegacyLevel,
+                secureStore.persistsValuesAcrossLaunches
             {
                 defaults.removeObject(forKey: permissionLevelKey)
             }
             return secureStore.antigravityPermissions().permissionLevel()
         }
-        return PermissionLevel.from(rawValue: defaults.string(forKey: permissionLevelKey))
+        guard defaults.object(forKey: permissionLevelKey) != nil else { return .managedDefault }
+        return PermissionLevel.headlessLevel(from: defaults.string(forKey: permissionLevelKey))
+            ?? .safeManagedUnavailable
     }
 
     static func setPermissionLevel(

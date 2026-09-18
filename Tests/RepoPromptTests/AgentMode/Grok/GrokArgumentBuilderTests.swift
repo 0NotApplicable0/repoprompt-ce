@@ -225,14 +225,43 @@ final class GrokArgumentBuilderTests: XCTestCase {
     }
 
     func testPermissionLevelHasTwoCases() {
-        XCTAssertEqual(GrokAgentToolPreferences.PermissionLevel.allCases.count, 2)
+        XCTAssertEqual(GrokAgentToolPreferences.PermissionLevel.allCases, [.managedDefault, .fullAccess])
     }
 
     func testPermissionLevelFromRawValue() {
         XCTAssertEqual(GrokAgentToolPreferences.PermissionLevel.from(rawValue: "fullAccess"), .fullAccess)
         XCTAssertEqual(GrokAgentToolPreferences.PermissionLevel.from(rawValue: "managedDefault"), .managedDefault)
         XCTAssertEqual(GrokAgentToolPreferences.PermissionLevel.from(rawValue: nil), .managedDefault)
-        XCTAssertEqual(GrokAgentToolPreferences.PermissionLevel.from(rawValue: "bogus"), .managedDefault)
+        let unknown = GrokAgentToolPreferences.PermissionLevel.from(rawValue: "bogus")
+        XCTAssertFalse(GrokAgentToolPreferences.PermissionLevel.allCases.contains(unknown))
+        XCTAssertNil(AgentProviderPermissionLevelID(providerID: .grok, subagentRawValue: unknown.rawValue))
+    }
+
+    @MainActor
+    func testRuntimePermissionBindingPreservesKnownGrokProfiles() throws {
+        let suiteName = "GrokArgumentBuilderTests.runtime-permissions.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let store = AgentProviderPreferenceSnapshotStore(
+            defaults: defaults,
+            securePermissions: nil,
+            codexMCPServerEntries: { [] }
+        )
+
+        XCTAssertEqual(store.runtimePermission(for: .grok, profile: .mcpSafeDefaults).grokPermissionLevel, .managedDefault)
+        for level in GrokAgentToolPreferences.PermissionLevel.allCases {
+            XCTAssertEqual(
+                store.runtimePermission(for: .grok, profile: .providerOverride(.grok(level))).grokPermissionLevel,
+                level
+            )
+            XCTAssertEqual(
+                AgentProviderPermissionLevelID(providerID: .grok, subagentRawValue: level.rawValue),
+                .grok(level)
+            )
+            XCTAssertTrue(AgentRuntimeProviderService.shared.makeProvider(
+                for: .grok, grokPermissionLevel: level
+            ) is GrokAgentProvider)
+        }
     }
 
     func testBuildArgumentsHonorsUseSandboxFalse() {
@@ -245,6 +274,26 @@ final class GrokArgumentBuilderTests: XCTestCase {
         )
         XCTAssertTrue(consecutive(args, ["--permission-mode", "bypassPermissions"]))
         XCTAssertFalse(args.contains("--sandbox"))
+    }
+
+    func testUnavailableCapabilitySummaryDoesNotAdvertiseFullAccess() throws {
+        let suiteName = "GrokArgumentBuilderTests.unavailable-capability.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        defaults.set("future_permission", forKey: "grokToolPermissionLevel")
+
+        let summary = AgentPermissionCapabilitySummaryBuilder(defaults: defaults).summary(
+            for: .grok,
+            profile: .userConfigured,
+            availability: .none.assumingAvailable(.grok)
+        )
+
+        XCTAssertFalse(summary.isAvailable)
+        XCTAssertTrue(summary.fileMutation.lowercased().contains("unavailable"))
+        XCTAssertEqual(summary.shell, "Not launched")
+        XCTAssertEqual(summary.externalMCP, "Not launched")
+        XCTAssertTrue(summary.approvalModeDescription.lowercased().contains("reset"))
+        XCTAssertTrue(summary.warnings.contains { $0.lowercased().contains("permission") })
     }
 
     func testManagedCapabilitySummaryDisclosesGlobalAutoApprovalRisk() throws {

@@ -4,6 +4,9 @@ enum GrokAgentToolPreferences {
     enum PermissionLevel: String, CaseIterable {
         case managedDefault
         case fullAccess
+        case storedPermissionUnavailable
+
+        static let allCases: [PermissionLevel] = [.managedDefault, .fullAccess]
 
         var displayName: String {
             switch self {
@@ -11,6 +14,8 @@ enum GrokAgentToolPreferences {
                 "Default"
             case .fullAccess:
                 "Full Access"
+            case .storedPermissionUnavailable:
+                "Stored Permissions Unavailable"
             }
         }
 
@@ -20,6 +25,8 @@ enum GrokAgentToolPreferences {
                 "Grok runs kernel-sandboxed to the workspace, but `--permission-mode bypassPermissions` auto-approves every native and configured MCP tool request. The workspace sandbox does not contain external MCP side effects."
             case .fullAccess:
                 "Grok auto-approves all tool requests (`--permission-mode bypassPermissions`). No sandbox — writes are not confined to the workspace."
+            case .storedPermissionUnavailable:
+                "Grok cannot run because stored permissions are unavailable or unsupported. Reset permissions before choosing a new permission level."
             }
         }
 
@@ -29,11 +36,13 @@ enum GrokAgentToolPreferences {
                 "shield"
             case .fullAccess:
                 "exclamationmark.shield.fill"
+            case .storedPermissionUnavailable:
+                "nosign"
             }
         }
 
         var isWarning: Bool {
-            self == .fullAccess
+            self != .managedDefault
         }
 
         /// Passes `--sandbox workspace` (kernel-confines writes to the CWD) when true.
@@ -50,10 +59,15 @@ enum GrokAgentToolPreferences {
         }
 
         static func from(rawValue: String?) -> PermissionLevel {
+            guard rawValue != nil else { return .managedDefault }
+            return storedLevel(from: rawValue) ?? .storedPermissionUnavailable
+        }
+
+        static func storedLevel(from rawValue: String?) -> PermissionLevel? {
             guard let raw = rawValue?.trimmingCharacters(in: .whitespacesAndNewlines),
                   !raw.isEmpty
             else {
-                return .managedDefault
+                return nil
             }
             switch raw.lowercased() {
             case PermissionLevel.fullAccess.rawValue.lowercased():
@@ -61,7 +75,7 @@ enum GrokAgentToolPreferences {
             case PermissionLevel.managedDefault.rawValue.lowercased():
                 return .managedDefault
             default:
-                return .managedDefault
+                return nil
             }
         }
     }
@@ -75,17 +89,22 @@ enum GrokAgentToolPreferences {
         if let secureStore = resolvedSecureStore(defaults: defaults, secureStore: secureStore) {
             let hasLegacyLevel = defaults.object(forKey: permissionLevelKey) != nil
             let legacyLevel = hasLegacyLevel
-                ? PermissionLevel.from(rawValue: defaults.string(forKey: permissionLevelKey))
+                ? PermissionLevel.storedLevel(from: defaults.string(forKey: permissionLevelKey))
                 : nil
-            if secureStore.migrateLegacyGrokPermissionLevelIfNeeded(legacyLevel),
-               hasLegacyLevel,
-               secureStore.persistsValuesAcrossLaunches
+            if secureStore.migrateLegacyGrokPermissionLevelIfNeeded(
+                legacyLevel,
+                legacyValueWasPresent: hasLegacyLevel
+            ),
+                hasLegacyLevel,
+                secureStore.persistsValuesAcrossLaunches
             {
                 defaults.removeObject(forKey: permissionLevelKey)
             }
             return secureStore.grokPermissions().permissionLevel()
         }
-        return PermissionLevel.from(rawValue: defaults.string(forKey: permissionLevelKey))
+        guard defaults.object(forKey: permissionLevelKey) != nil else { return .managedDefault }
+        return PermissionLevel.storedLevel(from: defaults.string(forKey: permissionLevelKey))
+            ?? .storedPermissionUnavailable
     }
 
     static func setPermissionLevel(
@@ -93,6 +112,7 @@ enum GrokAgentToolPreferences {
         defaults: UserDefaults = .standard,
         secureStore: AgentPermissionSecureStore? = nil
     ) {
+        guard PermissionLevel.allCases.contains(level) else { return }
         if let secureStore = resolvedSecureStore(defaults: defaults, secureStore: secureStore) {
             if secureStore.setGrokPermissionLevel(level),
                secureStore.persistsValuesAcrossLaunches

@@ -103,12 +103,19 @@ struct SecureSubagentPermissionDocument: Codable, Equatable {
     }
 
     func providerPermissionLevel(for providerID: AgentProviderBindingID) -> AgentProviderPermissionLevelID {
-        guard let raw = providerPermissionLevelsRawByProviderID?[providerID.rawValue],
-              let level = AgentProviderPermissionLevelID(providerID: providerID, subagentRawValue: raw)
-        else {
+        guard let raw = providerPermissionLevelsRawByProviderID?[providerID.rawValue] else {
             return AgentProviderPermissionLevelID.subagentDefault(for: providerID)
         }
-        return level
+        if let level = AgentProviderPermissionLevelID(providerID: providerID, subagentRawValue: raw) {
+            return level
+        }
+        if providerID == .antigravity {
+            return .antigravity(.safeManagedUnavailable)
+        }
+        if providerID == .grok {
+            return .grok(.storedPermissionUnavailable)
+        }
+        return AgentProviderPermissionLevelID.subagentDefault(for: providerID)
     }
 }
 
@@ -307,11 +314,12 @@ struct SecureAntigravityPermissionDocument: Codable, Equatable {
     }
 
     static func failClosedDocument(now: Date = Date()) -> SecureAntigravityPermissionDocument {
-        SecureAntigravityPermissionDocument(updatedAt: now)
+        SecureAntigravityPermissionDocument(updatedAt: now, permissionLevelRaw: nil)
     }
 
     func permissionLevel() -> AntigravityAgentToolPreferences.PermissionLevel {
-        AntigravityAgentToolPreferences.PermissionLevel.from(rawValue: permissionLevelRaw)
+        AntigravityAgentToolPreferences.PermissionLevel.headlessLevel(from: permissionLevelRaw)
+            ?? .safeManagedUnavailable
     }
 }
 
@@ -333,11 +341,12 @@ struct SecureGrokPermissionDocument: Codable, Equatable {
     }
 
     static func failClosedDocument(now: Date = Date()) -> SecureGrokPermissionDocument {
-        SecureGrokPermissionDocument(updatedAt: now)
+        SecureGrokPermissionDocument(updatedAt: now, permissionLevelRaw: nil)
     }
 
     func permissionLevel() -> GrokAgentToolPreferences.PermissionLevel {
-        GrokAgentToolPreferences.PermissionLevel.from(rawValue: permissionLevelRaw)
+        GrokAgentToolPreferences.PermissionLevel.storedLevel(from: permissionLevelRaw)
+            ?? .storedPermissionUnavailable
     }
 }
 
@@ -479,14 +488,14 @@ final class AgentPermissionSecureStore {
             _ = normalizeCursor(&cursor)
             record(.cursor, resetLocked(cursor, domain: .cursor, cache: &cursorCache, deferred: &effects))
 
-            var antigravity = SecureAntigravityPermissionDocument.failClosedDocument(now: resetDate)
+            var antigravity = SecureAntigravityPermissionDocument(updatedAt: resetDate)
             _ = normalizeAntigravity(&antigravity)
             record(
                 .antigravity,
                 resetLocked(antigravity, domain: .antigravity, cache: &antigravityCache, deferred: &effects)
             )
 
-            var grok = SecureGrokPermissionDocument.failClosedDocument(now: resetDate)
+            var grok = SecureGrokPermissionDocument(updatedAt: resetDate)
             _ = normalizeGrok(&grok)
             record(.grok, resetLocked(grok, domain: .grok, cache: &grokCache, deferred: &effects))
 
@@ -567,7 +576,15 @@ final class AgentPermissionSecureStore {
             resetFailedCacheBeforeMutation(domain: .subagent, cache: &subagentCache)
             var document = loadSubagentPermissionsLocked(deferred: &effects)
             guard mutationCanProceed(domain: .subagent, deferred: &effects) else { return false }
+            let previousGrokRaw = document.providerPermissionLevelsRawByProviderID?[AgentProviderBindingID.grok.rawValue]
             mutation(&document)
+            let grokRaw = document.providerPermissionLevelsRawByProviderID?[AgentProviderBindingID.grok.rawValue]
+            if grokRaw == GrokAgentToolPreferences.PermissionLevel.storedPermissionUnavailable.rawValue,
+               grokRaw != previousGrokRaw
+            {
+                effects.requestChangeNotification(domain: .subagent, writeSucceeded: false)
+                return false
+            }
             normalizeSubagent(&document)
             document.updatedAt = now()
             return saveLocked(document, domain: .subagent, cache: &subagentCache, deferred: &effects)
@@ -646,6 +663,10 @@ final class AgentPermissionSecureStore {
             var document = loadGrokPermissionsLocked(deferred: &effects)
             guard mutationCanProceed(domain: .grok, deferred: &effects) else { return false }
             mutation(&document)
+            guard GrokAgentToolPreferences.PermissionLevel.storedLevel(from: document.permissionLevelRaw) != nil else {
+                effects.requestChangeNotification(domain: .grok, writeSucceeded: false)
+                return false
+            }
             normalizeGrok(&document)
             document.updatedAt = now()
             return saveLocked(document, domain: .grok, cache: &grokCache, deferred: &effects)
@@ -655,13 +676,8 @@ final class AgentPermissionSecureStore {
     @discardableResult
     func updateGrokBuildPermissions(_ mutation: (inout SecureGrokBuildPermissionDocument) -> Void) -> Bool {
         withLockAndDeferredSideEffects { effects in
-            resetFailedCacheBeforeMutation(domain: .grokBuild, cache: &grokBuildCache)
-            var document = loadGrokBuildPermissionsLocked(deferred: &effects)
-            guard mutationCanProceed(domain: .grokBuild, deferred: &effects) else { return false }
-            mutation(&document)
-            normalizeGrokBuild(&document)
-            document.updatedAt = now()
-            return saveLocked(document, domain: .grokBuild, cache: &grokBuildCache, deferred: &effects)
+            effects.requestChangeNotification(domain: .grokBuild, writeSucceeded: false)
+            return false
         }
     }
 
@@ -697,14 +713,35 @@ final class AgentPermissionSecureStore {
 
     @discardableResult
     func setAntigravityPermissionLevel(_ level: AntigravityAgentToolPreferences.PermissionLevel) -> Bool {
-        updateAntigravityPermissions { document in
+        withLockAndDeferredSideEffects { effects in
+            guard AntigravityAgentToolPreferences.PermissionLevel.allCases.contains(level) else {
+                effects.requestChangeNotification(domain: .antigravity, writeSucceeded: false)
+                return false
+            }
+            resetFailedCacheBeforeMutation(domain: .antigravity, cache: &antigravityCache)
+            var document = loadAntigravityPermissionsLocked(deferred: &effects)
+            let canReplaceRetiredACPValue = AntigravityAgentToolPreferences.PermissionLevel
+                .isRetiredACPRawValue(document.permissionLevelRaw)
+            guard diagnosticsByDomain[.antigravity] == nil || canReplaceRetiredACPValue else {
+                effects.requestChangeNotification(domain: .antigravity, writeSucceeded: false)
+                return false
+            }
             document.permissionLevelRaw = level.rawValue
+            normalizeAntigravity(&document)
+            document.updatedAt = now()
+            return saveLocked(document, domain: .antigravity, cache: &antigravityCache, deferred: &effects)
         }
     }
 
     @discardableResult
     func setGrokPermissionLevel(_ level: GrokAgentToolPreferences.PermissionLevel) -> Bool {
-        updateGrokPermissions { document in
+        guard GrokAgentToolPreferences.PermissionLevel.allCases.contains(level) else {
+            return withLockAndDeferredSideEffects { effects in
+                effects.requestChangeNotification(domain: .grok, writeSucceeded: false)
+                return false
+            }
+        }
+        return updateGrokPermissions { document in
             document.permissionLevelRaw = level.rawValue
         }
     }
@@ -723,7 +760,8 @@ final class AgentPermissionSecureStore {
     ///   only when the secure backend also persists across launches.
     @discardableResult
     func migrateLegacyAntigravityPermissionLevelIfNeeded(
-        _ level: AntigravityAgentToolPreferences.PermissionLevel?
+        _ level: AntigravityAgentToolPreferences.PermissionLevel?,
+        legacyValueWasPresent: Bool
     ) -> Bool {
         withLockAndDeferredSideEffects { effects in
             // Re-read only a cache explicitly known to come from a non-persisting missing-document
@@ -731,46 +769,58 @@ final class AgentPermissionSecureStore {
             if unpersistedMissingDomains.remove(.antigravity) != nil {
                 antigravityCache = nil
             }
-            let requestedLevel = level ?? .managedDefault
-            let persistedLevel = AntigravityAgentToolPreferences.PermissionLevel.allCases.contains(requestedLevel)
-                ? requestedLevel
-                : .managedDefault
-            _ = loadLocked(
+            let recognizedLevel = level.flatMap {
+                AntigravityAgentToolPreferences.PermissionLevel.headlessLevel(from: $0.rawValue)
+            }
+            let hasUnsupportedLegacyValue = legacyValueWasPresent && recognizedLevel == nil
+            let persistedLevel = recognizedLevel ?? .managedDefault
+            let document = loadLocked(
                 domain: .antigravity,
                 cache: &antigravityCache,
                 missingDocument: SecureAntigravityPermissionDocument(
                     updatedAt: now(),
-                    permissionLevelRaw: persistedLevel.rawValue
+                    permissionLevelRaw: hasUnsupportedLegacyValue ? nil : persistedLevel.rawValue
                 ),
                 failClosedDocument: SecureAntigravityPermissionDocument.failClosedDocument(now: now()),
                 normalize: normalizeAntigravity,
+                persistMissingDocument: !hasUnsupportedLegacyValue,
                 deferred: &effects
             )
-            return diagnosticsByDomain[.antigravity] == nil
+            validateAntigravityDocumentLocked(document, deferred: &effects)
+            return !hasUnsupportedLegacyValue && diagnosticsByDomain[.antigravity] == nil
         }
     }
 
     /// Imports a legacy preference only when no canonical secure document exists. See the
     /// Antigravity migration above for the fail-closed precedence and return-value contracts.
     @discardableResult
-    func migrateLegacyGrokPermissionLevelIfNeeded(_ level: GrokAgentToolPreferences.PermissionLevel?) -> Bool {
+    func migrateLegacyGrokPermissionLevelIfNeeded(
+        _ level: GrokAgentToolPreferences.PermissionLevel?,
+        legacyValueWasPresent: Bool
+    ) -> Bool {
         withLockAndDeferredSideEffects { effects in
             if unpersistedMissingDomains.remove(.grok) != nil {
                 grokCache = nil
             }
-            let persistedLevel = level ?? .managedDefault
-            _ = loadLocked(
+            let recognizedLevel = level.flatMap {
+                GrokAgentToolPreferences.PermissionLevel.storedLevel(from: $0.rawValue)
+            }
+            let hasUnsupportedLegacyValue = legacyValueWasPresent && recognizedLevel == nil
+            let persistedLevel = recognizedLevel ?? .managedDefault
+            let document = loadLocked(
                 domain: .grok,
                 cache: &grokCache,
                 missingDocument: SecureGrokPermissionDocument(
                     updatedAt: now(),
-                    permissionLevelRaw: persistedLevel.rawValue
+                    permissionLevelRaw: hasUnsupportedLegacyValue ? nil : persistedLevel.rawValue
                 ),
                 failClosedDocument: SecureGrokPermissionDocument.failClosedDocument(now: now()),
                 normalize: normalizeGrok,
+                persistMissingDocument: !hasUnsupportedLegacyValue,
                 deferred: &effects
             )
-            return diagnosticsByDomain[.grok] == nil
+            validateGrokDocumentLocked(document, deferred: &effects)
+            return !hasUnsupportedLegacyValue && diagnosticsByDomain[.grok] == nil
         }
     }
 
@@ -830,25 +880,66 @@ final class AgentPermissionSecureStore {
     private func loadAntigravityPermissionsLocked(
         deferred effects: inout DeferredSideEffects
     ) -> SecureAntigravityPermissionDocument {
-        loadLocked(
+        let document = loadLocked(
             domain: .antigravity,
             cache: &antigravityCache,
+            missingDocument: SecureAntigravityPermissionDocument(updatedAt: now()),
             failClosedDocument: SecureAntigravityPermissionDocument.failClosedDocument(now: now()),
             normalize: normalizeAntigravity,
             persistMissingDocument: false,
             deferred: &effects
         )
+        validateAntigravityDocumentLocked(document, deferred: &effects)
+        return document
+    }
+
+    private func validateAntigravityDocumentLocked(
+        _ document: SecureAntigravityPermissionDocument,
+        deferred effects: inout DeferredSideEffects
+    ) {
+        guard diagnosticsByDomain[.antigravity] == nil,
+              document.permissionLevel() == .safeManagedUnavailable
+        else {
+            return
+        }
+        let message = if AntigravityAgentToolPreferences.PermissionLevel
+            .isRetiredACPRawValue(document.permissionLevelRaw)
+        {
+            "Stored Antigravity permission mode is retired and cannot run headlessly. Choose a current Headless permission level or reset permissions."
+        } else {
+            "Stored Antigravity permission value is unsupported and cannot run headlessly. Reset permissions before choosing a new Headless permission level."
+        }
+        recordDiagnostic(domain: .antigravity, kind: .decodeFailed, message: message)
+        effects.requestDiagnosticsNotification(for: .antigravity)
     }
 
     private func loadGrokPermissionsLocked(deferred effects: inout DeferredSideEffects) -> SecureGrokPermissionDocument {
-        loadLocked(
+        let document = loadLocked(
             domain: .grok,
             cache: &grokCache,
+            missingDocument: SecureGrokPermissionDocument(updatedAt: now()),
             failClosedDocument: SecureGrokPermissionDocument.failClosedDocument(now: now()),
             normalize: normalizeGrok,
             persistMissingDocument: false,
             deferred: &effects
         )
+        validateGrokDocumentLocked(document, deferred: &effects)
+        return document
+    }
+
+    private func validateGrokDocumentLocked(
+        _ document: SecureGrokPermissionDocument,
+        deferred effects: inout DeferredSideEffects
+    ) {
+        guard diagnosticsByDomain[.grok] == nil,
+              document.permissionLevel() == .storedPermissionUnavailable
+        else { return }
+        recordDiagnostic(
+            domain: .grok,
+            kind: .decodeFailed,
+            message: GrokAgentToolPreferences.PermissionLevel.storedPermissionUnavailable.detailText
+        )
+        effects.requestDiagnosticsNotification(for: .grok)
     }
 
     private func loadGrokBuildPermissionsLocked(deferred effects: inout DeferredSideEffects) -> SecureGrokBuildPermissionDocument {
@@ -856,7 +947,8 @@ final class AgentPermissionSecureStore {
             domain: .grokBuild,
             cache: &grokBuildCache,
             failClosedDocument: SecureGrokBuildPermissionDocument.failClosedDocument(now: now()),
-            normalize: normalizeGrokBuild,
+            normalize: { _ in false },
+            persistMissingDocument: false,
             deferred: &effects
         )
     }
@@ -1119,20 +1211,6 @@ final class AgentPermissionSecureStore {
             changed = true
         }
 
-        let originalLevels = document.providerPermissionLevelsRawByProviderID ?? [:]
-        var normalizedLevels: [String: String] = [:]
-        for providerID in AgentProviderBindingID.allCases {
-            if let raw = originalLevels[providerID.rawValue],
-               let level = AgentProviderPermissionLevelID(providerID: providerID, subagentRawValue: raw)
-            {
-                normalizedLevels[providerID.rawValue] = level.subagentRawValue
-            }
-        }
-
-        if normalizedLevels != originalLevels {
-            document.providerPermissionLevelsRawByProviderID = normalizedLevels.isEmpty ? nil : normalizedLevels
-            changed = true
-        }
         return changed
     }
 
@@ -1240,8 +1318,9 @@ final class AgentPermissionSecureStore {
             document.schemaVersion = SecureAntigravityPermissionDocument.currentSchemaVersion
             changed = true
         }
-        let level = AntigravityAgentToolPreferences.PermissionLevel.from(rawValue: document.permissionLevelRaw)
-        if document.permissionLevelRaw != level.rawValue {
+        if let level = AntigravityAgentToolPreferences.PermissionLevel.headlessLevel(
+            from: document.permissionLevelRaw
+        ), document.permissionLevelRaw != level.rawValue {
             document.permissionLevelRaw = level.rawValue
             changed = true
         }
@@ -1250,12 +1329,14 @@ final class AgentPermissionSecureStore {
 
     @discardableResult
     private func normalizeGrok(_ document: inout SecureGrokPermissionDocument) -> Bool {
+        guard let level = GrokAgentToolPreferences.PermissionLevel.storedLevel(from: document.permissionLevelRaw) else {
+            return false
+        }
         var changed = false
         if document.schemaVersion != SecureGrokPermissionDocument.currentSchemaVersion {
             document.schemaVersion = SecureGrokPermissionDocument.currentSchemaVersion
             changed = true
         }
-        let level = GrokAgentToolPreferences.PermissionLevel.from(rawValue: document.permissionLevelRaw)
         if document.permissionLevelRaw != level.rawValue {
             document.permissionLevelRaw = level.rawValue
             changed = true

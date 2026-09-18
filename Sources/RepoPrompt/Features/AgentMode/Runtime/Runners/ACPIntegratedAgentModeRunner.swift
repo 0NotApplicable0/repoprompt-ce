@@ -32,6 +32,15 @@ final class ACPIntegratedAgentModeRunner {
         let errorText: String?
     }
 
+    private struct StaleModelParameterSelectionError: LocalizedError {
+        let selections: [ACPModelParameterSelection]
+
+        var errorDescription: String? {
+            let values = selections.map { "\($0.configID)=\($0.valueRaw)" }.joined(separator: ", ")
+            return "The selected model settings are stale or unsupported for this ACP session: \(values). Refresh the model settings and try again."
+        }
+    }
+
     private let hooks: AgentModeRunService.Hooks
     private let terminalCommitBarrier: AgentRunTerminalCommitBarrier
     private let toolTrackingHooks: AgentToolTrackingHooks
@@ -420,10 +429,37 @@ final class ACPIntegratedAgentModeRunner {
             runID,
             attachments
         )
+        // Active ACP steering is its own logical dispatch. If this send returns `false` the batch is
+        // requeued as a follow-up, which composes again through `runPromptTurn` under a different
+        // dispatch ID — correct, because this attempt was never accepted and the follow-up must
+        // render whatever membership is current when it dispatches.
+        let monitoring = hooks.providerInput.decoratedAgentMessage(
+            agentMessage,
+            session: session,
+            dispatchID: .acpActiveSteering(runAttemptID: runAttemptID)
+        )
+        guard !monitoring.mustAbortDispatch else {
+            hooks.providerInput.recordAgentSessionLinkPhysicalDispatchNotAttempted(
+                session,
+                .acpActiveSteering(runAttemptID: runAttemptID)
+            )
+            return false
+        }
+        guard hooks.providerInput.acquireAgentSessionLinkPhysicalDispatch(
+            session,
+            .acpActiveSteering(runAttemptID: runAttemptID)
+        ) else {
+            hooks.providerInput.recordAgentSessionLinkPhysicalDispatchNotAttempted(
+                session,
+                .acpActiveSteering(runAttemptID: runAttemptID)
+            )
+            return false
+        }
 
         do {
             log("active steering session/prompt begin attempt=\(runAttemptID)", runID: runID)
-            try await controller.prompt(agentMessage, request: runRequest)
+            try await controller.prompt(monitoring.message, request: runRequest)
+            hooks.providerInput.acceptAgentSessionLinkPrompt(session, monitoring.dispatchContext, monitoring.claim)
             log("active steering session/prompt completed attempt=\(runAttemptID)", runID: runID)
             let identity = await controller.currentProviderSessionIdentity()
             applyProviderSessionIdentity(identity, session: session)
@@ -433,6 +469,10 @@ final class ACPIntegratedAgentModeRunner {
             // activeRunAttemptID to still be present here.
             return true
         } catch {
+            hooks.providerInput.recordAgentSessionLinkPhysicalDispatchFailure(
+                session,
+                .acpActiveSteering(runAttemptID: runAttemptID)
+            )
             let identity = await controller.refreshProviderSessionIdentityAfterPromptInterruption()
             applyProviderSessionIdentity(identity, session: session)
             let normalized = await controller.normalizeError(error)
@@ -533,6 +573,7 @@ final class ACPIntegratedAgentModeRunner {
         lease: MCPBootstrapLease,
         attachmentReservationID: UUID?
     ) async {
+        let isPeriodic = session.oversight.pendingAutoWake?.isPeriodic == true
         let modelDescription = runRequest.modelString ?? "default"
         let resumeDescription = runRequest.resumeSessionID ?? "nil"
         let workspaceDescription = runRequest.workspacePath ?? "nil"
@@ -570,6 +611,10 @@ final class ACPIntegratedAgentModeRunner {
                 }
                 var initialMessageForPromptTurn = initialMessageForRun
                 if bootstrap.didFallbackToNewSessionAfterLoadFailure {
+                    // Periodic turns preserve handoffs, so they cannot adopt a contextless replacement.
+                    // Existing cancellation cleanup retires this unprompted controller.
+                    guard !isPeriodic else { throw CancellationError() }
+
                     await hooks.providerInput.stageResumeRecoveryHandoffIfNeeded(session)
                     initialMessageForPromptTurn = hooks.providerInput.prependPendingHandoffIfNeeded(initialMessageForRun, session)
                 }
@@ -584,6 +629,8 @@ final class ACPIntegratedAgentModeRunner {
                 hooks.bindingObservation.updateBindings(session)
 
                 try await applyExplicitSelectedModelIfNeeded(runRequest, controller: controller, runID: runID)
+                let parameterReport = try await controller.applySessionModelParameterSelections(runRequest.modelParameterSelections)
+                try Self.validateModelParameterApplicationReport(parameterReport)
                 await controller.setAutoApproveAllToolPermissions(runRequest.autoApproveAllToolPermissions)
                 try await applyRequestedSessionModeIfNeeded(runRequest.sessionModeID, controller: controller, runID: runID)
                 setRunningStatus(waitingForConnectionStatusText(for: runRequest.agentKind), source: .transport, session: session, urgent: true)
@@ -663,6 +710,8 @@ final class ACPIntegratedAgentModeRunner {
                 }
 
                 try await applyExplicitSelectedModelIfNeeded(runRequest, controller: controller, runID: runID)
+                let parameterReport = try await controller.applySessionModelParameterSelections(runRequest.modelParameterSelections)
+                try Self.validateModelParameterApplicationReport(parameterReport)
                 await controller.setAutoApproveAllToolPermissions(runRequest.autoApproveAllToolPermissions)
                 try await applyRequestedSessionModeIfNeeded(runRequest.sessionModeID, controller: controller, runID: runID)
 
@@ -750,13 +799,51 @@ final class ACPIntegratedAgentModeRunner {
             )
         }
 
+        // Composed here, not next to `buildHeadlessAgentMessage`: `prepareForNextTurn()` and the
+        // event-stream acquisition above both suspend, and an oversight link can be added or revoked while
+        // they do. Reading membership before those awaits would ship enqueue-time inventory on every
+        // reused/follow-up turn. This covers the initial, resumed, reusable-session, and follow-up
+        // routes, which all converge here. Resumed providers still omit `AgentMessage.systemPrompt`;
+        // the supplement rides the user-message channel precisely because a resumed thread cannot
+        // refresh system text.
+        let monitoring = hooks.providerInput.decoratedAgentMessage(
+            agentMessage,
+            session: session,
+            dispatchID: .acpPromptTurn(runAttemptID: runAttemptID)
+        )
+        // Required lane content is the turn's only new provider input. Refusal is a quiet
+        // pre-acceptance cancellation, not an ACP prompt failure.
+        guard !monitoring.mustAbortDispatch else {
+            hooks.providerInput.recordAgentSessionLinkPhysicalDispatchNotAttempted(
+                session,
+                .acpPromptTurn(runAttemptID: runAttemptID)
+            )
+            return .cancelled
+        }
+        guard hooks.providerInput.acquireAgentSessionLinkPhysicalDispatch(
+            session,
+            .acpPromptTurn(runAttemptID: runAttemptID)
+        ) else {
+            hooks.providerInput.recordAgentSessionLinkPhysicalDispatchNotAttempted(
+                session,
+                .acpPromptTurn(runAttemptID: runAttemptID)
+            )
+            return .cancelled
+        }
+
         do {
             log("controller.prompt begin", runID: runID)
-            try await controller.prompt(agentMessage, request: runRequest)
+            try await controller.prompt(monitoring.message, request: runRequest)
+            // A non-throwing `controller.prompt` return is ACP's acceptance signal.
+            hooks.providerInput.acceptAgentSessionLinkPrompt(session, monitoring.dispatchContext, monitoring.claim)
             let identity = await controller.currentProviderSessionIdentity()
             applyProviderSessionIdentity(identity, session: session)
             log("controller.prompt returned; awaiting event consumer", runID: runID)
         } catch {
+            hooks.providerInput.recordAgentSessionLinkPhysicalDispatchFailure(
+                session,
+                .acpPromptTurn(runAttemptID: runAttemptID)
+            )
             let identity = await controller.refreshProviderSessionIdentityAfterPromptInterruption()
             applyProviderSessionIdentity(identity, session: session)
             let normalizedError = await controller.normalizeError(error)
@@ -820,30 +907,46 @@ final class ACPIntegratedAgentModeRunner {
         controller: ACPAgentSessionController,
         runID: UUID
     ) async throws {
-        guard runRequest.agentKind == .openCode || runRequest.agentKind == .cursor || runRequest.agentKind == .grokBuild else { return }
-        guard let model = runRequest.modelString?.trimmingCharacters(in: .whitespacesAndNewlines),
-              !model.isEmpty,
-              model.caseInsensitiveCompare(AgentModel.defaultModel.rawValue) != .orderedSame
-        else {
+        guard let model = try Self.explicitSelectedModel(
+            agentKind: runRequest.agentKind,
+            modelString: runRequest.modelString
+        ) else {
             return
-        }
-        if runRequest.agentKind == .cursor,
-           model.caseInsensitiveCompare(AgentModel.cursorAuto.rawValue) != .orderedSame,
-           AgentACPModelRegistry.shared.resolvedSnapshot(for: .cursor)?.contains(rawModel: model) != true
-        {
-            return
-        }
-        if runRequest.agentKind == .grokBuild,
-           AgentACPModelRegistry.shared.resolvedSnapshot(for: .grokBuild)?.contains(rawModel: model) != true
-        {
-            // Grok has no provider-side alias surface: an unknown concrete model fails the
-            // run instead of silently running Grok's current default.
-            throw AIProviderError.invalidConfiguration(
-                detail: "Grok Build model `\(model)` is not in the discovered model set. Refresh Grok Build models and retry."
-            )
         }
         log("applying \(runRequest.agentKind.displayName) selected model=\(model)", runID: runID)
         try await controller.setSessionModel(model)
+    }
+
+    private static func explicitSelectedModel(
+        agentKind: AgentProviderKind,
+        modelString: String?
+    ) throws -> String? {
+        guard agentKind == .openCode || agentKind == .cursor || agentKind == .grokBuild || agentKind == .antigravity else { return nil }
+        guard let model = modelString?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !model.isEmpty,
+              model.caseInsensitiveCompare(AgentModel.defaultModel.rawValue) != .orderedSame
+        else {
+            return nil
+        }
+        if agentKind == .cursor,
+           model.caseInsensitiveCompare(AgentModel.cursorAuto.rawValue) != .orderedSame,
+           !CursorAIModelCatalog.contains(modelRaw: model)
+        {
+            throw AIProviderError.invalidConfiguration(
+                detail: "Cursor model `\(model)` is not in this release's supported model catalog. Update RepoPrompt CE or choose Cursor Auto."
+            )
+        }
+        if agentKind == .grokBuild || agentKind == .antigravity,
+           let providerID = agentKind.acpProviderID,
+           AgentACPModelRegistry.shared.resolvedSnapshot(for: providerID)?.contains(rawModel: model) != true
+        {
+            // These ACP providers have no provider-side alias surface: an unknown
+            // concrete model fails instead of silently running the provider's default.
+            throw AIProviderError.invalidConfiguration(
+                detail: "\(agentKind.displayName) model `\(model)` is not in the discovered model set. Refresh its models and retry."
+            )
+        }
+        return model
     }
 
     private func promptFailureErrorText(
@@ -1696,7 +1799,28 @@ final class ACPIntegratedAgentModeRunner {
                 classification.report.trace
             )
         }
+
+        static func testValidateModelParameterApplicationReport(
+            _ report: ACPModelParameterApplicationReport
+        ) throws {
+            try validateModelParameterApplicationReport(report)
+        }
+
+        static func testExplicitSelectedModel(
+            agentKind: AgentProviderKind,
+            modelString: String?
+        ) throws -> String? {
+            try explicitSelectedModel(agentKind: agentKind, modelString: modelString)
+        }
     #endif
+
+    private static func validateModelParameterApplicationReport(
+        _ report: ACPModelParameterApplicationReport
+    ) throws {
+        guard report.skipped.isEmpty else {
+            throw StaleModelParameterSelectionError(selections: report.skipped)
+        }
+    }
 
     // MARK: - Provider Stream Tool Event Handling
 
@@ -1705,6 +1829,7 @@ final class ACPIntegratedAgentModeRunner {
         session: AgentTabSession
     ) -> Bool {
         guard let providerID = agentKind.acpProviderID,
+              providerID != .cursor,
               let snapshot = AgentACPModelRegistry.shared.resolvedSnapshot(for: providerID)
         else {
             return false

@@ -100,7 +100,9 @@ enum AgentProviderPermissionLevelID: Hashable {
             else { return nil }
             self = .antigravity(level)
         case .grok:
-            guard let level = GrokAgentToolPreferences.PermissionLevel(rawValue: raw) else { return nil }
+            guard let level = GrokAgentToolPreferences.PermissionLevel(rawValue: raw),
+                  GrokAgentToolPreferences.PermissionLevel.allCases.contains(level)
+            else { return nil }
             self = .grok(level)
         case .grokBuild:
             guard let level = GrokBuildAgentToolPreferences.PermissionLevel(rawValue: raw) else { return nil }

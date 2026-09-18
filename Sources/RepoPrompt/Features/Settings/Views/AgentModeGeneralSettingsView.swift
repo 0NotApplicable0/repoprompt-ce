@@ -583,7 +583,7 @@ struct AgentModeGeneralSettingsView: View {
         case .cursor: apiSettingsVM.isCursorConnected
         case .antigravity: apiSettingsVM.isAntigravityConnected
         case .grok: apiSettingsVM.isGrokConnected
-        case .grokBuild: apiSettingsVM.isGrokBuildConnected
+        case .grokBuild: false
         }
     }
 

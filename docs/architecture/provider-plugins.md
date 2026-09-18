@@ -220,17 +220,14 @@ RepoPrompt CE cannot impose one MCP tool-call timeout across external ACP provid
 
 - **OpenCode:** Timeout values are milliseconds. For a 10,000-second call, set `"timeout": 10000000` on the existing RepoPrompt MCP server entry, preserving its `type`, `command`, and `environment` fields.
 - **Cursor Agent:** Current builds expose no supported ACP, CLI, environment, or configuration override that RepoPrompt CE can set to 10,000 seconds. Do not add a speculative CE timeout control; add one only if Cursor documents a supported configuration surface.
-- **Grok Build:** The session-injected RepoPrompt MCP server follows Grok's default MCP timeout. To pin one, add `tool_timeout_sec` under `[mcp_servers.RepoPromptCE]` in `~/.grok/config.toml` (Grok's per-server MCP config; seconds).
 
-### Grok Build provider notes
+### Restored headless CLI providers and retired Grok Build agent identity
 
-`AgentProviderKind.grokBuild` drives `grok agent stdio` (ACP protocolVersion 1). Verified wire facts as of grok 1.0.3 (2026-08-13):
-
-- Model advertisement is a top-level `SessionModelState` (`models` in `session/new`/`session/load` responses), not modern `configOptions`; explicit selection goes through `session/set_model` (`{sessionId, modelId}`). The controller consults the provider's `ACPDirectSessionModelProvider` conformance only when no modern model selector exists; malformed modern selectors never fall back.
-- Usage arrives in the `session/prompt` response `_meta.usage` (same field names as the ACP-standard top-level `usage`); Grok emits no `usage_update` notifications.
-- Full access is a launch flag (`grok agent --always-approve stdio`), never controller-side permission-option auto-selection; `enable-always-approve` is denylisted from every option picker.
-- Auth: RepoPrompt never sends ACP `authenticate`; Grok's own precedence (config.toml key → `~/.grok/auth.json` → `XAI_API_KEY` env, the last injected from the existing `.grokAPI` keychain account at provider construction) applies.
-- MCP client name is `grok-shell-<injected server name>`; `MCPClientIdentity` maps the `grok-shell` prefix family.
+- `AgentProviderKind.antigravity` and `.grok` use their headless CLI providers, not ACP. Their headless model registries are execution authority; Default remains valid, while unknown explicit models are rejected without launching metadata discovery. Saved raw selections survive normalization and hydration unchanged. Antigravity Safe Managed rejection remains earlier than preparation/model execution, and legacy session fences prevent foreign resume handles from reaching the restored provider.
+- `AgentProviderKind.grokBuild` is retired for Agent Mode and Context Builder. Its raw kind, binding, secure domain, `ACPProviderID`, and legacy `grok-shell-<injected server name>` client hint remain compatibility data. Active enumeration, pickers, discovery, permissions UI, and task-label candidates exclude it; the ACP route/factory returns nil and the headless factory returns an actionable unsupported provider before credential/process lookup.
+- Unavailable explicit role pins and affected Context Builder selections are preserved, not replaced by recommendations. Dispatch validates availability and model validity; users must choose another selection or clear the pin. Automatic recommendations without overrides retain their existing behavior.
+- **Grok Build Chat/Oracle is not retired.** `AIProviderType.grokBuild`, `AIModel.grokBuildCustom`, and `GrokBuildCLIProvider` keep the separate prompt-only non-agent path without RepoPrompt tools. `GrokBuildCLILaunchResolver.probeSupport` checks prompt capability, not ACP. A manual connection check also completes a minimal text request before claiming authenticated readiness; startup capability probing alone does not.
+- Chat model options come from `ACPAIModelCatalog` using Default and previously stored/custom records, independently of the retired agent catalog. Connection/auth data and chat/recommendation identities remain separate from agent retirement. No Grok Build ACP model polling or background model discovery runs.
 
 ## How a new provider plugs in
 

@@ -1,20 +1,18 @@
 import Foundation
 
 /// Prompt-only Grok Build adapter for chat, Oracle, and other non-Agent-Mode requests.
-/// Agent Mode continues to use `grok agent stdio`; this adapter uses the documented
-/// one-shot JSON CLI and preserves the existing trusted Grok executable preflight.
 final class GrokBuildOneShotHeadlessAgentProvider: HeadlessAgentProvider {
     typealias APIKeyProvider = @Sendable () async throws -> String?
 
     private let config: GrokBuildAgentConfig
-    private let launchResolver: GrokBuildACPLaunchResolver
+    private let launchResolver: GrokBuildCLILaunchResolver
     private let requestTimeout: TimeInterval
     private let apiKeyProvider: APIKeyProvider
     private let activeRuns = ActiveGrokBuildOneShotRunStore()
 
     init(
         config: GrokBuildAgentConfig,
-        launchResolver: GrokBuildACPLaunchResolver = GrokBuildACPLaunchResolver(),
+        launchResolver: GrokBuildCLILaunchResolver = GrokBuildCLILaunchResolver(),
         requestTimeout: TimeInterval = 6000,
         apiKeyProvider: @escaping APIKeyProvider = {
             try await KeyManager().getAPIKey(for: .grok)
@@ -84,7 +82,7 @@ final class GrokBuildOneShotHeadlessAgentProvider: HeadlessAgentProvider {
             )
         }
 
-        let launch: GrokBuildACPResolvedLaunch
+        let launch: GrokBuildCLIResolvedLaunch
         do {
             launch = try launchResolver.resolvedLaunch(for: config)
         } catch is CancellationError {
@@ -202,7 +200,7 @@ final class GrokBuildOneShotHeadlessAgentProvider: HeadlessAgentProvider {
                 return AIProviderError.apiError(source: error)
             }
         }
-        if error is GrokBuildACPLaunchResolutionError || error is ExecutableFileIdentityError {
+        if error is GrokBuildCLILaunchResolutionError || error is ExecutableFileIdentityError {
             return AIProviderError.invalidConfiguration(detail: error.localizedDescription)
         }
         return AIProviderError.apiError(source: error)

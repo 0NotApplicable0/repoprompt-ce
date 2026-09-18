@@ -601,8 +601,10 @@ enum MCPIntegrationHelper {
     /// Invoked from the UI when users opt-in to the integration. Ensures our MCP server exists and is
     /// enabled globally so Codex can use it outside of discovery runs.
     @discardableResult
-    static func installInCodex() -> (success: Bool, wasAlreadyPresent: Bool, errorMessage: String?) {
-        let result = CodexIntegrationConfiguration.installPersistentMCPConfig()
+    static func installInCodex(
+        launchSnapshot: CodexRuntimeAuthority.LaunchSnapshot? = nil
+    ) -> (success: Bool, wasAlreadyPresent: Bool, errorMessage: String?) {
+        let result = CodexIntegrationConfiguration.installPersistentMCPConfig(launchSnapshot: launchSnapshot)
         if result.success {
             // Also install Codex slash commands for MCP tool usage.
             installCodexCommands(useCLIVariant: false)
@@ -615,8 +617,10 @@ enum MCPIntegrationHelper {
     /// `enabled = false` so normal Codex usage stays opt-in, while the agent enables it at runtime via
     /// `-c` overrides.
     @discardableResult
-    static func ensureCodexServerForDiscovery() -> (success: Bool, wasAlreadyPresent: Bool, errorMessage: String?) {
-        CodexIntegrationConfiguration.ensureServerForDiscovery()
+    static func ensureCodexServerForDiscovery(
+        launchSnapshot: CodexRuntimeAuthority.LaunchSnapshot? = nil
+    ) -> (success: Bool, wasAlreadyPresent: Bool, errorMessage: String?) {
+        CodexIntegrationConfiguration.ensureServerForDiscovery(launchSnapshot: launchSnapshot)
     }
 
     /// Installs the RepoPrompt MCP server into Antigravity (`agy`) HOME-level config.

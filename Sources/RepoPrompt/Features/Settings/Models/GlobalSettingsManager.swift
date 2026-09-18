@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptDomainRuntime
 
 // MARK: - Canonical Settings Keys
 
@@ -330,6 +331,12 @@ protocol CodexHookApprovalSettingsProviding {
 @MainActor
 class GlobalSettingsStore: ObservableObject, CodexHookApprovalSettingsProviding {
     static let shared = GlobalSettingsStore()
+    private static let defaultUserDefaults: UserDefaults = {
+        if AppLaunchConfiguration.isUnitTestProcess {
+            return UserDefaults(suiteName: "RepoPromptCE.unit-settings.\(UUID().uuidString)")!
+        }
+        return .standard
+    }()
 
     private let defaults: UserDefaults
     private let fileStore: GlobalSettingsFileStoring
@@ -340,9 +347,15 @@ class GlobalSettingsStore: ObservableObject, CodexHookApprovalSettingsProviding 
     @Published private(set) var agentModelsSettingsByWorkspaceID: [UUID: WorkspaceAgentModelsSettings] = [:]
     @Published private(set) var codeMapsGloballyDisabled: Bool = false
     /// Non-nil when the on-disk settings file is blocked (unreadable or a newer schema).
-    /// UI surfaces this so the user can recover; RepoPrompt never auto-recovers.
+    /// UI surfaces this when the store cannot safely repair the document automatically.
     @Published private(set) var persistenceBlockReason: GlobalSettingsPersistenceBlockReason? {
         didSet { reconcilePersistenceBlockDismissal() }
+    }
+
+    /// True when a failed startup migration must be retried through the raw-preserving
+    /// transaction instead of the ordinary typed save path.
+    var isPendingPreservingMigrationRetry: Bool {
+        fileStore.hasPendingStartupMigration
     }
 
     @Published private(set) var sessionDismissedPersistenceBlockReason: GlobalSettingsPersistenceBlockReason?
@@ -361,11 +374,11 @@ class GlobalSettingsStore: ObservableObject, CodexHookApprovalSettingsProviding 
     private var settingsWriteDiagnostics: [GlobalSettingsWriteDiagnostic] = []
 
     init(
-        defaults: UserDefaults = .standard,
+        defaults: UserDefaults? = nil,
         fileStore: GlobalSettingsFileStoring = GlobalSettingsFileStore(),
         invalidAgentModelsProfileAssertion: @escaping (String) -> Void = { assertionFailure($0) }
     ) {
-        self.defaults = defaults
+        self.defaults = defaults ?? Self.defaultUserDefaults
         self.fileStore = fileStore
         self.invalidAgentModelsProfileAssertion = invalidAgentModelsProfileAssertion
         load()
@@ -488,6 +501,7 @@ class GlobalSettingsStore: ObservableObject, CodexHookApprovalSettingsProviding 
     func globalAgentModelsProfile() -> AgentModelsSettingsProfile {
         AgentModelsSettingsProfile(
             planningModelRaw: scalarPreferences.modelSelection?.planningModel,
+            additionalOracleModelRaws: scalarPreferences.modelSelection?.additionalOracleModels ?? [],
             preferredComposeModelRaw: scalarPreferences.modelSelection?.preferredComposeModel,
             syncChatModelWithOracle: resolvedSyncChatModelWithOracleFromCurrentPreferences(),
             contextBuilderAgentRaw: globalDefaults.discoverAgentRaw,
@@ -505,6 +519,9 @@ class GlobalSettingsStore: ObservableObject, CodexHookApprovalSettingsProviding 
         let normalized = normalizedAgentModelsProfile(profile)
         var modelSelection = scalarPreferences.modelSelection ?? GlobalScalarPreferences.ModelSelectionSettings()
         modelSelection.planningModel = normalized.planningModelRaw
+        modelSelection.additionalOracleModels = normalized.additionalOracleModelRaws.isEmpty
+            ? nil
+            : normalized.additionalOracleModelRaws
         modelSelection.preferredComposeModel = normalized.preferredComposeModelRaw
         modelSelection.syncChatModelWithOracle = normalized.syncChatModelWithOracle
         scalarPreferences.modelSelection = modelSelection
@@ -630,9 +647,14 @@ class GlobalSettingsStore: ObservableObject, CodexHookApprovalSettingsProviding 
         var globalChanged = false
         var modelSelection = scalarPreferences.modelSelection ?? GlobalScalarPreferences.ModelSelectionSettings()
         let planning = normalized(modelSelection.planningModel)
+        let additional = modelSelection.additionalOracleModels?.compactMap(normalized)
         let compose = normalized(modelSelection.preferredComposeModel)
-        if planning != modelSelection.planningModel || compose != modelSelection.preferredComposeModel {
+        if planning != modelSelection.planningModel
+            || additional != modelSelection.additionalOracleModels
+            || compose != modelSelection.preferredComposeModel
+        {
             modelSelection.planningModel = planning
+            modelSelection.additionalOracleModels = additional?.isEmpty == false ? additional : nil
             modelSelection.preferredComposeModel = compose
             scalarPreferences.modelSelection = modelSelection
             globalChanged = true
@@ -655,6 +677,7 @@ class GlobalSettingsStore: ObservableObject, CodexHookApprovalSettingsProviding 
             guard var settings = agentModelsSettingsByWorkspaceID[workspaceID], var profile = settings.profile else { continue }
             let old = profile
             profile.planningModelRaw = normalized(profile.planningModelRaw)
+            profile.additionalOracleModelRaws = profile.additionalOracleModelRaws.compactMap(normalized)
             profile.preferredComposeModelRaw = normalized(profile.preferredComposeModelRaw)
             if let models = profile.contextBuilderModelsByAgent {
                 profile.contextBuilderModelsByAgent = models.mapValues { AIModel.rawValueWithoutOpenAIServiceTier($0) }
@@ -1117,6 +1140,19 @@ class GlobalSettingsStore: ObservableObject, CodexHookApprovalSettingsProviding 
         if globalAgentModelsProfile() != oldAgentModelsProfile {
             postAgentModelsSettingsDidChange(scope: .global)
         }
+    }
+
+    func additionalOracleModelRaws() -> [String] {
+        scalarPreferences.modelSelection?.additionalOracleModels ?? []
+    }
+
+    func setAdditionalOracleModelRaws(_ raws: [String], commit: Bool = true) throws {
+        let normalized = try OracleRosterContract.normalizedAdditionalModelIDs(raws)
+        guard normalized != additionalOracleModelRaws() else { return }
+        updateModelSelectionScalar(commit: commit) { settings in
+            settings.additionalOracleModels = normalized.isEmpty ? nil : normalized
+        }
+        postAgentModelsSettingsDidChange(scope: .global)
     }
 
     func syncChatModelWithOracle() -> Bool {
@@ -1833,12 +1869,19 @@ class GlobalSettingsStore: ObservableObject, CodexHookApprovalSettingsProviding 
     ) {
         var repositories = globalDefaults.worktreeVisualIdentitiesByRepositoryID ?? [:]
         var bucket = repositories[repositoryID] ?? WorktreeVisualIdentityRepositoryBucket()
+        let previousLabel = normalizedWorktreeVisualLabel(bucket.identitiesByWorktreeID[worktreeID]?.label)
         bucket.identitiesByWorktreeID[worktreeID] = identity
         repositories[repositoryID] = bucket
         globalDefaults.worktreeVisualIdentitiesByRepositoryID = repositories
         objectWillChange.send()
         if commit {
             save()
+        }
+        // Label only. Color, icon, marker style, and `updatedAt` cannot change any oversight row's
+        // location text, so they must not schedule a repaint. Fired from the live assignment rather
+        // than from `save()`: presentation follows memory, and a revert emits its own refresh.
+        if previousLabel != normalizedWorktreeVisualLabel(identity.label) {
+            AgentSessionLinkLocationInvalidationSink.locationLabelsChanged(inWorkspace: nil)
         }
     }
 
@@ -1930,6 +1973,9 @@ class GlobalSettingsStore: ObservableObject, CodexHookApprovalSettingsProviding 
         else {
             return (nil, nil)
         }
+        if AgentProviderKind(rawValue: agentRaw)?.preservesSavedSelection == true {
+            return (agentRaw, globalDefaults.discoverModelsByAgent?[agentRaw])
+        }
         let modelRaw = globalDefaults.discoverModelsByAgent?[agentRaw]?
             .trimmingCharacters(in: .whitespacesAndNewlines)
         return (agentRaw, modelRaw?.isEmpty == false ? modelRaw : nil)
@@ -1953,7 +1999,10 @@ class GlobalSettingsStore: ObservableObject, CodexHookApprovalSettingsProviding 
     /// should continue using `globalContextBuilderAgentSelection()`.
     func globalContextBuilderRememberedModelRaw(for agentRaw: String) -> String? {
         let trimmedAgentRaw = agentRaw.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard AgentProviderKind(rawValue: trimmedAgentRaw) != nil else { return nil }
+        guard let agent = AgentProviderKind(rawValue: trimmedAgentRaw) else { return nil }
+        if agent.preservesSavedSelection {
+            return globalDefaults.discoverModelsByAgent?[trimmedAgentRaw]
+        }
         guard let raw = globalDefaults.discoverModelsByAgent?[trimmedAgentRaw]?.trimmingCharacters(in: .whitespacesAndNewlines),
               !raw.isEmpty
         else {
@@ -2031,10 +2080,10 @@ class GlobalSettingsStore: ObservableObject, CodexHookApprovalSettingsProviding 
 
         let trimmedModelRaw = modelRaw?.trimmingCharacters(in: .whitespacesAndNewlines)
         let newModelRaw: String?
-        if let trimmedModelRaw, !trimmedModelRaw.isEmpty {
+        if let trimmedModelRaw, !trimmedModelRaw.isEmpty || agent.preservesSavedSelection {
             let normalized = AgentModelCatalog.normalizeSelection(
                 agentRaw: agent.rawValue,
-                modelRaw: trimmedModelRaw
+                modelRaw: agent.preservesSavedSelection ? modelRaw : trimmedModelRaw
             )
             if globalDefaults.discoverModelsByAgent == nil {
                 globalDefaults.discoverModelsByAgent = [:]
@@ -2237,6 +2286,7 @@ class GlobalSettingsStore: ObservableObject, CodexHookApprovalSettingsProviding 
     private func normalizedAgentModelsProfile(_ profile: AgentModelsSettingsProfile) -> AgentModelsSettingsProfile {
         var normalized = AgentModelsSettingsProfile(
             planningModelRaw: profile.planningModelRaw,
+            additionalOracleModelRaws: profile.additionalOracleModelRaws,
             preferredComposeModelRaw: profile.preferredComposeModelRaw,
             syncChatModelWithOracle: profile.syncChatModelWithOracle,
             contextBuilderAgentRaw: profile.contextBuilderAgentRaw,
@@ -2298,6 +2348,7 @@ class GlobalSettingsStore: ObservableObject, CodexHookApprovalSettingsProviding 
         let contextBuilderModelRaw = profile.contextBuilderAgentRaw.flatMap { profile.contextBuilderModelsByAgent?[$0] }
         return [
             "planning=\(profile.planningModelRaw ?? "nil")",
+            "additionalOracles=\(profile.additionalOracleModelRaws.joined(separator: ","))",
             "compose=\(profile.preferredComposeModelRaw ?? "nil")",
             "sync=\(profile.syncChatModelWithOracle)",
             "contextBuilder=\(profile.contextBuilderAgentRaw ?? "nil"):\(contextBuilderModelRaw ?? "nil")",
@@ -2342,6 +2393,7 @@ class GlobalSettingsStore: ObservableObject, CodexHookApprovalSettingsProviding 
             }
         }
         let document = loadedExistingDocument ?? fileStore.loadOrCreateDefault()
+        let needsSchemaVersionUpgrade = document.requiredSchemaVersion > document.schemaVersion
         copySettings = document.copySettings
         let migratedContextBuilderState = Self.migratingLegacyContextBuilderState(
             chatSettings: document.chatSettings,
@@ -2360,7 +2412,10 @@ class GlobalSettingsStore: ObservableObject, CodexHookApprovalSettingsProviding 
         codeMapsGloballyDisabled = globalDefaults.codeMapsGloballyDisabled ?? false
         persistenceBlockReason = fileStore.blockReason
         if persistenceBlockReason == nil,
-           migratedContextBuilderState.didChange || seededFileSystemDefaults || disabledInvalidSync
+           migratedContextBuilderState.didChange
+           || seededFileSystemDefaults
+           || disabledInvalidSync
+           || needsSchemaVersionUpgrade
         {
             saveStartupMigration(includeModelSelectionRepair: disabledInvalidSync)
         }
@@ -2379,15 +2434,23 @@ class GlobalSettingsStore: ObservableObject, CodexHookApprovalSettingsProviding 
 
     /// User-initiated recovery when `persistenceBlockReason` is non-nil. The file store backs
     /// up the offending on-disk file, writes the current in-memory settings as a fresh
-    /// current-schema document, and clears the block; this method then re-reads state so the
-    /// store and observers refresh.
+    /// current-schema document, and clears the block on success. A failed replacement keeps
+    /// the current in-memory document and the file store's blocked state intact.
     /// Returns true only when recovery completed successfully.
     @discardableResult
     func recoverBlockedPersistenceAfterBackup() -> Bool {
-        let backedUp = fileStore.performUserInitiatedRecovery(replacementDocument: makeDocument())
+        let recovered = fileStore.performUserInitiatedRecovery(replacementDocument: makeDocument())
         objectWillChange.send()
-        load(notifyAgentModelsChanges: true)
-        return backedUp
+        if recovered {
+            load(notifyAgentModelsChanges: true)
+        } else {
+            // Recovery may have moved the original file before its replacement write failed.
+            // Do not reload a missing primary file: that would install and persist defaults.
+            // Keep the live document intact and surface the store's actionable blocked state so
+            // the user can retry the intended settings after fixing the underlying failure.
+            persistenceBlockReason = fileStore.blockReason
+        }
+        return recovered
     }
 
     /// User-initiated compatible import from a blocked newer/different-schema settings file.
@@ -2409,7 +2472,20 @@ class GlobalSettingsStore: ObservableObject, CodexHookApprovalSettingsProviding 
     /// backing up or resetting the user's settings. Returns true when persistence is unblocked.
     @discardableResult
     func retryBlockedPersistenceSave() -> Bool {
-        save()
+        // Reload is an explicit, separate action: never overwrite another writer or
+        // persist provisional defaults through the generic save retry.
+        guard persistenceBlockReason != .changedOnDisk,
+              persistenceBlockReason != .missingOnDisk,
+              persistenceBlockReason != .loadFailed
+        else {
+            return false
+        }
+        if fileStore.hasPendingStartupMigration {
+            return persist {
+                try fileStore.retryStartupMigrationPreservingUnknownFields(makeDocument())
+            }
+        }
+        return save()
     }
 
     @discardableResult
@@ -2418,6 +2494,7 @@ class GlobalSettingsStore: ObservableObject, CodexHookApprovalSettingsProviding 
             let oldGlobalProfile = globalAgentModelsProfile()
             let oldWorkspaceSettings = agentModelsSettingsByWorkspaceID
             let document = try fileStore.load()
+            let needsSchemaVersionUpgrade = document.requiredSchemaVersion > document.schemaVersion
             objectWillChange.send()
             copySettings = document.copySettings
             let migratedContextBuilderState = Self.migratingLegacyContextBuilderState(
@@ -2435,7 +2512,10 @@ class GlobalSettingsStore: ObservableObject, CodexHookApprovalSettingsProviding 
             codeMapsGloballyDisabled = globalDefaults.codeMapsGloballyDisabled ?? false
             persistenceBlockReason = fileStore.blockReason
             if persistenceBlockReason == nil,
-               migratedContextBuilderState.didChange || seededFileSystemDefaults || disabledInvalidSync
+               migratedContextBuilderState.didChange
+               || seededFileSystemDefaults
+               || disabledInvalidSync
+               || needsSchemaVersionUpgrade
             {
                 saveStartupMigration(includeModelSelectionRepair: disabledInvalidSync)
             }

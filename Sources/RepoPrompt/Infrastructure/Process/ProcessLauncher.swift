@@ -210,11 +210,12 @@ enum ProcessLauncher {
         }
         defer { posix_spawnattr_destroy(&attributes) }
 
-        // Parent-side write paths use no-SIGPIPE hardening; restore the default SIGPIPE
-        // disposition in spawned children so CLI/tool processes keep normal pipe semantics.
+        // Parent-side write paths use no-SIGPIPE hardening; restore the default SIGPIPE and
+        // SIGTERM dispositions in spawned children so CLI/tool processes keep normal signal semantics.
         var defaultSignals = sigset_t()
         sigemptyset(&defaultSignals)
         sigaddset(&defaultSignals, SIGPIPE)
+        sigaddset(&defaultSignals, SIGTERM)
 
         // We may spawn from a GCD/worker thread whose signal mask has signals blocked. posix_spawn
         // inherits the calling thread's signal mask, so without resetting it the child starts with

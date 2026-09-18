@@ -369,6 +369,77 @@ final class AgentPermissionSecureStoreTests: XCTestCase {
         XCTAssertNil(store.diagnostic(for: .subagent))
     }
 
+    func testCurrentSchemaSubagentRawProviderMapIsPreservedAcrossUnrelatedProviderUpdate() throws {
+        let secureStrings = FakeSecurePlainStringStore()
+        let key = AgentPermissionSecureDomain.subagent.storageKey
+        let rawLevels = [
+            AgentProviderBindingID.antigravity.rawValue: "auto_edit",
+            "grokBuild": "managedDefault",
+            "futureProvider": "opaque"
+        ]
+        let payload = try encode(
+            SecureSubagentPermissionDocument(
+                globalPolicyRaw: AgentSubagentPermissionPolicy.custom.rawValue,
+                providerPermissionLevelsRawByProviderID: rawLevels
+            )
+        )
+        secureStrings.plainValues[key] = payload
+        let store = makeStore(secureStrings: secureStrings)
+
+        let permissions = store.subagentPermissions()
+        let antigravityLevel = permissions.providerPermissionLevel(for: .antigravity)
+
+        XCTAssertEqual(permissions.providerPermissionLevelsRawByProviderID, rawLevels)
+        XCTAssertEqual(antigravityLevel, .antigravity(.safeManagedUnavailable))
+        if case let .antigravity(level) = antigravityLevel {
+            XCTAssertFalse(level.supportsHeadlessRun)
+        } else {
+            XCTFail("Expected an Antigravity permission level")
+        }
+        XCTAssertEqual(secureStrings.plainValues[key], payload)
+        XCTAssertTrue(secureStrings.savedPlainValues.isEmpty)
+
+        XCTAssertTrue(store.updateSubagentPermissions { document in
+            var levels = document.providerPermissionLevelsRawByProviderID ?? [:]
+            levels[AgentProviderBindingID.grok.rawValue] = GrokAgentToolPreferences.PermissionLevel.managedDefault.rawValue
+            document.providerPermissionLevelsRawByProviderID = levels
+        })
+
+        var expectedLevels = rawLevels
+        expectedLevels[AgentProviderBindingID.grok.rawValue] = GrokAgentToolPreferences.PermissionLevel.managedDefault.rawValue
+        let saved = try decode(SecureSubagentPermissionDocument.self, from: secureStrings.plainValues[key])
+        XCTAssertEqual(saved.providerPermissionLevelsRawByProviderID, expectedLevels)
+    }
+
+    func testInvalidGrokSubagentValueIsUnavailableAndSurvivesUnrelatedUpdate() throws {
+        let secureStrings = FakeSecurePlainStringStore()
+        let key = AgentPermissionSecureDomain.subagent.storageKey
+        let rawLevels = ["grok": "future_permission", "grokBuild": "opaque", "futureProvider": "opaque"]
+        let payload = try encode(SecureSubagentPermissionDocument(
+            globalPolicyRaw: AgentSubagentPermissionPolicy.custom.rawValue,
+            providerPermissionLevelsRawByProviderID: rawLevels
+        ))
+        secureStrings.plainValues[key] = payload
+        let store = makeStore(secureStrings: secureStrings)
+
+        guard case let .grok(level) = store.providerSubagentPermissionLevel(for: .grok) else {
+            return XCTFail("Expected a Grok permission level")
+        }
+        assertGrokUnavailable(level)
+        XCTAssertEqual(secureStrings.plainValues[key], payload)
+        XCTAssertTrue(secureStrings.savedPlainValues.isEmpty)
+        XCTAssertTrue(store.updateSubagentPermissions { document in
+            var levels = document.providerPermissionLevelsRawByProviderID ?? [:]
+            levels["antigravity"] = "fullAccess"
+            document.providerPermissionLevelsRawByProviderID = levels
+        })
+        var expected = rawLevels
+        expected["antigravity"] = "fullAccess"
+        let saved = try decode(SecureSubagentPermissionDocument.self, from: secureStrings.plainValues[key])
+        XCTAssertEqual(saved.providerPermissionLevelsRawByProviderID, expected)
+        XCTAssertEqual(saved.providerPermissionLevel(for: .grok), .grok(level))
+    }
+
     func testSubagentFutureSchemaFailsClosedWithoutRewriting() throws {
         let secureStrings = FakeSecurePlainStringStore()
         let key = AgentPermissionSecureDomain.subagent.storageKey
@@ -436,8 +507,10 @@ final class AgentPermissionSecureStoreTests: XCTestCase {
         secureStrings.plainValues[grokKey] = grokPayload
         let store = makeStore(secureStrings: secureStrings)
 
-        XCTAssertEqual(store.antigravityPermissions().permissionLevel(), .managedDefault)
-        XCTAssertEqual(store.grokPermissions().permissionLevel(), .managedDefault)
+        let antigravityLevel = store.antigravityPermissions().permissionLevel()
+        XCTAssertEqual(antigravityLevel, .safeManagedUnavailable)
+        XCTAssertFalse(antigravityLevel.supportsHeadlessRun)
+        assertGrokUnavailable(store.grokPermissions().permissionLevel())
         XCTAssertEqual(store.diagnostic(for: .antigravity)?.kind, .decodeFailed)
         XCTAssertEqual(store.diagnostic(for: .grok)?.kind, .decodeFailed)
         XCTAssertTrue(secureStrings.savedPlainValues.isEmpty)
@@ -449,35 +522,86 @@ final class AgentPermissionSecureStoreTests: XCTestCase {
         XCTAssertTrue(secureStrings.savedPlainValues.isEmpty)
     }
 
-    func testAntigravityAndGrokUnknownPermissionValuesNormalizeFailClosed() throws {
+    func testUnknownProviderPermissionValuesArePreservedAndUnavailable() throws {
         let secureStrings = FakeSecurePlainStringStore()
         let antigravityKey = AgentPermissionSecureDomain.antigravity.storageKey
         let grokKey = AgentPermissionSecureDomain.grok.storageKey
-        secureStrings.plainValues[antigravityKey] = try encode(
-            SecureAntigravityPermissionDocument(
-                permissionLevelRaw: AntigravityAgentToolPreferences.PermissionLevel.safeManagedUnavailable.rawValue
-            )
+        let antigravityPayload = try encode(
+            SecureAntigravityPermissionDocument(permissionLevelRaw: "futurePermission")
         )
-        secureStrings.plainValues[grokKey] = try encode(
-            SecureGrokPermissionDocument(permissionLevelRaw: "futureFullAccess")
-        )
+        secureStrings.plainValues[antigravityKey] = antigravityPayload
+        let grokPayload = try encode(SecureGrokPermissionDocument(permissionLevelRaw: "futureFullAccess"))
+        secureStrings.plainValues[grokKey] = grokPayload
         let store = makeStore(secureStrings: secureStrings)
 
-        XCTAssertEqual(store.antigravityPermissions().permissionLevel(), .managedDefault)
-        XCTAssertEqual(store.grokPermissions().permissionLevel(), .managedDefault)
+        let antigravityLevel = store.antigravityPermissions().permissionLevel()
+        XCTAssertEqual(antigravityLevel, .safeManagedUnavailable)
+        XCTAssertFalse(antigravityLevel.supportsHeadlessRun)
+        assertGrokUnavailable(store.grokPermissions().permissionLevel())
 
-        let savedAntigravity = try decode(
-            SecureAntigravityPermissionDocument.self,
-            from: secureStrings.plainValues[antigravityKey]
-        )
-        let savedGrok = try decode(SecureGrokPermissionDocument.self, from: secureStrings.plainValues[grokKey])
-        XCTAssertEqual(
-            savedAntigravity.permissionLevelRaw,
-            AntigravityAgentToolPreferences.PermissionLevel.managedDefault.rawValue
-        )
-        XCTAssertEqual(savedGrok.permissionLevelRaw, GrokAgentToolPreferences.PermissionLevel.managedDefault.rawValue)
-        XCTAssertNil(store.diagnostic(for: .antigravity))
-        XCTAssertNil(store.diagnostic(for: .grok))
+        XCTAssertEqual(secureStrings.plainValues[antigravityKey], antigravityPayload)
+        XCTAssertEqual(secureStrings.plainValues[grokKey], grokPayload)
+        XCTAssertTrue(secureStrings.savedPlainValues.isEmpty)
+        XCTAssertEqual(store.diagnostic(for: .antigravity)?.kind, .decodeFailed)
+        XCTAssertTrue(store.diagnostic(for: .antigravity)?.message.lowercased().contains("reset") == true)
+        XCTAssertEqual(store.diagnostic(for: .grok)?.kind, .decodeFailed)
+        XCTAssertTrue(store.diagnostic(for: .grok)?.message.lowercased().contains("reset") == true)
+    }
+
+    func testCurrentSchemaAntigravityUnsupportedRawValuesArePreservedAndCannotRunHeadless() throws {
+        let cases: [(rawValue: String?, allowsExplicitReplacement: Bool)] = [
+            (nil, false),
+            ("default", true),
+            ("auto_edit", true),
+            ("yolo", true),
+            ("future_permission", false),
+            (AntigravityAgentToolPreferences.PermissionLevel.safeManagedUnavailable.rawValue, false)
+        ]
+        for testCase in cases {
+            let secureStrings = FakeSecurePlainStringStore()
+            let key = AgentPermissionSecureDomain.antigravity.storageKey
+            let payload = try encode(SecureAntigravityPermissionDocument(permissionLevelRaw: testCase.rawValue))
+            secureStrings.plainValues[key] = payload
+            let store = makeStore(secureStrings: secureStrings)
+
+            let permissions = store.antigravityPermissions()
+
+            XCTAssertEqual(permissions.permissionLevelRaw, testCase.rawValue)
+            XCTAssertEqual(permissions.permissionLevel(), .safeManagedUnavailable)
+            XCTAssertFalse(permissions.permissionLevel().supportsHeadlessRun)
+            XCTAssertEqual(secureStrings.plainValues[key], payload)
+            XCTAssertTrue(secureStrings.savedPlainValues.isEmpty)
+            XCTAssertEqual(store.diagnostic(for: .antigravity)?.kind, .decodeFailed)
+            XCTAssertTrue(
+                store.diagnostic(for: .antigravity)?.message.lowercased().contains("reset") == true ||
+                    store.diagnostic(for: .antigravity)?.message.lowercased().contains("choose") == true
+            )
+
+            XCTAssertEqual(
+                store.setAntigravityPermissionLevel(.fullAccess),
+                testCase.allowsExplicitReplacement
+            )
+            if testCase.allowsExplicitReplacement {
+                XCTAssertEqual(store.antigravityPermissions().permissionLevel(), .fullAccess)
+                XCTAssertNil(store.diagnostic(for: .antigravity))
+            } else {
+                XCTAssertEqual(secureStrings.plainValues[key], payload)
+                XCTAssertTrue(store.resetAgentPermissionsToSafeDefaults().succeeded)
+                XCTAssertEqual(store.antigravityPermissions().permissionLevel(), .managedDefault)
+                let resetDocument = try decode(
+                    SecureAntigravityPermissionDocument.self,
+                    from: secureStrings.plainValues[key]
+                )
+                XCTAssertEqual(resetDocument.permissionLevelRaw, "managedDefault")
+            }
+        }
+
+        let missingSecureStrings = FakeSecurePlainStringStore()
+        let missingStore = makeStore(secureStrings: missingSecureStrings)
+        XCTAssertEqual(missingStore.antigravityPermissions().permissionLevel(), .managedDefault)
+        XCTAssertNil(missingSecureStrings.plainValues[AgentPermissionSecureDomain.antigravity.storageKey])
+        XCTAssertTrue(missingSecureStrings.savedPlainValues.isEmpty)
+        XCTAssertNil(missingStore.diagnostic(for: .antigravity))
     }
 
     func testProviderLegacyPermissionLevelsMigrateOnlyWhenSecureDocumentsAreMissing() throws {
@@ -625,14 +749,19 @@ final class AgentPermissionSecureStoreTests: XCTestCase {
         XCTAssertNil(defaults.object(forKey: "grokToolPermissionLevel"))
     }
 
-    func testMalformedOrFutureSecureProviderDocumentsDoNotUsePermissiveLegacyValues() throws {
+    func testFutureSecureProviderDocumentsDoNotUsePermissiveLegacyValues() throws {
         let (defaults, suiteName) = try makeDefaults()
         defer { defaults.removePersistentDomain(forName: suiteName) }
         AntigravityAgentToolPreferences.setPermissionLevel(.fullAccess, defaults: defaults)
         GrokAgentToolPreferences.setPermissionLevel(.fullAccess, defaults: defaults)
 
         let secureStrings = FakeSecurePlainStringStore()
-        secureStrings.plainValues[AgentPermissionSecureDomain.antigravity.storageKey] = "{not-json"
+        secureStrings.plainValues[AgentPermissionSecureDomain.antigravity.storageKey] = try encode(
+            SecureAntigravityPermissionDocument(
+                schemaVersion: SecureAntigravityPermissionDocument.currentSchemaVersion + 1,
+                permissionLevelRaw: AntigravityAgentToolPreferences.PermissionLevel.fullAccess.rawValue
+            )
+        )
         secureStrings.plainValues[AgentPermissionSecureDomain.grok.storageKey] = try encode(
             SecureGrokPermissionDocument(
                 schemaVersion: SecureGrokPermissionDocument.currentSchemaVersion + 1,
@@ -640,33 +769,51 @@ final class AgentPermissionSecureStoreTests: XCTestCase {
             )
         )
         let store = makeStore(secureStrings: secureStrings)
-        let malformedAntigravityPayload = secureStrings.plainValues[AgentPermissionSecureDomain.antigravity.storageKey]
+        let futureAntigravityPayload = secureStrings.plainValues[AgentPermissionSecureDomain.antigravity.storageKey]
         let futureGrokPayload = secureStrings.plainValues[AgentPermissionSecureDomain.grok.storageKey]
 
-        XCTAssertEqual(
-            AntigravityAgentToolPreferences.permissionLevel(defaults: defaults, secureStore: store),
-            .managedDefault
-        )
-        XCTAssertEqual(
-            GrokAgentToolPreferences.permissionLevel(defaults: defaults, secureStore: store),
-            .managedDefault
-        )
+        let antigravityLevel = AntigravityAgentToolPreferences.permissionLevel(defaults: defaults, secureStore: store)
+        XCTAssertEqual(antigravityLevel, .safeManagedUnavailable)
+        XCTAssertFalse(antigravityLevel.supportsHeadlessRun)
+        assertGrokUnavailable(GrokAgentToolPreferences.permissionLevel(defaults: defaults, secureStore: store))
         XCTAssertTrue(secureStrings.savedPlainValues.isEmpty)
         XCTAssertEqual(defaults.string(forKey: "antigravityToolPermissionLevel"), "fullAccess")
         XCTAssertEqual(defaults.string(forKey: "grokToolPermissionLevel"), "fullAccess")
-        XCTAssertEqual(store.diagnostic(for: .antigravity)?.kind, .decodeFailed)
+        XCTAssertEqual(store.diagnostic(for: .antigravity)?.kind, .unsupportedFutureSchema)
         XCTAssertEqual(store.diagnostic(for: .grok)?.kind, .unsupportedFutureSchema)
 
         XCTAssertFalse(store.setAntigravityPermissionLevel(.fullAccess))
         XCTAssertFalse(store.setGrokPermissionLevel(.fullAccess))
         XCTAssertEqual(
             secureStrings.plainValues[AgentPermissionSecureDomain.antigravity.storageKey],
-            malformedAntigravityPayload
+            futureAntigravityPayload
         )
         XCTAssertEqual(
             secureStrings.plainValues[AgentPermissionSecureDomain.grok.storageKey],
             futureGrokPayload
         )
+    }
+
+    func testLegacyAntigravityFullAccessDoesNotOverwriteForeignSecureDocumentOrEnableHeadlessRun() throws {
+        let (defaults, suiteName) = try makeDefaults()
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        AntigravityAgentToolPreferences.setPermissionLevel(.fullAccess, defaults: defaults)
+
+        let secureStrings = FakeSecurePlainStringStore()
+        let key = AgentPermissionSecureDomain.antigravity.storageKey
+        let payload = """
+        {"schemaVersion":1,"updatedAt":0,"permissionLevelRaw":"future_permission","foreign":{"owner":"agy"}}
+        """
+        secureStrings.plainValues[key] = payload
+        let store = makeStore(secureStrings: secureStrings)
+
+        let level = AntigravityAgentToolPreferences.permissionLevel(defaults: defaults, secureStore: store)
+
+        XCTAssertEqual(level, .safeManagedUnavailable)
+        XCTAssertFalse(level.supportsHeadlessRun)
+        XCTAssertEqual(secureStrings.plainValues[key], payload)
+        XCTAssertTrue(secureStrings.savedPlainValues.isEmpty)
+        XCTAssertEqual(defaults.string(forKey: "antigravityToolPermissionLevel"), "fullAccess")
     }
 
     func testLegacyProviderMigrationWriteFailuresFailClosedAndRetainLegacyKeys() throws {
@@ -682,14 +829,13 @@ final class AgentPermissionSecureStoreTests: XCTestCase {
         ]
         let store = makeStore(secureStrings: secureStrings)
 
-        XCTAssertEqual(
-            AntigravityAgentToolPreferences.permissionLevel(defaults: defaults, secureStore: store),
-            .managedDefault
+        let antigravityLevel = AntigravityAgentToolPreferences.permissionLevel(
+            defaults: defaults,
+            secureStore: store
         )
-        XCTAssertEqual(
-            GrokAgentToolPreferences.permissionLevel(defaults: defaults, secureStore: store),
-            .managedDefault
-        )
+        XCTAssertEqual(antigravityLevel, .safeManagedUnavailable)
+        XCTAssertFalse(antigravityLevel.supportsHeadlessRun)
+        assertGrokUnavailable(GrokAgentToolPreferences.permissionLevel(defaults: defaults, secureStore: store))
         XCTAssertEqual(defaults.string(forKey: "antigravityToolPermissionLevel"), "fullAccess")
         XCTAssertEqual(defaults.string(forKey: "grokToolPermissionLevel"), "fullAccess")
         XCTAssertEqual(store.diagnostic(for: .antigravity)?.kind, .keychainWriteFailed)
@@ -713,18 +859,402 @@ final class AgentPermissionSecureStoreTests: XCTestCase {
         AntigravityAgentToolPreferences.setPermissionLevel(.fullAccess, defaults: defaults, secureStore: store)
         GrokAgentToolPreferences.setPermissionLevel(.fullAccess, defaults: defaults, secureStore: store)
 
-        XCTAssertEqual(
-            AntigravityAgentToolPreferences.permissionLevel(defaults: defaults, secureStore: store),
-            .managedDefault
+        let antigravityLevel = AntigravityAgentToolPreferences.permissionLevel(
+            defaults: defaults,
+            secureStore: store
         )
-        XCTAssertEqual(
-            GrokAgentToolPreferences.permissionLevel(defaults: defaults, secureStore: store),
-            .managedDefault
-        )
+        XCTAssertEqual(antigravityLevel, .safeManagedUnavailable)
+        XCTAssertFalse(antigravityLevel.supportsHeadlessRun)
+        assertGrokUnavailable(GrokAgentToolPreferences.permissionLevel(defaults: defaults, secureStore: store))
         XCTAssertEqual(defaults.string(forKey: "antigravityToolPermissionLevel"), "fullAccess")
         XCTAssertEqual(defaults.string(forKey: "grokToolPermissionLevel"), "fullAccess")
         XCTAssertEqual(store.diagnostic(for: .antigravity)?.kind, .keychainWriteFailed)
         XCTAssertEqual(store.diagnostic(for: .grok)?.kind, .keychainWriteFailed)
+    }
+
+    func testAntigravitySecurePreferencesIgnoreRetiredACPAgentModeLiteralYolo() throws {
+        let (defaults, suiteName) = try makeDefaults()
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        defaults.set("yolo", forKey: "antigravityACPAgentMode")
+
+        let secureStrings = FakeSecurePlainStringStore()
+        let store = makeStore(secureStrings: secureStrings)
+
+        XCTAssertEqual(
+            AntigravityAgentToolPreferences.permissionLevel(defaults: defaults, secureStore: store),
+            .managedDefault
+        )
+        XCTAssertEqual(defaults.string(forKey: "antigravityACPAgentMode"), "yolo")
+        let saved = try decode(
+            SecureAntigravityPermissionDocument.self,
+            from: secureStrings.plainValues[AgentPermissionSecureDomain.antigravity.storageKey]
+        )
+        XCTAssertEqual(saved.permissionLevel(), .managedDefault)
+    }
+
+    func testAntigravityOwnedLegacyYoloIsUnavailableUntilExplicitFullAccessSetter() throws {
+        let (defaults, suiteName) = try makeDefaults()
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        defaults.set("yolo", forKey: "antigravityToolPermissionLevel")
+
+        let secureStrings = FakeSecurePlainStringStore()
+        let notificationCenter = NotificationCenter()
+        let store = makeStore(secureStrings: secureStrings, notificationCenter: notificationCenter)
+
+        let level = AntigravityAgentToolPreferences.permissionLevel(defaults: defaults, secureStore: store)
+        XCTAssertEqual(level, .safeManagedUnavailable)
+        XCTAssertFalse(level.supportsHeadlessRun)
+        XCTAssertEqual(defaults.string(forKey: "antigravityToolPermissionLevel"), "yolo")
+        XCTAssertNil(secureStrings.plainValues[AgentPermissionSecureDomain.antigravity.storageKey])
+        XCTAssertTrue(secureStrings.savedPlainValues.isEmpty)
+
+        let changed = expectation(
+            forNotification: .agentPermissionSecureStoreDidChange,
+            object: store,
+            notificationCenter: notificationCenter
+        ) { notification in
+            XCTAssertEqual(
+                notification.userInfo?[AgentPermissionSecureStoreNotificationKey.domain] as? String,
+                AgentPermissionSecureDomain.antigravity.rawValue
+            )
+            XCTAssertEqual(
+                notification.userInfo?[AgentPermissionSecureStoreNotificationKey.writeSucceeded] as? Bool,
+                true
+            )
+            return true
+        }
+
+        AntigravityAgentToolPreferences.setPermissionLevel(.fullAccess, defaults: defaults, secureStore: store)
+        wait(for: [changed], timeout: 1)
+
+        XCTAssertNil(defaults.object(forKey: "antigravityToolPermissionLevel"))
+        XCTAssertEqual(store.antigravityPermissions().permissionLevel(), .fullAccess)
+        let saved = try decode(
+            SecureAntigravityPermissionDocument.self,
+            from: secureStrings.plainValues[AgentPermissionSecureDomain.antigravity.storageKey]
+        )
+        XCTAssertEqual(saved.permissionLevel(), .fullAccess)
+    }
+
+    func testMalformedAntigravityDocumentIsPreservedAndBlocksHeadlessExecutionAndWrites() {
+        let secureStrings = FakeSecurePlainStringStore()
+        let key = AgentPermissionSecureDomain.antigravity.storageKey
+        let payload = "{not-json"
+        secureStrings.plainValues[key] = payload
+        let store = makeStore(secureStrings: secureStrings)
+
+        let level = store.antigravityPermissions().permissionLevel()
+
+        XCTAssertEqual(level, .safeManagedUnavailable)
+        XCTAssertFalse(level.supportsHeadlessRun)
+        XCTAssertEqual(store.diagnostic(for: .antigravity)?.kind, .decodeFailed)
+        XCTAssertEqual(secureStrings.plainValues[key], payload)
+        XCTAssertTrue(secureStrings.savedPlainValues.isEmpty)
+        XCTAssertFalse(store.setAntigravityPermissionLevel(.fullAccess))
+        XCTAssertEqual(secureStrings.plainValues[key], payload)
+        XCTAssertTrue(secureStrings.savedPlainValues.isEmpty)
+    }
+
+    func testResetIncludesAntigravityAndPersistsManagedDefaultAcrossRestart() throws {
+        let secureStrings = FakeSecurePlainStringStore()
+        let store = makeStore(secureStrings: secureStrings)
+        XCTAssertTrue(store.setAntigravityPermissionLevel(.fullAccess))
+
+        let result = store.resetAgentPermissionsToSafeDefaults()
+
+        XCTAssertTrue(result.succeeded)
+        XCTAssertTrue(result.succeededDomains.contains(.antigravity))
+        XCTAssertEqual(store.antigravityPermissions().permissionLevel(), .managedDefault)
+
+        let restartedStore = makeStore(secureStrings: secureStrings)
+        XCTAssertEqual(restartedStore.antigravityPermissions().permissionLevel(), .managedDefault)
+        let saved = try decode(
+            SecureAntigravityPermissionDocument.self,
+            from: secureStrings.plainValues[AgentPermissionSecureDomain.antigravity.storageKey]
+        )
+        XCTAssertEqual(saved.permissionLevel(), .managedDefault)
+    }
+
+    func testGrokInvalidCanonicalDataRequiresResetWithoutRewriting() throws {
+        let payloads = try [
+            encode(SecureGrokPermissionDocument(permissionLevelRaw: nil)),
+            encode(SecureGrokPermissionDocument(permissionLevelRaw: "future_permission")),
+            "{not-json",
+            "\u{FEFF}{\"schemaVersion\":1,\"updatedAt\":0,\"permissionLevelRaw\":\"managedDefault\",\"permissionLevelRaw\":\"fullAccess\"}",
+            encode(SecureGrokPermissionDocument(schemaVersion: 2, permissionLevelRaw: "fullAccess"))
+        ]
+        for payload in payloads {
+            let (defaults, suiteName) = try makeDefaults()
+            defer { defaults.removePersistentDomain(forName: suiteName) }
+            defaults.set("fullAccess", forKey: "grokToolPermissionLevel")
+            let secureStrings = FakeSecurePlainStringStore()
+            let key = AgentPermissionSecureDomain.grok.storageKey
+            secureStrings.plainValues[key] = payload
+            let store = makeStore(secureStrings: secureStrings)
+
+            let level = GrokAgentToolPreferences.permissionLevel(defaults: defaults, secureStore: store)
+            assertGrokUnavailable(level)
+            XCTAssertNotNil(store.diagnostic(for: .grok))
+            XCTAssertEqual(defaults.string(forKey: "grokToolPermissionLevel"), "fullAccess")
+            XCTAssertFalse(store.setGrokPermissionLevel(.fullAccess))
+            GrokAgentToolPreferences.setPermissionLevel(.fullAccess, defaults: defaults, secureStore: store)
+            XCTAssertEqual(secureStrings.plainValues[key].map { Data($0.utf8) }, Data(payload.utf8))
+            XCTAssertTrue(secureStrings.savedPlainValues.isEmpty)
+            XCTAssertTrue(secureStrings.plainDeleteAccessModes.isEmpty)
+
+            let reset = store.resetAgentPermissionsToSafeDefaults()
+            XCTAssertTrue(reset.succeededDomains.contains(.grok))
+            let restartedStore = makeStore(secureStrings: secureStrings)
+            XCTAssertEqual(restartedStore.grokPermissions().permissionLevel(), .managedDefault)
+            XCTAssertNil(restartedStore.diagnostic(for: .grok))
+        }
+    }
+
+    func testGrokInvalidStoredPermissionFailsImmediatelyWithResetGuidance() async throws {
+        let secureStrings = FakeSecurePlainStringStore()
+        secureStrings.plainValues[AgentPermissionSecureDomain.grok.storageKey] = try encode(
+            SecureGrokPermissionDocument(permissionLevelRaw: "future_permission")
+        )
+        let level = makeStore(secureStrings: secureStrings).grokPermissions().permissionLevel()
+        let provider = AgentRuntimeProviderService.shared.makeProvider(for: .grok, grokPermissionLevel: level)
+        guard let unsupported = provider as? UnsupportedHeadlessAgentProvider else {
+            return XCTFail("Invalid stored Grok permissions must never create a runnable provider")
+        }
+
+        do {
+            _ = try await unsupported.streamAgentMessage(AgentMessage(userMessage: "do not launch"), runID: nil)
+            XCTFail("Unsupported permissions must fail before returning a stream")
+        } catch {
+            let message = error.localizedDescription.lowercased()
+            XCTAssertTrue(message.contains("permission"))
+            XCTAssertTrue(message.contains("reset"))
+        }
+    }
+
+    func testUnreadableGrokDataIsUnavailableWithoutMutation() throws {
+        let secureStrings = FakeSecurePlainStringStore(plainGetError: KeychainService.KeychainError.interactionNotAllowed)
+        let key = AgentPermissionSecureDomain.grok.storageKey
+        let payload = try encode(SecureGrokPermissionDocument(permissionLevelRaw: "fullAccess"))
+        secureStrings.plainValues[key] = payload
+        let store = makeStore(secureStrings: secureStrings)
+
+        assertGrokUnavailable(store.grokPermissions().permissionLevel())
+        XCTAssertEqual(store.diagnostic(for: .grok)?.kind, .keychainInteractionNotAllowed)
+        XCTAssertFalse(store.setGrokPermissionLevel(.fullAccess))
+        XCTAssertEqual(secureStrings.plainValues[key], payload)
+        XCTAssertTrue(secureStrings.savedPlainValues.isEmpty)
+        XCTAssertTrue(secureStrings.plainDeleteAccessModes.isEmpty)
+    }
+
+    func testUnknownOwnedLegacyProviderValuesRequireExplicitSetting() throws {
+        for raw in ["future_permission", "yolo", ""] {
+            let (defaults, suiteName) = try makeDefaults()
+            defer { defaults.removePersistentDomain(forName: suiteName) }
+            defaults.set(raw, forKey: "antigravityToolPermissionLevel")
+            defaults.set(raw, forKey: "grokToolPermissionLevel")
+            let secureStrings = FakeSecurePlainStringStore()
+            let store = makeStore(secureStrings: secureStrings)
+
+            XCTAssertFalse(AntigravityAgentToolPreferences.permissionLevel(
+                defaults: defaults, secureStore: store
+            ).supportsHeadlessRun)
+            assertGrokUnavailable(GrokAgentToolPreferences.permissionLevel(defaults: defaults, secureStore: store))
+            XCTAssertEqual(defaults.string(forKey: "antigravityToolPermissionLevel"), raw)
+            XCTAssertEqual(defaults.string(forKey: "grokToolPermissionLevel"), raw)
+            XCTAssertTrue(secureStrings.plainValues.isEmpty)
+            XCTAssertTrue(secureStrings.savedPlainValues.isEmpty)
+
+            AntigravityAgentToolPreferences.setPermissionLevel(.fullAccess, defaults: defaults, secureStore: store)
+            GrokAgentToolPreferences.setPermissionLevel(.fullAccess, defaults: defaults, secureStore: store)
+            XCTAssertEqual(store.antigravityPermissions().permissionLevel(), .fullAccess)
+            XCTAssertEqual(store.grokPermissions().permissionLevel(), .fullAccess)
+            XCTAssertNil(defaults.object(forKey: "antigravityToolPermissionLevel"))
+            XCTAssertNil(defaults.object(forKey: "grokToolPermissionLevel"))
+        }
+    }
+
+    func testValidCanonicalProviderLevelsWinOverUnknownOwnedLegacyValues() throws {
+        for raw in ["managedDefault", "fullAccess"] {
+            let (defaults, suiteName) = try makeDefaults()
+            defer { defaults.removePersistentDomain(forName: suiteName) }
+            defaults.set("future_permission", forKey: "antigravityToolPermissionLevel")
+            defaults.set("future_permission", forKey: "grokToolPermissionLevel")
+            let secureStrings = FakeSecurePlainStringStore()
+            secureStrings.plainValues[AgentPermissionSecureDomain.antigravity.storageKey] = try encode(
+                SecureAntigravityPermissionDocument(permissionLevelRaw: raw)
+            )
+            secureStrings.plainValues[AgentPermissionSecureDomain.grok.storageKey] = try encode(
+                SecureGrokPermissionDocument(permissionLevelRaw: raw)
+            )
+            let original = secureStrings.plainValues
+            let store = makeStore(secureStrings: secureStrings)
+
+            XCTAssertEqual(AntigravityAgentToolPreferences.permissionLevel(
+                defaults: defaults, secureStore: store
+            ).rawValue, raw)
+            XCTAssertEqual(GrokAgentToolPreferences.permissionLevel(defaults: defaults, secureStore: store).rawValue, raw)
+            XCTAssertEqual(secureStrings.plainValues, original)
+            XCTAssertTrue(secureStrings.savedPlainValues.isEmpty)
+            XCTAssertNil(store.diagnostic(for: .antigravity))
+            XCTAssertNil(store.diagnostic(for: .grok))
+        }
+    }
+
+    func testGrokUnavailableLevelCannotBePersistedAsAnExplicitPreference() throws {
+        let secureStrings = FakeSecurePlainStringStore()
+        let key = AgentPermissionSecureDomain.grok.storageKey
+        secureStrings.plainValues[key] = try encode(SecureGrokPermissionDocument(permissionLevelRaw: "future_permission"))
+        let level = makeStore(secureStrings: secureStrings).grokPermissions().permissionLevel()
+        assertGrokUnavailable(level)
+        let (defaults, suiteName) = try makeDefaults()
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        defaults.set("fullAccess", forKey: "grokToolPermissionLevel")
+        let validStrings = FakeSecurePlainStringStore()
+        validStrings.plainValues[key] = try encode(SecureGrokPermissionDocument(permissionLevelRaw: "fullAccess"))
+        let original = validStrings.plainValues[key]
+        let store = makeStore(secureStrings: validStrings)
+
+        XCTAssertFalse(store.setGrokPermissionLevel(level))
+        XCTAssertFalse(store.updateGrokPermissions { $0.permissionLevelRaw = level.rawValue })
+        GrokAgentToolPreferences.setPermissionLevel(level, defaults: defaults, secureStore: store)
+        GrokAgentToolPreferences.setPermissionLevel(level, defaults: defaults)
+        XCTAssertEqual(validStrings.plainValues[key], original)
+        XCTAssertTrue(validStrings.savedPlainValues.isEmpty)
+        XCTAssertEqual(defaults.string(forKey: "grokToolPermissionLevel"), "fullAccess")
+    }
+
+    func testGrokCustomDefaultsPreserveInvalidPermissions() throws {
+        let (defaults, suiteName) = try makeDefaults()
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let directKey = "grokToolPermissionLevel"
+        let subagentKey = AgentModePermissionPreferences.providerPermissionLevelKey(for: .grok)
+        XCTAssertEqual(GrokAgentToolPreferences.permissionLevel(defaults: defaults), .managedDefault)
+        XCTAssertEqual(
+            AgentModePermissionPreferences.providerSubagentPermissionLevel(for: .grok, defaults: defaults),
+            .grok(.managedDefault)
+        )
+
+        let rawValues: [Any] = ["future_permission", "", ["unsupported": true]]
+        for raw in rawValues {
+            defaults.set(raw, forKey: directKey)
+            defaults.set(raw, forKey: subagentKey)
+            let originalDirect = defaults.object(forKey: directKey) as? NSObject
+            let originalSubagent = defaults.object(forKey: subagentKey) as? NSObject
+
+            let level = GrokAgentToolPreferences.permissionLevel(defaults: defaults)
+            assertGrokUnavailable(level)
+            XCTAssertEqual(
+                AgentModePermissionPreferences.providerSubagentPermissionLevel(for: .grok, defaults: defaults),
+                .grok(level)
+            )
+            GrokAgentToolPreferences.setPermissionLevel(level, defaults: defaults)
+            AgentModePermissionPreferences.setProviderSubagentPermissionLevel(.grok(level), for: .grok, defaults: defaults)
+            XCTAssertEqual(defaults.object(forKey: directKey) as? NSObject, originalDirect)
+            XCTAssertEqual(defaults.object(forKey: subagentKey) as? NSObject, originalSubagent)
+        }
+    }
+
+    func testGrokUnavailableSubagentPreferenceCannotBePersisted() throws {
+        let (defaults, suiteName) = try makeDefaults()
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let secureStrings = FakeSecurePlainStringStore()
+        let key = AgentPermissionSecureDomain.subagent.storageKey
+        let payload = try encode(SecureSubagentPermissionDocument(
+            globalPolicyRaw: AgentSubagentPermissionPolicy.custom.rawValue,
+            providerPermissionLevelsRawByProviderID: ["grok": "fullAccess"]
+        ))
+        secureStrings.plainValues[key] = payload
+        let store = makeStore(secureStrings: secureStrings)
+        let unavailable = GrokAgentToolPreferences.PermissionLevel.from(rawValue: "future_permission")
+
+        AgentModePermissionPreferences.setProviderSubagentPermissionLevel(
+            .grok(unavailable), for: .grok, defaults: defaults, secureStore: store
+        )
+        XCTAssertFalse(store.updateSubagentPermissions {
+            $0.providerPermissionLevelsRawByProviderID = ["grok": unavailable.rawValue]
+        })
+        XCTAssertEqual(store.providerSubagentPermissionLevel(for: .grok), .grok(.fullAccess))
+        XCTAssertEqual(secureStrings.plainValues[key], payload)
+        XCTAssertTrue(secureStrings.savedPlainValues.isEmpty)
+    }
+
+    func testRetiredGrokBuildMissingReadIsPassive() throws {
+        let (defaults, suiteName) = try makeDefaults()
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let secureStrings = FakeSecurePlainStringStore()
+        let store = makeStore(secureStrings: secureStrings)
+
+        XCTAssertEqual(GrokBuildAgentToolPreferences.permissionLevel(defaults: defaults, secureStore: store), .managedDefault)
+        XCTAssertEqual(store.grokBuildPermissions().permissionLevel(), .managedDefault)
+        XCTAssertTrue(secureStrings.plainValues.isEmpty)
+        XCTAssertTrue(secureStrings.savedPlainValues.isEmpty)
+        XCTAssertTrue(secureStrings.plainDeleteAccessModes.isEmpty)
+    }
+
+    func testRetiredGrokBuildStoredValuesAreReadWithoutRewriting() throws {
+        for raw in ["fullAccess", "future_permission"] {
+            let secureStrings = FakeSecurePlainStringStore()
+            let key = AgentPermissionSecureDomain.grokBuild.storageKey
+            let payload = try encode(SecureGrokBuildPermissionDocument(permissionLevelRaw: raw))
+            secureStrings.plainValues[key] = payload
+            let store = makeStore(secureStrings: secureStrings)
+
+            let document = store.grokBuildPermissions()
+            XCTAssertEqual(document.permissionLevelRaw, raw)
+            if raw == "fullAccess" {
+                XCTAssertEqual(document.permissionLevel(), .fullAccess)
+            }
+            XCTAssertEqual(secureStrings.plainValues[key], payload)
+            XCTAssertTrue(secureStrings.savedPlainValues.isEmpty)
+            XCTAssertTrue(secureStrings.plainDeleteAccessModes.isEmpty)
+        }
+    }
+
+    func testRetiredGrokBuildSettersAreUnsupportedButGlobalResetIsAllowed() throws {
+        let payloads: [String?] = try [
+            nil,
+            encode(SecureGrokBuildPermissionDocument(permissionLevelRaw: "fullAccess")),
+            encode(SecureGrokBuildPermissionDocument(permissionLevelRaw: "future_permission"))
+        ]
+        for payload in payloads {
+            let (defaults, suiteName) = try makeDefaults()
+            defer { defaults.removePersistentDomain(forName: suiteName) }
+            defaults.set("fullAccess", forKey: "grokBuildACPToolPermissionLevel")
+            let secureStrings = FakeSecurePlainStringStore()
+            let key = AgentPermissionSecureDomain.grokBuild.storageKey
+            secureStrings.plainValues[key] = payload
+            let store = makeStore(secureStrings: secureStrings)
+
+            XCTAssertFalse(store.setGrokBuildPermissionLevel(.managedDefault))
+            XCTAssertFalse(store.updateGrokBuildPermissions { $0.permissionLevelRaw = "fullAccess" })
+            GrokBuildAgentToolPreferences.setPermissionLevel(.managedDefault, defaults: defaults, secureStore: store)
+            GrokBuildAgentToolPreferences.setPermissionLevel(.managedDefault, defaults: defaults)
+            XCTAssertEqual(secureStrings.plainValues[key], payload)
+            XCTAssertTrue(secureStrings.savedPlainValues.isEmpty)
+            XCTAssertEqual(defaults.string(forKey: "grokBuildACPToolPermissionLevel"), "fullAccess")
+
+            let result = store.resetAgentPermissionsToSafeDefaults()
+            XCTAssertTrue(result.succeededDomains.contains(.grokBuild))
+            let restartedStore = makeStore(secureStrings: secureStrings)
+            XCTAssertEqual(restartedStore.grokBuildPermissions().permissionLevel(), .managedDefault)
+            let saved = try decode(SecureGrokBuildPermissionDocument.self, from: secureStrings.plainValues[key])
+            XCTAssertEqual(saved.permissionLevelRaw, "managedDefault")
+        }
+    }
+
+    private func assertGrokUnavailable(
+        _ level: GrokAgentToolPreferences.PermissionLevel,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) {
+        XCTAssertFalse(GrokAgentToolPreferences.PermissionLevel.allCases.contains(level), file: file, line: line)
+        XCTAssertNil(
+            AgentProviderPermissionLevelID(providerID: .grok, subagentRawValue: level.rawValue),
+            file: file,
+            line: line
+        )
+        let provider = AgentRuntimeProviderService.shared.makeProvider(for: .grok, grokPermissionLevel: level)
+        XCTAssertTrue(provider is UnsupportedHeadlessAgentProvider, file: file, line: line)
     }
 
     private func makeStore(

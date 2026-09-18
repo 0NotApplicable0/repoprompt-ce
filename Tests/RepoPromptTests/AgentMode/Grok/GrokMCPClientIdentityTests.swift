@@ -24,13 +24,9 @@ final class GrokMCPClientIdentityTests: XCTestCase {
     }
 
     func testGrokAnnouncedShellNameCanonicalizesToGrokFamily() {
-        // grok's actual MCP `initialize` clientInfo.name embeds the server, e.g.
-        // "grok-shell-RepoPromptCE". The trailing server-name word suffix would defeat the
-        // version-only suffix rule of the family matcher, so the leading-token path keeps it in the
-        // grok family — which is what lets grok's agent-mode run policy (keyed on "grok-client") bind
-        // to its connection so gated tools like set_status are advertised and accepted.
-        XCTAssertEqual(MCPClientIdentity.canonicalFamilyID("grok-shell-RepoPromptCE"), "grok-client")
-        XCTAssertEqual(MCPClientIdentity.canonicalFamilyID("grok-shell-SomeOtherServer"), "grok-client")
+        // Shell announcements retain the historical storage identity while matching the headless hint.
+        XCTAssertEqual(MCPClientIdentity.canonicalFamilyID("grok-shell-RepoPromptCE"), "grok-shell")
+        XCTAssertEqual(MCPClientIdentity.canonicalFamilyID("grok-shell-SomeOtherServer"), "grok-shell")
         XCTAssertTrue(MCPClientIdentity.matches("grok-client", "grok-shell-RepoPromptCE"))
     }
 
@@ -48,6 +44,34 @@ final class GrokMCPClientIdentityTests: XCTestCase {
 
     func testGrokClientIsRecognizedAsHeadlessAgentClient() {
         XCTAssertTrue(MCPClientIdentity.isHeadlessAgentClient(grokClientID))
+        XCTAssertTrue(MCPClientIdentity.isHeadlessAgentClient("grok-shell"))
+        XCTAssertTrue(MCPClientIdentity.isHeadlessAgentClient("grok-shell-RepoPromptCE"))
+    }
+
+    func testGrokStorageKeysRemainStableAcrossFamilyAliases() {
+        for (name, expectedKey) in [
+            ("grok-shell", "grok-shell"),
+            ("grok-shell-RepoPromptCE", "grok-shell"),
+            ("  GROK-SHELL-SomeOtherServer  ", "grok-shell"),
+            ("grok", "grok-client"),
+            ("grok-client", "grok-client"),
+            ("grok v1.0.3", "grok-client"),
+            ("grok-client/1.0.3", "grok-client")
+        ] {
+            XCTAssertEqual(MCPClientIdentity.storageKey(name), expectedKey, name)
+        }
+    }
+
+    func testGrokShellAndClientAreSymmetricFamilyAliases() {
+        for name in ["grok-shell", "grok-shell-RepoPromptCE", "grok-shell-SomeOtherServer"] {
+            XCTAssertTrue(MCPClientIdentity.matches(name, grokClientID), name)
+            XCTAssertTrue(MCPClientIdentity.matches(grokClientID, name), name)
+            XCTAssertTrue(MCPClientIdentity.sameFamily(name, grokClientID), name)
+            XCTAssertTrue(MCPClientIdentity.sameFamily(grokClientID, name), name)
+            XCTAssertTrue(MCPClientIdentity.sameFamily(name, "grok v1.0.3"), name)
+            XCTAssertFalse(MCPClientIdentity.matches(name, "cursor"), name)
+            XCTAssertFalse(MCPClientIdentity.sameFamily(name, "antigravity-client"), name)
+        }
     }
 
     func testGrokClientIsNotMisclassifiedAsAnotherFamily() {

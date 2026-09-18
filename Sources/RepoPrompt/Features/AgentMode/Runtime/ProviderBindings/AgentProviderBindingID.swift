@@ -9,6 +9,9 @@ enum AgentProviderBindingID: String, CaseIterable, Hashable {
     case grok
     case grokBuild
 
+    /// Keep grokBuild decodable without exposing retired agent permissions.
+    static let allCases: [AgentProviderBindingID] = [.codex, .claude, .openCode, .cursor, .antigravity, .grok]
+
     var displayName: String {
         switch self {
         case .codex:

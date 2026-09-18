@@ -47,6 +47,16 @@ enum AgentProviderKind: String, CaseIterable, Hashable {
     case kimiCode
     case customClaudeCompatible
 
+    /// Retired raw identities remain decodable but never participate in active enumeration.
+    static let allCases: [AgentProviderKind] = [
+        .claudeCode, .codexExec, .openCode, .cursor, .antigravity, .grok,
+        .claudeCodeGLM, .kimiCode, .customClaudeCompatible
+    ]
+
+    var preservesSavedSelection: Bool {
+        self == .antigravity || self == .grok || self == .grokBuild
+    }
+
     static let claudeMCPClientID = "claude-code"
     static let codexMCPClientID = "codex-mcp-client"
     static let openCodeMCPClientID = "opencode"
@@ -112,12 +122,12 @@ enum AgentProviderKind: String, CaseIterable, Hashable {
             Self.openCodeMCPClientID
         case .cursor:
             Self.cursorMCPClientID
-        case .antigravity:
-            Self.antigravityMCPClientID
         case .grok:
             Self.grokMCPClientID
         case .grokBuild:
             Self.grokBuildMCPClientID
+        case .antigravity:
+            Self.antigravityMCPClientID
         }
     }
 
@@ -127,9 +137,7 @@ enum AgentProviderKind: String, CaseIterable, Hashable {
             .openCode
         case .cursor:
             .cursor
-        case .grokBuild:
-            .grokBuild
-        case .claudeCode, .codexExec, .claudeCodeGLM, .kimiCode, .customClaudeCompatible, .antigravity, .grok:
+        case .claudeCode, .codexExec, .claudeCodeGLM, .kimiCode, .customClaudeCompatible, .antigravity, .grok, .grokBuild:
             nil
         }
     }
@@ -179,7 +187,7 @@ enum AgentProviderKind: String, CaseIterable, Hashable {
         case .grok:
             return "xAI's Grok CLI (grok), a Grok-powered terminal coding agent. Runs headless one-shot prompts and uses RepoPrompt MCP tools."
         case .grokBuild:
-            return "xAI Grok Build ACP agent. Uses Grok Build's ACP runtime (`grok agent stdio`) and injects RepoPrompt MCP tools through ACP session configuration."
+            return "Retired Agent Mode provider. Grok Build remains available for Chat and Oracle; choose Grok CLI or another active provider for agent tasks."
         case .claudeCodeGLM:
             let config = ClaudeCodeCompatibleBackendStore.shared.config(for: .glmZAI)
             if case let .claudeSlotMapping(mapping) = config.modelBehavior {
@@ -246,6 +254,18 @@ final class AgentRuntimeProviderService {
     private static let logger = Logger(label: "com.repoprompt.agent.runtime.provider")
 
     private init() {}
+
+    private func rejectedModelProvider(for agent: AgentProviderKind, modelString: String?) -> HeadlessAgentProvider? {
+        let model = modelString ?? AgentModel.defaultModel.rawValue
+        guard !AgentModelCatalog.isValid(
+            rawModel: model,
+            for: agent,
+            availability: .none.assumingAvailable(agent)
+        ) else { return nil }
+        return UnsupportedHeadlessAgentProvider(
+            reason: "Model '\(model)' is unavailable for \(agent.displayName). Choose Default or a model from the provider's current model catalog. The saved selection has not been changed."
+        )
+    }
 
     /// Create a headless agent provider.
     /// - Parameters:
@@ -315,7 +335,6 @@ final class AgentRuntimeProviderService {
             return OpenCodeACPHeadlessAgentProvider(config: config, workspacePath: workspacePath)
         case .cursor:
             let config = CursorAgentConfig(
-                commandName: agent.commandName,
                 enableDebugLogging: Self.enableDebugLogging,
                 modelString: modelString,
                 includeRepoPromptMCPServer: true,
@@ -330,6 +349,12 @@ final class AgentRuntimeProviderService {
             // per-provider overrides); discovery / no-session callers omit it and fall back to
             // the user's global Antigravity permission preference.
             let permissionLevel = antigravityPermissionLevel ?? AntigravityAgentToolPreferences.permissionLevel()
+            // Safe Managed must retain its pre-preparation rejection, even for an unknown model.
+            if permissionLevel.supportsHeadlessRun,
+               let rejection = rejectedModelProvider(for: agent, modelString: modelString)
+            {
+                return rejection
+            }
             let config = AntigravityAgentConfig(
                 modelString: modelString,
                 useSandbox: permissionLevel.useSandbox,
@@ -352,10 +377,13 @@ final class AgentRuntimeProviderService {
             }
             return AntigravityAgentProvider(runner: runner, config: config, workspacePath: workspacePath)
         case .grok:
-            // Real Agent Mode runs pass the session-resolved level (honoring Safe-Managed /
-            // per-provider overrides); discovery / no-session callers omit it and fall back to
-            // the user's global Grok permission preference.
             let permissionLevel = grokPermissionLevel ?? GrokAgentToolPreferences.permissionLevel()
+            guard permissionLevel != .storedPermissionUnavailable else {
+                return UnsupportedHeadlessAgentProvider(reason: permissionLevel.detailText)
+            }
+            if let rejection = rejectedModelProvider(for: agent, modelString: modelString) {
+                return rejection
+            }
             let config = GrokAgentConfig(
                 modelString: modelString,
                 useSandbox: permissionLevel.useSandbox,
@@ -377,15 +405,9 @@ final class AgentRuntimeProviderService {
             }
             return GrokAgentProvider(runner: runner, config: config, workspacePath: workspacePath)
         case .grokBuild:
-            let config = GrokBuildAgentConfig(
-                enableDebugLogging: Self.enableDebugLogging,
-                modelString: modelString,
-                alwaysApproveTools: GrokBuildAgentToolPreferences.permissionLevel() == .fullAccess
+            return UnsupportedHeadlessAgentProvider(
+                reason: "Grok Build (grokBuild) is retired for Agent Mode and Context Builder. Choose Grok CLI or another active agent provider. Grok Build remains available for Chat and Oracle."
             )
-            if Self.enableDebugLogging {
-                Self.logger.debug("Created GrokBuildACPHeadlessAgentProvider")
-            }
-            return GrokBuildACPHeadlessAgentProvider(config: config, workspacePath: workspacePath)
         }
     }
 }

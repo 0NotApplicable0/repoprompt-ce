@@ -13,19 +13,6 @@ enum MCPClientIdentity {
         character.unicodeScalars.allSatisfy(separatorCharacters.contains)
     }
 
-    /// Whether `normalized` begins with `token` as a whole leading identity token: either exactly
-    /// `token`, or `token` immediately followed by a separator (e.g. `grok` in
-    /// "grok-shell-RepoPromptCE"). Unlike `matchesFamily`, this tolerates a trailing WORD suffix —
-    /// grok's MCP client announces itself as "grok-shell-<server>", whose server-name suffix
-    /// `matchesFamily` rejects (it only tolerates numeric/`v` version suffixes). Used to keep grok's
-    /// announced name in the grok family so its agent-mode run policy (keyed on "grok-client") binds.
-    private static func hasLeadingToken(_ normalized: String, _ token: String) -> Bool {
-        guard normalized.hasPrefix(token) else { return false }
-        let rest = normalized.dropFirst(token.count)
-        guard let next = rest.first else { return true }
-        return isSeparator(next)
-    }
-
     private static func matchesFamily(_ normalized: String, tokens: [String]) -> Bool {
         guard !tokens.isEmpty else { return false }
         var remainder = normalized[...]
@@ -85,7 +72,6 @@ enum MCPClientIdentity {
         }
         if matchesFamily(normalized, tokens: ["grok", "client"])
             || matchesFamily(normalized, tokens: ["grok"])
-            || hasLeadingToken(normalized, "grok")
         {
             return "grok-client"
         }
@@ -103,7 +89,12 @@ enum MCPClientIdentity {
         else {
             return false
         }
-        return lhsFamily == rhsFamily
+        switch (lhsFamily, rhsFamily) {
+        case ("grok-shell", "grok-client"), ("grok-client", "grok-shell"):
+            return true
+        default:
+            return lhsFamily == rhsFamily
+        }
     }
 
     static func matches(_ lhs: String?, _ rhs: String?) -> Bool {
@@ -122,7 +113,7 @@ enum MCPClientIdentity {
         guard let family = canonicalFamilyID(raw) else { return false }
         switch family {
         case "claude-code", "codex-mcp-client", "gemini-cli-mcp-client", "cursor", "antigravity-client",
-             "grok-client":
+             "grok-client", "grok-shell":
             return true
         default:
             return false
