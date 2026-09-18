@@ -165,7 +165,7 @@ final class ContextBuilderOracleResultTests: XCTestCase {
     }
 
     @MainActor
-    func testSettledReplyBoundaryDeliversFailedPrimaryAndKeepsErrorNavigation() throws {
+    func testSettledReplyBoundaryPreservesFailedPrimaryPreviewAndKeepsErrorNavigation() throws {
         for mode in [HeadlessMode.plan, .review] {
             for primaryStatus in [OracleLaneResultStatus.failed, .cancelled] {
                 let result = try groupResult(status: .failed, lanes: [
@@ -176,6 +176,7 @@ final class ContextBuilderOracleResultTests: XCTestCase {
                     lane(index: 2, status: .completed, response: "third answer")
                 ])
                 let (session, generation, members) = try preparedSession(for: result)
+                session.backgroundPlanResponseText = "primary partial"
                 let workspaceID = UUID()
                 let reply = try session.completeOracleGroupReply(
                     ContextBuilderOracleGroupReply(result: result),
@@ -227,9 +228,12 @@ final class ContextBuilderOracleResultTests: XCTestCase {
                 status: additionalStatus == .completed ? .completed : .partialFailure,
                 lanes: [
                     lane(index: 0, status: .completed, response: "primary answer"),
-                    lane(index: 1, status: additionalStatus,
-                         response: additionalStatus == .completed ? "second answer" : nil,
-                         error: additionalStatus == .failed ? laneError(message: "second failed") : nil)
+                    lane(
+                        index: 1,
+                        status: additionalStatus,
+                        response: additionalStatus == .completed ? "second answer" : nil,
+                        error: additionalStatus == .failed ? laneError(message: "second failed") : nil
+                    )
                 ]
             )
             let (session, generation, _) = try preparedSession(for: result)
@@ -319,8 +323,8 @@ final class ContextBuilderOracleResultTests: XCTestCase {
         session.isBackgroundPlanGenerating = true
         let generation = session.followUpOracleGroupState.beginRun()
         let members = try result.oracleResults.map {
-            ContextBuilderOracleMemberHandle(
-                laneID: try OracleLaneID(index: $0.laneIndex), sessionID: UUID(), chatID: $0.chatID
+            try ContextBuilderOracleMemberHandle(
+                laneID: OracleLaneID(index: $0.laneIndex), sessionID: UUID(), chatID: $0.chatID
             )
         }
         XCTAssertTrue(session.followUpOracleGroupState.bind(

@@ -62,8 +62,8 @@ final class ContextBuilderOracleGroupStreamingProgressTests: XCTestCase {
 
     private func makeMembers() throws -> [ContextBuilderOracleMemberHandle] {
         try (0 ..< 3).map { index in
-            ContextBuilderOracleMemberHandle(
-                laneID: try OracleLaneID(index: index), sessionID: UUID(), chatID: "chat-\(index)"
+            try ContextBuilderOracleMemberHandle(
+                laneID: OracleLaneID(index: index), sessionID: UUID(), chatID: "chat-\(index)"
             )
         }
     }
