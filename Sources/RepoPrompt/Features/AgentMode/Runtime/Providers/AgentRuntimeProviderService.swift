@@ -266,7 +266,8 @@ final class AgentRuntimeProviderService {
         for agent: AgentProviderKind,
         modelString: String? = nil,
         runType: AgentRunType = .discover,
-        workspacePath: String? = nil
+        workspacePath: String? = nil,
+        modelParameterSelections: [ACPModelParameterSelection] = []
     ) -> HeadlessAgentProvider {
         if Self.enableDebugLogging {
             Self.logger.debug("Creating provider for agent: \(agent.displayName), model: \(modelString ?? "default"), runType: \(String(describing: runType))")
@@ -311,7 +312,8 @@ final class AgentRuntimeProviderService {
             let config = OpenCodeAgentConfig(
                 modelString: modelString,
                 enableDebugLogging: Self.enableDebugLogging,
-                toolProfile: .headless
+                toolProfile: .headless,
+                modelParameterSelections: modelParameterSelections
             )
             if Self.enableDebugLogging {
                 Self.logger.debug("Created OpenCodeACPHeadlessAgentProvider")

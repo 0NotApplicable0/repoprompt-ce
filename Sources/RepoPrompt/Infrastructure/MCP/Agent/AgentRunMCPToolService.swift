@@ -511,11 +511,6 @@ struct AgentRunMCPToolService {
             availability: targetWindow.apiSettingsViewModel.agentModeAvailabilityContext,
             workspaceID: workspace.id
         )
-        let modelParameterSelections = try AgentMCPModelParameterSupport.resolve(
-            value: args["model_parameters"],
-            agent: selection.agentRaw.flatMap { AgentProviderKind(rawValue: $0) },
-            modelRaw: selection.modelRaw
-        )
 
         #if DEBUG
             if let rawToken = normalizedString(args["_worktree_startup_benchmark_token"]) {
@@ -761,6 +756,41 @@ struct AgentRunMCPToolService {
                 "targetOrigin": String(describing: target.origin)
             ])
         #endif
+        // Resolve the parameter-validation workspace and acquire/validate parameters AFTER the
+        // worktree binding is reconciled and prepared, and inside a discard-on-failure scope.
+        //
+        // Ordering matters: OpenCode's advertised values are per-installation, so a run that
+        // creates or inherits a worktree must be validated against that worktree's config. When
+        // this ran before worktree preparation it validated against the repo root, and an
+        // explicit value that the worktree's `opencode.json` enables was rejected outright —
+        // runtime validation never got the chance to accept it. A throw here must not leak the
+        // allocated target, and the parameters are still rejected before any configuration is
+        // applied; the authority/target recheck after this suspension is the guard that follows.
+        let runParameterWorkspacePath: String?
+        let modelParameterSelections: [ACPModelParameterSelection]
+        do {
+            runParameterWorkspacePath = try agentModeVM.session(for: target.tabID, createIfNeeded: false)
+                .flatMap { try agentModeVM.effectiveWorkspacePath(for: $0) }
+                ?? workspace.repoPaths.first
+            let explicitModelParameterSelections = try await AgentMCPModelParameterSupport.resolve(
+                value: args["model_parameters"],
+                agent: selection.agentRaw.flatMap { AgentProviderKind(rawValue: $0) },
+                modelRaw: selection.modelRaw,
+                workspacePath: runParameterWorkspacePath
+            )
+            // A role-label start inherits the role's stored pin as a baseline, captured with the
+            // role resolution (never re-read after awaited setup). Explicit request parameters
+            // override matching identities; a compound model_id inherits nothing, because the
+            // resolver hands back no baseline for one — which is why the merge needs no role
+            // check here.
+            modelParameterSelections = AgentMCPModelParameterSupport.merged(
+                inherited: selection.modelParameterSelections,
+                explicit: explicitModelParameterSelections
+            )
+        } catch {
+            await agentModeVM.mcpDiscardSessionTarget(target)
+            throw error
+        }
         let outcome: AgentExternalMCPRunStarter.StartOutcome
         var lifecycleAdmissionAttempted = false
         var providerDispatchAttempted = false
