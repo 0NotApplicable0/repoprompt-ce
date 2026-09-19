@@ -63,6 +63,46 @@ final class JevRouterCredentialServiceTests: XCTestCase {
             return XCTFail("Missing stored credential must fail closed")
         }
     }
+
+    func testReadinessGenerationPublishesToTwoWindowObservers() async {
+        let service = JevRouterCredentialService(
+            secureKeys: SecureKeysService(secureStorage: TestSecureStorageBackend(values: [.jevRouterAPIKey: "stored"])),
+            client: ImmediateJevClient()
+        )
+        let firstStream = await service.readinessUpdates()
+        let secondStream = await service.readinessUpdates()
+        let first = Task { await firstStream.firstPolicyUnavailableGeneration() }
+        let second = Task { await secondStream.firstPolicyUnavailableGeneration() }
+        await service.bootstrapStoredConfigurationIfNeeded()
+        let firstGeneration = await first.value
+        let secondGeneration = await second.value
+        XCTAssertNotNil(firstGeneration)
+        XCTAssertEqual(firstGeneration, secondGeneration)
+    }
+
+    func testCancelValidationCancelsExactTransportTask() async {
+        let client = CancellationObservingJevClient()
+        let service = JevRouterCredentialService(client: client)
+        let validation = Task { await service.validateAndSave("candidate", operationID: UUID()) }
+        await client.waitUntilStarted()
+        await service.cancelAndAdvanceGeneration()
+        let validationResult = await validation.value
+        XCTAssertEqual(validationResult, .superseded)
+        await client.waitUntilCancelled()
+        guard case let .needsConfiguration(generation, _) = await service.readinessSnapshot() else {
+            return XCTFail("Cancellation must advance generation and fail closed")
+        }
+        XCTAssertGreaterThan(generation, 0)
+    }
+}
+
+private extension AsyncStream where Element == AgentTaskRouterBackendReadiness {
+    func firstPolicyUnavailableGeneration() async -> UInt64? {
+        for await readiness in self {
+            if case let .policyUnavailable(generation, _) = readiness { return generation }
+        }
+        return nil
+    }
 }
 
 private actor ControlledJevClient: JevRoutingClientProtocol {
@@ -90,13 +130,13 @@ private actor ControlledJevClient: JevRoutingClientProtocol {
     }
 
     func complete(_ key: String) {
-        completions.removeValue(forKey: key)?.resume(returning: .init(models: [.init(id: JevRouterCredentialService.pinnedModel)]))
+        completions.removeValue(forKey: key)?.resume(returning: .init(models: [.init(name: "jev")]))
     }
 }
 
 private struct ImmediateJevClient: JevRoutingClientProtocol {
     func listModels(apiKey: String, timeout: Duration) async throws -> JevModelList {
-        .init(models: [.init(id: JevRouterCredentialService.pinnedModel)])
+        .init(models: [.init(name: "jev-latest")])
     }
 
     func judge(
@@ -105,5 +145,41 @@ private struct ImmediateJevClient: JevRoutingClientProtocol {
         timeout: Duration
     ) async throws -> JevRoutingWireResponse {
         throw JevRoutingClientError.invalidRequest
+    }
+}
+
+private actor CancellationObservingJevClient: JevRoutingClientProtocol {
+    private var started = false
+    private var cancelled = false
+    private var startWaiters: [CheckedContinuation<Void, Never>] = []
+    private var cancellationWaiters: [CheckedContinuation<Void, Never>] = []
+
+    func listModels(apiKey: String, timeout: Duration) async throws -> JevModelList {
+        started = true
+        startWaiters.forEach { $0.resume() }
+        startWaiters.removeAll()
+        do {
+            try await Task.sleep(for: .seconds(60))
+            throw JevRoutingClientError.timeout
+        } catch is CancellationError {
+            cancelled = true
+            cancellationWaiters.forEach { $0.resume() }
+            cancellationWaiters.removeAll()
+            throw CancellationError()
+        }
+    }
+
+    func judge(request: JevRoutingWireRequest, apiKey: String, timeout: Duration) async throws -> JevRoutingWireResponse {
+        throw JevRoutingClientError.invalidRequest
+    }
+
+    func waitUntilStarted() async {
+        if started { return }
+        await withCheckedContinuation { startWaiters.append($0) }
+    }
+
+    func waitUntilCancelled() async {
+        if cancelled { return }
+        await withCheckedContinuation { cancellationWaiters.append($0) }
     }
 }

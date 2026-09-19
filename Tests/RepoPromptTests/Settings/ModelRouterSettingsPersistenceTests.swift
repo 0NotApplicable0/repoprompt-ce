@@ -66,4 +66,50 @@ final class ModelRouterSettingsPersistenceTests: XCTestCase {
     func testMissingRouterGroupRemainsBaselineSchema() {
         XCTAssertEqual(GlobalSettingsDocument().requiredSchemaVersion, GlobalSettingsDocument.baselineSchemaVersion)
     }
+
+    func testFirstEnableMaterializesAllAndPreservesUnknownRaws() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let fileStore = GlobalSettingsFileStore(fileURL: root.appendingPathComponent("globalSettings.json"))
+        var document = GlobalSettingsDocument()
+        document.scalarPreferences = GlobalScalarPreferences(modelRouter: .init(
+            enabled: false,
+            selectedBackendRawValue: "jev",
+            candidateRoleRawValues: ["future-role"],
+            allowedProviderRawValues: ["future-provider"]
+        ))
+        try fileStore.save(document)
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: "ModelRouter.first-enable.\(UUID())"))
+        let store = GlobalSettingsStore(defaults: defaults, fileStore: fileStore)
+        store.enableModelRouterWithCurrentPolicy(
+            backendID: .jev,
+            roles: Set(AgentModelCatalog.TaskLabelKind.allCases),
+            providers: [.codexExec, .claudeCode]
+        )
+        let raw = try XCTUnwrap(try fileStore.load().scalarPreferences?.modelRouter)
+        XCTAssertTrue(raw.candidateRoleRawValues?.contains("future-role") == true)
+        XCTAssertTrue(raw.allowedProviderRawValues?.contains("future-provider") == true)
+        XCTAssertEqual(Set(raw.allowedProviderRawValues ?? []), ["codexExec", "claudeCode", "future-provider"])
+    }
+
+    func testMaterializedProviderPolicyDoesNotAutoAuthorizeNewProvider() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let suite = "ModelRouter.new-provider.\(UUID())"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let store = GlobalSettingsStore(
+            defaults: defaults,
+            fileStore: GlobalSettingsFileStore(fileURL: root.appendingPathComponent("globalSettings.json"))
+        )
+        store.enableModelRouterWithCurrentPolicy(
+            backendID: .jev,
+            roles: [.explore, .engineer],
+            providers: [.codexExec]
+        )
+        XCTAssertEqual(store.modelRouterConfiguration().allowedProviders, [.codexExec])
+        XCTAssertFalse(store.modelRouterConfiguration().allowedProviders.contains(.claudeCode))
+    }
 }

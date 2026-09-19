@@ -4,9 +4,9 @@ import XCTest
 
 final class JevRoutingClientTests: XCTestCase {
     func testModelValidationUsesDocumentedEndpointAndBearerKey() async throws {
-        let transport = RecordingJevTransport(status: 200, body: #"{"models":[{"id":"jev-1.13.0"}]}"#)
+        let transport = RecordingJevTransport(status: 200, body: #"{"models":[{"name":"jev"}]}"#)
         let response = try await JevRoutingClient(transport: transport).listModels(apiKey: "secret", timeout: .seconds(5))
-        XCTAssertEqual(response.models.map(\.id), ["jev-1.13.0"])
+        XCTAssertEqual(response.models.map(\.name), ["jev"])
         let request = try XCTUnwrap(transport.lastRequest)
         XCTAssertEqual(request.url?.absoluteString, "https://api.typesafe.ai/v1/models")
         XCTAssertEqual(request.httpMethod, "GET")
@@ -15,17 +15,15 @@ final class JevRoutingClientTests: XCTestCase {
     }
 
     func testJudgeUsesSingleSystemOneChoiceRequestWithoutProviderIdentity() async throws {
-        let body = #"{"model":"jev-1.13.0","answers":[{"name":"route","type":"choice","choice":"opaque-a","probabilities":{"opaque-a":0.6,"opaque-b":0.4},"confidence":0.8}],"usage":{"input_tokens":4,"output_tokens":1}}"#
+        let body = #"{"model":"jev-1.13.0","answers":{"route":{"type":"choice","choice":"opaque-a","probabilities":{"opaque-a":0.6,"opaque-b":0.4},"confidence":0.8}},"usage":{"input_tokens":4,"output_tokens":1}}"#
         let transport = RecordingJevTransport(status: 200, body: body)
         let wire = JevRoutingWireRequest(
             model: JevRouterCredentialService.pinnedModel,
             state: "task",
-            questions: [.init(
-                name: "route", type: "choice", prompt: "Choose one supplied task-handling rubric.",
-                choices: [
-                    .init(value: "opaque-a", description: "Explore"),
-                    .init(value: "opaque-b", description: "Engineer")
-                ]
+            questions: ["route": .init(
+                type: "choice",
+                instructions: "Choose one supplied task-handling rubric.",
+                criteria: ["opaque-a": "Explore", "opaque-b": "Engineer"]
             )]
         )
         _ = try await JevRoutingClient(transport: transport).judge(request: wire, apiKey: "secret", timeout: .seconds(5))
@@ -36,6 +34,8 @@ final class JevRoutingClientTests: XCTestCase {
         XCTAssertTrue(encoded.contains("opaque-a"))
         XCTAssertFalse(encoded.contains("codex"))
         XCTAssertFalse(encoded.contains("provider"))
+        XCTAssertTrue(encoded.contains(#""questions":{"route":{"#))
+        XCTAssertTrue(encoded.contains(#""criteria":{"#))
     }
 
     func testOuterDeadlineCancelsTheRequestWithoutRetry() async {

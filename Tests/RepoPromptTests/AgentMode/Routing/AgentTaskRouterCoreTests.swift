@@ -17,6 +17,29 @@ final class AgentTaskRouterCoreTests: XCTestCase {
         XCTAssertEqual(registrations.map(\.id), [.init(rawValue: "fake")])
     }
 
+    func testSecondBackendRegistrationOwnsSettingsWithoutGenericJevSwitches() async throws {
+        let fake = FakeBackend(id: .init(rawValue: "second"), readiness: .ready(generation: 1, policyVersion: "v1"))
+        let settings = FakeBackendSettingsController()
+        let runtime = try AgentTaskRouterRuntime(registrations: [
+            .init(
+                backend: fake,
+                settings: .init(
+                    presentation: .init(
+                        title: "Second backend",
+                        configurationDetail: "Fake settings",
+                        secretFieldLabel: nil,
+                        links: []
+                    ),
+                    controller: settings
+                )
+            )
+        ])
+        let registration = await runtime.registry.registration(for: fake.id)
+        XCTAssertEqual(registration?.settings?.presentation.title, "Second backend")
+        let readiness = await registration?.settings?.controller.readinessSnapshot()
+        XCTAssertEqual(readiness, .ready(generation: 1, policyVersion: "v1"))
+    }
+
     func testEnvelopeIsExactAndRejectsPrivacyExpansionsOrTruncation() throws {
         let candidates = [descriptor("a"), descriptor("b")]
         let request = try AgentTaskRoutingEnvelopeBuilder().build(
@@ -100,6 +123,72 @@ final class AgentTaskRouterCoreTests: XCTestCase {
         XCTAssertEqual(outcome, .cancelled)
     }
 
+    func testCoordinatorReservesBeforeReadinessAndDuplicateCannotPass() async throws {
+        let backend = SuspendedReadinessBackend()
+        let registry = try AgentTaskRouterRegistry(registrations: [.init(backend: backend)])
+        let coordinator = AgentFreshTaskRoutingCoordinator(registry: registry)
+        let request = try AgentTaskRoutingEnvelopeBuilder().build(
+            requestID: UUID(), text: "task", candidates: [descriptor("a"), descriptor("b")]
+        )
+        let first = Task { await coordinator.route(backendID: backend.id, request: request) }
+        await backend.waitUntilReadinessStarted()
+        let duplicate = await coordinator.route(backendID: backend.id, request: request)
+        XCTAssertEqual(duplicate, .failed(category: .invalidRequest, retryable: false, evidence: nil))
+        await coordinator.cancel(requestID: request.requestID)
+        let firstOutcome = await first.value
+        XCTAssertEqual(firstOutcome, .cancelled)
+    }
+
+    func testCancelPromptlySettlesWhenBackendNeverCompletes() async throws {
+        let backend = NeverCompletingRouteBackend()
+        let registry = try AgentTaskRouterRegistry(registrations: [.init(backend: backend)])
+        let coordinator = AgentFreshTaskRoutingCoordinator(registry: registry)
+        let request = try AgentTaskRoutingEnvelopeBuilder().build(
+            requestID: UUID(), text: "task", candidates: [descriptor("a"), descriptor("b")]
+        )
+        let route = Task { await coordinator.route(backendID: backend.id, request: request) }
+        await backend.waitUntilStarted()
+        await coordinator.cancelAll()
+        let routeOutcome = await route.value
+        XCTAssertEqual(routeOutcome, .cancelled)
+    }
+
+    func testOptionalEvidenceIsValidatedUniformly() async throws {
+        let invalid = AgentTaskRoutingDecisionEvidence(
+            policyVersion: "wrong", confidence: .nan, scores: ["unknown": -1],
+            inputTokens: -1, outputTokens: -1, reasonCode: nil
+        )
+        for outcome in [
+            AgentTaskRoutingBackendOutcome.abstained(reason: "test", evidence: invalid),
+            .failed(category: .transport, retryable: true, evidence: invalid)
+        ] {
+            let backend = FakeBackend(
+                id: .init(rawValue: UUID().uuidString),
+                readiness: .ready(generation: 1, policyVersion: "v1"),
+                outcome: outcome
+            )
+            let registry = try AgentTaskRouterRegistry(registrations: [.init(backend: backend)])
+            let request = try AgentTaskRoutingEnvelopeBuilder().build(
+                requestID: UUID(), text: "task", candidates: [descriptor("a"), descriptor("b")]
+            )
+            let outcome = await AgentFreshTaskRoutingCoordinator(registry: registry)
+                .route(backendID: backend.id, request: request)
+            XCTAssertEqual(outcome, .failed(category: .invalidResponse, retryable: false, evidence: nil))
+        }
+        let nilEvidenceBackend = FakeBackend(
+            id: .init(rawValue: "nil-evidence"),
+            readiness: .ready(generation: 1, policyVersion: "v1"),
+            outcome: .selected(opaqueKey: "a", evidence: nil)
+        )
+        let registry = try AgentTaskRouterRegistry(registrations: [.init(backend: nilEvidenceBackend)])
+        let request = try AgentTaskRoutingEnvelopeBuilder().build(
+            requestID: UUID(), text: "task", candidates: [descriptor("a"), descriptor("b")]
+        )
+        let outcome = await AgentFreshTaskRoutingCoordinator(registry: registry)
+            .route(backendID: nilEvidenceBackend.id, request: request)
+        XCTAssertEqual(outcome, .selected(opaqueKey: "a", evidence: nil))
+    }
+
     func testJevBackendIsFailClosedUntilReviewedPolicyExists() async {
         let credentials = JevRouterCredentialService()
         let backend = JevTaskRouterBackend(credentialService: credentials)
@@ -133,6 +222,25 @@ private struct FakeBackend: AgentTaskRouterBackend {
     func route(_ request: AgentTaskRoutingRequest) async -> AgentTaskRoutingBackendOutcome {
         outcome
     }
+}
+
+private actor FakeBackendSettingsController: AgentTaskRouterBackendSettingsController {
+    func readinessSnapshot() -> AgentTaskRouterBackendReadiness {
+        .ready(generation: 1, policyVersion: "v1")
+    }
+
+    func readinessUpdates() -> AsyncStream<AgentTaskRouterBackendReadiness> {
+        AsyncStream { $0.yield(.ready(generation: 1, policyVersion: "v1"))
+            $0.finish()
+        }
+    }
+
+    func perform(_ action: AgentTaskRouterBackendSettingsAction) -> AgentTaskRouterBackendSettingsActionResult {
+        .succeeded("ok")
+    }
+
+    func bootstrapStoredConfigurationIfNeeded() {}
+    func cancelAndAdvanceGeneration() {}
 }
 
 private actor AdvancingReadinessBackend: AgentTaskRouterBackend {
@@ -186,5 +294,145 @@ private actor LateCompletionBackend: AgentTaskRouterBackend {
             )
         ))
         completion = nil
+    }
+}
+
+private actor SuspendedReadinessBackend: AgentTaskRouterBackend {
+    nonisolated let id = AgentTaskRouterBackendID(rawValue: "suspended-readiness")
+    nonisolated let displayName = "Suspended readiness"
+    private var started = false
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+
+    func readinessSnapshot() async -> AgentTaskRouterBackendReadiness {
+        started = true
+        waiters.forEach { $0.resume() }
+        waiters.removeAll()
+        return await withUnsafeContinuation { (_: UnsafeContinuation<AgentTaskRouterBackendReadiness, Never>) in }
+    }
+
+    func route(_ request: AgentTaskRoutingRequest) -> AgentTaskRoutingBackendOutcome {
+        .cancelled
+    }
+
+    func waitUntilReadinessStarted() async {
+        if started { return }
+        await withCheckedContinuation { waiters.append($0) }
+    }
+}
+
+private actor NeverCompletingRouteBackend: AgentTaskRouterBackend {
+    nonisolated let id = AgentTaskRouterBackendID(rawValue: "never-completing")
+    nonisolated let displayName = "Never completing"
+    private var started = false
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+
+    func readinessSnapshot() -> AgentTaskRouterBackendReadiness {
+        .ready(generation: 1, policyVersion: "v1")
+    }
+
+    func route(_ request: AgentTaskRoutingRequest) async -> AgentTaskRoutingBackendOutcome {
+        started = true
+        waiters.forEach { $0.resume() }
+        waiters.removeAll()
+        return await withUnsafeContinuation { (_: UnsafeContinuation<AgentTaskRoutingBackendOutcome, Never>) in }
+    }
+
+    func waitUntilStarted() async {
+        if started { return }
+        await withCheckedContinuation { waiters.append($0) }
+    }
+}
+
+@MainActor
+final class AgentTaskRoutingCandidateBuilderPolicyTests: XCTestCase {
+    func testWorkspaceOverrideIsAuthoritative() throws {
+        let workspaceID = UUID()
+        let claude = AgentModelSelectionID(
+            agentRaw: AgentProviderKind.claudeCode.rawValue,
+            modelRaw: AgentModel.claudeSonnet.rawValue
+        ).rawValue
+        let store = WorkspaceAwareRoleStore(workspaceID: workspaceID, workspaceOverrides: ["explore": claude])
+        let availability = AgentModelCatalog.AvailabilityContext(
+            claudeCodeAvailable: true,
+            codexAvailable: true,
+            openCodeAvailable: false
+        )
+        let workspaceCandidates = try AgentTaskRoutingCandidateBuilder(opaqueKey: { UUID().uuidString }).build(
+            workspaceID: workspaceID,
+            roles: [.explore, .engineer],
+            allowedProviders: [.claudeCode, .codexExec],
+            availability: availability,
+            settingsStore: store
+        )
+        let explore = try XCTUnwrap(workspaceCandidates.first(where: { $0.roles.contains(.explore) }))
+        XCTAssertEqual(explore.target.agentRaw, AgentProviderKind.claudeCode.rawValue)
+    }
+
+    func testEmptyProviderAndDuplicateTargetsFailClosed() {
+        let availability = AgentModelCatalog.AvailabilityContext(
+            claudeCodeAvailable: true,
+            codexAvailable: true,
+            openCodeAvailable: false
+        )
+        XCTAssertThrowsError(try AgentTaskRoutingCandidateBuilder().build(
+            workspaceID: nil,
+            roles: [.explore, .engineer],
+            allowedProviders: [],
+            availability: availability
+        ))
+
+        let same = AgentModelSelectionID(
+            agentRaw: AgentProviderKind.codexExec.rawValue,
+            modelRaw: AgentModel.gpt56SolMedium.rawValue
+        ).rawValue
+        let store = WorkspaceAwareRoleStore(
+            workspaceID: UUID(),
+            workspaceOverrides: ["explore": same, "engineer": same]
+        )
+        XCTAssertThrowsError(try AgentTaskRoutingCandidateBuilder().build(
+            workspaceID: store.workspaceID,
+            roles: [.explore, .engineer],
+            allowedProviders: [.codexExec],
+            availability: availability,
+            settingsStore: store
+        )) { error in
+            XCTAssertEqual(error as? AgentTaskRoutingCandidateBuilder.BuildError, .insufficientDistinctTargets)
+        }
+    }
+}
+
+@MainActor
+private final class WorkspaceAwareRoleStore: MCPAgentRoleDefaultsStoring {
+    let workspaceID: UUID
+    private var workspaceOverrides: [String: String]?
+
+    init(workspaceID: UUID, workspaceOverrides: [String: String]?) {
+        self.workspaceID = workspaceID
+        self.workspaceOverrides = workspaceOverrides
+    }
+
+    func mcpAgentRoleOverrides(workspaceID: UUID?) -> [String: String]? {
+        workspaceID == self.workspaceID ? workspaceOverrides : nil
+    }
+
+    func mcpAgentRoleOverrides(scope: AgentModelsEditingScope) -> [String: String]? {
+        if case let .workspace(id) = scope, id == workspaceID { return workspaceOverrides }
+        return nil
+    }
+
+    func updateMCPAgentRoleOverrides(
+        _ overrides: [String: String]?,
+        scope: AgentModelsEditingScope,
+        commit: Bool
+    ) {
+        if case let .workspace(id) = scope, id == workspaceID { workspaceOverrides = overrides }
+    }
+
+    func mcpAgentRoleModelParameters(scope: AgentModelsEditingScope) -> [String: [ACPModelParameterSelection]]? {
+        nil
+    }
+
+    func mcpAgentRoleModelParameters(workspaceID: UUID?) -> [String: [ACPModelParameterSelection]]? {
+        nil
     }
 }

@@ -4,7 +4,7 @@ Current as of 2026-09-19.
 
 ## Status
 
-RepoPrompt CE contains a backend-neutral routing framework and a bundled Jev adapter. The adapter's credential validation and strict HTTP contracts are implemented, but **Jev cannot route tasks yet**: there is no authorized live-key calibration corpus or reviewed acceptance policy in this repository. Jev therefore reports `policyUnavailable`, Settings cannot enable routing, and Agent Mode does not expose a routing control. This is intentional fail-closed behavior, not a fallback to the current model.
+RepoPrompt CE contains a backend-neutral routing framework, generic Settings/composer integration, and a bundled Jev adapter. The generic flow is exercised with deterministic fake-ready backends, but **Jev cannot route tasks yet**: there is no authorized live-key calibration corpus or reviewed acceptance policy in this repository. Jev therefore reports `policyUnavailable`, Settings cannot enable routing, and Agent Mode does not expose the one-shot routing control in production. This is intentional fail-closed behavior, not a fallback to the current model.
 
 ## Authority boundary
 
@@ -44,14 +44,14 @@ Absence resolves disabled. First enable must materialize the selected backend an
 
 The bundled adapter uses TypeSafe's documented HTTP surface directly; there is no Swift SDK:
 
-- `GET https://api.typesafe.ai/v1/models` validates an account and the pinned `jev-1.13.0` evaluator;
-- `POST https://api.typesafe.ai/v1/systemone` is reserved for one choice question;
+- `GET https://api.typesafe.ai/v1/models` validates an account from a supported Jev alias/family entry (`name`); the pinned version need not appear in that alias list;
+- `POST https://api.typesafe.ai/v1/systemone` sends a map containing one `route` choice question and always pins evaluation to `jev-1.13.0`;
 - Bearer authentication;
 - one request, five-second outer deadline, no RepoPrompt-layer retry;
 - explicit 401/403, 422, 429, and 529 classification;
 - no request/response-body logging.
 
-`JevRoutingResponseInterpreter` strictly validates evaluator identity, the single `route` choice answer, exact opaque-key coverage, finite ranged probabilities, distribution sum, confidence, and nonnegative usage. Confidence and winning probability remain distinct evidence. The interpreter intentionally does not choose acceptance thresholds.
+`JevRoutingResponseInterpreter` strictly validates returned evaluator identity, the single mapped `route` choice answer, exact opaque-key coverage, finite ranged probabilities, distribution sum, a unique probability argmax matching `choice`, confidence, and nonnegative usage. Confidence and winning probability remain distinct evidence. The interpreter intentionally does not choose acceptance thresholds.
 
 The Jev key uses the dedicated `JevRouterAPIKey` secure-storage account. It is included in the complete repair inventory but excluded from provider/CLI, Claude-compatible, and frozen identity-migration inventories. The app-global credential service is shared across windows; each Settings window owns only its view model and observes live `APISettingsViewModel.agentAvailability`.
 
@@ -60,21 +60,28 @@ The Jev key uses the dedicated `JevRouterAPIKey` secure-storage account. It is i
 1. Implement `AgentTaskRouterBackend` with a stable lowercase ID.
 2. Keep transport, credentials, response validation, and acceptance policy in the backend directory.
 3. Register the adapter once in `AgentTaskRouterRuntime`; duplicate IDs are programmer errors.
-4. Add its Settings configuration section without putting secrets into generic state.
+4. Attach its redacted Settings presentation/actions controller to the registration without putting secrets or backend switches into generic state.
 5. Test unknown selection, cancellation, readiness-generation changes, privacy, and normalized outcomes using the generic coordinator.
 6. Prove the backend can return `selected` only under a reviewed policy. Until then, return `policyUnavailable`.
 
 Adding a backend must not require changes to candidate construction, the semantic privacy contract, or provider runtimes.
 
-## Remaining activation work
+## Generic host integration
+
+The composer captures backend-neutral one-shot routing intent in the immutable submit attempt. After the final destination and execution location are ready, but immediately before `submitUserTurn`, the host rechecks fresh/plain-text eligibility, builds two to four distinct executable targets from the active workspace's effective role settings and live availability, and awaits the selected registration through exact coordinator ownership. Selected targets are committed with provider, model, reasoning effort, and normalized ACP parameters. Any submission rejection rolls that complete target back without writing manual defaults. Abstention, failure, cancellation, and staleness block the send and retain the draft and explicit selection. Failed newly-created destinations are discarded and the exact source tab is reactivated.
+
+`submitPreparedUserTurn`, `startAgentRun`, `AgentModeRunService`, MCP starts, continuations, steering, Chat/Oracle, and Context Builder remain unchanged.
+
+## Remaining Jev activation work
 
 Before Jev routing can become user-visible:
 
 1. obtain an authorized key and a redacted calibration/held-out corpus;
 2. freeze the pinned evaluator, semantic contract, rubric version, thresholds, and fixtures together;
 3. demonstrate candidate-cardinality, ambiguity, multilingual/domain, adversarial, repeat-variance, and latency acceptance;
-4. integrate the one-shot intent only inside `executeComposerSubmitAttempt`, after destination preparation and before `submitUserTurn`;
-5. revalidate destination/session identity, configuration revision, backend generation, and complete executable target before atomic commit;
-6. on every failure/cancellation/stale result, keep the draft and explicit selection and never auto-send.
+4. change Jev readiness from `policyUnavailable` to `ready` only when that reviewed policy is present and its policy version is bound to the pinned evaluator and fixtures;
+5. validate with an authorized live key separately from deterministic repository fixtures, without committing credentials or response bodies.
 
-`submitPreparedUserTurn`, `startAgentRun`, `AgentModeRunService`, MCP starts, continuations, steering, Chat/Oracle, and Context Builder remain unchanged.
+## Validation scope
+
+Repository tests cover schema-v9 preservation, workspace-aware candidate construction, provider filtering and executable-target deduplication, registration-owned Settings, readiness generation streams, transport cancellation, exact official Jev shapes, unique argmax/evaluator checks, reservation-before-await coordinator ownership, prompt cancellation against non-cooperative backends, normalized optional evidence, and generic transaction placement. Live Jev policy quality is deliberately **not** claimed or tested because no authorized key/corpus or acceptance threshold exists.

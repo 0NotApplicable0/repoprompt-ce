@@ -22,22 +22,29 @@ final class RouterSettingsViewModel: ObservableObject {
     @Published private(set) var configuration: AgentTaskRouterConfiguration
     @Published private(set) var readiness: AgentTaskRouterBackendReadiness
     @Published private(set) var targetPreviews: [TargetPreview] = []
+    @Published private(set) var backendSettingsPresentation: AgentTaskRouterBackendSettingsPresentation?
     @Published private(set) var operationMessage: String?
-    @Published private(set) var isPerformingCredentialOperation = false
+    @Published private(set) var isPerformingBackendOperation = false
+    @Published private(set) var policyCanBuildCandidates = false
 
     private let settingsStore: GlobalSettingsStore
     private let runtime: AgentTaskRouterRuntime
     private let apiSettingsViewModel: APISettingsViewModel
+    private weak var workspaceManager: WorkspaceManagerViewModel?
+    private var readinessTask: Task<Void, Never>?
+    private var observedBackendID: AgentTaskRouterBackendID?
     private var cancellables = Set<AnyCancellable>()
 
     init(
         settingsStore: GlobalSettingsStore,
         runtime: AgentTaskRouterRuntime,
-        apiSettingsViewModel: APISettingsViewModel
+        apiSettingsViewModel: APISettingsViewModel,
+        workspaceManager: WorkspaceManagerViewModel
     ) {
         self.settingsStore = settingsStore
         self.runtime = runtime
         self.apiSettingsViewModel = apiSettingsViewModel
+        self.workspaceManager = workspaceManager
         configuration = settingsStore.modelRouterConfiguration()
         readiness = .needsConfiguration(generation: 0, reason: "Select and configure a routing backend.")
         settingsStore.objectWillChange
@@ -49,24 +56,62 @@ final class RouterSettingsViewModel: ObservableObject {
             .receive(on: RunLoop.main)
             .sink { [weak self] _ in self?.scheduleRefresh() }
             .store(in: &cancellables)
+        workspaceManager.$activeWorkspaceID
+            .removeDuplicates()
+            .receive(on: RunLoop.main)
+            .sink { [weak self] _ in self?.scheduleRefresh() }
+            .store(in: &cancellables)
         scheduleRefresh()
     }
+
+    deinit { readinessTask?.cancel() }
 
     var selectedBackendID: AgentTaskRouterBackendID? {
         configuration.selectedBackendID
     }
 
     var canEnable: Bool {
-        readiness.isReady && Set(targetPreviews.map(\.target)).count >= 2
+        readiness.isReady && policyCanBuildCandidates
+    }
+
+    var eligibleRoles: Set<AgentModelCatalog.TaskLabelKind> {
+        configuration.candidateRoles.isEmpty
+            ? Set(AgentModelCatalog.TaskLabelKind.allCases)
+            : Set(configuration.candidateRoles)
+    }
+
+    var availableProviders: Set<AgentProviderKind> {
+        Set(targetPreviews.map(\.provider))
+    }
+
+    func isProviderAllowed(_ provider: AgentProviderKind) -> Bool {
+        configuration.allowedProviders.isEmpty
+            ? availableProviders.contains(provider)
+            : configuration.allowedProviders.contains(provider)
     }
 
     func selectBackend(_ id: AgentTaskRouterBackendID) {
         settingsStore.setModelRouterBackend(id)
         Task {
-            await runtime.coordinator.cancelAll()
-            await runtime.jevCredentialService.cancelValidation()
+            await runtime.backendSelectionDidChange(selectedID: id)
             await refresh()
         }
+    }
+
+    func setRole(_ role: AgentModelCatalog.TaskLabelKind, enabled: Bool) {
+        var roles = eligibleRoles
+        if enabled { roles.insert(role) } else { roles.remove(role) }
+        settingsStore.setModelRouterCandidateRoles(roles)
+        scheduleRefresh()
+    }
+
+    func setProvider(_ provider: AgentProviderKind, enabled: Bool) {
+        var providers = configuration.allowedProviders.isEmpty
+            ? availableProviders
+            : configuration.allowedProviders
+        if enabled { providers.insert(provider) } else { providers.remove(provider) }
+        settingsStore.setModelRouterAllowedProviders(providers)
+        scheduleRefresh()
     }
 
     func setEnabled(_ enabled: Bool) {
@@ -79,7 +124,7 @@ final class RouterSettingsViewModel: ObservableObject {
             settingsStore.enableModelRouterWithCurrentPolicy(
                 backendID: selectedBackendID,
                 roles: Set(AgentModelCatalog.TaskLabelKind.allCases),
-                providers: Set(targetPreviews.map(\.provider))
+                providers: availableProviders
             )
         } else {
             settingsStore.setModelRouterEnabled(enabled)
@@ -87,56 +132,63 @@ final class RouterSettingsViewModel: ObservableObject {
         scheduleRefresh()
     }
 
-    func validateAndSaveJevKey(_ key: String) async {
-        isPerformingCredentialOperation = true
+    func performBackendAction(_ action: AgentTaskRouterBackendSettingsAction) async {
+        guard let id = configuration.selectedBackendID,
+              let controller = await runtime.registry.registration(for: id)?.settings?.controller
+        else { return }
+        isPerformingBackendOperation = true
+        defer { isPerformingBackendOperation = false }
         operationMessage = nil
-        let result = await runtime.jevCredentialService.validateAndSave(key, operationID: UUID())
-        isPerformingCredentialOperation = false
-        operationMessage = message(for: result)
-        await refresh()
-    }
-
-    func revalidateStoredJevKey() async {
-        isPerformingCredentialOperation = true
-        operationMessage = nil
-        let result = await runtime.jevCredentialService.validateStoredKey(
-            operationID: UUID(),
-            accessMode: .interactive
-        )
-        isPerformingCredentialOperation = false
-        operationMessage = message(for: result)
-        await refresh()
-    }
-
-    func removeJevKey() async {
-        isPerformingCredentialOperation = true
-        operationMessage = nil
-        do {
-            try await runtime.jevCredentialService.delete(operationID: UUID())
-            operationMessage = "Stored Jev key removed."
-        } catch {
-            operationMessage = "The stored Jev key could not be removed."
+        let result = await controller.perform(action)
+        guard configuration.selectedBackendID == id else { return }
+        operationMessage = switch result {
+        case let .succeeded(message), let .missingSecret(message),
+             let .superseded(message), let .failed(message): message
         }
-        isPerformingCredentialOperation = false
-        await runtime.coordinator.cancelAll()
         await refresh()
     }
 
     func refresh() async {
         configuration = settingsStore.modelRouterConfiguration()
-        backendOptions = await runtime.registry.registrations().map {
-            BackendOption(id: $0.id, displayName: $0.displayName)
+        let registrations = await runtime.registry.registrations()
+        backendOptions = registrations.map { BackendOption(id: $0.id, displayName: $0.displayName) }
+        let registration = configuration.selectedBackendID.flatMap { selected in
+            registrations.first(where: { $0.id == selected })
         }
-        if let id = configuration.selectedBackendID,
-           let registration = await runtime.registry.registration(for: id)
-        {
+        backendSettingsPresentation = registration?.settings?.presentation
+        if let registration {
             readiness = await registration.backend.readinessSnapshot()
+            observeReadinessIfNeeded(registration)
         } else if let raw = configuration.selectedBackendRawValue, !raw.isEmpty {
             readiness = .temporarilyUnavailable(generation: 0, reason: "Router backend '\(raw)' is not available in this build.")
+            cancelReadinessObservation()
         } else {
             readiness = .needsConfiguration(generation: 0, reason: "Choose a routing backend.")
+            cancelReadinessObservation()
         }
         rebuildTargetPreviews()
+    }
+
+    private func observeReadinessIfNeeded(_ registration: AgentTaskRouterBackendRegistration) {
+        guard observedBackendID != registration.id else { return }
+        readinessTask?.cancel()
+        observedBackendID = registration.id
+        guard let controller = registration.settings?.controller else { return }
+        readinessTask = Task { [weak self] in
+            for await snapshot in await controller.readinessUpdates() {
+                guard !Task.isCancelled else { return }
+                await MainActor.run {
+                    guard self?.observedBackendID == registration.id else { return }
+                    self?.readiness = snapshot
+                }
+            }
+        }
+    }
+
+    private func cancelReadinessObservation() {
+        readinessTask?.cancel()
+        readinessTask = nil
+        observedBackendID = nil
     }
 
     private func scheduleRefresh() {
@@ -147,9 +199,14 @@ final class RouterSettingsViewModel: ObservableObject {
     }
 
     private func rebuildTargetPreviews() {
-        targetPreviews = MCPAgentRoleDefaultsService.resolutions(
-            availability: apiSettingsViewModel.agentAvailability
-        ).filter { !$0.overrideUnavailable }.map { resolution in
+        let availability = apiSettingsViewModel.agentAvailability
+        let workspaceID = workspaceManager?.activeWorkspaceID
+        let resolutions = MCPAgentRoleDefaultsService.resolutions(
+            availability: availability,
+            workspaceID: workspaceID,
+            settingsStore: settingsStore
+        )
+        targetPreviews = resolutions.filter { !$0.overrideUnavailable }.map { resolution in
             TargetPreview(
                 role: resolution.role,
                 provider: resolution.effective.agent,
@@ -164,14 +221,18 @@ final class RouterSettingsViewModel: ObservableObject {
                 )
             )
         }
-    }
-
-    private func message(for result: JevRouterCredentialService.ValidationResult) -> String {
-        switch result {
-        case let .saved(_, model): "Key validated for \(model). Routing remains disabled until a reviewed policy is available."
-        case .missingKey: "Enter a TypeSafe API key."
-        case .superseded: "Validation was cancelled or superseded."
-        case let .failed(message): message
-        }
+        let roles = configuration.candidateRoles.isEmpty
+            ? Set(AgentModelCatalog.TaskLabelKind.allCases)
+            : Set(configuration.candidateRoles)
+        let providers = configuration.allowedProviders.isEmpty
+            ? Set(targetPreviews.map(\.provider))
+            : configuration.allowedProviders
+        policyCanBuildCandidates = (try? AgentTaskRoutingCandidateBuilder().build(
+            workspaceID: workspaceID,
+            roles: roles,
+            allowedProviders: providers,
+            availability: availability,
+            settingsStore: settingsStore
+        )) != nil
     }
 }

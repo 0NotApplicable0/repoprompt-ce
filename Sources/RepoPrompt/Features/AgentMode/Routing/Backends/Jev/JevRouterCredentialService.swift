@@ -1,6 +1,6 @@
 import Foundation
 
-actor JevRouterCredentialService {
+actor JevRouterCredentialService: AgentTaskRouterBackendSettingsController {
     enum ValidationResult: Equatable {
         case saved(generation: UInt64, supportedModel: String)
         case missingKey
@@ -15,8 +15,11 @@ actor JevRouterCredentialService {
     private let client: any JevRoutingClientProtocol
     private var generation: UInt64 = 0
     private var activeValidationID: UUID?
+    private var activeValidationTask: Task<JevModelList, Error>?
     private var hasValidatedKey = false
     private var isValidating = false
+    private var startupValidatedGeneration: UInt64?
+    private var readinessContinuations: [UUID: AsyncStream<AgentTaskRouterBackendReadiness>.Continuation] = [:]
 
     init(
         secureKeys: SecureKeysService = SecureKeysService(),
@@ -33,86 +36,87 @@ actor JevRouterCredentialService {
         }
         return .policyUnavailable(
             generation: generation,
-            reason: "Jev routing remains disabled until a reviewed calibration policy is available."
+            reason: "Jev routing is unavailable until RepoPrompt ships a reviewed calibration policy."
         )
+    }
+
+    func readinessUpdates() -> AsyncStream<AgentTaskRouterBackendReadiness> {
+        let observationID = UUID()
+        return AsyncStream { continuation in
+            readinessContinuations[observationID] = continuation
+            continuation.yield(readinessSnapshot())
+            continuation.onTermination = { [weak self] _ in
+                Task { await self?.removeReadinessContinuation(observationID) }
+            }
+        }
     }
 
     func validateAndSave(_ candidate: String, operationID: UUID) async -> ValidationResult {
         let trimmed = candidate.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return .missingKey }
-        activeValidationID = operationID
-        isValidating = true
-        defer {
-            if activeValidationID == operationID {
-                activeValidationID = nil
-                isValidating = false
-            }
-        }
+        beginValidation(operationID: operationID)
+        defer { finishValidationIfOwned(operationID: operationID) }
         do {
-            let models = try await client.listModels(apiKey: trimmed, timeout: JevRoutingClient.outerDeadline)
-            guard activeValidationID == operationID, !Task.isCancelled else { return .superseded }
-            guard models.models.contains(where: { $0.id == Self.pinnedModel }) else {
-                return .failed("The account does not expose the pinned Jev evaluator \(Self.pinnedModel).")
+            let models = try await validateModels(apiKey: trimmed, operationID: operationID)
+            guard owns(operationID), !Task.isCancelled else { return .superseded }
+            guard let supportedModel = models.models.map(\.name).first(where: Self.isSupportedModelName) else {
+                return .failed("The account does not expose a supported Jev evaluator.")
             }
             try secureKeys.saveAPIKey(trimmed, for: .jevRouterAPIKey, accessMode: .interactive)
-            guard activeValidationID == operationID, !Task.isCancelled else { return .superseded }
-            generation &+= 1
-            hasValidatedKey = true
-            return .saved(generation: generation, supportedModel: Self.pinnedModel)
+            guard owns(operationID), !Task.isCancelled else { return .superseded }
+            advanceGeneration(validated: true)
+            startupValidatedGeneration = generation
+            return .saved(generation: generation, supportedModel: supportedModel)
         } catch is CancellationError {
             return .superseded
         } catch {
-            guard activeValidationID == operationID, !Task.isCancelled else { return .superseded }
+            guard owns(operationID), !Task.isCancelled else { return .superseded }
+            if error as? JevRoutingClientError == .authentication {
+                advanceGeneration(validated: false)
+            }
             return .failed(Self.redactedMessage(for: error))
         }
     }
 
-    func validateStoredKey(operationID: UUID, accessMode: KeychainAccessMode = .nonInteractive(reason: .backgroundAvailabilityCheck)) async -> ValidationResult {
-        activeValidationID = operationID
-        isValidating = true
-        defer {
-            if activeValidationID == operationID {
-                activeValidationID = nil
-                isValidating = false
-            }
-        }
+    func validateStoredKey(
+        operationID: UUID,
+        accessMode: KeychainAccessMode = .nonInteractive(reason: .backgroundAvailabilityCheck)
+    ) async -> ValidationResult {
+        beginValidation(operationID: operationID)
+        defer { finishValidationIfOwned(operationID: operationID) }
         do {
             let storedKey = try await secureKeys.getAPIKey(for: .jevRouterAPIKey, accessMode: accessMode)
-            guard activeValidationID == operationID, !Task.isCancelled else { return .superseded }
+            guard owns(operationID), !Task.isCancelled else { return .superseded }
             guard let key = storedKey, !key.isEmpty else {
-                invalidateValidatedCredential()
+                advanceGeneration(validated: false)
                 return .missingKey
             }
-            let models = try await client.listModels(apiKey: key, timeout: JevRoutingClient.outerDeadline)
-            guard activeValidationID == operationID, !Task.isCancelled else { return .superseded }
-            guard models.models.contains(where: { $0.id == Self.pinnedModel }) else {
-                return .failed("The account does not expose the pinned Jev evaluator \(Self.pinnedModel).")
+            let models = try await validateModels(apiKey: key, operationID: operationID)
+            guard owns(operationID), !Task.isCancelled else { return .superseded }
+            guard let supportedModel = models.models.map(\.name).first(where: Self.isSupportedModelName) else {
+                advanceGeneration(validated: false)
+                return .failed("The account does not expose a supported Jev evaluator.")
             }
-            generation &+= 1
-            hasValidatedKey = true
-            return .saved(generation: generation, supportedModel: Self.pinnedModel)
+            advanceGeneration(validated: true)
+            startupValidatedGeneration = generation
+            return .saved(generation: generation, supportedModel: supportedModel)
         } catch is CancellationError {
             return .superseded
         } catch {
-            guard activeValidationID == operationID, !Task.isCancelled else { return .superseded }
+            guard owns(operationID), !Task.isCancelled else { return .superseded }
             if error as? JevRoutingClientError == .authentication {
-                invalidateValidatedCredential()
+                advanceGeneration(validated: false)
             }
             return .failed(Self.redactedMessage(for: error))
         }
     }
 
     func delete(operationID: UUID) throws {
-        activeValidationID = operationID
-        isValidating = true
-        defer {
-            if activeValidationID == operationID {
-                activeValidationID = nil
-                isValidating = false
-            }
-        }
+        beginValidation(operationID: operationID)
+        defer { finishValidationIfOwned(operationID: operationID) }
         try secureKeys.deleteAPIKey(for: .jevRouterAPIKey, accessMode: .interactive)
-        invalidateValidatedCredential(forceGenerationChange: true)
+        advanceGeneration(validated: false)
+        startupValidatedGeneration = nil
     }
 
     func loadForRouting() async throws -> (key: String, generation: UInt64) {
@@ -122,21 +126,123 @@ actor JevRouterCredentialService {
             for: .jevRouterAPIKey,
             accessMode: .nonInteractive(reason: .backgroundAvailabilityCheck)
         ), !key.isEmpty, hasValidatedKey, generation == capturedGeneration else {
+            advanceGeneration(validated: false)
             throw JevRoutingClientError.authentication
         }
         return (key, capturedGeneration)
     }
 
     func cancelValidation() {
+        activeValidationTask?.cancel()
+        activeValidationTask = nil
         activeValidationID = nil
         isValidating = false
+        publishReadiness()
     }
 
-    private func invalidateValidatedCredential(forceGenerationChange: Bool = false) {
-        if hasValidatedKey || forceGenerationChange {
-            generation &+= 1
+    func bootstrapStoredConfigurationIfNeeded() async {
+        guard startupValidatedGeneration != generation else { return }
+        let attemptedGeneration = generation
+        _ = await validateStoredKey(
+            operationID: UUID(),
+            accessMode: .nonInteractive(reason: .backgroundAvailabilityCheck)
+        )
+        if startupValidatedGeneration == nil, generation == attemptedGeneration {
+            startupValidatedGeneration = generation
         }
+    }
+
+    func cancelAndAdvanceGeneration() {
+        activeValidationTask?.cancel()
+        activeValidationTask = nil
+        activeValidationID = nil
+        isValidating = false
+        generation &+= 1
         hasValidatedKey = false
+        startupValidatedGeneration = nil
+        publishReadiness()
+    }
+
+    func perform(
+        _ action: AgentTaskRouterBackendSettingsAction
+    ) async -> AgentTaskRouterBackendSettingsActionResult {
+        switch action {
+        case let .validateAndSaveSecret(secret):
+            return await Self.actionResult(from: validateAndSave(secret, operationID: UUID()))
+        case .revalidateStoredSecret:
+            return await Self.actionResult(from: validateStoredKey(operationID: UUID(), accessMode: .interactive))
+        case .removeStoredSecret:
+            do {
+                try delete(operationID: UUID())
+                return .succeeded("Stored Jev key removed.")
+            } catch {
+                return .failed("The stored Jev key could not be removed.")
+            }
+        }
+    }
+
+    static func isSupportedModelName(_ name: String) -> Bool {
+        let normalized = name.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return normalized == "jev" || normalized == "jev-latest" || normalized.hasPrefix("jev-")
+    }
+
+    private func validateModels(apiKey: String, operationID: UUID) async throws -> JevModelList {
+        let task = Task { try await client.listModels(apiKey: apiKey, timeout: JevRoutingClient.outerDeadline) }
+        activeValidationTask = task
+        defer {
+            if owns(operationID) { activeValidationTask = nil }
+        }
+        return try await task.value
+    }
+
+    private func beginValidation(operationID: UUID) {
+        activeValidationTask?.cancel()
+        activeValidationTask = nil
+        activeValidationID = operationID
+        isValidating = true
+        publishReadiness()
+    }
+
+    private func finishValidationIfOwned(operationID: UUID) {
+        guard owns(operationID) else { return }
+        activeValidationTask = nil
+        activeValidationID = nil
+        isValidating = false
+        publishReadiness()
+    }
+
+    private func owns(_ operationID: UUID) -> Bool {
+        activeValidationID == operationID
+    }
+
+    private func advanceGeneration(validated: Bool) {
+        generation &+= 1
+        hasValidatedKey = validated
+        publishReadiness()
+    }
+
+    private func publishReadiness() {
+        let snapshot = readinessSnapshot()
+        for continuation in readinessContinuations.values {
+            continuation.yield(snapshot)
+        }
+    }
+
+    private func removeReadinessContinuation(_ id: UUID) {
+        readinessContinuations.removeValue(forKey: id)
+    }
+
+    private static func actionResult(from result: ValidationResult) -> AgentTaskRouterBackendSettingsActionResult {
+        switch result {
+        case let .saved(_, supportedModel):
+            .succeeded("Key validated for \(supportedModel). Routing remains unavailable until a reviewed policy ships.")
+        case .missingKey:
+            .missingSecret("Enter a TypeSafe API key.")
+        case .superseded:
+            .superseded("Validation was cancelled or superseded.")
+        case let .failed(message):
+            .failed(message)
+        }
     }
 
     private static func redactedMessage(for error: Error) -> String {

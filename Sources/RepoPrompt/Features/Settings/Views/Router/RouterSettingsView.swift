@@ -2,13 +2,12 @@ import SwiftUI
 
 struct RouterSettingsView: View {
     @ObservedObject var viewModel: RouterSettingsViewModel
-    @State private var candidateKey = ""
+    @State private var candidateSecret = ""
 
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 20) {
-                Text("Model Router")
-                    .font(.title2.bold())
+                Text("Model Router").font(.title2.bold())
                 Text("Optionally ask a configured routing backend to choose among existing Agent Mode role targets. RepoPrompt remains responsible for provider execution, credentials, permissions, sessions, and cancellation.")
                     .foregroundStyle(.secondary)
 
@@ -21,23 +20,33 @@ struct RouterSettingsView: View {
                             }
                         }
                         .pickerStyle(.menu)
-
-                        if viewModel.selectedBackendID == .jev {
-                            JevRouterSettingsSection(
-                                candidateKey: $candidateKey,
-                                isBusy: viewModel.isPerformingCredentialOperation,
-                                operationMessage: viewModel.operationMessage,
-                                validate: {
-                                    let key = candidateKey
-                                    Task {
-                                        await viewModel.validateAndSaveJevKey(key)
-                                        candidateKey = ""
-                                    }
-                                },
-                                revalidate: { Task { await viewModel.revalidateStoredJevKey() } },
-                                remove: { Task { await viewModel.removeJevKey() } }
-                            )
+                        if let presentation = viewModel.backendSettingsPresentation {
+                            backendSettings(presentation)
                         }
+                    }
+                    .padding(8)
+                }
+
+                GroupBox("Candidate policy") {
+                    VStack(alignment: .leading, spacing: 10) {
+                        Text("Eligible roles").font(.headline)
+                        ForEach(AgentModelCatalog.TaskLabelKind.allCases, id: \.rawValue) { role in
+                            Toggle(role.rawValue.capitalized, isOn: Binding(
+                                get: { viewModel.eligibleRoles.contains(role) },
+                                set: { viewModel.setRole(role, enabled: $0) }
+                            ))
+                        }
+                        Divider()
+                        Text("Allowed providers").font(.headline)
+                        ForEach(Array(viewModel.availableProviders).sorted(by: { $0.rawValue < $1.rawValue }), id: \.rawValue) { provider in
+                            Toggle(provider.rawValue, isOn: Binding(
+                                get: { viewModel.isProviderAllowed(provider) },
+                                set: { viewModel.setProvider(provider, enabled: $0) }
+                            ))
+                        }
+                        Text("On first enable, empty role/provider policy is materialized as all currently available choices. Later providers remain opt-in.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
                     }
                     .padding(8)
                 }
@@ -54,7 +63,7 @@ struct RouterSettingsView: View {
                         ))
                         .disabled(!viewModel.canEnable && !viewModel.configuration.enabled)
                         if !viewModel.readiness.isReady {
-                            Text("The composer control stays hidden until the selected backend has validated configuration and a reviewed accepting policy.")
+                            Text("The composer control stays unavailable until the selected backend has validated configuration and RepoPrompt ships a reviewed accepting policy.")
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
                         }
@@ -68,17 +77,47 @@ struct RouterSettingsView: View {
                         .foregroundStyle(.secondary)
                         .padding(8)
                 }
-
-                HStack {
-                    Link("TypeSafe API documentation", destination: URL(string: "https://docs.typesafe.ai/api")!)
-                    Link("TypeSafe privacy policy", destination: URL(string: "https://typesafe.ai/legal/privacy-policy")!)
-                }
-                .font(.caption)
             }
             .padding(24)
             .frame(maxWidth: 720, alignment: .leading)
         }
         .task { await viewModel.refresh() }
+    }
+
+    @ViewBuilder
+    private func backendSettings(_ presentation: AgentTaskRouterBackendSettingsPresentation) -> some View {
+        Divider()
+        Text(presentation.title).font(.headline)
+        Text(presentation.configurationDetail).font(.caption).foregroundStyle(.secondary)
+        if let label = presentation.secretFieldLabel {
+            SecureField(label, text: $candidateSecret)
+            HStack {
+                Button("Validate & Save") {
+                    let secret = candidateSecret
+                    Task {
+                        await viewModel.performBackendAction(.validateAndSaveSecret(secret))
+                        candidateSecret = ""
+                    }
+                }
+                .disabled(candidateSecret.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || viewModel.isPerformingBackendOperation)
+                Button("Revalidate Stored Secret") {
+                    Task { await viewModel.performBackendAction(.revalidateStoredSecret) }
+                }
+                .disabled(viewModel.isPerformingBackendOperation)
+                Button("Remove Secret", role: .destructive) {
+                    Task { await viewModel.performBackendAction(.removeStoredSecret) }
+                }
+                .disabled(viewModel.isPerformingBackendOperation)
+                if viewModel.isPerformingBackendOperation { ProgressView().controlSize(.small) }
+            }
+        }
+        if let operationMessage = viewModel.operationMessage {
+            Text(operationMessage).font(.caption).foregroundStyle(.secondary)
+        }
+        HStack {
+            ForEach(presentation.links) { link in Link(link.title, destination: link.url) }
+        }
+        .font(.caption)
     }
 
     private var selectedBackendBinding: Binding<AgentTaskRouterBackendID?> {

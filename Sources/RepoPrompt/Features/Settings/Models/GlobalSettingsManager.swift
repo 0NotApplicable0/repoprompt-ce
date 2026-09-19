@@ -1645,13 +1645,21 @@ class GlobalSettingsStore: ObservableObject, CodexHookApprovalSettingsProviding 
         commit: Bool = true
     ) {
         updateModelRouterScalar(commit: commit) { settings in
+            let unknownRoles = (settings.candidateRoleRawValues ?? []).filter {
+                !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                    && AgentModelCatalog.TaskLabelKind(rawValue: $0) == nil
+            }
+            let unknownProviders = (settings.allowedProviderRawValues ?? []).filter {
+                !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                    && AgentProviderKind(rawValue: $0) == nil
+            }
             settings.selectedBackendRawValue = backendID.rawValue
             settings.candidateRoleRawValues = AgentModelCatalog.TaskLabelKind.allCases
                 .filter(roles.contains)
-                .map(\.rawValue)
+                .map(\.rawValue) + unknownRoles
             settings.allowedProviderRawValues = AgentProviderKind.allCases
                 .filter(providers.contains)
-                .map(\.rawValue)
+                .map(\.rawValue) + unknownProviders
             settings.enabled = true
         }
     }

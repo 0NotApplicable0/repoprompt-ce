@@ -14,6 +14,7 @@ struct JevRoutingResponseInterpreter {
         case wrongAnswerShape
         case unknownOrMissingCandidates
         case invalidProbability
+        case nonUniqueWinningChoice
         case invalidConfidence
         case invalidUsage
     }
@@ -27,8 +28,7 @@ struct JevRoutingResponseInterpreter {
     ) throws -> ValidatedResponse {
         guard response.model == pinnedModel else { throw ValidationError.wrongEvaluator }
         guard response.answers.count == 1,
-              let answer = response.answers.first,
-              answer.name == "route",
+              let answer = response.answers["route"],
               answer.type == "choice",
               submittedOpaqueKeys.contains(answer.choice)
         else { throw ValidationError.wrongAnswerShape }
@@ -40,6 +40,11 @@ struct JevRoutingResponseInterpreter {
         }
         let sum = answer.probabilities.values.reduce(0, +)
         guard abs(sum - 1) <= 0.000_1 else { throw ValidationError.invalidProbability }
+        guard let maximum = answer.probabilities.values.max() else {
+            throw ValidationError.invalidProbability
+        }
+        let winners = answer.probabilities.filter { $0.value == maximum }.map(\.key)
+        guard winners == [answer.choice] else { throw ValidationError.nonUniqueWinningChoice }
         guard answer.confidence.isFinite, (0 ... 1).contains(answer.confidence) else {
             throw ValidationError.invalidConfidence
         }

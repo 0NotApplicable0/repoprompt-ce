@@ -16,6 +16,7 @@ struct AgentComposerActions {
     let claimSubmit: (_ attempt: AgentComposerSubmitAttempt) -> AgentModeViewModel.AgentComposerSubmitClaimResult
     let executeSubmit: (_ claim: AgentModeViewModel.AgentComposerSubmitClaim, _ text: String) async -> AgentModeViewModel.UserTurnSubmissionResult
     let cancelRun: (_ target: AgentRunCancelTarget) async -> Void
+    let cancelRouting: (_ tabID: UUID) async -> Void
     let attachImages: (_ tabID: UUID, _ urls: [URL]) -> Void
     let removeImage: (_ tabID: UUID, _ attachmentID: UUID) -> Void
     let commitTaggedFile: (_ tabID: UUID, _ suggestion: MentionSuggestion, _ displayName: String) -> Void
@@ -114,6 +115,7 @@ struct AgentInputBar: View {
                 await agentModeVM.executeComposerSubmitAttempt(text: text, claim: claim)
             },
             cancelRun: { target in _ = await agentModeVM.cancelAgentRun(target: target) },
+            cancelRouting: { tabID in await agentModeVM.cancelFreshTaskRouting(tabID: tabID) },
             attachImages: { tabID, urls in agentModeVM.attachImages(tabID: tabID, urls: urls) },
             removeImage: { tabID, attachmentID in agentModeVM.removePendingImage(tabID: tabID, attachmentID: attachmentID) },
             commitTaggedFile: { tabID, suggestion, displayName in
@@ -258,6 +260,7 @@ struct AgentComposerView: View, Equatable {
     @FocusState var isFocused: Bool
 
     @State private var localInputText: String = ""
+    @State private var routeFreshTask = false
     @State private var submissionLatch = AgentComposerSubmissionLatch()
     @State private var lastAppliedDraftRestorationEventIDByTab: [UUID: UUID] = [:]
     @State private var editorTextFieldHeight: CGFloat = ResizableTextField.height(forPresetIndex: 0, preset: .normal)
@@ -662,6 +665,12 @@ struct AgentComposerView: View, Equatable {
                         connectAgentProvidersButton
                     }
                     approvalPopoverChip
+                    if props.canRouteFreshTask {
+                        Toggle("Route", isOn: $routeFreshTask)
+                            .toggleStyle(.checkbox)
+                            .font(fontPreset.swiftUIFont(sizeAtNormal: 11))
+                            .hoverTooltip("Ask the configured router to choose a target for this fresh plain-text task")
+                    }
                 }
                 .padding(.vertical, 2)
             }
@@ -685,7 +694,9 @@ struct AgentComposerView: View, Equatable {
                     transaction.animation = nil
                 }
 
-                if let cancelTarget = props.cancelTarget {
+                if props.isRoutingFreshTask, let tabID = props.currentTabID {
+                    CancelButton(action: { Task { await actions.cancelRouting(tabID) } })
+                } else if let cancelTarget = props.cancelTarget {
                     CancelButton(action: { cancelRun(cancelTarget) })
                 } else {
                     SendOrResendButton(
@@ -1533,7 +1544,8 @@ struct AgentComposerView: View, Equatable {
         }
         guard let attempt = submissionLatch.begin(
             target: submitTarget,
-            rawDraftSnapshot: rawDraftSnapshot
+            rawDraftSnapshot: rawDraftSnapshot,
+            routingIntent: routeFreshTask ? .routeFreshTask : .useCurrentSelection
         ) else {
             logViewSubmitRejection(reason: "local_attempt_latched", target: submitTarget)
             return
@@ -1556,6 +1568,7 @@ struct AgentComposerView: View, Equatable {
                 }
                 if effects.shouldClearInput {
                     setLocalInputText("")
+                    routeFreshTask = false
                     resetTextFieldTrigger.toggle()
                 }
                 if let blockedMessage = effects.blockedMessage {

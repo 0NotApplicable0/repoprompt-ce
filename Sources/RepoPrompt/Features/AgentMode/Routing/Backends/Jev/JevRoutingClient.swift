@@ -13,31 +13,24 @@ struct JevURLSessionTransport: JevHTTPTransport {
 }
 
 struct JevModelList: Decodable, Equatable {
-    struct Model: Decodable, Equatable { let id: String }
+    struct Model: Decodable, Equatable { let name: String }
     let models: [Model]
 }
 
 struct JevRoutingWireRequest: Encodable, Equatable {
     struct Question: Encodable, Equatable {
-        struct Choice: Encodable, Equatable {
-            let value: String
-            let description: String
-        }
-
-        let name: String
         let type: String
-        let prompt: String
-        let choices: [Choice]
+        let instructions: String
+        let criteria: [String: String]
     }
 
     let model: String
     let state: String
-    let questions: [Question]
+    let questions: [String: Question]
 }
 
 struct JevRoutingWireResponse: Decodable, Equatable {
     struct Answer: Decodable, Equatable {
-        let name: String
         let type: String
         let choice: String
         let probabilities: [String: Double]
@@ -55,7 +48,7 @@ struct JevRoutingWireResponse: Decodable, Equatable {
     }
 
     let model: String
-    let answers: [Answer]
+    let answers: [String: Answer]
     let usage: Usage
 }
 

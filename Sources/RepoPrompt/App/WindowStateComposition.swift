@@ -72,11 +72,6 @@ enum WindowStateCompositionFactory {
 
         // 5) Settings Manager (per-window overlay)
         let settingsManager = WindowSettingsManager(windowID: windowID, store: settingsStore)
-        let routerSettingsViewModel = RouterSettingsViewModel(
-            settingsStore: settingsStore,
-            runtime: modelRouterRuntime,
-            apiSettingsViewModel: apiSettingsViewModel
-        )
 
         // 6) Prompt
         let promptManager = PromptViewModel(
@@ -98,6 +93,12 @@ enum WindowStateCompositionFactory {
             workspaceSearchService: workspaceSearchService,
             domainWorkspaceAuthorityClient: domainWorkspaceClient,
             switchTimingPolicy: workspaceSwitchTimingPolicy
+        )
+        let routerSettingsViewModel = RouterSettingsViewModel(
+            settingsStore: settingsStore,
+            runtime: modelRouterRuntime,
+            apiSettingsViewModel: apiSettingsViewModel,
+            workspaceManager: workspaceManager
         )
         let domainWorkspacePresentationBridge = domainWorkspaceClient.map {
             DomainWorkspacePresentationBridge(workspaceManager: workspaceManager, client: $0)
@@ -181,7 +182,9 @@ enum WindowStateCompositionFactory {
             workspaceManager: workspaceManager,
             mcpServer: mcpServer,
             oracleViewModel: oracleViewModel,
-            applyEditsApprovalStore: applyEditsApprovalStore
+            applyEditsApprovalStore: applyEditsApprovalStore,
+            modelRouterSettingsStore: settingsStore,
+            modelRouterRuntime: modelRouterRuntime
         )
         workspaceFilesViewModel.setSessionWorktreeBindingStatesProvider { [weak agentModeViewModel] sessionIDs in
             agentModeViewModel?.worktreeBindingStates(forAgentSessionIDs: sessionIDs) ?? [:]

@@ -23,6 +23,15 @@ final class JevRoutingResponseInterpreterTests: XCTestCase {
         assertError(.wrongEvaluator, response: wrong)
     }
 
+    func testRejectsChoiceThatIsNotUniqueProbabilityArgmax() {
+        assertError(.nonUniqueWinningChoice, response: makeResponse(
+            choice: "b", probabilities: ["a": 0.6, "b": 0.4], confidence: 0.9
+        ))
+        assertError(.nonUniqueWinningChoice, response: makeResponse(
+            choice: "a", probabilities: ["a": 0.5, "b": 0.5], confidence: 0.9
+        ))
+    }
+
     private func assertError(
         _ expected: JevRoutingResponseInterpreter.ValidationError,
         response: JevRoutingWireResponse,
@@ -43,7 +52,7 @@ final class JevRoutingResponseInterpreterTests: XCTestCase {
     ) -> JevRoutingWireResponse {
         .init(
             model: JevRouterCredentialService.pinnedModel,
-            answers: [.init(name: "route", type: "choice", choice: choice, probabilities: probabilities, confidence: confidence)],
+            answers: ["route": .init(type: "choice", choice: choice, probabilities: probabilities, confidence: confidence)],
             usage: .init(inputTokens: 10, outputTokens: 2)
         )
     }
