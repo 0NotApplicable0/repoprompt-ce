@@ -187,7 +187,11 @@ actor JevRouterCredentialService: AgentTaskRouterBackendSettingsController {
     }
 
     private func validateModels(apiKey: String, operationID: UUID) async throws -> JevModelList {
-        let task = Task { try await client.listModels(apiKey: apiKey, timeout: JevRoutingClient.outerDeadline) }
+        let task = Task {
+            try await JevOwnedFirstResult<JevModelList>().run([
+                { try await self.client.listModels(apiKey: apiKey, timeout: JevRoutingClient.outerDeadline) }
+            ])
+        }
         activeValidationTask = task
         defer {
             if owns(operationID) { activeValidationTask = nil }

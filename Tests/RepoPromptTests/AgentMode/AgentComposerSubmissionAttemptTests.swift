@@ -229,8 +229,64 @@ extension AgentComposerSubmissionAttemptTests {
         XCTAssertTrue(session.transcript.turns.isEmpty)
     }
 
+    func testNewDestinationOwnsVisibleCancelAndRejectsSecondSubmit() async throws {
+        let backend = SuspendedComposerRoutingBackend()
+        let (viewModel, _) = try makeRoutingViewModel(backend: backend)
+        let sourceTabID = UUID()
+        let destinationTabID = UUID()
+        viewModel.test_setCurrentTabIDOverride(sourceTabID)
+        let sourceSession = viewModel.session(for: sourceTabID)
+        let claim = try routingClaim(viewModel: viewModel, session: sourceSession, text: "Route this task")
+
+        let execution = Task { @MainActor in
+            await viewModel.executeComposerSubmitAttempt(
+                text: "Route this task",
+                claim: claim,
+                createAndActivateSessionTab: {
+                    _ = viewModel.session(for: destinationTabID)
+                    viewModel.test_setCurrentTabIDOverride(destinationTabID)
+                    return destinationTabID
+                }
+            )
+        }
+        await backend.waitUntilStarted()
+
+        XCTAssertTrue(viewModel.makeComposerProps(tabID: destinationTabID).isRoutingFreshTask)
+        let destinationSession = viewModel.session(for: destinationTabID)
+        let secondTarget = try XCTUnwrap(
+            viewModel.makeComposerSubmitTarget(tabID: destinationTabID, session: destinationSession)
+        )
+        let secondAttempt = AgentComposerSubmitAttempt(
+            id: UUID(),
+            target: secondTarget,
+            inputRevision: 0,
+            noticeRevision: 0,
+            rawDraftSnapshot: "second"
+        )
+        guard case let .rejected(.activeAttemptExists(activeAttemptID)) = viewModel.claimComposerSubmitAttempt(
+            secondAttempt,
+            requireActiveTabOwnership: false
+        ) else {
+            return XCTFail("The visible destination must share exact route ownership")
+        }
+        XCTAssertEqual(activeAttemptID, claim.attempt.id)
+
+        await viewModel.cancelFreshTaskRouting(tabID: destinationTabID)
+        guard case .blocked = await execution.value else {
+            return XCTFail("Visible destination cancellation must block the pending send")
+        }
+        XCTAssertFalse(viewModel.makeComposerProps(tabID: destinationTabID).isRoutingFreshTask)
+        XCTAssertTrue(sourceSession.items.isEmpty)
+        XCTAssertTrue(destinationSession.items.isEmpty)
+
+        await backend.completeLateSelection()
+        await Task.yield()
+        XCTAssertTrue(sourceSession.items.isEmpty)
+        XCTAssertTrue(destinationSession.items.isEmpty)
+    }
+
     private func makeRoutingViewModel(
-        backend: ComposerRoutingBackend
+        backend: any AgentTaskRouterBackend
     ) throws -> (AgentModeViewModel, GlobalSettingsStore) {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
@@ -301,5 +357,35 @@ private actor ComposerRoutingBackend: AgentTaskRouterBackend {
         case .abstain:
             .abstained(reason: "ambiguous", evidence: nil)
         }
+    }
+}
+
+private actor SuspendedComposerRoutingBackend: AgentTaskRouterBackend {
+    nonisolated let id = AgentTaskRouterBackendID(rawValue: "composer-suspended")
+    nonisolated let displayName = "Composer suspended"
+    private var request: AgentTaskRoutingRequest?
+    private var startedWaiters: [CheckedContinuation<Void, Never>] = []
+    private var completion: CheckedContinuation<AgentTaskRoutingBackendOutcome, Never>?
+
+    func readinessSnapshot() -> AgentTaskRouterBackendReadiness {
+        .ready(generation: 1, policyVersion: "fake-v1")
+    }
+
+    func route(_ request: AgentTaskRoutingRequest) async -> AgentTaskRoutingBackendOutcome {
+        self.request = request
+        startedWaiters.forEach { $0.resume() }
+        startedWaiters.removeAll()
+        return await withCheckedContinuation { completion = $0 }
+    }
+
+    func waitUntilStarted() async {
+        if request != nil { return }
+        await withCheckedContinuation { startedWaiters.append($0) }
+    }
+
+    func completeLateSelection() {
+        guard let key = request?.candidates.first?.opaqueKey else { return }
+        completion?.resume(returning: .selected(opaqueKey: key, evidence: nil))
+        completion = nil
     }
 }

@@ -707,7 +707,14 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     private let sessionLifecycleAuthority = AgentSessionLifecycleAuthority()
     var modelRouterSettingsStore: GlobalSettingsStore = .shared
     var modelRouterRuntime: AgentTaskRouterRuntime?
-    var freshTaskRoutingBySourceTabID: [UUID: (requestID: UUID, task: Task<AgentTaskRoutingBackendOutcome, Never>)] = [:]
+    struct FreshTaskRoutingOwnership {
+        let requestID: UUID
+        let sourceTabID: UUID
+        let destinationTabID: UUID
+        let task: Task<AgentTaskRoutingBackendOutcome, Never>
+    }
+
+    var freshTaskRoutingByTabID: [UUID: FreshTaskRoutingOwnership] = [:]
 
     private var isRestoringState = false
     private var activeUISyncSuppressionDepth = 0
@@ -19115,6 +19122,17 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         guard ObjectIdentifier(session) == attempt.sourceTabSessionIdentity else {
             let rejection = AgentComposerSubmitClaimRejection.sourceSessionIdentityMismatch
             logRejectedSubmitTarget(target, session: session, reason: rejection.diagnosticReason, attempt: attempt)
+            resyncAfterRejectedSubmitTarget(target)
+            return .rejected(rejection)
+        }
+        if let routing = freshTaskRoutingByTabID[target.tabID] {
+            let rejection = AgentComposerSubmitClaimRejection.activeAttemptExists(activeAttemptID: routing.requestID)
+            logRejectedSubmitTarget(
+                target,
+                session: session,
+                reason: rejection.diagnosticReason,
+                attempt: attempt
+            )
             resyncAfterRejectedSubmitTarget(target)
             return .rejected(rejection)
         }

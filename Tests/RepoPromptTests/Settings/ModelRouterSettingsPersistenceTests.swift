@@ -67,7 +67,7 @@ final class ModelRouterSettingsPersistenceTests: XCTestCase {
         XCTAssertEqual(GlobalSettingsDocument().requiredSchemaVersion, GlobalSettingsDocument.baselineSchemaVersion)
     }
 
-    func testFirstEnableMaterializesAllAndPreservesUnknownRaws() throws {
+    func testFirstEnableMaterializesAllOnlyFromUnmaterializedPolicy() throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: root) }
@@ -76,8 +76,8 @@ final class ModelRouterSettingsPersistenceTests: XCTestCase {
         document.scalarPreferences = GlobalScalarPreferences(modelRouter: .init(
             enabled: false,
             selectedBackendRawValue: "jev",
-            candidateRoleRawValues: ["future-role"],
-            allowedProviderRawValues: ["future-provider"]
+            candidateRoleRawValues: nil,
+            allowedProviderRawValues: nil
         ))
         try fileStore.save(document)
         let defaults = try XCTUnwrap(UserDefaults(suiteName: "ModelRouter.first-enable.\(UUID())"))
@@ -88,9 +88,65 @@ final class ModelRouterSettingsPersistenceTests: XCTestCase {
             providers: [.codexExec, .claudeCode]
         )
         let raw = try XCTUnwrap(try fileStore.load().scalarPreferences?.modelRouter)
-        XCTAssertTrue(raw.candidateRoleRawValues?.contains("future-role") == true)
-        XCTAssertTrue(raw.allowedProviderRawValues?.contains("future-provider") == true)
-        XCTAssertEqual(Set(raw.allowedProviderRawValues ?? []), ["codexExec", "claudeCode", "future-provider"])
+        XCTAssertEqual(Set(raw.candidateRoleRawValues ?? []), Set(AgentModelCatalog.TaskLabelKind.allCases.map(\.rawValue)))
+        XCTAssertEqual(Set(raw.allowedProviderRawValues ?? []), ["codexExec", "claudeCode"])
+    }
+
+    func testExplicitEmptyConsentSurvivesReloadAndVMDoesNotDefaultItToAll() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let fileStore = GlobalSettingsFileStore(fileURL: root.appendingPathComponent("globalSettings.json"))
+        var document = GlobalSettingsDocument()
+        document.scalarPreferences = GlobalScalarPreferences(modelRouter: .init(
+            enabled: false,
+            selectedBackendRawValue: "jev",
+            candidateRoleRawValues: ["explore", "future-role"],
+            allowedProviderRawValues: ["codexExec", "future-provider"]
+        ))
+        try fileStore.save(document)
+        let suite = "ModelRouter.explicit-empty.\(UUID())"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let store = GlobalSettingsStore(defaults: defaults, fileStore: fileStore)
+        store.setModelRouterCandidateRoles([])
+        store.setModelRouterAllowedProviders([])
+
+        let raw = try XCTUnwrap(try fileStore.load().scalarPreferences?.modelRouter)
+        XCTAssertEqual(raw.candidateRoleRawValues, ["future-role"])
+        XCTAssertEqual(raw.allowedProviderRawValues, ["future-provider"])
+
+        let reloaded = try GlobalSettingsStore(
+            defaults: XCTUnwrap(UserDefaults(suiteName: "\(suite).reload")),
+            fileStore: fileStore
+        ).modelRouterConfiguration()
+        XCTAssertTrue(reloaded.candidateRolesMaterialized)
+        XCTAssertTrue(reloaded.allowedProvidersMaterialized)
+        XCTAssertTrue(reloaded.candidateRoles.isEmpty)
+        XCTAssertTrue(reloaded.allowedProviders.isEmpty)
+        XCTAssertTrue(RouterSettingsViewModel.effectiveRoles(reloaded).isEmpty)
+        XCTAssertTrue(RouterSettingsViewModel.effectiveProviders(reloaded, available: [.codexExec]).isEmpty)
+        XCTAssertEqual(reloaded.unknownRoleRawValues, ["future-role"])
+        XCTAssertEqual(reloaded.unknownProviderRawValues, ["future-provider"])
+    }
+
+    func testNilConsentUsesFirstUseDefaultsWithoutMutatingStorage() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = try GlobalSettingsStore(
+            defaults: XCTUnwrap(UserDefaults(suiteName: "ModelRouter.nil-consent.\(UUID())")),
+            fileStore: GlobalSettingsFileStore(fileURL: root.appendingPathComponent("globalSettings.json"))
+        )
+        store.setModelRouterBackend(.jev)
+        let configuration = store.modelRouterConfiguration()
+        XCTAssertFalse(configuration.candidateRolesMaterialized)
+        XCTAssertFalse(configuration.allowedProvidersMaterialized)
+        XCTAssertEqual(RouterSettingsViewModel.effectiveRoles(configuration), Set(AgentModelCatalog.TaskLabelKind.allCases))
+        XCTAssertEqual(
+            RouterSettingsViewModel.effectiveProviders(configuration, available: [.codexExec, .claudeCode]),
+            [.codexExec, .claudeCode]
+        )
     }
 
     func testMaterializedProviderPolicyDoesNotAutoAuthorizeNewProvider() throws {

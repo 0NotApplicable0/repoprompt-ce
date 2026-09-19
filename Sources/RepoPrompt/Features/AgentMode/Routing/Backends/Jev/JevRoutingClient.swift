@@ -125,21 +125,16 @@ struct JevRoutingClient: JevRoutingClientProtocol {
         timeout: Duration,
         as type: T.Type
     ) async throws -> T {
-        let result = try await withThrowingTaskGroup(of: JevTransportResult.self) { group in
-            group.addTask {
+        let result = try await JevOwnedFirstResult<JevTransportResult>().run([
+            {
                 let (data, response) = try await transport.data(for: request)
                 return JevTransportResult(data: data, response: response)
-            }
-            group.addTask {
+            },
+            {
                 try await sleep(timeout)
                 throw JevRoutingClientError.timeout
             }
-            defer { group.cancelAll() }
-            guard let result = try await group.next() else {
-                throw JevRoutingClientError.invalidResponse
-            }
-            return result
-        }
+        ])
         switch result.response.statusCode {
         case 200 ..< 300:
             do { return try decoder.decode(type, from: result.data) }
@@ -156,6 +151,73 @@ struct JevRoutingClient: JevRoutingClientProtocol {
 private struct JevTransportResult {
     let data: Data
     let response: HTTPURLResponse
+}
+
+/// Settles the awaiting caller on the first result without structurally waiting for a
+/// cancellation-ignoring loser. Losers remain owned, receive cancellation, and cannot publish late.
+final class JevOwnedFirstResult<Value>: @unchecked Sendable {
+    private let lock = NSLock()
+    private var continuation: CheckedContinuation<Value, Error>?
+    private var settledResult: Result<Value, Error>?
+    private var tasks: [Task<Void, Never>] = []
+
+    func run(
+        _ operations: [@Sendable () async throws -> Value]
+    ) async throws -> Value {
+        try await withTaskCancellationHandler(operation: {
+            try await withCheckedThrowingContinuation { continuation in
+                guard install(continuation) else { return }
+                let started = operations.map { operation in
+                    Task { [weak self] in
+                        do { try await self?.settle(.success(operation())) }
+                        catch { self?.settle(.failure(error)) }
+                    }
+                }
+                install(started)
+            }
+        }, onCancel: {
+            self.settle(.failure(CancellationError()))
+        })
+    }
+
+    private func install(_ newContinuation: CheckedContinuation<Value, Error>) -> Bool {
+        lock.lock()
+        if let settledResult {
+            lock.unlock()
+            newContinuation.resume(with: settledResult)
+            return false
+        }
+        continuation = newContinuation
+        lock.unlock()
+        return true
+    }
+
+    private func install(_ newTasks: [Task<Void, Never>]) {
+        lock.lock()
+        if settledResult != nil {
+            lock.unlock()
+            newTasks.forEach { $0.cancel() }
+            return
+        }
+        tasks = newTasks
+        lock.unlock()
+    }
+
+    private func settle(_ result: Result<Value, Error>) {
+        lock.lock()
+        guard settledResult == nil else {
+            lock.unlock()
+            return
+        }
+        settledResult = result
+        let continuation = continuation
+        self.continuation = nil
+        let tasks = tasks
+        self.tasks.removeAll()
+        lock.unlock()
+        tasks.forEach { $0.cancel() }
+        continuation?.resume(with: result)
+    }
 }
 
 private extension Duration {

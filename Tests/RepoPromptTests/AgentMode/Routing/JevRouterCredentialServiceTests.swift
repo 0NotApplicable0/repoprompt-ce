@@ -94,6 +94,28 @@ final class JevRouterCredentialServiceTests: XCTestCase {
         }
         XCTAssertGreaterThan(generation, 0)
     }
+
+    func testCancelValidationSettlesWhenClientIgnoresCancellationAndFiltersLateSuccess() async {
+        let storage = TestSecureStorageBackend()
+        let client = ControlledJevClient()
+        let service = JevRouterCredentialService(
+            secureKeys: SecureKeysService(secureStorage: storage),
+            client: client
+        )
+        let validation = Task { await service.validateAndSave("candidate", operationID: UUID()) }
+        await client.waitUntilStarted("candidate")
+
+        await service.cancelAndAdvanceGeneration()
+        let result = await validation.value
+        XCTAssertEqual(result, .superseded)
+        await client.complete("candidate")
+        await Task.yield()
+
+        XCTAssertNil(storage.value(for: .jevRouterAPIKey))
+        guard case .needsConfiguration = await service.readinessSnapshot() else {
+            return XCTFail("Late success must not republish validated readiness")
+        }
+    }
 }
 
 private extension AsyncStream where Element == AgentTaskRouterBackendReadiness {

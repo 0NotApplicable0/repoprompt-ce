@@ -40,6 +40,52 @@ final class AgentTaskRouterCoreTests: XCTestCase {
         XCTAssertEqual(readiness, .ready(generation: 1, policyVersion: "v1"))
     }
 
+    func testRuntimeBootstrapsOnlyExplicitSelectedBackendAndNeverBootstrapsWhenDisabled() async throws {
+        let selectedID = AgentTaskRouterBackendID(rawValue: "selected")
+        let inactiveID = AgentTaskRouterBackendID(rawValue: "inactive")
+        let selectedSettings = BootstrapCountingSettingsController()
+        let inactiveSettings = BootstrapCountingSettingsController()
+        _ = try AgentTaskRouterRuntime(
+            registrations: [
+                .init(
+                    backend: FakeBackend(id: selectedID, readiness: .needsConfiguration(generation: 0, reason: "test")),
+                    settings: .init(presentation: testSettingsPresentation("Selected"), controller: selectedSettings)
+                ),
+                .init(
+                    backend: FakeBackend(id: inactiveID, readiness: .needsConfiguration(generation: 0, reason: "test")),
+                    settings: .init(presentation: testSettingsPresentation("Inactive"), controller: inactiveSettings)
+                )
+            ],
+            bootstrapBackendID: selectedID
+        )
+        await selectedSettings.waitUntilObserved()
+        await inactiveSettings.waitUntilObserved()
+        await selectedSettings.waitUntilBootstrapped()
+        let selectedBootstrapCount = await selectedSettings.bootstrapCount
+        let inactiveBootstrapCount = await inactiveSettings.bootstrapCount
+        XCTAssertEqual(selectedBootstrapCount, 1)
+        XCTAssertEqual(inactiveBootstrapCount, 0)
+
+        let disabledA = BootstrapCountingSettingsController()
+        let disabledB = BootstrapCountingSettingsController()
+        _ = try AgentTaskRouterRuntime(registrations: [
+            .init(
+                backend: FakeBackend(id: .init(rawValue: "disabled-a"), readiness: .needsConfiguration(generation: 0, reason: "test")),
+                settings: .init(presentation: testSettingsPresentation("A"), controller: disabledA)
+            ),
+            .init(
+                backend: FakeBackend(id: .init(rawValue: "disabled-b"), readiness: .needsConfiguration(generation: 0, reason: "test")),
+                settings: .init(presentation: testSettingsPresentation("B"), controller: disabledB)
+            )
+        ])
+        await disabledA.waitUntilObserved()
+        await disabledB.waitUntilObserved()
+        let disabledABootstrapCount = await disabledA.bootstrapCount
+        let disabledBBootstrapCount = await disabledB.bootstrapCount
+        XCTAssertEqual(disabledABootstrapCount, 0)
+        XCTAssertEqual(disabledBBootstrapCount, 0)
+    }
+
     func testEnvelopeIsExactAndRejectsPrivacyExpansionsOrTruncation() throws {
         let candidates = [descriptor("a"), descriptor("b")]
         let request = try AgentTaskRoutingEnvelopeBuilder().build(
@@ -207,6 +253,10 @@ final class AgentTaskRouterCoreTests: XCTestCase {
     private func descriptor(_ key: String) -> AgentTaskRoutingCandidateDescriptor {
         .init(opaqueKey: key, roleLabels: [key], rubricVersion: "v1", rubric: "rubric")
     }
+
+    private func testSettingsPresentation(_ title: String) -> AgentTaskRouterBackendSettingsPresentation {
+        .init(title: title, configurationDetail: "test", secretFieldLabel: nil, links: [])
+    }
 }
 
 private struct FakeBackend: AgentTaskRouterBackend {
@@ -241,6 +291,49 @@ private actor FakeBackendSettingsController: AgentTaskRouterBackendSettingsContr
 
     func bootstrapStoredConfigurationIfNeeded() {}
     func cancelAndAdvanceGeneration() {}
+}
+
+private actor BootstrapCountingSettingsController: AgentTaskRouterBackendSettingsController {
+    private(set) var bootstrapCount = 0
+    private var observed = false
+    private var observationWaiters: [CheckedContinuation<Void, Never>] = []
+    private var bootstrapWaiters: [CheckedContinuation<Void, Never>] = []
+
+    func readinessSnapshot() -> AgentTaskRouterBackendReadiness {
+        .needsConfiguration(generation: 0, reason: "test")
+    }
+
+    func readinessUpdates() -> AsyncStream<AgentTaskRouterBackendReadiness> {
+        observed = true
+        observationWaiters.forEach { $0.resume() }
+        observationWaiters.removeAll()
+        return AsyncStream { continuation in
+            continuation.yield(.needsConfiguration(generation: 0, reason: "test"))
+            continuation.finish()
+        }
+    }
+
+    func perform(_ action: AgentTaskRouterBackendSettingsAction) -> AgentTaskRouterBackendSettingsActionResult {
+        .succeeded("test")
+    }
+
+    func bootstrapStoredConfigurationIfNeeded() {
+        bootstrapCount += 1
+        bootstrapWaiters.forEach { $0.resume() }
+        bootstrapWaiters.removeAll()
+    }
+
+    func cancelAndAdvanceGeneration() {}
+
+    func waitUntilObserved() async {
+        if observed { return }
+        await withCheckedContinuation { observationWaiters.append($0) }
+    }
+
+    func waitUntilBootstrapped() async {
+        if bootstrapCount > 0 { return }
+        await withCheckedContinuation { bootstrapWaiters.append($0) }
+    }
 }
 
 private actor AdvancingReadinessBackend: AgentTaskRouterBackend {
@@ -378,6 +471,12 @@ final class AgentTaskRoutingCandidateBuilderPolicyTests: XCTestCase {
             workspaceID: nil,
             roles: [.explore, .engineer],
             allowedProviders: [],
+            availability: availability
+        ))
+        XCTAssertThrowsError(try AgentTaskRoutingCandidateBuilder().build(
+            workspaceID: nil,
+            roles: [],
+            allowedProviders: [.claudeCode, .codexExec],
             availability: availability
         ))
 

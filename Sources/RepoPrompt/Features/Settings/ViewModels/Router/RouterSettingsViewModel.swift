@@ -75,9 +75,7 @@ final class RouterSettingsViewModel: ObservableObject {
     }
 
     var eligibleRoles: Set<AgentModelCatalog.TaskLabelKind> {
-        configuration.candidateRoles.isEmpty
-            ? Set(AgentModelCatalog.TaskLabelKind.allCases)
-            : Set(configuration.candidateRoles)
+        Self.effectiveRoles(configuration)
     }
 
     var availableProviders: Set<AgentProviderKind> {
@@ -85,15 +83,16 @@ final class RouterSettingsViewModel: ObservableObject {
     }
 
     func isProviderAllowed(_ provider: AgentProviderKind) -> Bool {
-        configuration.allowedProviders.isEmpty
-            ? availableProviders.contains(provider)
-            : configuration.allowedProviders.contains(provider)
+        Self.effectiveProviders(configuration, available: availableProviders).contains(provider)
     }
 
     func selectBackend(_ id: AgentTaskRouterBackendID) {
         settingsStore.setModelRouterBackend(id)
         Task {
-            await runtime.backendSelectionDidChange(selectedID: id)
+            await runtime.backendSelectionDidChange(
+                selectedID: id,
+                shouldBootstrap: settingsStore.modelRouterConfiguration().enabled
+            )
             await refresh()
         }
     }
@@ -106,9 +105,7 @@ final class RouterSettingsViewModel: ObservableObject {
     }
 
     func setProvider(_ provider: AgentProviderKind, enabled: Bool) {
-        var providers = configuration.allowedProviders.isEmpty
-            ? availableProviders
-            : configuration.allowedProviders
+        var providers = Self.effectiveProviders(configuration, available: availableProviders)
         if enabled { providers.insert(provider) } else { providers.remove(provider) }
         settingsStore.setModelRouterAllowedProviders(providers)
         scheduleRefresh()
@@ -117,14 +114,13 @@ final class RouterSettingsViewModel: ObservableObject {
     func setEnabled(_ enabled: Bool) {
         guard !enabled || canEnable else { return }
         if enabled,
-           configuration.candidateRoles.isEmpty,
-           configuration.allowedProviders.isEmpty,
+           !configuration.candidateRolesMaterialized || !configuration.allowedProvidersMaterialized,
            let selectedBackendID
         {
             settingsStore.enableModelRouterWithCurrentPolicy(
                 backendID: selectedBackendID,
-                roles: Set(AgentModelCatalog.TaskLabelKind.allCases),
-                providers: availableProviders
+                roles: Self.effectiveRoles(configuration),
+                providers: Self.effectiveProviders(configuration, available: availableProviders)
             )
         } else {
             settingsStore.setModelRouterEnabled(enabled)
@@ -221,12 +217,8 @@ final class RouterSettingsViewModel: ObservableObject {
                 )
             )
         }
-        let roles = configuration.candidateRoles.isEmpty
-            ? Set(AgentModelCatalog.TaskLabelKind.allCases)
-            : Set(configuration.candidateRoles)
-        let providers = configuration.allowedProviders.isEmpty
-            ? Set(targetPreviews.map(\.provider))
-            : configuration.allowedProviders
+        let roles = Self.effectiveRoles(configuration)
+        let providers = Self.effectiveProviders(configuration, available: Set(targetPreviews.map(\.provider)))
         policyCanBuildCandidates = (try? AgentTaskRoutingCandidateBuilder().build(
             workspaceID: workspaceID,
             roles: roles,
@@ -234,5 +226,20 @@ final class RouterSettingsViewModel: ObservableObject {
             availability: availability,
             settingsStore: settingsStore
         )) != nil
+    }
+
+    static func effectiveRoles(
+        _ configuration: AgentTaskRouterConfiguration
+    ) -> Set<AgentModelCatalog.TaskLabelKind> {
+        configuration.candidateRolesMaterialized
+            ? Set(configuration.candidateRoles)
+            : Set(AgentModelCatalog.TaskLabelKind.allCases)
+    }
+
+    static func effectiveProviders(
+        _ configuration: AgentTaskRouterConfiguration,
+        available: Set<AgentProviderKind>
+    ) -> Set<AgentProviderKind> {
+        configuration.allowedProvidersMaterialized ? configuration.allowedProviders : available
     }
 }

@@ -117,6 +117,7 @@ struct AgentTaskRouterConfiguration: Equatable {
         case disabled
         case backendMissing
         case fewerThanTwoRoles
+        case noAllowedProviders
     }
 
     let enabled: Bool
@@ -124,6 +125,8 @@ struct AgentTaskRouterConfiguration: Equatable {
     let selectedBackendRawValue: String?
     let candidateRoles: [AgentModelCatalog.TaskLabelKind]
     let allowedProviders: Set<AgentProviderKind>
+    let candidateRolesMaterialized: Bool
+    let allowedProvidersMaterialized: Bool
     let unknownRoleRawValues: [String]
     let unknownProviderRawValues: [String]
     let validity: Validity

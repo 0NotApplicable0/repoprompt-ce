@@ -1567,6 +1567,7 @@ class GlobalSettingsStore: ObservableObject, CodexHookApprovalSettingsProviding 
         let backendRaw = stored?.selectedBackendRawValue?.trimmingCharacters(in: .whitespacesAndNewlines)
         let backendID = backendRaw.flatMap { $0.isEmpty ? nil : AgentTaskRouterBackendID(rawValue: $0) }
 
+        let rolesMaterialized = stored?.candidateRoleRawValues != nil
         let rawRoles = stored?.candidateRoleRawValues ?? []
         let knownRoles = AgentModelCatalog.TaskLabelKind.allCases.filter { rawRoles.contains($0.rawValue) }
         let unknownRoles = rawRoles.filter { raw in
@@ -1574,6 +1575,7 @@ class GlobalSettingsStore: ObservableObject, CodexHookApprovalSettingsProviding 
                 && AgentModelCatalog.TaskLabelKind(rawValue: raw) == nil
         }
 
+        let providersMaterialized = stored?.allowedProviderRawValues != nil
         let rawProviders = stored?.allowedProviderRawValues ?? []
         let knownProviders = Set(rawProviders.compactMap(AgentProviderKind.init(rawValue:)))
         let unknownProviders = rawProviders.filter { raw in
@@ -1588,6 +1590,8 @@ class GlobalSettingsStore: ObservableObject, CodexHookApprovalSettingsProviding 
             .backendMissing
         } else if knownRoles.count < 2 {
             .fewerThanTwoRoles
+        } else if providersMaterialized, knownProviders.isEmpty {
+            .noAllowedProviders
         } else {
             .valid
         }
@@ -1597,6 +1601,8 @@ class GlobalSettingsStore: ObservableObject, CodexHookApprovalSettingsProviding 
             selectedBackendRawValue: backendRaw,
             candidateRoles: knownRoles,
             allowedProviders: knownProviders,
+            candidateRolesMaterialized: rolesMaterialized,
+            allowedProvidersMaterialized: providersMaterialized,
             unknownRoleRawValues: unknownRoles,
             unknownProviderRawValues: unknownProviders,
             validity: validity,

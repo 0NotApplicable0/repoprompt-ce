@@ -10,25 +10,30 @@ final class AgentTaskRouterRuntime: ObservableObject {
     private let readinessLock = NSLock()
     private var readinessByBackendID: [AgentTaskRouterBackendID: AgentTaskRouterBackendReadiness] = [:]
 
-    init(registrations: [AgentTaskRouterBackendRegistration]) throws {
+    init(
+        registrations: [AgentTaskRouterBackendRegistration],
+        bootstrapBackendID: AgentTaskRouterBackendID? = nil
+    ) throws {
         let registry = try AgentTaskRouterRegistry(registrations: registrations)
         self.registry = registry
         coordinator = AgentFreshTaskRoutingCoordinator(registry: registry)
-        start()
+        start(bootstrapBackendID: bootstrapBackendID)
     }
 
+    @MainActor
     convenience init(
         secureKeys: SecureKeysService = SecureKeysService(),
         jevClient: any JevRoutingClientProtocol = JevRoutingClient()
     ) {
         let credentials = JevRouterCredentialService(secureKeys: secureKeys, client: jevClient)
+        let configuration = GlobalSettingsStore.shared.modelRouterConfiguration()
         do {
             try self.init(registrations: [
                 AgentTaskRouterBackendRegistration(
                     backend: JevTaskRouterBackend(credentialService: credentials),
                     settings: JevTaskRouterBackend.settingsRegistration(controller: credentials)
                 )
-            ])
+            ], bootstrapBackendID: configuration.enabled ? configuration.selectedBackendID : nil)
         } catch {
             preconditionFailure("Invalid bundled model-router registry: \(error)")
         }
@@ -49,24 +54,28 @@ final class AgentTaskRouterRuntime: ObservableObject {
         }
     }
 
-    func backendSelectionDidChange(selectedID: AgentTaskRouterBackendID?) async {
+    func backendSelectionDidChange(
+        selectedID: AgentTaskRouterBackendID?,
+        shouldBootstrap: Bool
+    ) async {
         await coordinator.cancelAll()
         for registration in await registry.registrations() {
             await registration.settings?.controller.cancelAndAdvanceGeneration()
         }
-        if let selectedID,
+        if shouldBootstrap,
+           let selectedID,
            let selected = await registry.registration(for: selectedID)
         {
             await selected.settings?.controller.bootstrapStoredConfigurationIfNeeded()
         }
     }
 
-    private func start() {
+    private func start(bootstrapBackendID: AgentTaskRouterBackendID?) {
         Task { [weak self, registry] in
-            for registration in await registry.registrations() {
+            let registrations = await registry.registrations()
+            for registration in registrations {
                 let initialReadiness = await registration.backend.readinessSnapshot()
                 self?.publishReadiness(initialReadiness, backendID: registration.id)
-                await registration.settings?.controller.bootstrapStoredConfigurationIfNeeded()
                 guard let controller = registration.settings?.controller else { continue }
                 Task { [weak self] in
                     for await snapshot in await controller.readinessUpdates() {
@@ -74,6 +83,11 @@ final class AgentTaskRouterRuntime: ObservableObject {
                         self?.publishReadiness(snapshot, backendID: registration.id)
                     }
                 }
+            }
+            if let bootstrapBackendID,
+               let selected = registrations.first(where: { $0.id == bootstrapBackendID })
+            {
+                await selected.settings?.controller.bootstrapStoredConfigurationIfNeeded()
             }
         }
     }

@@ -40,6 +40,8 @@ allowedProviderRawValues
 
 Absence resolves disabled. First enable must materialize the selected backend and explicit current role/provider sets. Later providers or roles do not become authorized automatically. Known-setting edits preserve unknown nonblank backend, role, and provider raw values for forward/rollback compatibility. Secrets never enter this document.
 
+Nil role/provider arrays mean the policy has not yet been materialized and may use the first-enable preview. Explicit empty arrays mean no consent: they survive reload, render empty, and cannot build candidates or enable routing. Deselecting the final known role or provider therefore remains empty rather than reopening the default-all policy.
+
 ## Jev adapter
 
 The bundled adapter uses TypeSafe's documented HTTP surface directly; there is no Swift SDK:
@@ -55,6 +57,8 @@ The bundled adapter uses TypeSafe's documented HTTP surface directly; there is n
 
 The Jev key uses the dedicated `JevRouterAPIKey` secure-storage account. It is included in the complete repair inventory but excluded from provider/CLI, Claude-compatible, and frozen identity-migration inventories. The app-global credential service is shared across windows; each Settings window owns only its view model and observes live `APISettingsViewModel.agentAvailability`.
 
+Startup readiness observation is noninteractive and network-free. The runtime bootstraps stored credentials only for an explicitly selected, enabled backend; inactive and disabled backends are not contacted. Selecting a backend while routing remains disabled also does not validate it—validation is an explicit Settings action.
+
 ## Adding a bundled backend
 
 1. Implement `AgentTaskRouterBackend` with a stable lowercase ID.
@@ -69,6 +73,10 @@ Adding a backend must not require changes to candidate construction, the semanti
 ## Generic host integration
 
 The composer captures backend-neutral one-shot routing intent in the immutable submit attempt. After the final destination and execution location are ready, but immediately before `submitUserTurn`, the host rechecks fresh/plain-text eligibility, builds two to four distinct executable targets from the active workspace's effective role settings and live availability, and awaits the selected registration through exact coordinator ownership. Selected targets are committed with provider, model, reasoning effort, and normalized ACP parameters. Any submission rejection rolls that complete target back without writing manual defaults. Abstention, failure, cancellation, and staleness block the send and retain the draft and explicit selection. Failed newly-created destinations are discarded and the exact source tab is reactivated.
+
+An in-flight route is one ownership record indexed by both its source and final destination tabs. The visible destination exposes the exact cancel action, and either related tab rejects a second submit until that ownership settles. Cancellation removes both indexes before late backend completion can reach submission.
+
+Jev's five-second deadline uses a first-result ownership bridge rather than structured task-group teardown: timeout or cancellation settles the caller immediately, cancels the transport task for cleanup, and filters any late result even if a transport ignores cancellation. Credential validation uses the same boundary, so generation cancellation cannot wait on or publish a late validation response.
 
 `submitPreparedUserTurn`, `startAgentRun`, `AgentModeRunService`, MCP starts, continuations, steering, Chat/Oracle, and Context Builder remain unchanged.
 

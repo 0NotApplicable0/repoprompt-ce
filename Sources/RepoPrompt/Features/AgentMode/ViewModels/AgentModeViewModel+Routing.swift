@@ -20,14 +20,11 @@ extension AgentModeViewModel {
 
     func cancelFreshTaskRouting(tabID: UUID) async {
         guard let runtime = modelRouterRuntime,
-              let owned = freshTaskRoutingBySourceTabID[tabID]
+              let owned = freshTaskRoutingByTabID[tabID]
         else { return }
         await runtime.coordinator.cancel(requestID: owned.requestID)
         owned.task.cancel()
-        if freshTaskRoutingBySourceTabID[tabID]?.requestID == owned.requestID {
-            freshTaskRoutingBySourceTabID.removeValue(forKey: tabID)
-            syncComposerUIState(tabID: tabID)
-        }
+        clearFreshTaskRoutingOwnership(owned)
     }
 
     func submitUserTurnAfterFreshTaskRouting(
@@ -81,14 +78,27 @@ extension AgentModeViewModel {
         let routeTask = Task {
             await runtime.coordinator.route(backendID: backendID, request: request)
         }
-        freshTaskRoutingBySourceTabID[claim.attempt.sourceTabID] = (request.requestID, routeTask)
-        syncComposerUIState(tabID: claim.attempt.sourceTabID)
+        let ownership = FreshTaskRoutingOwnership(
+            requestID: request.requestID,
+            sourceTabID: claim.attempt.sourceTabID,
+            destinationTabID: destinationTabID,
+            task: routeTask
+        )
+        guard freshTaskRoutingByTabID[ownership.sourceTabID] == nil,
+              freshTaskRoutingByTabID[ownership.destinationTabID] == nil
+        else {
+            routeTask.cancel()
+            await runtime.coordinator.cancel(requestID: request.requestID)
+            return .blocked(message: "Model routing is already in progress for this task.")
+        }
+        freshTaskRoutingByTabID[ownership.sourceTabID] = ownership
+        freshTaskRoutingByTabID[ownership.destinationTabID] = ownership
+        syncComposerUIState()
         let outcome = await routeTask.value
-        guard freshTaskRoutingBySourceTabID[claim.attempt.sourceTabID]?.requestID == request.requestID else {
+        guard ownsFreshTaskRouting(ownership) else {
             return .blocked(message: "Model routing was cancelled.")
         }
-        freshTaskRoutingBySourceTabID.removeValue(forKey: claim.attempt.sourceTabID)
-        syncComposerUIState(tabID: claim.attempt.sourceTabID)
+        clearFreshTaskRoutingOwnership(ownership)
 
         let currentConfiguration = modelRouterSettingsStore.modelRouterConfiguration()
         guard composerSubmitClaimIsCurrent(claim),
@@ -181,6 +191,25 @@ extension AgentModeViewModel {
         session.selectedReasoningEffortRaw = rollback.target.reasoningEffortRaw
         session.acpModelParameterSelections = rollback.target.modelParameters
         if session.tabID == currentTabID { applySessionToBindings(session) }
+    }
+
+    private func ownsFreshTaskRouting(_ ownership: FreshTaskRoutingOwnership) -> Bool {
+        freshTaskRoutingByTabID[ownership.sourceTabID]?.requestID == ownership.requestID
+            && freshTaskRoutingByTabID[ownership.destinationTabID]?.requestID == ownership.requestID
+    }
+
+    private func clearFreshTaskRoutingOwnership(_ ownership: FreshTaskRoutingOwnership) {
+        if freshTaskRoutingByTabID[ownership.sourceTabID]?.requestID == ownership.requestID {
+            freshTaskRoutingByTabID.removeValue(forKey: ownership.sourceTabID)
+        }
+        if freshTaskRoutingByTabID[ownership.destinationTabID]?.requestID == ownership.requestID {
+            freshTaskRoutingByTabID.removeValue(forKey: ownership.destinationTabID)
+        }
+        syncComposerUIState()
+        requestUIRefresh(tabID: ownership.sourceTabID, urgent: true)
+        if ownership.destinationTabID != ownership.sourceTabID {
+            requestUIRefresh(tabID: ownership.destinationTabID, urgent: true)
+        }
     }
 }
 

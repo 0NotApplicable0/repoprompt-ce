@@ -39,14 +39,25 @@ final class JevRoutingClientTests: XCTestCase {
     }
 
     func testOuterDeadlineCancelsTheRequestWithoutRetry() async {
-        let transport = DelayedJevTransport()
-        let client = JevRoutingClient(transport: transport, sleep: { _ in })
-        do {
-            _ = try await client.listModels(apiKey: "secret", timeout: .seconds(5))
-            XCTFail("Expected the outer deadline to fail")
-        } catch {
-            XCTAssertEqual(error as? JevRoutingClientError, .timeout)
+        let transport = CancellationIgnoringJevTransport()
+        let deadline = ControlledJevDeadline()
+        let client = JevRoutingClient(transport: transport, sleep: { _ in try await deadline.wait() })
+        let request = Task { () -> JevRoutingClientError? in
+            do {
+                _ = try await client.listModels(apiKey: "secret", timeout: .seconds(5))
+                return nil
+            } catch {
+                return error as? JevRoutingClientError
+            }
         }
+        await transport.waitUntilStarted()
+        await deadline.waitUntilStarted()
+        await deadline.fire()
+        let requestError = await request.value
+        XCTAssertEqual(requestError, .timeout)
+
+        // The cancellation-ignoring loser may finish later, but cannot replace the deadline.
+        await transport.complete()
     }
 
     func testDocumentedErrorsAreClassifiedWithoutRetry() async {
@@ -96,9 +107,54 @@ private final class RecordingJevTransport: JevHTTPTransport, @unchecked Sendable
     }
 }
 
-private actor DelayedJevTransport: JevHTTPTransport {
+private actor CancellationIgnoringJevTransport: JevHTTPTransport {
+    private var started = false
+    private var startWaiters: [CheckedContinuation<Void, Never>] = []
+    private var completion: CheckedContinuation<(Data, HTTPURLResponse), Error>?
+
     func data(for request: URLRequest) async throws -> (Data, HTTPURLResponse) {
-        try await Task.sleep(for: .seconds(60))
-        throw CancellationError()
+        started = true
+        startWaiters.forEach { $0.resume() }
+        startWaiters.removeAll()
+        return try await withCheckedThrowingContinuation { completion = $0 }
+    }
+
+    func waitUntilStarted() async {
+        if started { return }
+        await withCheckedContinuation { startWaiters.append($0) }
+    }
+
+    func complete() {
+        let response = HTTPURLResponse(
+            url: URL(string: "https://api.typesafe.ai/v1/models")!,
+            statusCode: 200,
+            httpVersion: "HTTP/1.1",
+            headerFields: nil
+        )!
+        completion?.resume(returning: (Data(#"{"models":[{"name":"jev"}]}"#.utf8), response))
+        completion = nil
+    }
+}
+
+private actor ControlledJevDeadline {
+    private var started = false
+    private var startWaiters: [CheckedContinuation<Void, Never>] = []
+    private var continuation: CheckedContinuation<Void, Error>?
+
+    func wait() async throws {
+        started = true
+        startWaiters.forEach { $0.resume() }
+        startWaiters.removeAll()
+        try await withCheckedThrowingContinuation { continuation = $0 }
+    }
+
+    func waitUntilStarted() async {
+        if started { return }
+        await withCheckedContinuation { startWaiters.append($0) }
+    }
+
+    func fire() {
+        continuation?.resume()
+        continuation = nil
     }
 }
