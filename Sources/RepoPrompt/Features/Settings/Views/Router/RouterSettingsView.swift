@@ -34,7 +34,7 @@ struct RouterSettingsView: View {
         VStack(alignment: .leading, spacing: 8) {
             Label("Model Router", systemImage: "arrow.triangle.branch")
                 .font(fontPreset.swiftUIFont(sizeAtNormal: 22, weight: .bold))
-            Text("Let Jev choose the best configured model, provider, and reasoning effort for each new task.")
+            Text("Let Jev choose the best available model, provider, and reasoning effort for each new task.")
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
         }
@@ -73,14 +73,14 @@ struct RouterSettingsView: View {
     private var routingPolicyCard: some View {
         card {
             Label("Routing behavior", systemImage: "slider.horizontal.3").font(.headline)
-            Text("Optionally limit each session type to one provider. Leave a limit unset to let Jev choose among all allowed providers.")
+            Text("Optionally require one provider for a session type. Leave it automatic to let Jev compare every supported connected provider.")
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
             providerLimitPicker("Primary sessions", scope: .primarySession)
             providerLimitPicker("Subagents", scope: .subagent)
             Divider()
             Text("Custom guidance").font(.headline)
-            Text("Use this for soft preferences such as “Prefer Claude Opus for execution, use GPT Astra sparingly, consult Fable for hard decisions.” Jev receives this text with every routing request.")
+            Text("Use this for routing directives such as “Prefer Claude Opus for execution, use GPT Astra sparingly, consult Fable for hard decisions.” Jev follows saved guidance within any required provider and receives it with every routing request.")
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
             TextEditor(text: $customInstructionsDraft)
@@ -123,10 +123,8 @@ struct RouterSettingsView: View {
             get: { viewModel.providerLimit(for: scope) },
             set: { viewModel.setProviderLimit($0, scope: scope) }
         )) {
-            Text("Any allowed provider").tag(AgentProviderKind?.none)
-            ForEach(viewModel.visibleProviders.filter {
-                viewModel.isProviderAllowed($0) || viewModel.providerLimit(for: scope) == $0
-            }, id: \.rawValue) { provider in
+            Text("Automatic (all connected)").tag(AgentProviderKind?.none)
+            ForEach(viewModel.visibleProviders, id: \.rawValue) { provider in
                 Text(provider.displayName).tag(Optional(provider))
             }
         }
@@ -166,84 +164,28 @@ struct RouterSettingsView: View {
     private var candidatesCard: some View {
         card {
             HStack {
-                Label("Routing targets", systemImage: "square.stack.3d.up").font(.headline)
+                Label("Automatic model frontier", systemImage: "square.stack.3d.up").font(.headline)
                 Spacer()
-                Text("\(viewModel.distinctTargetCount) distinct targets")
+                Text("\(viewModel.distinctTargetCount) current targets")
                     .font(fontPreset.swiftUIFont(sizeAtNormal: 11))
                     .foregroundStyle(.secondary)
             }
-            Text("Jev chooses one complete target below, including its model and reasoning effort. Edit Agent Models to change those target definitions.")
+            Text("Router automatically builds a quality-and-cost frontier from the live Claude Code and Codex catalogs. It chooses the complete provider, model, and effort target; Agent Models role settings do not affect Router mode.")
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
-            VStack(alignment: .leading, spacing: 0) {
-                ForEach(AgentModelCatalog.TaskLabelKind.allCases, id: \.rawValue) { role in
-                    roleRow(role)
-                    if role != AgentModelCatalog.TaskLabelKind.allCases.last { Divider() }
-                }
-            }
-            Divider()
-            Text("Provider access").font(.headline)
             if viewModel.visibleProviders.isEmpty {
-                Text("Connect an agent provider and assign models in Agent Models to make targets available.")
+                Text("Connect Claude Code or Codex CLI to make automatic targets available.")
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
             } else {
-                LazyVGrid(columns: [GridItem(.adaptive(minimum: 190), alignment: .leading)], alignment: .leading, spacing: 10) {
-                    ForEach(viewModel.visibleProviders, id: \.rawValue) { provider in
-                        Toggle(isOn: Binding(
-                            get: { viewModel.isProviderAllowed(provider) },
-                            set: { viewModel.setProvider(provider, enabled: $0) }
-                        )) {
-                            VStack(alignment: .leading, spacing: 2) {
-                                Text(provider.displayName)
-                                if !viewModel.availableProviders.contains(provider) {
-                                    Text("No available role target")
-                                        .font(fontPreset.swiftUIFont(sizeAtNormal: 11))
-                                        .foregroundStyle(.secondary)
-                                }
-                            }
-                        }
-                        .toggleStyle(.checkbox)
-                    }
-                }
+                Text("Connected providers: \(viewModel.availableProviders.sorted { $0.displayName < $1.displayName }.map(\.displayName).joined(separator: ", ")).")
+                    .foregroundStyle(.secondary)
             }
-            Text("With two or more distinct targets, Jev chooses one. A scope with one available target applies it directly. Roles using the same provider, model, effort, and options count as one. Provider access limits where routed tasks may run.")
+            Text("Pricing and capability evidence is versioned and sent with each candidate. Provider requirements and saved custom guidance are applied to every relevant routing request.")
                 .font(fontPreset.swiftUIFont(sizeAtNormal: 11))
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
-            if let onNavigate {
-                Button("Edit Agent Models…") { onNavigate(.agentModels) }
-                    .buttonStyle(.link)
-            }
         }
-    }
-
-    private func roleRow(_ role: AgentModelCatalog.TaskLabelKind) -> some View {
-        let preview = viewModel.targetPreviews.first { $0.role == role }
-        return Toggle(isOn: Binding(
-            get: { viewModel.eligibleRoles.contains(role) },
-            set: { viewModel.setRole(role, enabled: $0) }
-        )) {
-            VStack(alignment: .leading, spacing: 3) {
-                Text(role.rawValue.capitalized).fontWeight(.medium)
-                if let preview {
-                    Text("\(preview.displayName) · \(preview.provider.displayName)")
-                        .foregroundStyle(.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
-                    if !viewModel.isProviderAllowed(preview.provider) {
-                        Text("Provider excluded")
-                            .font(fontPreset.swiftUIFont(sizeAtNormal: 11))
-                            .foregroundStyle(.secondary)
-                    }
-                } else {
-                    Text("No available model")
-                        .foregroundStyle(.secondary)
-                }
-            }
-            .frame(maxWidth: .infinity, alignment: .leading)
-        }
-        .toggleStyle(.checkbox)
-        .padding(.vertical, 9)
     }
 
     private var privacyNotice: some View {
@@ -349,7 +291,7 @@ struct RouterSettingsView: View {
     private var readinessTitle: String {
         switch viewModel.readiness {
         case .ready:
-            if !viewModel.policyCanBuildCandidates { return "Choose routing targets" }
+            if !viewModel.policyCanBuildCandidates { return "Connect a supported provider" }
             return viewModel.configuration.enabled ? "Model Router is on" : "Ready to enable"
         case .validating: return "Checking your API key…"
         case .needsConfiguration: return "Set up a routing service"
@@ -363,7 +305,7 @@ struct RouterSettingsView: View {
         case .ready:
             viewModel.policyCanBuildCandidates
                 ? "Enable Router here or from the Agent Mode toolbar. It stays enabled across sessions until you turn it off."
-                : "Select at least one role and provider with an available target."
+                : "Connect Claude Code or Codex CLI, or clear a provider requirement that is unavailable."
         case .validating: "The routing service is validating your configuration."
         case let .needsConfiguration(_, reason),
              let .policyUnavailable(_, reason),

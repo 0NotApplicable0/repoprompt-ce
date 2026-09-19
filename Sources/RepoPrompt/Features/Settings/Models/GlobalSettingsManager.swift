@@ -1597,10 +1597,6 @@ class GlobalSettingsStore: ObservableObject, CodexHookApprovalSettingsProviding 
             .disabled
         } else if backendID == nil {
             .backendMissing
-        } else if knownRoles.count < 2 {
-            .fewerThanTwoRoles
-        } else if providersMaterialized, knownProviders.isEmpty {
-            .noAllowedProviders
         } else {
             .valid
         }

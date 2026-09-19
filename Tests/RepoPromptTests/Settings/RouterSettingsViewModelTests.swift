@@ -3,37 +3,30 @@ import XCTest
 
 @MainActor
 final class RouterSettingsViewModelTests: XCTestCase {
-    func testRapidConsentEditsAndExternalWritesPreserveLatestChoices() throws {
+    func testAutomaticFrontierIgnoresLegacyRoleAndProviderSelections() async throws {
         let fixture = try makeFixture()
-        let viewModel = fixture.viewModel
-        viewModel.setRole(.explore, enabled: false)
-        viewModel.setRole(.engineer, enabled: false)
-        XCTAssertEqual(viewModel.eligibleRoles, [.pair, .design])
-        XCTAssertEqual(Set(fixture.store.modelRouterConfiguration().candidateRoles), [.pair, .design])
+        fixture.store.setModelRouterCandidateRoles([])
+        fixture.store.setModelRouterAllowedProviders([])
 
-        fixture.store.setModelRouterCandidateRoles([.design])
-        viewModel.setRole(.explore, enabled: true)
-        XCTAssertEqual(viewModel.eligibleRoles, [.explore, .design])
+        await fixture.viewModel.refresh()
 
-        fixture.store.setModelRouterAllowedProviders([.codexExec, .claudeCode])
-        viewModel.setProvider(.codexExec, enabled: false)
-        viewModel.setProvider(.claudeCode, enabled: false)
-        XCTAssertTrue(viewModel.configuration.allowedProviders.isEmpty)
-        XCTAssertTrue(fixture.store.modelRouterConfiguration().allowedProviders.isEmpty)
+        XCTAssertTrue(fixture.viewModel.policyCanBuildCandidates)
+        XCTAssertGreaterThan(fixture.viewModel.distinctTargetCount, 1)
+        XCTAssertTrue(fixture.viewModel.availableProviders.contains(.codexExec))
+        XCTAssertTrue(fixture.viewModel.availableProviders.contains(.claudeCode))
     }
 
     func testSelectingBackendImmediatelyClearsOldReadinessAndPreservesConsent() async throws {
         let fixture = try makeFixture()
         await fixture.viewModel.refresh()
         XCTAssertTrue(fixture.viewModel.readiness.isReady)
-        fixture.viewModel.setRole(.explore, enabled: false)
-        let roles = fixture.viewModel.eligibleRoles
+        fixture.viewModel.setProviderLimit(.claudeCode, scope: .subagent)
 
         fixture.viewModel.selectBackend(.init(rawValue: "uninstalled"))
         XCTAssertEqual(fixture.viewModel.selectedBackendID?.rawValue, "uninstalled")
         XCTAssertFalse(fixture.viewModel.canEnable)
         XCTAssertNil(fixture.viewModel.backendSettingsPresentation)
-        XCTAssertEqual(fixture.viewModel.eligibleRoles, roles)
+        XCTAssertEqual(fixture.viewModel.providerLimit(for: .subagent), .claudeCode)
         await fixture.viewModel.refresh()
         guard case .temporarilyUnavailable = fixture.viewModel.readiness else {
             return XCTFail("Unknown backend must remain unavailable")
@@ -123,7 +116,13 @@ final class RouterSettingsViewModelTests: XCTestCase {
         let runtime = try AgentTaskRouterRuntime(registrations: [
             .init(backend: backend, settings: settings)
         ])
-        let viewModel = RouterSettingsViewModel(settingsStore: store, runtime: runtime, apiSettingsViewModel: api, workspaceManager: workspace)
+        let viewModel = RouterSettingsViewModel(
+            settingsStore: store,
+            runtime: runtime,
+            apiSettingsViewModel: api,
+            workspaceManager: workspace,
+            availabilityProvider: { .current }
+        )
         return Fixture(store: store, viewModel: viewModel, workspace: workspace)
     }
 }

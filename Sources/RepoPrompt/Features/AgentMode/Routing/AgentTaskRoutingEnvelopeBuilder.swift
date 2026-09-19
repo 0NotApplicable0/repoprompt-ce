@@ -11,6 +11,7 @@ struct AgentTaskRoutingEnvelopeBuilder {
 
     static let maximumCharacters = 4000
     static let maximumUTF8Bytes = 16 * 1024
+    static let maximumCandidates = 12
 
     func build(
         requestID: UUID,
@@ -29,7 +30,7 @@ struct AgentTaskRoutingEnvelopeBuilder {
         guard !containsAttachments, !containsTaggedPaths, !invokesWorkflowOrSlashCommand else {
             throw Rejection.unsupportedContent
         }
-        guard (2 ... 4).contains(candidates.count) else { throw Rejection.invalidCandidateCount }
+        guard (2 ... Self.maximumCandidates).contains(candidates.count) else { throw Rejection.invalidCandidateCount }
         return AgentTaskRoutingRequest(
             requestID: requestID,
             contractVersion: AgentTaskRoutingRequest.currentContractVersion,

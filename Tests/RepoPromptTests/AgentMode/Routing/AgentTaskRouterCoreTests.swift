@@ -108,6 +108,16 @@ final class AgentTaskRouterCoreTests: XCTestCase {
         XCTAssertThrowsError(try AgentTaskRoutingEnvelopeBuilder().build(
             requestID: UUID(), text: "task", candidates: [descriptor("a")]
         )) { XCTAssertEqual($0 as? AgentTaskRoutingEnvelopeBuilder.Rejection, .invalidCandidateCount) }
+        XCTAssertNoThrow(try AgentTaskRoutingEnvelopeBuilder().build(
+            requestID: UUID(),
+            text: "task",
+            candidates: (0 ..< 8).map { descriptor("candidate-\($0)") }
+        ))
+        XCTAssertThrowsError(try AgentTaskRoutingEnvelopeBuilder().build(
+            requestID: UUID(),
+            text: "task",
+            candidates: (0 ... AgentTaskRoutingEnvelopeBuilder.maximumCandidates).map { descriptor("candidate-\($0)") }
+        )) { XCTAssertEqual($0 as? AgentTaskRoutingEnvelopeBuilder.Rejection, .invalidCandidateCount) }
     }
 
     func testExecutableIdentityIncludesEffortAndNormalizedACPParameters() {
@@ -275,6 +285,11 @@ final class AgentTaskRouterCoreTests: XCTestCase {
         ])
         XCTAssertTrue(request?.questions["route"]?.instructions.contains("delegated subagent session") == true)
         XCTAssertTrue(request?.questions["route"]?.instructions.contains("Prefer b.") == true)
+        XCTAssertTrue(request?.questions["route"]?.instructions.contains("best expected utility") == true)
+        XCTAssertTrue(request?.questions["route"]?.instructions.contains("ask avoidable questions") == true)
+        XCTAssertTrue(request?.questions["route"]?.instructions.contains("Do not over-weight the first verb") == true)
+        XCTAssertTrue(request?.questions["route"]?.instructions.contains("guidance is authoritative") == true)
+        XCTAssertFalse(request?.questions["route"]?.instructions.contains("least expensive target") == true)
     }
 
     func testJevBackendRejectsDuplicateOpaqueKeysWithoutCallingService() async {
@@ -516,100 +531,100 @@ private actor NeverCompletingRouteBackend: AgentTaskRouterBackend {
 
 @MainActor
 final class AgentTaskRoutingCandidateBuilderPolicyTests: XCTestCase {
-    func testWorkspaceOverrideIsAuthoritative() throws {
-        let workspaceID = UUID()
-        let claude = AgentModelSelectionID(
-            agentRaw: AgentProviderKind.claudeCode.rawValue,
-            modelRaw: AgentModel.claudeSonnet.rawValue
-        ).rawValue
-        let store = WorkspaceAwareRoleStore(workspaceID: workspaceID, workspaceOverrides: ["explore": claude])
+    func testCandidateDescriptionsIncludeAuditedCapabilityPricingAndEffortEvidence() throws {
         let availability = AgentModelCatalog.AvailabilityContext(
             claudeCodeAvailable: true,
             codexAvailable: true,
             openCodeAvailable: false
         )
-        let workspaceCandidates = try AgentTaskRoutingCandidateBuilder(opaqueKey: { UUID().uuidString }).build(
-            workspaceID: workspaceID,
-            roles: [.explore, .engineer],
+
+        let candidates = try AgentTaskRoutingCandidateBuilder(opaqueKey: { UUID().uuidString }).build(
             allowedProviders: [.claudeCode, .codexExec],
-            availability: availability,
-            settingsStore: store
+            availability: availability
         )
-        let explore = try XCTUnwrap(workspaceCandidates.first(where: { $0.roles.contains(.explore) }))
-        XCTAssertEqual(explore.target.agentRaw, AgentProviderKind.claudeCode.rawValue)
+
+        let lunaCandidate = try XCTUnwrap(candidates.first(where: {
+            CodexModelSpecifier(raw: $0.target.modelRaw).baseModel == "gpt-5.6-luna"
+        }))
+        XCTAssertEqual(lunaCandidate.utilityTier, "economy")
+        XCTAssertTrue(lunaCandidate.descriptor.targetDescription.contains("nano-tier"))
+        XCTAssertTrue(lunaCandidate.descriptor.targetDescription.contains("$0.20 input / $1.20 output"))
+        XCTAssertTrue(lunaCandidate.descriptor.targetDescription.contains("Effort: low"))
+        XCTAssertEqual(lunaCandidate.descriptor.rubricVersion, "rpce.automatic-utility-frontier.v1-evidence-2026-09-19")
+
+        let fableCandidate = try XCTUnwrap(candidates.first(where: {
+            ClaudeModelSpecifier(raw: $0.target.modelRaw).baseModel == AgentModel.claudeFable51.rawValue
+        }))
+        XCTAssertEqual(fableCandidate.utilityTier, "frontier")
+        XCTAssertTrue(fableCandidate.descriptor.targetDescription.contains("Terminal-Bench 4.0"))
+        XCTAssertTrue(fableCandidate.descriptor.targetDescription.contains("$10 input / $50 output"))
+        XCTAssertTrue(fableCandidate.descriptor.targetDescription.contains("Effort: high"))
     }
 
-    func testEmptyPolicyFailsClosedAndDuplicateTargetsCollapseToOne() throws {
+    func testAutomaticFrontierIgnoresManualRoleAssignmentsAndCoversUtilityTiers() throws {
+        let availability = AgentModelCatalog.AvailabilityContext(
+            claudeCodeAvailable: true,
+            codexAvailable: true,
+            openCodeAvailable: false
+        )
+
+        let candidates = try AgentTaskRoutingCandidateBuilder().build(
+            allowedProviders: [.claudeCode, .codexExec],
+            availability: availability
+        )
+
+        XCTAssertEqual(Set(candidates.map(\.utilityTier)), ["economy", "balanced", "strong", "frontier"])
+        XCTAssertEqual(Set(candidates.map(\.target.agentRaw)), [
+            AgentProviderKind.claudeCode.rawValue,
+            AgentProviderKind.codexExec.rawValue
+        ])
+        XCTAssertFalse(candidates.contains { $0.descriptor.roleLabels.contains("explore") })
+        XCTAssertGreaterThan(candidates.count, 4)
+        XCTAssertLessThanOrEqual(candidates.count, AgentTaskRoutingEnvelopeBuilder.maximumCandidates)
+    }
+
+    func testUnknownModelEvidenceMakesCapabilityAndCostUncertaintyExplicit() {
+        let target = AgentRoutingExecutableTarget(
+            agentRaw: AgentProviderKind.openCode.rawValue,
+            modelRaw: "future-model",
+            reasoningEffortRaw: nil,
+            modelParameters: []
+        )
+
+        let description = AgentTaskRoutingModelProfileCatalog.description(for: target)
+
+        XCTAssertTrue(description.contains("No audited benchmark or pricing profile"))
+        XCTAssertTrue(description.contains("Treat capability and cost as uncertain"))
+    }
+
+    func testProviderDirectiveConstrainsAutomaticFrontier() throws {
+        let availability = AgentModelCatalog.AvailabilityContext(
+            claudeCodeAvailable: true,
+            codexAvailable: true,
+            openCodeAvailable: false
+        )
+        let candidates = try AgentTaskRoutingCandidateBuilder().build(
+            allowedProviders: [.claudeCode],
+            availability: availability
+        )
+
+        XCTAssertFalse(candidates.isEmpty)
+        XCTAssertTrue(candidates.allSatisfy { $0.target.agentRaw == AgentProviderKind.claudeCode.rawValue })
+    }
+
+    func testUnavailableProviderPolicyFailsClosed() {
         let availability = AgentModelCatalog.AvailabilityContext(
             claudeCodeAvailable: true,
             codexAvailable: true,
             openCodeAvailable: false
         )
         XCTAssertThrowsError(try AgentTaskRoutingCandidateBuilder().build(
-            workspaceID: nil,
-            roles: [.explore, .engineer],
             allowedProviders: [],
             availability: availability
         ))
         XCTAssertThrowsError(try AgentTaskRoutingCandidateBuilder().build(
-            workspaceID: nil,
-            roles: [],
-            allowedProviders: [.claudeCode, .codexExec],
+            allowedProviders: [.openCode],
             availability: availability
         ))
-
-        let same = AgentModelSelectionID(
-            agentRaw: AgentProviderKind.codexExec.rawValue,
-            modelRaw: AgentModel.gpt56SolMedium.rawValue
-        ).rawValue
-        let store = WorkspaceAwareRoleStore(
-            workspaceID: UUID(),
-            workspaceOverrides: ["explore": same, "engineer": same]
-        )
-        let collapsed = try AgentTaskRoutingCandidateBuilder().build(
-            workspaceID: store.workspaceID,
-            roles: [.explore, .engineer],
-            allowedProviders: [.codexExec],
-            availability: availability,
-            settingsStore: store
-        )
-        XCTAssertEqual(collapsed.count, 1)
-        XCTAssertEqual(Set(collapsed[0].roles), [.explore, .engineer])
-    }
-}
-
-@MainActor
-private final class WorkspaceAwareRoleStore: MCPAgentRoleDefaultsStoring {
-    let workspaceID: UUID
-    private var workspaceOverrides: [String: String]?
-
-    init(workspaceID: UUID, workspaceOverrides: [String: String]?) {
-        self.workspaceID = workspaceID
-        self.workspaceOverrides = workspaceOverrides
-    }
-
-    func mcpAgentRoleOverrides(workspaceID: UUID?) -> [String: String]? {
-        workspaceID == self.workspaceID ? workspaceOverrides : nil
-    }
-
-    func mcpAgentRoleOverrides(scope: AgentModelsEditingScope) -> [String: String]? {
-        if case let .workspace(id) = scope, id == workspaceID { return workspaceOverrides }
-        return nil
-    }
-
-    func updateMCPAgentRoleOverrides(
-        _ overrides: [String: String]?,
-        scope: AgentModelsEditingScope,
-        commit: Bool
-    ) {
-        if case let .workspace(id) = scope, id == workspaceID { workspaceOverrides = overrides }
-    }
-
-    func mcpAgentRoleModelParameters(scope: AgentModelsEditingScope) -> [String: [ACPModelParameterSelection]]? {
-        nil
-    }
-
-    func mcpAgentRoleModelParameters(workspaceID: UUID?) -> [String: [ACPModelParameterSelection]]? {
-        nil
     }
 }

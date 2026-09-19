@@ -168,6 +168,29 @@ final class AgentComposerSubmissionAttemptTests: XCTestCase {
 
 @MainActor
 extension AgentComposerSubmissionAttemptTests {
+    func testGlobalRouterOwnsFreshTaskModelPresentationUntilDisabled() throws {
+        let backend = ComposerRoutingBackend(outcome: .selectLast)
+        let (viewModel, store) = try makeRoutingViewModel(backend: backend)
+        let tabID = UUID()
+        viewModel.test_setCurrentTabIDOverride(tabID)
+        let session = viewModel.session(for: tabID)
+        session.selectedAgent = .claudeCode
+        session.selectedModelRaw = AgentModel.claudeHaiku.rawValue
+
+        let routedProps = viewModel.makeComposerProps(tabID: tabID)
+        XCTAssertTrue(routedProps.isGlobalModelRouterControllingFreshTask)
+        XCTAssertTrue(routedProps.areModelControlsDisabled)
+        XCTAssertEqual(session.selectedAgent, .claudeCode)
+        XCTAssertEqual(session.selectedModelRaw, AgentModel.claudeHaiku.rawValue)
+
+        store.setModelRouterEnabled(false)
+
+        let manualProps = viewModel.makeComposerProps(tabID: tabID)
+        XCTAssertFalse(manualProps.isGlobalModelRouterControllingFreshTask)
+        XCTAssertFalse(manualProps.areModelControlsDisabled)
+        XCTAssertEqual(session.selectedModelRaw, AgentModel.claudeHaiku.rawValue)
+    }
+
     func testFakeReadyRouterCommitsSelectedExecutableTargetAtSubmitBoundary() async throws {
         let backend = ComposerRoutingBackend(outcome: .selectLast)
         let (viewModel, store) = try makeRoutingViewModel(backend: backend)

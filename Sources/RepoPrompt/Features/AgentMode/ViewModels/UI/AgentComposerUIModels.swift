@@ -267,6 +267,7 @@ struct AgentComposerProps: Equatable {
     let hasAvailableAgentProviders: Bool
     let canSendWithCurrentProvider: Bool
     let isRoutingFreshTask: Bool
+    let isGlobalModelRouterControllingFreshTask: Bool
     let unavailableSelectedAgentMessage: String?
     let selectedAgent: AgentProviderKind
     let selectedModelRaw: String
@@ -301,6 +302,7 @@ struct AgentComposerProps: Equatable {
         hasAvailableAgentProviders: false,
         canSendWithCurrentProvider: false,
         isRoutingFreshTask: false,
+        isGlobalModelRouterControllingFreshTask: false,
         unavailableSelectedAgentMessage: nil,
         selectedAgent: .claudeCode,
         selectedModelRaw: AgentModel.defaultModel.rawValue,

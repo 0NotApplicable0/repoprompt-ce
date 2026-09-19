@@ -654,12 +654,16 @@ struct AgentComposerView: View, Equatable {
                         mcpControlChip
                     }
                     if props.hasAvailableAgentProviders {
-                        agentProviderModelPicker
-                        acpModelParameterPickers
-                        reasoningEffortPicker
-                        claudeEffortPicker
-                        codexToolsButton
-                        claudeToolsButton
+                        if props.isGlobalModelRouterControllingFreshTask {
+                            automaticRouterTargetChip
+                        } else {
+                            agentProviderModelPicker
+                            acpModelParameterPickers
+                            reasoningEffortPicker
+                            claudeEffortPicker
+                            codexToolsButton
+                            claudeToolsButton
+                        }
                     } else {
                         connectAgentProvidersButton
                     }
@@ -732,6 +736,25 @@ struct AgentComposerView: View, Equatable {
     }
 
     // MARK: - Agent Pickers
+
+    private var automaticRouterTargetChip: some View {
+        HStack(spacing: 5) {
+            Image(systemName: "arrow.triangle.branch")
+                .font(fontPreset.swiftUIFont(sizeAtNormal: 11, weight: .medium))
+            Text("Automatic · Jev")
+                .font(fontPreset.swiftUIFont(sizeAtNormal: 11, weight: .medium))
+        }
+        .foregroundColor(.accentColor)
+        .padding(.horizontal, 8)
+        .padding(.vertical, 4)
+        .background(Color.accentColor.opacity(0.10))
+        .cornerRadius(6)
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("Model Router")
+        .accessibilityValue("Automatic with Jev")
+        .hoverTooltip("Jev will choose the provider, model, and reasoning effort after you send. Turn off Router to choose them manually.")
+        .fixedSize(horizontal: true, vertical: false)
+    }
 
     private enum LayoutMetrics {
         static let providerChipMaxWidth: CGFloat = 250

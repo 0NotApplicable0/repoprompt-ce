@@ -28,16 +28,10 @@ extension AgentModeViewModel {
         let backendReady = configuration.selectedBackendID.map {
             modelRouterRuntime?.isBackendReady($0) == true
         } ?? false
-        let available = backendReady
-            && !RouterSettingsViewModel.effectiveRoles(configuration).isEmpty
-            && !RouterSettingsViewModel.effectiveProviders(
-                configuration,
-                available: Set(MCPAgentRoleDefaultsService.resolutions(
-                    availability: agentAvailabilityContext,
-                    workspaceID: workspaceManager?.activeWorkspaceID,
-                    settingsStore: modelRouterSettingsStore
-                ).filter { !$0.overrideUnavailable }.map(\.effective.agent))
-            ).isEmpty
+        let available = backendReady && (try? AgentTaskRoutingCandidateBuilder().build(
+            allowedProviders: providers(for: .primarySession, configuration: configuration),
+            availability: agentAvailabilityContext
+        )) != nil
         let isRouting = currentTabID.map { freshTaskRoutingByTabID[$0] != nil } ?? false
         return AgentModelRouterPillProps(
             isOn: configuration.enabled,
@@ -60,22 +54,11 @@ extension AgentModeViewModel {
         guard let backendID = configuration.selectedBackendID,
               modelRouterRuntime?.isBackendReady(backendID) == true
         else { return }
-        let resolutions = MCPAgentRoleDefaultsService.resolutions(
-            availability: agentAvailabilityContext,
-            workspaceID: workspaceManager?.activeWorkspaceID,
-            settingsStore: modelRouterSettingsStore
-        ).filter { !$0.overrideUnavailable }
-        let roles = RouterSettingsViewModel.effectiveRoles(configuration)
-        let providers = RouterSettingsViewModel.effectiveProviders(
-            configuration,
-            available: Set(resolutions.map(\.effective.agent))
-        )
-        guard !roles.isEmpty, !providers.isEmpty else { return }
-        modelRouterSettingsStore.enableModelRouterWithCurrentPolicy(
-            backendID: backendID,
-            roles: roles,
-            providers: providers
-        )
+        guard (try? AgentTaskRoutingCandidateBuilder().build(
+            allowedProviders: providers(for: .primarySession, configuration: configuration),
+            availability: agentAvailabilityContext
+        )) != nil else { return }
+        modelRouterSettingsStore.setModelRouterEnabled(true)
         syncAllActiveUIState()
     }
 
@@ -86,6 +69,11 @@ extension AgentModeViewModel {
         await runtime.coordinator.cancel(requestID: owned.requestID)
         owned.task.cancel()
         clearFreshTaskRoutingOwnership(owned)
+    }
+
+    func isGlobalModelRouterControllingFreshTask(_ session: TabSession) -> Bool {
+        modelRouterSettingsStore.modelRouterConfiguration().enabled
+            && freshTaskRoutingEligibility(session: session, text: nil)
     }
 
     func submitUserTurnAfterFreshTaskRouting(
@@ -116,14 +104,10 @@ extension AgentModeViewModel {
             return .blocked(message: "Model Router is unavailable. Turn it off to send with the current selection.")
         }
 
-        let roles = Set(configuration.candidateRoles)
         let providers = providers(for: .primarySession, configuration: configuration)
         guard let candidates = try? AgentTaskRoutingCandidateBuilder().build(
-            workspaceID: workspaceManager?.activeWorkspaceID,
-            roles: roles,
             allowedProviders: providers,
-            availability: agentAvailabilityContext,
-            settingsStore: modelRouterSettingsStore
+            availability: agentAvailabilityContext
         ) else {
             return .blocked(message: "The configured Router policy has no available primary-session targets.")
         }
@@ -226,12 +210,9 @@ extension AgentModeViewModel {
               runtime.isBackendReady(backendID)
         else { throw GlobalModelRoutingError.unavailable }
         let candidates = try AgentTaskRoutingCandidateBuilder().build(
-            workspaceID: workspaceManager?.activeWorkspaceID,
-            roles: Set(configuration.candidateRoles),
             allowedProviders: providers(for: .subagent, configuration: configuration),
             availability: agentAvailabilityContext,
-            surface: surface,
-            settingsStore: modelRouterSettingsStore
+            surface: surface
         )
         guard let first = candidates.first else { throw GlobalModelRoutingError.noTargets }
         guard candidates.count > 1 else {
@@ -282,8 +263,12 @@ extension AgentModeViewModel {
         case .primarySession: configuration.primaryProvider
         case .subagent: configuration.subagentProvider
         }
-        guard let limit else { return configuration.allowedProviders }
-        return configuration.allowedProviders.intersection([limit])
+        let available = AgentTaskRoutingCandidateBuilder.availableProviders(
+            availability: agentAvailabilityContext,
+            surface: scope == .subagent ? .headless : .general
+        )
+        guard let limit else { return available }
+        return available.intersection([limit])
     }
 
     private func freshTaskRoutingEligibility(session: TabSession, text: String?) -> Bool {

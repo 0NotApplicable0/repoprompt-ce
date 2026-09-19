@@ -23,12 +23,12 @@ final class RouterSettingsViewModel: ObservableObject {
     }
 
     struct TargetPreview: Identifiable, Equatable {
-        let role: AgentModelCatalog.TaskLabelKind
+        let utilityTier: String
         let provider: AgentProviderKind
         let displayName: String
         let target: AgentRoutingExecutableTarget
         var id: String {
-            role.rawValue
+            "\(provider.rawValue):\(target.modelRaw)"
         }
     }
 
@@ -44,6 +44,7 @@ final class RouterSettingsViewModel: ObservableObject {
     private let settingsStore: GlobalSettingsStore
     private let runtime: AgentTaskRouterRuntime
     private let apiSettingsViewModel: APISettingsViewModel
+    private let availabilityProvider: @MainActor () -> AgentModelCatalog.AvailabilityContext
     private weak var workspaceManager: WorkspaceManagerViewModel?
     private var readinessTask: Task<Void, Never>?
     private var observedBackendID: AgentTaskRouterBackendID?
@@ -55,11 +56,13 @@ final class RouterSettingsViewModel: ObservableObject {
         settingsStore: GlobalSettingsStore,
         runtime: AgentTaskRouterRuntime,
         apiSettingsViewModel: APISettingsViewModel,
-        workspaceManager: WorkspaceManagerViewModel
+        workspaceManager: WorkspaceManagerViewModel,
+        availabilityProvider: (@MainActor () -> AgentModelCatalog.AvailabilityContext)? = nil
     ) {
         self.settingsStore = settingsStore
         self.runtime = runtime
         self.apiSettingsViewModel = apiSettingsViewModel
+        self.availabilityProvider = availabilityProvider ?? { apiSettingsViewModel.agentAvailability }
         self.workspaceManager = workspaceManager
         configuration = settingsStore.modelRouterConfiguration()
         readiness = .needsConfiguration(generation: 0, reason: "Select and configure a routing backend.")
@@ -90,22 +93,18 @@ final class RouterSettingsViewModel: ObservableObject {
         readiness.isReady && policyCanBuildCandidates
     }
 
-    var eligibleRoles: Set<AgentModelCatalog.TaskLabelKind> {
-        Self.effectiveRoles(configuration)
-    }
-
     var availableProviders: Set<AgentProviderKind> {
         Set(targetPreviews.map(\.provider))
     }
 
     var visibleProviders: [AgentProviderKind] {
-        availableProviders.union(configuration.allowedProviders).sorted { $0.displayName < $1.displayName }
+        availableProviders
+            .union([configuration.primaryProvider, configuration.subagentProvider].compactMap(\.self))
+            .sorted { $0.displayName < $1.displayName }
     }
 
     var distinctTargetCount: Int {
-        Set(targetPreviews.filter {
-            eligibleRoles.contains($0.role) && isProviderAllowed($0.provider)
-        }.map(\.target)).count
+        Set(targetPreviews.map(\.target)).count
     }
 
     func providerLimit(for scope: AgentTaskRoutingScope) -> AgentProviderKind? {
@@ -113,10 +112,6 @@ final class RouterSettingsViewModel: ObservableObject {
         case .primarySession: configuration.primaryProvider
         case .subagent: configuration.subagentProvider
         }
-    }
-
-    func isProviderAllowed(_ provider: AgentProviderKind) -> Bool {
-        Self.effectiveProviders(configuration, available: availableProviders).contains(provider)
     }
 
     func selectBackend(_ id: AgentTaskRouterBackendID) {
@@ -131,22 +126,6 @@ final class RouterSettingsViewModel: ObservableObject {
             )
             await refresh()
         }
-    }
-
-    func setRole(_ role: AgentModelCatalog.TaskLabelKind, enabled: Bool) {
-        var roles = Self.effectiveRoles(settingsStore.modelRouterConfiguration())
-        if enabled { roles.insert(role) } else { roles.remove(role) }
-        settingsStore.setModelRouterCandidateRoles(roles)
-        synchronizeConfiguration()
-        scheduleRefresh()
-    }
-
-    func setProvider(_ provider: AgentProviderKind, enabled: Bool) {
-        var providers = Self.effectiveProviders(settingsStore.modelRouterConfiguration(), available: availableProviders)
-        if enabled { providers.insert(provider) } else { providers.remove(provider) }
-        settingsStore.setModelRouterAllowedProviders(providers)
-        synchronizeConfiguration()
-        scheduleRefresh()
     }
 
     func setProviderLimit(_ provider: AgentProviderKind?, scope: AgentTaskRoutingScope) {
@@ -165,18 +144,7 @@ final class RouterSettingsViewModel: ObservableObject {
     func setEnabled(_ enabled: Bool) {
         synchronizeConfiguration()
         guard !enabled || canEnable else { return }
-        if enabled,
-           !configuration.candidateRolesMaterialized || !configuration.allowedProvidersMaterialized,
-           let selectedBackendID
-        {
-            settingsStore.enableModelRouterWithCurrentPolicy(
-                backendID: selectedBackendID,
-                roles: Self.effectiveRoles(configuration),
-                providers: Self.effectiveProviders(configuration, available: availableProviders)
-            )
-        } else {
-            settingsStore.setModelRouterEnabled(enabled)
-        }
+        settingsStore.setModelRouterEnabled(enabled)
         synchronizeConfiguration()
         scheduleRefresh()
     }
@@ -298,37 +266,31 @@ final class RouterSettingsViewModel: ObservableObject {
     }
 
     private func rebuildTargetPreviews() {
-        let availability = apiSettingsViewModel.agentAvailability
-        let workspaceID = workspaceManager?.activeWorkspaceID
-        let resolutions = MCPAgentRoleDefaultsService.resolutions(
-            availability: availability,
-            workspaceID: workspaceID,
-            settingsStore: settingsStore
+        let availability = availabilityProvider()
+        let providers = AgentTaskRoutingCandidateBuilder.availableProviders(availability: availability)
+        let candidates = try? AgentTaskRoutingCandidateBuilder().build(
+            allowedProviders: providers,
+            availability: availability
         )
-        targetPreviews = resolutions.filter { !$0.overrideUnavailable }.map { resolution in
-            TargetPreview(
-                role: resolution.role,
-                provider: resolution.effective.agent,
-                displayName: resolution.effectiveDisplayName,
-                target: AgentRoutingExecutableTarget(
-                    agentRaw: resolution.effective.agent.rawValue,
-                    modelRaw: resolution.effective.modelRaw,
-                    reasoningEffortRaw: resolution.effective.agent == .codexExec
-                        ? CodexModelSpecifier(raw: resolution.effective.modelRaw).reasoningEffort?.rawValue
-                        : nil,
-                    modelParameters: resolution.modelParameters
-                )
+        targetPreviews = (candidates ?? []).compactMap { candidate in
+            guard let provider = AgentProviderKind(rawValue: candidate.target.agentRaw) else { return nil }
+            return TargetPreview(
+                utilityTier: candidate.utilityTier,
+                provider: provider,
+                displayName: AgentModelCatalog.displayName(
+                    for: candidate.target.modelRaw,
+                    agentKind: provider,
+                    availability: availability
+                ),
+                target: candidate.target
             )
         }
-        let roles = Self.effectiveRoles(configuration)
-        let providers = Self.effectiveProviders(configuration, available: Set(targetPreviews.map(\.provider)))
-        policyCanBuildCandidates = (try? AgentTaskRoutingCandidateBuilder().build(
-            workspaceID: workspaceID,
-            roles: roles,
-            allowedProviders: providers,
-            availability: availability,
-            settingsStore: settingsStore
-        )) != nil
+        let limitedProviders = Set(
+            [configuration.primaryProvider, configuration.subagentProvider]
+                .compactMap(\.self)
+        )
+        policyCanBuildCandidates = !targetPreviews.isEmpty
+            && limitedProviders.isSubset(of: Set(targetPreviews.map(\.provider)))
     }
 
     static func effectiveRoles(
