@@ -260,7 +260,6 @@ struct AgentComposerView: View, Equatable {
     @FocusState var isFocused: Bool
 
     @State private var localInputText: String = ""
-    @State private var routeFreshTask = false
     @State private var submissionLatch = AgentComposerSubmissionLatch()
     @State private var lastAppliedDraftRestorationEventIDByTab: [UUID: UUID] = [:]
     @State private var editorTextFieldHeight: CGFloat = ResizableTextField.height(forPresetIndex: 0, preset: .normal)
@@ -499,7 +498,6 @@ struct AgentComposerView: View, Equatable {
             modelMenuSnapshotByAgent = nil
         }
         .onChange(of: currentTabID) { oldTabID, newTabID in
-            routeFreshTask = false
             // Switch drafts when tab changes
             if let oldTabID {
                 actions.storeDraft(oldTabID, localInputText)
@@ -507,9 +505,6 @@ struct AgentComposerView: View, Equatable {
             if let newTabID {
                 loadDraftFromSession(for: newTabID)
             }
-        }
-        .onChange(of: props.canRouteFreshTask) { _, canRoute in
-            if !canRoute { routeFreshTask = false }
         }
         .onChange(of: localInputText) { _, newValue in
             isInputEmpty = newValue.isEmpty
@@ -669,19 +664,6 @@ struct AgentComposerView: View, Equatable {
                         connectAgentProvidersButton
                     }
                     approvalPopoverChip
-                    if props.isRoutingFreshTask {
-                        HStack(spacing: 5) {
-                            ProgressView().controlSize(.mini)
-                            Text("Choosing model…")
-                        }
-                        .font(fontPreset.swiftUIFont(sizeAtNormal: 11))
-                        .foregroundStyle(.secondary)
-                    } else if props.canRouteFreshTask {
-                        Toggle("Route once", isOn: $routeFreshTask)
-                            .toggleStyle(.checkbox)
-                            .font(fontPreset.swiftUIFont(sizeAtNormal: 11))
-                            .hoverTooltip("Ask the configured router to choose a target for this fresh plain-text task")
-                    }
                 }
                 .padding(.vertical, 2)
             }
@@ -1555,8 +1537,7 @@ struct AgentComposerView: View, Equatable {
         }
         guard let attempt = submissionLatch.begin(
             target: submitTarget,
-            rawDraftSnapshot: rawDraftSnapshot,
-            routingIntent: routeFreshTask && props.canRouteFreshTask ? .routeFreshTask : .useCurrentSelection
+            rawDraftSnapshot: rawDraftSnapshot
         ) else {
             logViewSubmitRejection(reason: "local_attempt_latched", target: submitTarget)
             return
@@ -1579,7 +1560,6 @@ struct AgentComposerView: View, Equatable {
                 }
                 if effects.shouldClearInput {
                     setLocalInputText("")
-                    routeFreshTask = false
                     resetTextFieldTrigger.toggle()
                 }
                 if let blockedMessage = effects.blockedMessage {

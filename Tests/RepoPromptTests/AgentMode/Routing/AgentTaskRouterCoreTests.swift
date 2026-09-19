@@ -89,10 +89,16 @@ final class AgentTaskRouterCoreTests: XCTestCase {
     func testEnvelopeIsExactAndRejectsPrivacyExpansionsOrTruncation() throws {
         let candidates = [descriptor("a"), descriptor("b")]
         let request = try AgentTaskRoutingEnvelopeBuilder().build(
-            requestID: UUID(), text: "  diagnose this  ", candidates: candidates
+            requestID: UUID(),
+            text: "  diagnose this  ",
+            scope: .subagent,
+            customInstructions: "  Prefer Claude for execution.  ",
+            candidates: candidates
         )
         XCTAssertEqual(request.task, "diagnose this")
         XCTAssertEqual(request.contractVersion, AgentTaskRoutingRequest.currentContractVersion)
+        XCTAssertEqual(request.scope, .subagent)
+        XCTAssertEqual(request.customInstructions, "Prefer Claude for execution.")
         XCTAssertThrowsError(try AgentTaskRoutingEnvelopeBuilder().build(
             requestID: UUID(), text: String(repeating: "a", count: 4001), candidates: candidates
         )) { XCTAssertEqual($0 as? AgentTaskRoutingEnvelopeBuilder.Rejection, .tooManyCharacters) }
@@ -248,7 +254,8 @@ final class AgentTaskRouterCoreTests: XCTestCase {
         let backend = JevTaskRouterBackend(credentialService: credentials)
         let outcome = await backend.route(.init(
             requestID: UUID(), contractVersion: AgentTaskRoutingRequest.currentContractVersion,
-            task: "task", candidates: [descriptor("a"), descriptor("b")]
+            task: "task", scope: .subagent, customInstructions: "Prefer b.",
+            candidates: [descriptor("a"), descriptor("b")]
         ))
         guard case let .selected(key, evidence) = outcome else {
             return XCTFail("Expected Jev selection, got \(outcome)")
@@ -262,7 +269,12 @@ final class AgentTaskRouterCoreTests: XCTestCase {
         let request = await client.lastRequest
         XCTAssertEqual(request?.model, JevRouterCredentialService.pinnedModel)
         XCTAssertEqual(request?.state, "task")
-        XCTAssertEqual(request?.questions["route"]?.criteria, ["a": "rubric", "b": "rubric"])
+        XCTAssertEqual(request?.questions["route"]?.criteria, [
+            "a": "Provider: Test; model: a. Suitable work: rubric",
+            "b": "Provider: Test; model: b. Suitable work: rubric"
+        ])
+        XCTAssertTrue(request?.questions["route"]?.instructions.contains("delegated subagent session") == true)
+        XCTAssertTrue(request?.questions["route"]?.instructions.contains("Prefer b.") == true)
     }
 
     func testJevBackendRejectsDuplicateOpaqueKeysWithoutCallingService() async {
@@ -274,7 +286,8 @@ final class AgentTaskRouterCoreTests: XCTestCase {
         let backend = JevTaskRouterBackend(credentialService: credentials)
         let outcome = await backend.route(.init(
             requestID: UUID(), contractVersion: AgentTaskRoutingRequest.currentContractVersion,
-            task: "task", candidates: [descriptor("duplicate"), descriptor("duplicate")]
+            task: "task", scope: .primarySession, customInstructions: nil,
+            candidates: [descriptor("duplicate"), descriptor("duplicate")]
         ))
         XCTAssertEqual(outcome, .failed(category: .invalidRequest, retryable: false, evidence: nil))
         let request = await client.lastRequest
@@ -282,7 +295,13 @@ final class AgentTaskRouterCoreTests: XCTestCase {
     }
 
     private func descriptor(_ key: String) -> AgentTaskRoutingCandidateDescriptor {
-        .init(opaqueKey: key, roleLabels: [key], rubricVersion: "v1", rubric: "rubric")
+        .init(
+            opaqueKey: key,
+            roleLabels: [key],
+            targetDescription: "Provider: Test; model: \(key).",
+            rubricVersion: "v1",
+            rubric: "rubric"
+        )
     }
 
     private func testSettingsPresentation(_ title: String) -> AgentTaskRouterBackendSettingsPresentation {
@@ -520,7 +539,7 @@ final class AgentTaskRoutingCandidateBuilderPolicyTests: XCTestCase {
         XCTAssertEqual(explore.target.agentRaw, AgentProviderKind.claudeCode.rawValue)
     }
 
-    func testEmptyProviderAndDuplicateTargetsFailClosed() {
+    func testEmptyPolicyFailsClosedAndDuplicateTargetsCollapseToOne() throws {
         let availability = AgentModelCatalog.AvailabilityContext(
             claudeCodeAvailable: true,
             codexAvailable: true,
@@ -547,15 +566,15 @@ final class AgentTaskRoutingCandidateBuilderPolicyTests: XCTestCase {
             workspaceID: UUID(),
             workspaceOverrides: ["explore": same, "engineer": same]
         )
-        XCTAssertThrowsError(try AgentTaskRoutingCandidateBuilder().build(
+        let collapsed = try AgentTaskRoutingCandidateBuilder().build(
             workspaceID: store.workspaceID,
             roles: [.explore, .engineer],
             allowedProviders: [.codexExec],
             availability: availability,
             settingsStore: store
-        )) { error in
-            XCTAssertEqual(error as? AgentTaskRoutingCandidateBuilder.BuildError, .insufficientDistinctTargets)
-        }
+        )
+        XCTAssertEqual(collapsed.count, 1)
+        XCTAssertEqual(Set(collapsed[0].roles), [.explore, .engineer])
     }
 }
 

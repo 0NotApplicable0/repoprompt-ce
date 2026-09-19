@@ -5,6 +5,8 @@ struct RouterSettingsView: View {
     var onNavigate: ((SettingsTab) -> Void)?
     @Environment(\.repoPromptFontScalePreset) private var fontPreset
     @State private var candidateSecret = ""
+    @State private var customInstructionsDraft = ""
+    @State private var customInstructionsFeedback: String?
 
     var body: some View {
         ScrollView {
@@ -12,6 +14,7 @@ struct RouterSettingsView: View {
                 header
                 statusCard
                 backendCard
+                routingPolicyCard
                 candidatesCard
                 privacyNotice
             }
@@ -20,7 +23,10 @@ struct RouterSettingsView: View {
             .padding(24)
             .frame(maxWidth: .infinity, alignment: .topLeading)
         }
-        .task { await viewModel.refresh() }
+        .task {
+            await viewModel.refresh()
+            customInstructionsDraft = viewModel.configuration.customInstructions
+        }
         .onChange(of: viewModel.selectedBackendID) { _, _ in candidateSecret = "" }
     }
 
@@ -57,11 +63,74 @@ struct RouterSettingsView: View {
                 .accessibilityLabel("Enable Model Router")
             }
             if viewModel.canEnable || viewModel.configuration.enabled {
-                Text("Enabling adds “Route once” to eligible new tasks. You choose when to use it.")
+                Text("When enabled, Router chooses the target for every new primary session and RepoPrompt-managed subagent. Existing sessions keep their established target.")
                     .font(fontPreset.swiftUIFont(sizeAtNormal: 11))
                     .foregroundStyle(.secondary)
             }
         }
+    }
+
+    private var routingPolicyCard: some View {
+        card {
+            Label("Routing behavior", systemImage: "slider.horizontal.3").font(.headline)
+            Text("Optionally limit each session type to one provider. Leave a limit unset to let Jev choose among all allowed providers.")
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            providerLimitPicker("Primary sessions", scope: .primarySession)
+            providerLimitPicker("Subagents", scope: .subagent)
+            Divider()
+            Text("Custom guidance").font(.headline)
+            Text("Use this for soft preferences such as “Prefer Claude Opus for execution, use GPT Astra sparingly, consult Fable for hard decisions.” Jev receives this text with every routing request.")
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            TextEditor(text: $customInstructionsDraft)
+                .font(fontPreset.swiftUIFont(sizeAtNormal: 12))
+                .frame(minHeight: 70, maxHeight: 110)
+                .padding(6)
+                .background(.background, in: RoundedRectangle(cornerRadius: 6))
+                .overlay(RoundedRectangle(cornerRadius: 6).strokeBorder(.quaternary))
+            HStack {
+                Text("\(customInstructionsDraft.count)/1000")
+                    .font(fontPreset.swiftUIFont(sizeAtNormal: 11))
+                    .foregroundStyle(customInstructionsDraft.count > 1000 ? Color.red : Color.secondary)
+                Spacer()
+                if let customInstructionsFeedback {
+                    Text(customInstructionsFeedback)
+                        .font(fontPreset.swiftUIFont(sizeAtNormal: 11))
+                        .foregroundStyle(.secondary)
+                }
+                Button("Save Guidance") {
+                    if viewModel.setCustomInstructions(customInstructionsDraft) {
+                        customInstructionsDraft = viewModel.configuration.customInstructions
+                        customInstructionsFeedback = "Saved"
+                    } else {
+                        customInstructionsFeedback = "Guidance is too long"
+                    }
+                }
+                .disabled(
+                    customInstructionsDraft == viewModel.configuration.customInstructions
+                        || customInstructionsDraft.count > 1000
+                )
+            }
+        }
+    }
+
+    private func providerLimitPicker(
+        _ title: String,
+        scope: AgentTaskRoutingScope
+    ) -> some View {
+        Picker(title, selection: Binding(
+            get: { viewModel.providerLimit(for: scope) },
+            set: { viewModel.setProviderLimit($0, scope: scope) }
+        )) {
+            Text("Any allowed provider").tag(AgentProviderKind?.none)
+            ForEach(viewModel.visibleProviders.filter {
+                viewModel.isProviderAllowed($0) || viewModel.providerLimit(for: scope) == $0
+            }, id: \.rawValue) { provider in
+                Text(provider.displayName).tag(Optional(provider))
+            }
+        }
+        .pickerStyle(.menu)
     }
 
     private var backendCard: some View {
@@ -138,7 +207,7 @@ struct RouterSettingsView: View {
                     }
                 }
             }
-            Text("Routing needs at least two distinct targets. Roles using the same provider, model, effort, and options count as one. Provider access limits where routed tasks may run.")
+            Text("With two or more distinct targets, Jev chooses one. A scope with one available target applies it directly. Roles using the same provider, model, effort, and options count as one. Provider access limits where routed tasks may run.")
                 .font(fontPreset.swiftUIFont(sizeAtNormal: 11))
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
@@ -182,7 +251,7 @@ struct RouterSettingsView: View {
             Image(systemName: "hand.raised").foregroundStyle(.secondary)
             VStack(alignment: .leading, spacing: 5) {
                 Text("What gets shared").fontWeight(.medium)
-                Text("When you choose Route once, the service receives your task text and general role descriptions. Attached files, workspace context, chat history, and provider credentials are excluded. Anything you type in the task itself is shared.")
+                Text("For each new routed session, the service receives your task text, custom guidance, and candidate provider/model/effort descriptions. Attached files, workspace context, chat history, and provider credentials are excluded. Anything you type in the task or guidance is shared.")
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
             }
@@ -280,7 +349,7 @@ struct RouterSettingsView: View {
     private var readinessTitle: String {
         switch viewModel.readiness {
         case .ready:
-            if !viewModel.policyCanBuildCandidates { return "Choose at least two routing targets" }
+            if !viewModel.policyCanBuildCandidates { return "Choose routing targets" }
             return viewModel.configuration.enabled ? "Model Router is on" : "Ready to enable"
         case .validating: return "Checking your API key…"
         case .needsConfiguration: return "Set up a routing service"
@@ -293,8 +362,8 @@ struct RouterSettingsView: View {
         switch viewModel.readiness {
         case .ready:
             viewModel.policyCanBuildCandidates
-                ? "Enable routing, then use Route once in the composer to let Jev choose a complete target."
-                : "Select at least two roles with distinct provider, model, effort, or option combinations."
+                ? "Enable Router here or from the Agent Mode toolbar. It stays enabled across sessions until you turn it off."
+                : "Select at least one role and provider with an available target."
         case .validating: "The routing service is validating your configuration."
         case let .needsConfiguration(_, reason),
              let .policyUnavailable(_, reason),

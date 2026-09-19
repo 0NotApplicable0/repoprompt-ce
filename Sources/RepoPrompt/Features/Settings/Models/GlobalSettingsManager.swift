@@ -1586,6 +1586,13 @@ class GlobalSettingsStore: ObservableObject, CodexHookApprovalSettingsProviding 
         }
 
         let enabled = stored?.enabled ?? false
+        let primaryProvider = stored?.primaryProviderRawValue.flatMap(AgentProviderKind.init(rawValue:))
+        let subagentProvider = stored?.subagentProviderRawValue.flatMap(AgentProviderKind.init(rawValue:))
+        let storedCustomInstructions = stored?.customInstructions?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let customInstructions = storedCustomInstructions.count <= 1000
+            && storedCustomInstructions.utf8.count <= 4096
+            ? storedCustomInstructions
+            : ""
         let validity: AgentTaskRouterConfiguration.Validity = if !enabled {
             .disabled
         } else if backendID == nil {
@@ -1607,6 +1614,9 @@ class GlobalSettingsStore: ObservableObject, CodexHookApprovalSettingsProviding 
             allowedProvidersMaterialized: providersMaterialized,
             unknownRoleRawValues: unknownRoles,
             unknownProviderRawValues: unknownProviders,
+            primaryProvider: primaryProvider,
+            subagentProvider: subagentProvider,
+            customInstructions: customInstructions,
             validity: validity,
             revision: modelRouterSettingsRevision
         )
@@ -1642,6 +1652,25 @@ class GlobalSettingsStore: ObservableObject, CodexHookApprovalSettingsProviding 
                 .filter(providers.contains)
                 .map(\.rawValue) + unknown
         }
+    }
+
+    func setModelRouterProvider(_ provider: AgentProviderKind?, scope: AgentTaskRoutingScope, commit: Bool = true) {
+        updateModelRouterScalar(commit: commit) { settings in
+            switch scope {
+            case .primarySession: settings.primaryProviderRawValue = provider?.rawValue
+            case .subagent: settings.subagentProviderRawValue = provider?.rawValue
+            }
+        }
+    }
+
+    @discardableResult
+    func setModelRouterCustomInstructions(_ instructions: String, commit: Bool = true) -> Bool {
+        let normalized = instructions.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard normalized.count <= 1000, normalized.utf8.count <= 4096 else { return false }
+        updateModelRouterScalar(commit: commit) { settings in
+            settings.customInstructions = normalized.isEmpty ? nil : normalized
+        }
+        return true
     }
 
     /// Materializes the currently visible policy on first enable; subsequent provider additions

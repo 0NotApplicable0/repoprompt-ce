@@ -505,12 +505,34 @@ struct AgentRunMCPToolService {
         let defaultTaskLabel = Self.defaultTaskLabelForStart(resolvedTabID: resolvedTabID, workflow: workflow)
 
         // Validate model selection before creating a target. Role labels resolve through effective workspace/global role defaults.
-        let selection = try AgentMCPSelectionResolver.resolve(
-            modelID: normalizedString(args["model_id"]),
+        let requestedModelID = normalizedString(args["model_id"])
+        var selection = try AgentMCPSelectionResolver.resolve(
+            modelID: requestedModelID,
             defaultTaskLabel: defaultTaskLabel,
             availability: targetWindow.apiSettingsViewModel.agentModeAvailabilityContext,
             workspaceID: workspace.id
         )
+        var routedReasoningEffortRaw: String?
+        let hasExactModelPin = requestedModelID?.contains(":") == true
+            || args["model_parameters"] != nil
+        if !hasExactModelPin {
+            do {
+                if let routed = try await agentModeVM.routeSubagentTargetIfEnabled(
+                    task: message,
+                    surface: .general
+                ) {
+                    selection = AgentMCPSelectionResolver.ResolvedSelection(
+                        agentRaw: routed.agentRaw,
+                        modelRaw: routed.modelRaw,
+                        taskLabelKind: selection.taskLabelKind,
+                        modelParameterSelections: routed.modelParameters
+                    )
+                    routedReasoningEffortRaw = routed.reasoningEffortRaw
+                }
+            } catch {
+                throw MCPError.invalidParams(error.localizedDescription)
+            }
+        }
 
         #if DEBUG
             if let rawToken = normalizedString(args["_worktree_startup_benchmark_token"]) {
@@ -837,7 +859,7 @@ struct AgentRunMCPToolService {
                 agentModeVM,
                 selection.agentRaw,
                 selection.modelRaw,
-                nil,
+                routedReasoningEffortRaw,
                 selection.taskLabelKind,
                 workflow,
                 spawnParentSessionID,

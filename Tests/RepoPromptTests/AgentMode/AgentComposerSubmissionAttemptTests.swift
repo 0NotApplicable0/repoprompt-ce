@@ -229,6 +229,24 @@ extension AgentComposerSubmissionAttemptTests {
         XCTAssertTrue(session.transcript.turns.isEmpty)
     }
 
+    func testGlobalRouterRoutesSubagentRequestWithScopeGuidanceAndTargetIdentity() async throws {
+        let backend = ComposerRoutingBackend(outcome: .selectLast)
+        let (viewModel, store) = try makeRoutingViewModel(backend: backend)
+        XCTAssertTrue(store.setModelRouterCustomInstructions("Prefer Claude Opus for execution."))
+
+        let selected = try await viewModel.routeSubagentTargetIfEnabled(
+            task: "Implement the parser and tests",
+            surface: .general
+        )
+
+        XCTAssertNotNil(selected)
+        let request = await backend.lastRequest
+        XCTAssertEqual(request?.scope, .subagent)
+        XCTAssertEqual(request?.customInstructions, "Prefer Claude Opus for execution.")
+        XCTAssertEqual(request?.task, "Implement the parser and tests")
+        XCTAssertTrue(request?.candidates.allSatisfy { !$0.targetDescription.isEmpty } == true)
+    }
+
     func testNewDestinationOwnsVisibleCancelAndRejectsSecondSubmit() async throws {
         let backend = SuspendedComposerRoutingBackend()
         let (viewModel, _) = try makeRoutingViewModel(backend: backend)
@@ -323,8 +341,7 @@ extension AgentComposerSubmissionAttemptTests {
             target: target,
             inputRevision: 0,
             noticeRevision: 0,
-            rawDraftSnapshot: text,
-            routingIntent: .routeFreshTask
+            rawDraftSnapshot: text
         )
         guard case let .claimed(claim) = viewModel.claimComposerSubmitAttempt(
             attempt,
@@ -341,6 +358,7 @@ private actor ComposerRoutingBackend: AgentTaskRouterBackend {
     nonisolated let id = AgentTaskRouterBackendID(rawValue: "composer-fake")
     nonisolated let displayName = "Composer fake"
     let outcome: Outcome
+    private(set) var lastRequest: AgentTaskRoutingRequest?
 
     init(outcome: Outcome) {
         self.outcome = outcome
@@ -351,7 +369,8 @@ private actor ComposerRoutingBackend: AgentTaskRouterBackend {
     }
 
     func route(_ request: AgentTaskRoutingRequest) -> AgentTaskRoutingBackendOutcome {
-        switch outcome {
+        lastRequest = request
+        return switch outcome {
         case .selectLast:
             .selected(opaqueKey: request.candidates[request.candidates.count - 1].opaqueKey, evidence: nil)
         case .abstain:

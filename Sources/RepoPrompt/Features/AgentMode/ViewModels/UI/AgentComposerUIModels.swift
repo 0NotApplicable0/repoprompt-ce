@@ -103,33 +103,11 @@ struct AgentComposerSubmitTarget: Equatable {
 }
 
 struct AgentComposerSubmitAttempt: Equatable {
-    enum RoutingIntent: Equatable {
-        case useCurrentSelection
-        case routeFreshTask
-    }
-
     let id: UUID
     let target: AgentComposerSubmitTarget
     let inputRevision: UInt64
     let noticeRevision: UInt64
     let rawDraftSnapshot: String
-    let routingIntent: RoutingIntent
-
-    init(
-        id: UUID,
-        target: AgentComposerSubmitTarget,
-        inputRevision: UInt64,
-        noticeRevision: UInt64,
-        rawDraftSnapshot: String,
-        routingIntent: RoutingIntent = .useCurrentSelection
-    ) {
-        self.id = id
-        self.target = target
-        self.inputRevision = inputRevision
-        self.noticeRevision = noticeRevision
-        self.rawDraftSnapshot = rawDraftSnapshot
-        self.routingIntent = routingIntent
-    }
 
     var sourceTabID: UUID {
         target.tabID
@@ -182,7 +160,6 @@ struct AgentComposerSubmissionLatch {
     mutating func begin(
         target: AgentComposerSubmitTarget,
         rawDraftSnapshot: String,
-        routingIntent: AgentComposerSubmitAttempt.RoutingIntent = .useCurrentSelection,
         attemptID: UUID = UUID()
     ) -> AgentComposerSubmitAttempt? {
         guard activeAttemptsByTabID[target.tabID] == nil else { return nil }
@@ -191,8 +168,7 @@ struct AgentComposerSubmissionLatch {
             target: target,
             inputRevision: inputRevision,
             noticeRevision: noticeRevision,
-            rawDraftSnapshot: rawDraftSnapshot,
-            routingIntent: routingIntent
+            rawDraftSnapshot: rawDraftSnapshot
         )
         activeAttemptsByTabID[target.tabID] = attempt
         return attempt
@@ -290,7 +266,6 @@ struct AgentComposerProps: Equatable {
     let isCodexRunActive: Bool
     let hasAvailableAgentProviders: Bool
     let canSendWithCurrentProvider: Bool
-    let canRouteFreshTask: Bool
     let isRoutingFreshTask: Bool
     let unavailableSelectedAgentMessage: String?
     let selectedAgent: AgentProviderKind
@@ -325,7 +300,6 @@ struct AgentComposerProps: Equatable {
         isCodexRunActive: false,
         hasAvailableAgentProviders: false,
         canSendWithCurrentProvider: false,
-        canRouteFreshTask: false,
         isRoutingFreshTask: false,
         unavailableSelectedAgentMessage: nil,
         selectedAgent: .claudeCode,

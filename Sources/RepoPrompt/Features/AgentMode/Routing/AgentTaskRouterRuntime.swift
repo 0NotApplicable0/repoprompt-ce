@@ -54,6 +54,10 @@ final class AgentTaskRouterRuntime: ObservableObject {
         }
     }
 
+    func cancelRoutingRequests() {
+        Task { await coordinator.cancelAll() }
+    }
+
     func backendSelectionDidChange(
         selectedID: AgentTaskRouterBackendID?,
         shouldBootstrap: Bool

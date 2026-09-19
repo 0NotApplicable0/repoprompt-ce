@@ -44,14 +44,18 @@ representing its content. Schema-requiring features have fixed introduction cons
 - `oracleRosterSchemaVersion = 7`
 - `agentModelParameterPinsSchemaVersion = 8`
 - `modelRouterSchemaVersion = 9`
+- `scopedModelRouterSchemaVersion = 10`
 
 `requiredSchemaVersion` returns the maximum fixed feature version required by the
 document. It must never use `currentSchemaVersion` as the version of an existing feature.
 Baseline CE content is stamped v2; a document is stamped v4 only when
 `agentModelsSettingsByWorkspaceID` is nonempty; and a document containing the
-`scalarPreferences.contextBuilder` group is stamped v5; Oracle roster content is stamped v7; Agent Models ACP parameter pins are stamped v8; and the optional `scalarPreferences.modelRouter` group is stamped v9. An existing same-lineage v4 file
-that already contains that group is upgraded through the raw-preserving startup
-transaction before an ordinary typed save can occur. Save, compatible import, recovery,
+`scalarPreferences.contextBuilder` group is stamped v5; Oracle roster content is stamped v7;
+Agent Models ACP parameter pins are stamped v8; and the optional
+`scalarPreferences.modelRouter` group is stamped v9. The router's primary/subagent provider
+limits or custom guidance require v10. An existing same-lineage v4 file that already contains
+the router group is upgraded through the raw-preserving startup transaction before an ordinary
+typed save can occur. Save, compatible import, recovery,
 and default creation all use this content-derived minimum. Lineage is still stamped on
 every CE write, and future-schema and unlineaged preservation guards remain unchanged.
 
@@ -197,11 +201,14 @@ scalarPreferences.modelRouter.enabled
 scalarPreferences.modelRouter.selectedBackendRawValue
 scalarPreferences.modelRouter.candidateRoleRawValues
 scalarPreferences.modelRouter.allowedProviderRawValues
+scalarPreferences.modelRouter.primaryProviderRawValue
+scalarPreferences.modelRouter.subagentProviderRawValue
+scalarPreferences.modelRouter.customInstructions
 ```
 
-This group is a schema-v9 feature fence. Its absence leaves the document's minimum schema unchanged; any presence requires v9 so older typed writers reject the document instead of silently dropping router consent. The group stores no API keys or backend secrets. Unknown nonblank backend, role, and provider raws are preserved during sibling edits and ignored by current runtime validation. An unknown backend is never replaced by the first registered backend.
+The base group is a schema-v9 feature fence. Its absence leaves the document's minimum schema unchanged; any presence requires v9 so older typed writers reject the document instead of silently dropping router consent. A nonnil primary provider, subagent provider, or custom guidance field requires v10. Clearing all three returns the content-derived minimum to v9. The group stores no API keys or backend secrets. Unknown nonblank backend, role, and provider raws are preserved during sibling edits and ignored by current runtime validation. An unknown backend is never replaced by the first registered backend.
 
-Missing values resolve disabled and do not materialize defaults. First enable explicitly writes the selected backend plus the current known role/provider policy; subsequently discovered roles/providers are not silently authorized. `GlobalSettingsStore.modelRouterSettingsRevision` is process-local and changes only after an actual in-memory router mutation. Future/foreign blocking, compatible import, raw unknown-field preservation, and rollback rules remain those of the owning global settings document.
+Missing values resolve disabled and do not materialize defaults. First enable explicitly writes the selected backend plus the current known role/provider policy; subsequently discovered roles/providers are not silently authorized. Scope provider fields are optional limits over the allowed-provider set. Custom guidance is trimmed on supported writes, removed when empty, and bounded to 1,000 characters and 4,096 UTF-8 bytes. `GlobalSettingsStore.modelRouterSettingsRevision` is process-local and changes only after an actual in-memory router mutation. Future/foreign blocking, compatible import, raw unknown-field preservation, and rollback rules remain those of the owning global settings document.
 
 ## Agent Mode Handoff instructions
 

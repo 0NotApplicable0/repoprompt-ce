@@ -40,7 +40,6 @@ extension AgentModeViewModel {
             isCodexRunActive: isCodexRunActive,
             hasAvailableAgentProviders: hasAvailableAgentProviders,
             canSendWithCurrentProvider: canSendWithCurrentProvider,
-            canRouteFreshTask: canRouteFreshTask(session: session),
             isRoutingFreshTask: tabID.map { freshTaskRoutingByTabID[$0] != nil } ?? false,
             unavailableSelectedAgentMessage: unavailableSelectedAgentMessage,
             selectedAgent: selectedAgent,

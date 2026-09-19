@@ -71,16 +71,24 @@ struct AgentRoutingExecutableTarget: Hashable {
 struct AgentTaskRoutingCandidateDescriptor: Codable, Equatable {
     let opaqueKey: String
     let roleLabels: [String]
+    let targetDescription: String
     let rubricVersion: String
     let rubric: String
 }
 
+enum AgentTaskRoutingScope: String, Codable, Equatable {
+    case primarySession
+    case subagent
+}
+
 struct AgentTaskRoutingRequest: Equatable {
-    static let currentContractVersion = "rpce.agent-fresh-task-router.v1"
+    static let currentContractVersion = "rpce.agent-session-router.v2"
 
     let requestID: UUID
     let contractVersion: String
     let task: String
+    let scope: AgentTaskRoutingScope
+    let customInstructions: String?
     let candidates: [AgentTaskRoutingCandidateDescriptor]
 }
 
@@ -129,6 +137,9 @@ struct AgentTaskRouterConfiguration: Equatable {
     let allowedProvidersMaterialized: Bool
     let unknownRoleRawValues: [String]
     let unknownProviderRawValues: [String]
+    let primaryProvider: AgentProviderKind?
+    let subagentProvider: AgentProviderKind?
+    let customInstructions: String
     let validity: Validity
     let revision: UInt64
 }

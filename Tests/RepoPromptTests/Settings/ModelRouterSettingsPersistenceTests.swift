@@ -13,7 +13,23 @@ final class ModelRouterSettingsPersistenceTests: XCTestCase {
         )
         let document = GlobalSettingsDocument(scalarPreferences: GlobalScalarPreferences(modelRouter: router))
         XCTAssertEqual(document.requiredSchemaVersion, GlobalSettingsDocument.modelRouterSchemaVersion)
-        XCTAssertEqual(GlobalSettingsDocument.currentSchemaVersion, 9)
+        XCTAssertEqual(GlobalSettingsDocument.currentSchemaVersion, 10)
+        let decoded = try JSONDecoder().decode(GlobalSettingsDocument.self, from: JSONEncoder().encode(document))
+        XCTAssertEqual(decoded.scalarPreferences?.modelRouter, router)
+    }
+
+    func testScopedProviderPolicyAndGuidanceRequireSchemaV10AndRoundTrip() throws {
+        let router = GlobalScalarPreferences.ModelRouterSettings(
+            enabled: true,
+            selectedBackendRawValue: "jev",
+            candidateRoleRawValues: ["explore", "engineer"],
+            allowedProviderRawValues: ["codexExec", "claudeCode"],
+            primaryProviderRawValue: "codexExec",
+            subagentProviderRawValue: "claudeCode",
+            customInstructions: "Prefer Claude Opus for execution."
+        )
+        let document = GlobalSettingsDocument(scalarPreferences: GlobalScalarPreferences(modelRouter: router))
+        XCTAssertEqual(document.requiredSchemaVersion, GlobalSettingsDocument.scopedModelRouterSchemaVersion)
         let decoded = try JSONDecoder().decode(GlobalSettingsDocument.self, from: JSONEncoder().encode(document))
         XCTAssertEqual(decoded.scalarPreferences?.modelRouter, router)
     }

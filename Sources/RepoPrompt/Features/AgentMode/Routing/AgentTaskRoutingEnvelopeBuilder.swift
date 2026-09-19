@@ -15,6 +15,8 @@ struct AgentTaskRoutingEnvelopeBuilder {
     func build(
         requestID: UUID,
         text: String,
+        scope: AgentTaskRoutingScope = .primarySession,
+        customInstructions: String? = nil,
         candidates: [AgentTaskRoutingCandidateDescriptor],
         containsAttachments: Bool = false,
         containsTaggedPaths: Bool = false,
@@ -32,7 +34,15 @@ struct AgentTaskRoutingEnvelopeBuilder {
             requestID: requestID,
             contractVersion: AgentTaskRoutingRequest.currentContractVersion,
             task: task,
+            scope: scope,
+            customInstructions: customInstructions?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty,
             candidates: candidates
         )
+    }
+}
+
+private extension String {
+    var nilIfEmpty: String? {
+        isEmpty ? nil : self
     }
 }

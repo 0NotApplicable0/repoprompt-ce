@@ -2461,6 +2461,15 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             .receive(on: RunLoop.main)
             .sink { [weak self] _ in self?.syncAllActiveUIState() }
             .store(in: &cancellables)
+        modelRouterSettingsStore.objectWillChange
+            .receive(on: RunLoop.main)
+            .sink { [weak self] _ in
+                Task { @MainActor [weak self] in
+                    await Task.yield()
+                    self?.syncAllActiveUIState()
+                }
+            }
+            .store(in: &cancellables)
         updateDynamicModelPolling(startCursorPolling: false)
         syncAllActiveUIState()
         scheduleInitialSkillCatalogRefresh()

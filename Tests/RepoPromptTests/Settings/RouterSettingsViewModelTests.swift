@@ -62,6 +62,22 @@ final class RouterSettingsViewModelTests: XCTestCase {
         )
     }
 
+    func testScopedProviderLimitsAndCustomGuidancePersistThroughViewModel() throws {
+        let fixture = try makeFixture()
+        fixture.store.setModelRouterAllowedProviders([.codexExec, .claudeCode])
+
+        fixture.viewModel.setProviderLimit(.codexExec, scope: .primarySession)
+        fixture.viewModel.setProviderLimit(.claudeCode, scope: .subagent)
+        XCTAssertTrue(fixture.viewModel.setCustomInstructions("  Prefer Claude Opus for execution.  "))
+
+        let configuration = fixture.store.modelRouterConfiguration()
+        XCTAssertEqual(configuration.primaryProvider, .codexExec)
+        XCTAssertEqual(configuration.subagentProvider, .claudeCode)
+        XCTAssertEqual(configuration.customInstructions, "Prefer Claude Opus for execution.")
+        XCTAssertEqual(fixture.viewModel.providerLimit(for: .primarySession), .codexExec)
+        XCTAssertEqual(fixture.viewModel.providerLimit(for: .subagent), .claudeCode)
+    }
+
     private struct Fixture {
         let store: GlobalSettingsStore
         let viewModel: RouterSettingsViewModel

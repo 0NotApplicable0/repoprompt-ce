@@ -108,6 +108,13 @@ final class RouterSettingsViewModel: ObservableObject {
         }.map(\.target)).count
     }
 
+    func providerLimit(for scope: AgentTaskRoutingScope) -> AgentProviderKind? {
+        switch scope {
+        case .primarySession: configuration.primaryProvider
+        case .subagent: configuration.subagentProvider
+        }
+    }
+
     func isProviderAllowed(_ provider: AgentProviderKind) -> Bool {
         Self.effectiveProviders(configuration, available: availableProviders).contains(provider)
     }
@@ -140,6 +147,19 @@ final class RouterSettingsViewModel: ObservableObject {
         settingsStore.setModelRouterAllowedProviders(providers)
         synchronizeConfiguration()
         scheduleRefresh()
+    }
+
+    func setProviderLimit(_ provider: AgentProviderKind?, scope: AgentTaskRoutingScope) {
+        settingsStore.setModelRouterProvider(provider, scope: scope)
+        synchronizeConfiguration()
+        scheduleRefresh()
+    }
+
+    @discardableResult
+    func setCustomInstructions(_ instructions: String) -> Bool {
+        guard settingsStore.setModelRouterCustomInstructions(instructions) else { return false }
+        synchronizeConfiguration()
+        return true
     }
 
     func setEnabled(_ enabled: Bool) {
