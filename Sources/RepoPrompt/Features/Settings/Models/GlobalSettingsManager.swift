@@ -353,6 +353,7 @@ class GlobalSettingsStore: ObservableObject, CodexHookApprovalSettingsProviding 
     @Published private(set) var chatSettings: [UUID: ChatGlobalSettings] = [:]
     @Published private(set) var agentModelsSettingsByWorkspaceID: [UUID: WorkspaceAgentModelsSettings] = [:]
     @Published private(set) var codeMapsGloballyDisabled: Bool = false
+    @Published private(set) var modelRouterSettingsRevision: UInt64 = 0
     /// Non-nil when the on-disk settings file is blocked (unreadable or a newer schema).
     /// UI surfaces this when the store cannot safely repair the document automatically.
     @Published private(set) var persistenceBlockReason: GlobalSettingsPersistenceBlockReason? {
@@ -1559,6 +1560,102 @@ class GlobalSettingsStore: ObservableObject, CodexHookApprovalSettingsProviding 
         scalarPreferences.agentMode?.agentSessionHandoffInstructions ?? ""
     }
 
+    // MARK: - Model Router
+
+    func modelRouterConfiguration() -> AgentTaskRouterConfiguration {
+        let stored = scalarPreferences.modelRouter
+        let backendRaw = stored?.selectedBackendRawValue?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let backendID = backendRaw.flatMap { $0.isEmpty ? nil : AgentTaskRouterBackendID(rawValue: $0) }
+
+        let rawRoles = stored?.candidateRoleRawValues ?? []
+        let knownRoles = AgentModelCatalog.TaskLabelKind.allCases.filter { rawRoles.contains($0.rawValue) }
+        let unknownRoles = rawRoles.filter { raw in
+            !raw.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                && AgentModelCatalog.TaskLabelKind(rawValue: raw) == nil
+        }
+
+        let rawProviders = stored?.allowedProviderRawValues ?? []
+        let knownProviders = Set(rawProviders.compactMap(AgentProviderKind.init(rawValue:)))
+        let unknownProviders = rawProviders.filter { raw in
+            !raw.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                && AgentProviderKind(rawValue: raw) == nil
+        }
+
+        let enabled = stored?.enabled ?? false
+        let validity: AgentTaskRouterConfiguration.Validity = if !enabled {
+            .disabled
+        } else if backendID == nil {
+            .backendMissing
+        } else if knownRoles.count < 2 {
+            .fewerThanTwoRoles
+        } else {
+            .valid
+        }
+        return AgentTaskRouterConfiguration(
+            enabled: enabled,
+            selectedBackendID: backendID,
+            selectedBackendRawValue: backendRaw,
+            candidateRoles: knownRoles,
+            allowedProviders: knownProviders,
+            unknownRoleRawValues: unknownRoles,
+            unknownProviderRawValues: unknownProviders,
+            validity: validity,
+            revision: modelRouterSettingsRevision
+        )
+    }
+
+    func setModelRouterEnabled(_ enabled: Bool, commit: Bool = true) {
+        updateModelRouterScalar(commit: commit) { $0.enabled = enabled }
+    }
+
+    func setModelRouterBackend(_ backendID: AgentTaskRouterBackendID, commit: Bool = true) {
+        updateModelRouterScalar(commit: commit) { $0.selectedBackendRawValue = backendID.rawValue }
+    }
+
+    func setModelRouterCandidateRoles(_ roles: Set<AgentModelCatalog.TaskLabelKind>, commit: Bool = true) {
+        updateModelRouterScalar(commit: commit) { settings in
+            let unknown = (settings.candidateRoleRawValues ?? []).filter {
+                !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                    && AgentModelCatalog.TaskLabelKind(rawValue: $0) == nil
+            }
+            settings.candidateRoleRawValues = AgentModelCatalog.TaskLabelKind.allCases
+                .filter(roles.contains)
+                .map(\.rawValue) + unknown
+        }
+    }
+
+    func setModelRouterAllowedProviders(_ providers: Set<AgentProviderKind>, commit: Bool = true) {
+        updateModelRouterScalar(commit: commit) { settings in
+            let unknown = (settings.allowedProviderRawValues ?? []).filter {
+                !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                    && AgentProviderKind(rawValue: $0) == nil
+            }
+            settings.allowedProviderRawValues = AgentProviderKind.allCases
+                .filter(providers.contains)
+                .map(\.rawValue) + unknown
+        }
+    }
+
+    /// Materializes the currently visible policy on first enable; subsequent provider additions
+    /// remain opt-in because these arrays are thereafter explicit.
+    func enableModelRouterWithCurrentPolicy(
+        backendID: AgentTaskRouterBackendID,
+        roles: Set<AgentModelCatalog.TaskLabelKind>,
+        providers: Set<AgentProviderKind>,
+        commit: Bool = true
+    ) {
+        updateModelRouterScalar(commit: commit) { settings in
+            settings.selectedBackendRawValue = backendID.rawValue
+            settings.candidateRoleRawValues = AgentModelCatalog.TaskLabelKind.allCases
+                .filter(roles.contains)
+                .map(\.rawValue)
+            settings.allowedProviderRawValues = AgentProviderKind.allCases
+                .filter(providers.contains)
+                .map(\.rawValue)
+            settings.enabled = true
+        }
+    }
+
     @discardableResult
     func setAgentSessionHandoffInstructions(_ instructions: String, commit: Bool = true) -> Bool {
         guard case .valid = AgentSessionHandoffInstructionsPolicy.validation(of: instructions) else {
@@ -1788,6 +1885,22 @@ class GlobalSettingsStore: ObservableObject, CodexHookApprovalSettingsProviding 
             mutation(&settings)
             preferences.agentMode = settings
         }
+    }
+
+    private func updateModelRouterScalar(
+        commit: Bool,
+        _ mutation: (inout GlobalScalarPreferences.ModelRouterSettings) -> Void
+    ) {
+        let before = scalarPreferences.modelRouter
+        updateScalarPreferences(commit: false) { preferences in
+            var settings = preferences.modelRouter ?? GlobalScalarPreferences.ModelRouterSettings()
+            mutation(&settings)
+            preferences.modelRouter = settings
+        }
+        if before != scalarPreferences.modelRouter {
+            modelRouterSettingsRevision &+= 1
+        }
+        if commit { save() }
     }
 
     private func updateTelemetryScalar(

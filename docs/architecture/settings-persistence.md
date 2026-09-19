@@ -1,6 +1,6 @@
 # Settings Persistence
 
-Current as of 2026-09-06. This document is contributor-facing: use it when changing durable settings, workspace overrides, Agent Models settings, or MCP settings surfaces.
+Current as of 2026-09-19. This document is contributor-facing: use it when changing durable settings, workspace overrides, Agent Models settings, or MCP settings surfaces.
 
 ## Durable settings file
 
@@ -41,12 +41,15 @@ representing its content. Schema-requiring features have fixed introduction cons
 - `baselineSchemaVersion = 2`
 - `workspaceAgentModelsSchemaVersion = 4`
 - `contextBuilderSchemaVersion = 5`
+- `oracleRosterSchemaVersion = 7`
+- `agentModelParameterPinsSchemaVersion = 8`
+- `modelRouterSchemaVersion = 9`
 
 `requiredSchemaVersion` returns the maximum fixed feature version required by the
 document. It must never use `currentSchemaVersion` as the version of an existing feature.
 Baseline CE content is stamped v2; a document is stamped v4 only when
 `agentModelsSettingsByWorkspaceID` is nonempty; and a document containing the
-`scalarPreferences.contextBuilder` group is stamped v5. An existing same-lineage v4 file
+`scalarPreferences.contextBuilder` group is stamped v5; Oracle roster content is stamped v7; Agent Models ACP parameter pins are stamped v8; and the optional `scalarPreferences.modelRouter` group is stamped v9. An existing same-lineage v4 file
 that already contains that group is upgraded through the raw-preserving startup
 transaction before an ordinary typed save can occur. Save, compatible import, recovery,
 and default creation all use this content-derived minimum. Lineage is still stamped on
@@ -184,6 +187,21 @@ Blocked-persistence warnings may be dismissed in workspace windows for the curre
 session. The store owns dismissal across workspace windows and clears it when the reason
 changes or persistence unblocks. It is never stored in `UserDefaults`. The Settings
 window always shows the active warning and recovery controls.
+
+## Model Router settings
+
+The optional app-global router policy lives at:
+
+```text
+scalarPreferences.modelRouter.enabled
+scalarPreferences.modelRouter.selectedBackendRawValue
+scalarPreferences.modelRouter.candidateRoleRawValues
+scalarPreferences.modelRouter.allowedProviderRawValues
+```
+
+This group is a schema-v9 feature fence. Its absence leaves the document's minimum schema unchanged; any presence requires v9 so older typed writers reject the document instead of silently dropping router consent. The group stores no API keys or backend secrets. Unknown nonblank backend, role, and provider raws are preserved during sibling edits and ignored by current runtime validation. An unknown backend is never replaced by the first registered backend.
+
+Missing values resolve disabled and do not materialize defaults. First enable explicitly writes the selected backend plus the current known role/provider policy; subsequently discovered roles/providers are not silently authorized. `GlobalSettingsStore.modelRouterSettingsRevision` is process-local and changes only after an actual in-memory router mutation. Future/foreign blocking, compatible import, raw unknown-field preservation, and rollback rules remain those of the owning global settings document.
 
 ## Agent Mode Handoff instructions
 
