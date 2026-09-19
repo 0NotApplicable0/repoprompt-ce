@@ -235,19 +235,50 @@ final class AgentTaskRouterCoreTests: XCTestCase {
         XCTAssertEqual(outcome, .selected(opaqueKey: "a", evidence: nil))
     }
 
-    func testJevBackendIsFailClosedUntilReviewedPolicyExists() async {
-        let credentials = JevRouterCredentialService()
+    func testJevBackendRoutesToStrictlyValidatedOpaqueChoice() async {
+        let storage = TestSecureStorageBackend()
+        let client = SelectingJevClient()
+        let credentials = JevRouterCredentialService(
+            secureKeys: SecureKeysService(secureStorage: storage),
+            client: client
+        )
+        guard case .saved = await credentials.validateAndSave("secret", operationID: UUID()) else {
+            return XCTFail("Expected test credential to validate")
+        }
         let backend = JevTaskRouterBackend(credentialService: credentials)
         let outcome = await backend.route(.init(
             requestID: UUID(), contractVersion: AgentTaskRoutingRequest.currentContractVersion,
             task: "task", candidates: [descriptor("a"), descriptor("b")]
         ))
-        guard case let .failed(category, retryable, evidence) = outcome else {
-            return XCTFail("Expected policy-unavailable failure")
+        guard case let .selected(key, evidence) = outcome else {
+            return XCTFail("Expected Jev selection, got \(outcome)")
         }
-        XCTAssertEqual(category, .policyUnavailable)
-        XCTAssertFalse(retryable)
-        XCTAssertEqual(evidence?.reasonCode, "calibration_required")
+        XCTAssertEqual(key, "b")
+        XCTAssertEqual(evidence?.policyVersion, JevRouterCredentialService.routingPolicyVersion)
+        XCTAssertEqual(evidence?.confidence, 0.8)
+        XCTAssertEqual(evidence?.scores, ["a": 0.2, "b": 0.8])
+        XCTAssertEqual(evidence?.reasonCode, "unique_argmax")
+
+        let request = await client.lastRequest
+        XCTAssertEqual(request?.model, JevRouterCredentialService.pinnedModel)
+        XCTAssertEqual(request?.state, "task")
+        XCTAssertEqual(request?.questions["route"]?.criteria, ["a": "rubric", "b": "rubric"])
+    }
+
+    func testJevBackendRejectsDuplicateOpaqueKeysWithoutCallingService() async {
+        let client = SelectingJevClient()
+        let credentials = JevRouterCredentialService(
+            secureKeys: SecureKeysService(secureStorage: TestSecureStorageBackend()),
+            client: client
+        )
+        let backend = JevTaskRouterBackend(credentialService: credentials)
+        let outcome = await backend.route(.init(
+            requestID: UUID(), contractVersion: AgentTaskRoutingRequest.currentContractVersion,
+            task: "task", candidates: [descriptor("duplicate"), descriptor("duplicate")]
+        ))
+        XCTAssertEqual(outcome, .failed(category: .invalidRequest, retryable: false, evidence: nil))
+        let request = await client.lastRequest
+        XCTAssertNil(request)
     }
 
     private func descriptor(_ key: String) -> AgentTaskRoutingCandidateDescriptor {
@@ -256,6 +287,34 @@ final class AgentTaskRouterCoreTests: XCTestCase {
 
     private func testSettingsPresentation(_ title: String) -> AgentTaskRouterBackendSettingsPresentation {
         .init(title: title, configurationDetail: "test", secretFieldLabel: nil, links: [])
+    }
+}
+
+private actor SelectingJevClient: JevRoutingClientProtocol {
+    private(set) var lastRequest: JevRoutingWireRequest?
+
+    func listModels(apiKey: String, timeout: Duration) -> JevModelList {
+        .init(models: [.init(name: "jev-latest")])
+    }
+
+    func judge(
+        request: JevRoutingWireRequest,
+        apiKey: String,
+        timeout: Duration
+    ) -> JevRoutingWireResponse {
+        lastRequest = request
+        return .init(
+            model: JevRouterCredentialService.pinnedModel,
+            answers: [
+                "route": .init(
+                    type: "choice",
+                    choice: "b",
+                    probabilities: ["a": 0.2, "b": 0.8],
+                    confidence: 0.8
+                )
+            ],
+            usage: .init(inputTokens: 12, outputTokens: 4)
+        )
     }
 }
 

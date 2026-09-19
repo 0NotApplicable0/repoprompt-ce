@@ -11,7 +11,7 @@ struct JevTaskRouterBackend: AgentTaskRouterBackend {
         AgentTaskRouterBackendSettingsRegistration(
             presentation: .init(
                 title: "Jev by TypeSafe",
-                configurationDetail: "Validation contacts GET /v1/models. Routing remains unavailable until RepoPrompt ships a reviewed calibration policy. A future enabled route will use one POST /v1/systemone request with a five-second deadline and no RepoPrompt retries.",
+                configurationDetail: "Verify a TypeSafe API key, then enable Model Router above. Key verification checks your account without sending a task. Each routed task uses one Jev request with a five-second deadline and no automatic retry.",
                 secretFieldLabel: "TypeSafe API key",
                 links: [
                     .init(title: "TypeSafe API documentation", url: URL(string: "https://docs.typesafe.ai/api")!),
@@ -27,15 +27,63 @@ struct JevTaskRouterBackend: AgentTaskRouterBackend {
     }
 
     func route(_ request: AgentTaskRoutingRequest) async -> AgentTaskRoutingBackendOutcome {
-        // Deliberately fail closed. The wire adapter and strict fixtures may be exercised,
-        // but no selection is accepted until a reviewed calibration policy is committed.
-        .failed(category: .policyUnavailable, retryable: false, evidence: .init(
-            policyVersion: JevRouterCredentialService.unavailablePolicyVersion,
-            confidence: nil,
-            scores: nil,
-            inputTokens: nil,
-            outputTokens: nil,
-            reasonCode: "calibration_required"
-        ))
+        guard request.contractVersion == AgentTaskRoutingRequest.currentContractVersion,
+              (2 ... 4).contains(request.candidates.count)
+        else {
+            return .failed(category: .invalidRequest, retryable: false, evidence: nil)
+        }
+        var criteria: [String: String] = [:]
+        for candidate in request.candidates {
+            guard !candidate.opaqueKey.isEmpty,
+                  criteria.updateValue(candidate.rubric, forKey: candidate.opaqueKey) == nil
+            else {
+                return .failed(category: .invalidRequest, retryable: false, evidence: nil)
+            }
+        }
+        let wireRequest = JevRoutingWireRequest(
+            model: JevRouterCredentialService.pinnedModel,
+            state: request.task,
+            questions: [
+                "route": .init(
+                    type: "choice",
+                    instructions: "Choose the best configured agent target for this task. Consider capability, task complexity, risk, latency, and cost. Prefer the least expensive target that can complete the task reliably.",
+                    criteria: criteria
+                )
+            ]
+        )
+        do {
+            let response = try await credentialService.judgeForRouting(wireRequest)
+            let validated = try JevRoutingResponseInterpreter().validate(
+                response,
+                submittedOpaqueKeys: Set(criteria.keys)
+            )
+            return .selected(
+                opaqueKey: validated.selectedOpaqueKey,
+                evidence: .init(
+                    policyVersion: JevRouterCredentialService.routingPolicyVersion,
+                    confidence: validated.confidence,
+                    scores: validated.probabilities,
+                    inputTokens: validated.inputTokens,
+                    outputTokens: validated.outputTokens,
+                    reasonCode: "unique_argmax"
+                )
+            )
+        } catch is CancellationError {
+            return .cancelled
+        } catch is JevRoutingResponseInterpreter.ValidationError {
+            return .failed(category: .invalidResponse, retryable: false, evidence: nil)
+        } catch let error as JevRoutingClientError {
+            return switch error {
+            case .authentication: .failed(category: .authentication, retryable: false, evidence: nil)
+            case .invalidRequest: .failed(category: .invalidRequest, retryable: false, evidence: nil)
+            case .rateLimited: .failed(category: .rateLimited, retryable: true, evidence: nil)
+            case .overloaded: .failed(category: .overloaded, retryable: true, evidence: nil)
+            case .timeout: .failed(category: .timeout, retryable: true, evidence: nil)
+            case .invalidResponse, .decoding: .failed(category: .invalidResponse, retryable: false, evidence: nil)
+            case .service: .failed(category: .transport, retryable: true, evidence: nil)
+            }
+        } catch {
+            return .failed(category: .transport, retryable: true, evidence: nil)
+        }
     }
 }

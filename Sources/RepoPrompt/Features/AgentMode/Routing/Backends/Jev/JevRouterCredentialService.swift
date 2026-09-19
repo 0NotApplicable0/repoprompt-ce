@@ -9,7 +9,7 @@ actor JevRouterCredentialService: AgentTaskRouterBackendSettingsController {
     }
 
     static let pinnedModel = "jev-1.13.0"
-    static let unavailablePolicyVersion = "jev-routing-policy-unavailable"
+    static let routingPolicyVersion = "jev-1.13.0-rpce-role-routing-v1"
 
     private let secureKeys: SecureKeysService
     private let client: any JevRoutingClientProtocol
@@ -34,10 +34,7 @@ actor JevRouterCredentialService: AgentTaskRouterBackendSettingsController {
         guard hasValidatedKey else {
             return .needsConfiguration(generation: generation, reason: "Validate a TypeSafe API key.")
         }
-        return .policyUnavailable(
-            generation: generation,
-            reason: "Jev routing is unavailable until RepoPrompt ships a reviewed calibration policy."
-        )
+        return .ready(generation: generation, policyVersion: Self.routingPolicyVersion)
     }
 
     func readinessUpdates() -> AsyncStream<AgentTaskRouterBackendReadiness> {
@@ -130,6 +127,24 @@ actor JevRouterCredentialService: AgentTaskRouterBackendSettingsController {
             throw JevRoutingClientError.authentication
         }
         return (key, capturedGeneration)
+    }
+
+    func judgeForRouting(_ request: JevRoutingWireRequest) async throws -> JevRoutingWireResponse {
+        let credential = try await loadForRouting()
+        do {
+            return try await client.judge(
+                request: request,
+                apiKey: credential.key,
+                timeout: JevRoutingClient.outerDeadline
+            )
+        } catch {
+            if error as? JevRoutingClientError == .authentication,
+               generation == credential.generation
+            {
+                advanceGeneration(validated: false)
+            }
+            throw error
+        }
     }
 
     func cancelValidation() {
@@ -239,7 +254,7 @@ actor JevRouterCredentialService: AgentTaskRouterBackendSettingsController {
     private static func actionResult(from result: ValidationResult) -> AgentTaskRouterBackendSettingsActionResult {
         switch result {
         case let .saved(_, supportedModel):
-            .succeeded("Key validated for \(supportedModel). Routing remains unavailable until a reviewed policy ships.")
+            .succeeded("Key verified. \(supportedModel) is available and routing is ready.")
         case .missingKey:
             .missingSecret("Enter a TypeSafe API key.")
         case .superseded:

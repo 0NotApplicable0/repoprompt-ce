@@ -398,7 +398,7 @@ struct SettingsView: View {
             )
             .transition(.opacity.animation(.easeInOut(duration: 0.15)))
         case .modelRouter:
-            RouterSettingsView(viewModel: windowState.routerSettingsViewModel)
+            RouterSettingsView(viewModel: windowState.routerSettingsViewModel, onNavigate: { selectedTab = $0 })
                 .transition(.opacity.animation(.easeInOut(duration: 0.15)))
         case .agentModels:
             AgentModelsSettingsView(

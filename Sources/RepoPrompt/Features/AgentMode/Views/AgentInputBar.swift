@@ -499,6 +499,7 @@ struct AgentComposerView: View, Equatable {
             modelMenuSnapshotByAgent = nil
         }
         .onChange(of: currentTabID) { oldTabID, newTabID in
+            routeFreshTask = false
             // Switch drafts when tab changes
             if let oldTabID {
                 actions.storeDraft(oldTabID, localInputText)
@@ -506,6 +507,9 @@ struct AgentComposerView: View, Equatable {
             if let newTabID {
                 loadDraftFromSession(for: newTabID)
             }
+        }
+        .onChange(of: props.canRouteFreshTask) { _, canRoute in
+            if !canRoute { routeFreshTask = false }
         }
         .onChange(of: localInputText) { _, newValue in
             isInputEmpty = newValue.isEmpty
@@ -665,8 +669,15 @@ struct AgentComposerView: View, Equatable {
                         connectAgentProvidersButton
                     }
                     approvalPopoverChip
-                    if props.canRouteFreshTask {
-                        Toggle("Route", isOn: $routeFreshTask)
+                    if props.isRoutingFreshTask {
+                        HStack(spacing: 5) {
+                            ProgressView().controlSize(.mini)
+                            Text("Choosing model…")
+                        }
+                        .font(fontPreset.swiftUIFont(sizeAtNormal: 11))
+                        .foregroundStyle(.secondary)
+                    } else if props.canRouteFreshTask {
+                        Toggle("Route once", isOn: $routeFreshTask)
                             .toggleStyle(.checkbox)
                             .font(fontPreset.swiftUIFont(sizeAtNormal: 11))
                             .hoverTooltip("Ask the configured router to choose a target for this fresh plain-text task")
@@ -1545,7 +1556,7 @@ struct AgentComposerView: View, Equatable {
         guard let attempt = submissionLatch.begin(
             target: submitTarget,
             rawDraftSnapshot: rawDraftSnapshot,
-            routingIntent: routeFreshTask ? .routeFreshTask : .useCurrentSelection
+            routingIntent: routeFreshTask && props.canRouteFreshTask ? .routeFreshTask : .useCurrentSelection
         ) else {
             logViewSubmitRejection(reason: "local_attempt_latched", target: submitTarget)
             return

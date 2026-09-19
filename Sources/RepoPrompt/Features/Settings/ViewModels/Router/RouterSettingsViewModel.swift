@@ -3,6 +3,20 @@ import Foundation
 
 @MainActor
 final class RouterSettingsViewModel: ObservableObject {
+    enum BackendOperationFeedback: Equatable {
+        case idle
+        case running(String)
+        case succeeded(String)
+        case failed(String)
+
+        var message: String? {
+            switch self {
+            case .idle: nil
+            case let .running(message), let .succeeded(message), let .failed(message): message
+            }
+        }
+    }
+
     struct BackendOption: Identifiable, Equatable {
         let id: AgentTaskRouterBackendID
         let displayName: String
@@ -23,7 +37,7 @@ final class RouterSettingsViewModel: ObservableObject {
     @Published private(set) var readiness: AgentTaskRouterBackendReadiness
     @Published private(set) var targetPreviews: [TargetPreview] = []
     @Published private(set) var backendSettingsPresentation: AgentTaskRouterBackendSettingsPresentation?
-    @Published private(set) var operationMessage: String?
+    @Published private(set) var backendOperationFeedback: BackendOperationFeedback = .idle
     @Published private(set) var isPerformingBackendOperation = false
     @Published private(set) var policyCanBuildCandidates = false
 
@@ -33,6 +47,8 @@ final class RouterSettingsViewModel: ObservableObject {
     private weak var workspaceManager: WorkspaceManagerViewModel?
     private var readinessTask: Task<Void, Never>?
     private var observedBackendID: AgentTaskRouterBackendID?
+    private var refreshTask: Task<Void, Never>?
+    private var refreshRequested = false
     private var cancellables = Set<AnyCancellable>()
 
     init(
@@ -82,12 +98,25 @@ final class RouterSettingsViewModel: ObservableObject {
         Set(targetPreviews.map(\.provider))
     }
 
+    var visibleProviders: [AgentProviderKind] {
+        availableProviders.union(configuration.allowedProviders).sorted { $0.displayName < $1.displayName }
+    }
+
+    var distinctTargetCount: Int {
+        Set(targetPreviews.filter {
+            eligibleRoles.contains($0.role) && isProviderAllowed($0.provider)
+        }.map(\.target)).count
+    }
+
     func isProviderAllowed(_ provider: AgentProviderKind) -> Bool {
         Self.effectiveProviders(configuration, available: availableProviders).contains(provider)
     }
 
     func selectBackend(_ id: AgentTaskRouterBackendID) {
+        guard settingsStore.modelRouterConfiguration().selectedBackendID != id else { return }
         settingsStore.setModelRouterBackend(id)
+        synchronizeConfiguration()
+        backendOperationFeedback = .idle
         Task {
             await runtime.backendSelectionDidChange(
                 selectedID: id,
@@ -98,20 +127,23 @@ final class RouterSettingsViewModel: ObservableObject {
     }
 
     func setRole(_ role: AgentModelCatalog.TaskLabelKind, enabled: Bool) {
-        var roles = eligibleRoles
+        var roles = Self.effectiveRoles(settingsStore.modelRouterConfiguration())
         if enabled { roles.insert(role) } else { roles.remove(role) }
         settingsStore.setModelRouterCandidateRoles(roles)
+        synchronizeConfiguration()
         scheduleRefresh()
     }
 
     func setProvider(_ provider: AgentProviderKind, enabled: Bool) {
-        var providers = Self.effectiveProviders(configuration, available: availableProviders)
+        var providers = Self.effectiveProviders(settingsStore.modelRouterConfiguration(), available: availableProviders)
         if enabled { providers.insert(provider) } else { providers.remove(provider) }
         settingsStore.setModelRouterAllowedProviders(providers)
+        synchronizeConfiguration()
         scheduleRefresh()
     }
 
     func setEnabled(_ enabled: Bool) {
+        synchronizeConfiguration()
         guard !enabled || canEnable else { return }
         if enabled,
            !configuration.candidateRolesMaterialized || !configuration.allowedProvidersMaterialized,
@@ -125,35 +157,73 @@ final class RouterSettingsViewModel: ObservableObject {
         } else {
             settingsStore.setModelRouterEnabled(enabled)
         }
+        synchronizeConfiguration()
         scheduleRefresh()
     }
 
     func performBackendAction(_ action: AgentTaskRouterBackendSettingsAction) async {
-        guard let id = configuration.selectedBackendID,
-              let controller = await runtime.registry.registration(for: id)?.settings?.controller
-        else { return }
+        guard !isPerformingBackendOperation,
+              let id = settingsStore.modelRouterConfiguration().selectedBackendID else { return }
         isPerformingBackendOperation = true
         defer { isPerformingBackendOperation = false }
-        operationMessage = nil
+        let progressMessage = switch action {
+        case .validateAndSaveSecret: "Verifying and saving the key…"
+        case .revalidateStoredSecret: "Checking the saved key…"
+        case .removeStoredSecret: "Removing the saved key…"
+        }
+        backendOperationFeedback = .running(progressMessage)
+        guard let controller = await runtime.registry.registration(for: id)?.settings?.controller,
+              settingsStore.modelRouterConfiguration().selectedBackendID == id else { return }
         let result = await controller.perform(action)
-        guard configuration.selectedBackendID == id else { return }
-        operationMessage = switch result {
-        case let .succeeded(message), let .missingSecret(message),
-             let .superseded(message), let .failed(message): message
+        guard settingsStore.modelRouterConfiguration().selectedBackendID == id else { return }
+        backendOperationFeedback = switch result {
+        case let .succeeded(message): .succeeded(message)
+        case let .missingSecret(message), let .superseded(message), let .failed(message): .failed(message)
         }
         await refresh()
     }
 
     func refresh() async {
-        configuration = settingsStore.modelRouterConfiguration()
+        refreshRequested = true
+        if let refreshTask {
+            await refreshTask.value
+            return
+        }
+        let task = Task { @MainActor [weak self] in
+            guard let self else { return }
+            await runRefreshLoop()
+        }
+        refreshTask = task
+        await task.value
+    }
+
+    private func runRefreshLoop() async {
+        while refreshRequested {
+            refreshRequested = false
+            await performRefresh()
+        }
+        refreshTask = nil
+    }
+
+    private func performRefresh() async {
+        synchronizeConfiguration()
+        var capturedConfiguration = configuration
         let registrations = await runtime.registry.registrations()
+        guard settingsStore.modelRouterConfiguration() == capturedConfiguration else { return }
+        if configuration.selectedBackendID == nil, registrations.count == 1, let onlyBackend = registrations.first {
+            settingsStore.setModelRouterBackend(onlyBackend.id)
+            synchronizeConfiguration()
+            capturedConfiguration = configuration
+        }
         backendOptions = registrations.map { BackendOption(id: $0.id, displayName: $0.displayName) }
         let registration = configuration.selectedBackendID.flatMap { selected in
             registrations.first(where: { $0.id == selected })
         }
         backendSettingsPresentation = registration?.settings?.presentation
         if let registration {
-            readiness = await registration.backend.readinessSnapshot()
+            let snapshot = await registration.backend.readinessSnapshot()
+            guard settingsStore.modelRouterConfiguration() == capturedConfiguration else { return }
+            readiness = snapshot
             observeReadinessIfNeeded(registration)
         } else if let raw = configuration.selectedBackendRawValue, !raw.isEmpty {
             readiness = .temporarilyUnavailable(generation: 0, reason: "Router backend '\(raw)' is not available in this build.")
@@ -162,6 +232,18 @@ final class RouterSettingsViewModel: ObservableObject {
             readiness = .needsConfiguration(generation: 0, reason: "Choose a routing backend.")
             cancelReadinessObservation()
         }
+        rebuildTargetPreviews()
+    }
+
+    private func synchronizeConfiguration() {
+        let current = settingsStore.modelRouterConfiguration()
+        if current.selectedBackendID != configuration.selectedBackendID {
+            cancelReadinessObservation()
+            backendSettingsPresentation = nil
+            backendOperationFeedback = .idle
+            readiness = .needsConfiguration(generation: 0, reason: "Checking the selected backend…")
+        }
+        configuration = current
         rebuildTargetPreviews()
     }
 
@@ -174,7 +256,8 @@ final class RouterSettingsViewModel: ObservableObject {
             for await snapshot in await controller.readinessUpdates() {
                 guard !Task.isCancelled else { return }
                 await MainActor.run {
-                    guard self?.observedBackendID == registration.id else { return }
+                    guard self?.observedBackendID == registration.id,
+                          self?.settingsStore.modelRouterConfiguration().selectedBackendID == registration.id else { return }
                     self?.readiness = snapshot
                 }
             }

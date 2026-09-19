@@ -41,9 +41,10 @@ final class JevRouterCredentialServiceTests: XCTestCase {
             account: .jevRouterAPIKey,
             accessMode: .nonInteractive(reason: .backgroundAvailabilityCheck)
         )))
-        guard case .policyUnavailable = await service.readinessSnapshot() else {
-            return XCTFail("A valid key must not bypass missing policy calibration")
+        guard case let .ready(_, policyVersion) = await service.readinessSnapshot() else {
+            return XCTFail("A valid key must make Jev ready")
         }
+        XCTAssertEqual(policyVersion, JevRouterCredentialService.routingPolicyVersion)
     }
 
     func testMissingStoredKeyInvalidatesPreviouslyValidatedReadiness() async throws {
@@ -71,8 +72,8 @@ final class JevRouterCredentialServiceTests: XCTestCase {
         )
         let firstStream = await service.readinessUpdates()
         let secondStream = await service.readinessUpdates()
-        let first = Task { await firstStream.firstPolicyUnavailableGeneration() }
-        let second = Task { await secondStream.firstPolicyUnavailableGeneration() }
+        let first = Task { await firstStream.firstReadyGeneration() }
+        let second = Task { await secondStream.firstReadyGeneration() }
         await service.bootstrapStoredConfigurationIfNeeded()
         let firstGeneration = await first.value
         let secondGeneration = await second.value
@@ -119,9 +120,9 @@ final class JevRouterCredentialServiceTests: XCTestCase {
 }
 
 private extension AsyncStream where Element == AgentTaskRouterBackendReadiness {
-    func firstPolicyUnavailableGeneration() async -> UInt64? {
+    func firstReadyGeneration() async -> UInt64? {
         for await readiness in self {
-            if case let .policyUnavailable(generation, _) = readiness { return generation }
+            if case let .ready(generation, _) = readiness { return generation }
         }
         return nil
     }

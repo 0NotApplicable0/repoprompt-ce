@@ -2,122 +2,273 @@ import SwiftUI
 
 struct RouterSettingsView: View {
     @ObservedObject var viewModel: RouterSettingsViewModel
+    var onNavigate: ((SettingsTab) -> Void)?
+    @Environment(\.repoPromptFontScalePreset) private var fontPreset
     @State private var candidateSecret = ""
 
     var body: some View {
         ScrollView {
-            VStack(alignment: .leading, spacing: 20) {
-                Text("Model Router").font(.title2.bold())
-                Text("Optionally ask a configured routing backend to choose among existing Agent Mode role targets. RepoPrompt remains responsible for provider execution, credentials, permissions, sessions, and cancellation.")
-                    .foregroundStyle(.secondary)
-
-                GroupBox("Routing backend") {
-                    VStack(alignment: .leading, spacing: 12) {
-                        Picker("Backend", selection: selectedBackendBinding) {
-                            Text("Choose…").tag(AgentTaskRouterBackendID?.none)
-                            ForEach(viewModel.backendOptions) { option in
-                                Text(option.displayName).tag(Optional(option.id))
-                            }
-                        }
-                        .pickerStyle(.menu)
-                        if let presentation = viewModel.backendSettingsPresentation {
-                            backendSettings(presentation)
-                        }
-                    }
-                    .padding(8)
-                }
-
-                GroupBox("Candidate policy") {
-                    VStack(alignment: .leading, spacing: 10) {
-                        Text("Eligible roles").font(.headline)
-                        ForEach(AgentModelCatalog.TaskLabelKind.allCases, id: \.rawValue) { role in
-                            Toggle(role.rawValue.capitalized, isOn: Binding(
-                                get: { viewModel.eligibleRoles.contains(role) },
-                                set: { viewModel.setRole(role, enabled: $0) }
-                            ))
-                        }
-                        Divider()
-                        Text("Allowed providers").font(.headline)
-                        ForEach(Array(viewModel.availableProviders).sorted(by: { $0.rawValue < $1.rawValue }), id: \.rawValue) { provider in
-                            Toggle(provider.rawValue, isOn: Binding(
-                                get: { viewModel.isProviderAllowed(provider) },
-                                set: { viewModel.setProvider(provider, enabled: $0) }
-                            ))
-                        }
-                        Text("On first enable, empty role/provider policy is materialized as all currently available choices. Later providers remain opt-in.")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    }
-                    .padding(8)
-                }
-
-                GroupBox("Status") {
-                    VStack(alignment: .leading, spacing: 8) {
-                        Label(readinessTitle, systemImage: readinessIcon)
-                        if let detail = readinessDetail {
-                            Text(detail).font(.callout).foregroundStyle(.secondary)
-                        }
-                        Toggle("Enable Model Router", isOn: Binding(
-                            get: { viewModel.configuration.enabled },
-                            set: viewModel.setEnabled
-                        ))
-                        .disabled(!viewModel.canEnable && !viewModel.configuration.enabled)
-                        if !viewModel.readiness.isReady {
-                            Text("The composer control stays unavailable until the selected backend has validated configuration and RepoPrompt ships a reviewed accepting policy.")
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                        }
-                    }
-                    .padding(8)
-                }
-
-                GroupBox("Privacy") {
-                    Text("For an eligible one-shot route, the selected backend receives the exact task text and opaque role rubrics only. RepoPrompt does not send workspace names, paths, selected files, file contents, diffs, provider/model identifiers, transcripts, system prompts, tools, or credentials.")
-                        .font(.callout)
-                        .foregroundStyle(.secondary)
-                        .padding(8)
-                }
+            VStack(alignment: .leading, spacing: 18) {
+                header
+                statusCard
+                backendCard
+                candidatesCard
+                privacyNotice
             }
+            .font(fontPreset.swiftUIFont(sizeAtNormal: 13))
+            .frame(maxWidth: 740, alignment: .leading)
             .padding(24)
-            .frame(maxWidth: 720, alignment: .leading)
+            .frame(maxWidth: .infinity, alignment: .topLeading)
         }
         .task { await viewModel.refresh() }
+        .onChange(of: viewModel.selectedBackendID) { _, _ in candidateSecret = "" }
+    }
+
+    private var header: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Label("Model Router", systemImage: "arrow.triangle.branch")
+                .font(fontPreset.swiftUIFont(sizeAtNormal: 22, weight: .bold))
+            Text("Let Jev choose the best configured model, provider, and reasoning effort for each new task.")
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
+    private var statusCard: some View {
+        card {
+            HStack(alignment: .top, spacing: 12) {
+                Image(systemName: readinessIcon)
+                    .font(.title3)
+                    .foregroundStyle(viewModel.canEnable ? Color.accentColor : Color.secondary)
+                VStack(alignment: .leading, spacing: 5) {
+                    Text(readinessTitle).font(.headline)
+                    Text(readinessDetail)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                Spacer(minLength: 0)
+                Toggle("Enable Model Router", isOn: Binding(
+                    get: { viewModel.configuration.enabled },
+                    set: viewModel.setEnabled
+                ))
+                .labelsHidden()
+                .toggleStyle(.switch)
+                .disabled(!viewModel.canEnable && !viewModel.configuration.enabled)
+                .accessibilityLabel("Enable Model Router")
+            }
+            if viewModel.canEnable || viewModel.configuration.enabled {
+                Text("Enabling adds “Route once” to eligible new tasks. You choose when to use it.")
+                    .font(fontPreset.swiftUIFont(sizeAtNormal: 11))
+                    .foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    private var backendCard: some View {
+        card {
+            Label("Routing service", systemImage: "network").font(.headline)
+            if viewModel.backendOptions.count == 1, let service = viewModel.backendOptions.first {
+                LabeledContent("Service") {
+                    Text(service.displayName).fontWeight(.medium)
+                }
+            } else {
+                Picker("Service", selection: selectedBackendBinding) {
+                    if viewModel.selectedBackendID == nil {
+                        Text("Choose a service…").tag(AgentTaskRouterBackendID?.none)
+                    }
+                    if let selected = viewModel.selectedBackendID,
+                       !viewModel.backendOptions.contains(where: { $0.id == selected })
+                    {
+                        Text("\(selected.rawValue) (unavailable)").tag(Optional(selected))
+                    }
+                    ForEach(viewModel.backendOptions) { option in
+                        Text(option.displayName).tag(Optional(option.id))
+                    }
+                }
+                .pickerStyle(.menu)
+                .disabled(viewModel.isPerformingBackendOperation)
+            }
+            if let presentation = viewModel.backendSettingsPresentation {
+                backendSettings(presentation)
+            }
+        }
+    }
+
+    private var candidatesCard: some View {
+        card {
+            HStack {
+                Label("Routing targets", systemImage: "square.stack.3d.up").font(.headline)
+                Spacer()
+                Text("\(viewModel.distinctTargetCount) distinct targets")
+                    .font(fontPreset.swiftUIFont(sizeAtNormal: 11))
+                    .foregroundStyle(.secondary)
+            }
+            Text("Jev chooses one complete target below, including its model and reasoning effort. Edit Agent Models to change those target definitions.")
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            VStack(alignment: .leading, spacing: 0) {
+                ForEach(AgentModelCatalog.TaskLabelKind.allCases, id: \.rawValue) { role in
+                    roleRow(role)
+                    if role != AgentModelCatalog.TaskLabelKind.allCases.last { Divider() }
+                }
+            }
+            Divider()
+            Text("Provider access").font(.headline)
+            if viewModel.visibleProviders.isEmpty {
+                Text("Connect an agent provider and assign models in Agent Models to make targets available.")
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            } else {
+                LazyVGrid(columns: [GridItem(.adaptive(minimum: 190), alignment: .leading)], alignment: .leading, spacing: 10) {
+                    ForEach(viewModel.visibleProviders, id: \.rawValue) { provider in
+                        Toggle(isOn: Binding(
+                            get: { viewModel.isProviderAllowed(provider) },
+                            set: { viewModel.setProvider(provider, enabled: $0) }
+                        )) {
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(provider.displayName)
+                                if !viewModel.availableProviders.contains(provider) {
+                                    Text("No available role target")
+                                        .font(fontPreset.swiftUIFont(sizeAtNormal: 11))
+                                        .foregroundStyle(.secondary)
+                                }
+                            }
+                        }
+                        .toggleStyle(.checkbox)
+                    }
+                }
+            }
+            Text("Routing needs at least two distinct targets. Roles using the same provider, model, effort, and options count as one. Provider access limits where routed tasks may run.")
+                .font(fontPreset.swiftUIFont(sizeAtNormal: 11))
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            if let onNavigate {
+                Button("Edit Agent Models…") { onNavigate(.agentModels) }
+                    .buttonStyle(.link)
+            }
+        }
+    }
+
+    private func roleRow(_ role: AgentModelCatalog.TaskLabelKind) -> some View {
+        let preview = viewModel.targetPreviews.first { $0.role == role }
+        return Toggle(isOn: Binding(
+            get: { viewModel.eligibleRoles.contains(role) },
+            set: { viewModel.setRole(role, enabled: $0) }
+        )) {
+            VStack(alignment: .leading, spacing: 3) {
+                Text(role.rawValue.capitalized).fontWeight(.medium)
+                if let preview {
+                    Text("\(preview.displayName) · \(preview.provider.displayName)")
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                    if !viewModel.isProviderAllowed(preview.provider) {
+                        Text("Provider excluded")
+                            .font(fontPreset.swiftUIFont(sizeAtNormal: 11))
+                            .foregroundStyle(.secondary)
+                    }
+                } else {
+                    Text("No available model")
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .toggleStyle(.checkbox)
+        .padding(.vertical, 9)
+    }
+
+    private var privacyNotice: some View {
+        HStack(alignment: .top, spacing: 10) {
+            Image(systemName: "hand.raised").foregroundStyle(.secondary)
+            VStack(alignment: .leading, spacing: 5) {
+                Text("What gets shared").fontWeight(.medium)
+                Text("When you choose Route once, the service receives your task text and general role descriptions. Attached files, workspace context, chat history, and provider credentials are excluded. Anything you type in the task itself is shared.")
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .font(fontPreset.swiftUIFont(sizeAtNormal: 11))
+        .padding(.horizontal, 4)
     }
 
     @ViewBuilder
     private func backendSettings(_ presentation: AgentTaskRouterBackendSettingsPresentation) -> some View {
         Divider()
-        Text(presentation.title).font(.headline)
-        Text(presentation.configurationDetail).font(.caption).foregroundStyle(.secondary)
+        Text(presentation.title).fontWeight(.medium)
+        Text(presentation.configurationDetail)
+            .foregroundStyle(.secondary)
+            .fixedSize(horizontal: false, vertical: true)
         if let label = presentation.secretFieldLabel {
             SecureField(label, text: $candidateSecret)
-            HStack {
-                Button("Validate & Save") {
-                    let secret = candidateSecret
-                    Task {
-                        await viewModel.performBackendAction(.validateAndSaveSecret(secret))
-                        candidateSecret = ""
-                    }
-                }
-                .disabled(candidateSecret.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || viewModel.isPerformingBackendOperation)
-                Button("Revalidate Stored Secret") {
-                    Task { await viewModel.performBackendAction(.revalidateStoredSecret) }
-                }
+                .textFieldStyle(.roundedBorder)
                 .disabled(viewModel.isPerformingBackendOperation)
-                Button("Remove Secret", role: .destructive) {
-                    Task { await viewModel.performBackendAction(.removeStoredSecret) }
-                }
-                .disabled(viewModel.isPerformingBackendOperation)
-                if viewModel.isPerformingBackendOperation { ProgressView().controlSize(.small) }
+                .accessibilityLabel(label)
+            ViewThatFits(in: .horizontal) {
+                HStack(spacing: 10) { credentialActions }
+                VStack(alignment: .leading, spacing: 10) { credentialActions }
             }
         }
-        if let operationMessage = viewModel.operationMessage {
-            Text(operationMessage).font(.caption).foregroundStyle(.secondary)
+        if let message = viewModel.backendOperationFeedback.message {
+            HStack(alignment: .firstTextBaseline, spacing: 6) {
+                backendOperationFeedbackIcon
+                Text(message).fixedSize(horizontal: false, vertical: true)
+            }
+            .font(fontPreset.swiftUIFont(sizeAtNormal: 11))
+            .foregroundStyle(backendOperationFeedbackColor)
         }
-        HStack {
-            ForEach(presentation.links) { link in Link(link.title, destination: link.url) }
+        ForEach(presentation.links) { link in
+            Link(link.title, destination: link.url)
+                .font(fontPreset.swiftUIFont(sizeAtNormal: 11))
         }
-        .font(.caption)
+    }
+
+    @ViewBuilder
+    private var credentialActions: some View {
+        Button("Validate & Save") {
+            let secret = candidateSecret
+            candidateSecret = ""
+            Task { await viewModel.performBackendAction(.validateAndSaveSecret(secret)) }
+        }
+        .disabled(candidateSecret.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || viewModel.isPerformingBackendOperation)
+        Button("Verify Saved Key") {
+            Task { await viewModel.performBackendAction(.revalidateStoredSecret) }
+        }
+        .disabled(viewModel.isPerformingBackendOperation)
+        Button("Remove Key", role: .destructive) {
+            Task { await viewModel.performBackendAction(.removeStoredSecret) }
+        }
+        .disabled(viewModel.isPerformingBackendOperation)
+        if viewModel.isPerformingBackendOperation { ProgressView().controlSize(.small) }
+    }
+
+    @ViewBuilder
+    private var backendOperationFeedbackIcon: some View {
+        switch viewModel.backendOperationFeedback {
+        case .idle:
+            EmptyView()
+        case .running:
+            ProgressView().controlSize(.mini)
+        case .succeeded:
+            Image(systemName: "checkmark.circle.fill")
+        case .failed:
+            Image(systemName: "exclamationmark.triangle.fill")
+        }
+    }
+
+    private var backendOperationFeedbackColor: Color {
+        switch viewModel.backendOperationFeedback {
+        case .idle, .running: .secondary
+        case .succeeded: .green
+        case .failed: .red
+        }
+    }
+
+    private func card(@ViewBuilder content: () -> some View) -> some View {
+        VStack(alignment: .leading, spacing: 12, content: content)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(16)
+            .background(.quaternary.opacity(0.35), in: RoundedRectangle(cornerRadius: 10))
+            .overlay(RoundedRectangle(cornerRadius: 10).strokeBorder(.quaternary, lineWidth: 1))
     }
 
     private var selectedBackendBinding: Binding<AgentTaskRouterBackendID?> {
@@ -128,18 +279,23 @@ struct RouterSettingsView: View {
 
     private var readinessTitle: String {
         switch viewModel.readiness {
-        case .ready: "Ready"
-        case .validating: "Validating backend configuration…"
-        case .needsConfiguration: "Configuration required"
-        case .policyUnavailable: "Routing policy unavailable"
-        case .temporarilyUnavailable: "Backend unavailable"
+        case .ready:
+            if !viewModel.policyCanBuildCandidates { return "Choose at least two routing targets" }
+            return viewModel.configuration.enabled ? "Model Router is on" : "Ready to enable"
+        case .validating: return "Checking your API key…"
+        case .needsConfiguration: return "Set up a routing service"
+        case .policyUnavailable: return "Task routing is not available yet"
+        case .temporarilyUnavailable: return "Routing service unavailable"
         }
     }
 
-    private var readinessDetail: String? {
+    private var readinessDetail: String {
         switch viewModel.readiness {
-        case let .ready(_, policy): "Policy \(policy)"
-        case .validating: nil
+        case .ready:
+            viewModel.policyCanBuildCandidates
+                ? "Enable routing, then use Route once in the composer to let Jev choose a complete target."
+                : "Select at least two roles with distinct provider, model, effort, or option combinations."
+        case .validating: "The routing service is validating your configuration."
         case let .needsConfiguration(_, reason),
              let .policyUnavailable(_, reason),
              let .temporarilyUnavailable(_, reason): reason
@@ -147,6 +303,12 @@ struct RouterSettingsView: View {
     }
 
     private var readinessIcon: String {
-        viewModel.readiness.isReady ? "checkmark.circle.fill" : "exclamationmark.triangle"
+        switch viewModel.readiness {
+        case .ready: viewModel.policyCanBuildCandidates ? "checkmark.circle.fill" : "info.circle"
+        case .validating: "hourglass"
+        case .needsConfiguration: "slider.horizontal.3"
+        case .policyUnavailable: "info.circle"
+        case .temporarilyUnavailable: "exclamationmark.triangle"
+        }
     }
 }
