@@ -858,6 +858,16 @@ class GlobalSettingsStore: ObservableObject, CodexHookApprovalSettingsProviding 
         }
     }
 
+    func orchestrationGraphEnabled() -> Bool {
+        scalarPreferences.ui?.orchestrationGraphEnabled ?? false
+    }
+
+    func setOrchestrationGraphEnabled(_ enabled: Bool, commit: Bool = true) {
+        updateUIScalar(commit: commit) { settings in
+            settings.orchestrationGraphEnabled = enabled
+        }
+    }
+
     func experimentalAttributedTextEditor() -> Bool {
         scalarPreferences.ui?.experimentalAttributedTextEditor ?? false
     }

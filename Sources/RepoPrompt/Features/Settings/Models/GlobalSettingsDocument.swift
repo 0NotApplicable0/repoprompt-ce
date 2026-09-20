@@ -665,6 +665,7 @@ struct GlobalScalarPreferences: Codable, Equatable {
         var enableKeyboardShortcuts: Bool?
         var fontScaleBodySize: Double?
         var showDatesInMessageTimestamps: Bool?
+        var orchestrationGraphEnabled: Bool?
 
         init(
             appearanceMode: String? = nil,
@@ -675,7 +676,8 @@ struct GlobalScalarPreferences: Codable, Equatable {
             fileMentionPickerStyle: String? = nil,
             enableKeyboardShortcuts: Bool? = nil,
             fontScaleBodySize: Double? = nil,
-            showDatesInMessageTimestamps: Bool? = nil
+            showDatesInMessageTimestamps: Bool? = nil,
+            orchestrationGraphEnabled: Bool? = nil
         ) {
             self.appearanceMode = appearanceMode
             self.useTransparency = useTransparency
@@ -686,6 +688,7 @@ struct GlobalScalarPreferences: Codable, Equatable {
             self.enableKeyboardShortcuts = enableKeyboardShortcuts
             self.fontScaleBodySize = fontScaleBodySize
             self.showDatesInMessageTimestamps = showDatesInMessageTimestamps
+            self.orchestrationGraphEnabled = orchestrationGraphEnabled
         }
     }
 

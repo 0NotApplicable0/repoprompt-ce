@@ -648,6 +648,14 @@ private enum AppSettingsMCPRegistry {
             read: { .bool($0.enableKeyboardShortcuts()) },
             write: { try $0.setEnableKeyboardShortcuts(requiredBool(from: $1)) }
         ),
+        boolSetting(
+            key: "ui.orchestration_graph_enabled",
+            group: "ui",
+            label: "Orchestration Graph",
+            description: "Whether RepoPrompt shows one orchestration graph window of every workspace and Agent Mode session instead of separate one-workspace windows.",
+            read: { .bool($0.orchestrationGraphEnabled()) },
+            write: { try $0.setOrchestrationGraphEnabled(requiredBool(from: $1)) }
+        ),
         AppSettingDefinition(
             key: "ui.font_scale",
             group: "ui",
