@@ -542,10 +542,36 @@ final class AgentPermissionSecureStoreTests: XCTestCase {
         XCTAssertEqual(secureStrings.plainValues[antigravityKey], antigravityPayload)
         XCTAssertEqual(secureStrings.plainValues[grokKey], grokPayload)
         XCTAssertTrue(secureStrings.savedPlainValues.isEmpty)
-        XCTAssertEqual(store.diagnostic(for: .antigravity)?.kind, .decodeFailed)
+        XCTAssertEqual(store.diagnostic(for: .antigravity)?.kind, .unsupportedStoredPermission)
         XCTAssertTrue(store.diagnostic(for: .antigravity)?.message.lowercased().contains("reset") == true)
-        XCTAssertEqual(store.diagnostic(for: .grok)?.kind, .decodeFailed)
+        XCTAssertEqual(store.diagnostic(for: .grok)?.kind, .unsupportedStoredPermission)
         XCTAssertTrue(store.diagnostic(for: .grok)?.message.lowercased().contains("reset") == true)
+    }
+
+    @MainActor
+    func testRetiredACPAntigravityPermissionDoesNotMarkSecureStorageDegraded() throws {
+        let secureStrings = FakeSecurePlainStringStore()
+        let key = AgentPermissionSecureDomain.antigravity.storageKey
+        let payload = try encode(SecureAntigravityPermissionDocument(permissionLevelRaw: "auto_edit"))
+        secureStrings.plainValues[key] = payload
+        let store = makeStore(secureStrings: secureStrings)
+
+        let permissions = store.antigravityPermissions()
+        let diagnostic = try XCTUnwrap(store.diagnostic(for: .antigravity))
+
+        XCTAssertEqual(permissions.permissionLevel(), .safeManagedUnavailable)
+        XCTAssertFalse(permissions.permissionLevel().supportsHeadlessRun)
+        XCTAssertEqual(diagnostic.kind, .unsupportedStoredPermission)
+        XCTAssertFalse(AgentPermissionStorageDiagnosticsViewModel.isDegrading(kind: diagnostic.kind))
+        XCTAssertEqual(secureStrings.plainValues[key], payload)
+        XCTAssertTrue(secureStrings.savedPlainValues.isEmpty)
+
+        let viewModel = AgentPermissionStorageDiagnosticsViewModel(
+            securePermissions: store,
+            notificationCenter: NotificationCenter()
+        )
+        XCTAssertFalse(viewModel.isSecurePermissionStorageDegraded)
+        XCTAssertNil(AgentPermissionSecureStorageDegradedBanner.userFacingDetail(for: viewModel.storageDiagnostics))
     }
 
     func testCurrentSchemaAntigravityUnsupportedRawValuesArePreservedAndCannotRunHeadless() throws {
@@ -571,7 +597,7 @@ final class AgentPermissionSecureStoreTests: XCTestCase {
             XCTAssertFalse(permissions.permissionLevel().supportsHeadlessRun)
             XCTAssertEqual(secureStrings.plainValues[key], payload)
             XCTAssertTrue(secureStrings.savedPlainValues.isEmpty)
-            XCTAssertEqual(store.diagnostic(for: .antigravity)?.kind, .decodeFailed)
+            XCTAssertEqual(store.diagnostic(for: .antigravity)?.kind, .unsupportedStoredPermission)
             XCTAssertTrue(
                 store.diagnostic(for: .antigravity)?.message.lowercased().contains("reset") == true ||
                     store.diagnostic(for: .antigravity)?.message.lowercased().contains("choose") == true

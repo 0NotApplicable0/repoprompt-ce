@@ -46,6 +46,7 @@ struct AgentPermissionStorageDiagnostic: Equatable {
         case keychainInteractionNotAllowed
         case keychainAuthenticationFailed
         case decodeFailed
+        case unsupportedStoredPermission
         case unsupportedFutureSchema
     }
 
@@ -909,7 +910,7 @@ final class AgentPermissionSecureStore {
         } else {
             "Stored Antigravity permission value is unsupported and cannot run headlessly. Reset permissions before choosing a new Headless permission level."
         }
-        recordDiagnostic(domain: .antigravity, kind: .decodeFailed, message: message)
+        recordDiagnostic(domain: .antigravity, kind: .unsupportedStoredPermission, message: message)
         effects.requestDiagnosticsNotification(for: .antigravity)
     }
 
@@ -936,7 +937,7 @@ final class AgentPermissionSecureStore {
         else { return }
         recordDiagnostic(
             domain: .grok,
-            kind: .decodeFailed,
+            kind: .unsupportedStoredPermission,
             message: GrokAgentToolPreferences.PermissionLevel.storedPermissionUnavailable.detailText
         )
         effects.requestDiagnosticsNotification(for: .grok)

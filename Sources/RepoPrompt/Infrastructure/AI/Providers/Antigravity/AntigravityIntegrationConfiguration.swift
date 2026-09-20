@@ -960,25 +960,63 @@ enum AntigravityIntegrationConfiguration {
         return jsonObjectsEqual(normalizedEntry, desiredEntry)
     }
 
-    /// Exact pre-token CE writer shape. A familiar key or basename alone never grants migration
-    /// authority; explicit Connect must also opt into the replacement in `mergedRoot`.
+    /// A familiar key or basename alone never grants migration; explicit Connect must still
+    /// opt into the replacement in `mergedRoot`.
+    private static let legacyCETimeoutEnvironmentKeys: Set<String> = [
+        "MAX_MCP_OUTPUT_TOKENS",
+        "MCP_TIMEOUT",
+        "MCP_TOOL_TIMEOUT"
+    ]
+
     private static func isMigratableLegacyEntry(
         _ currentEntry: [String: Any],
         desiredEntry: [String: Any],
         managedCommandIsRecognized: (String) -> Bool
     ) -> Bool {
-        guard Set(currentEntry.keys) == Set(["command", "args"]),
-              Set(desiredEntry.keys) == Set(["command", "args"]),
+        let allowedKeys: Set = ["command", "args", "env"]
+        guard Set(currentEntry.keys).isSubset(of: allowedKeys),
+              Set(desiredEntry.keys).isSubset(of: allowedKeys),
+              currentEntry.keys.contains("command"),
+              currentEntry.keys.contains("args"),
+              desiredEntry.keys.contains("command"),
+              desiredEntry.keys.contains("args"),
               let currentCommand = currentEntry["command"] as? String,
               let desiredCommand = desiredEntry["command"] as? String,
-              currentCommand != desiredCommand,
               let currentArgs = currentEntry["args"] as? [Any],
               let desiredArgs = desiredEntry["args"] as? [Any],
-              currentArgs.isEmpty,
-              desiredArgs.isEmpty,
+              isMigratableLegacyStdioArgs(currentArgs),
+              isMigratableLegacyStdioArgs(desiredArgs),
+              isMigratableLegacyEnvironment(currentEntry["env"]),
+              isMigratableLegacyEnvironment(desiredEntry["env"]),
               managedCommandIsRecognized(currentCommand),
               managedCommandIsRecognized(desiredCommand)
         else { return false }
+        return true
+    }
+
+    private static func isMigratableLegacyStdioArgs(_ args: [Any]) -> Bool {
+        if args.isEmpty { return true }
+        guard args.count == 2,
+              let flag = args[0] as? String,
+              let value = args[1] as? String
+        else { return false }
+        return flag == "--backend" && value == "app"
+    }
+
+    private static func isMigratableLegacyEnvironment(_ value: Any?) -> Bool {
+        guard let value else { return true }
+        guard let environment = value as? [String: Any] else { return false }
+        for (key, entry) in environment {
+            if key == ownershipEnvironmentKey {
+                guard let token = entry as? String, UUID(uuidString: token) != nil else {
+                    return false
+                }
+                continue
+            }
+            guard legacyCETimeoutEnvironmentKeys.contains(key), entry is String else {
+                return false
+            }
+        }
         return true
     }
 

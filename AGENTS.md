@@ -4,6 +4,15 @@ This is a Swift Package macOS app for RepoPrompt CE.
 
 Prefer the coordinated developer daemon (`make dev-*`, see "Developer daemon / coordinated validation" below) for builds, runs, and tests. It runs every job through a lane-serialized queue so concurrent agents do not build, launch, or test over each other, and it returns a ticket for each job so long builds can be detached and checked on later instead of blocking. The plain `make` / `swift` / `./Scripts` commands shown below are the uncoordinated fallback for when the daemon is unavailable.
 
+## Git remotes / personal fork
+
+This tree's writable GitHub copy is the personal fork
+[`0NotApplicable0/repoprompt-ce`](https://github.com/0NotApplicable0/repoprompt-ce).
+`origin` remains upstream [`repoprompt/repoprompt-ce`](https://github.com/repoprompt/repoprompt-ce).
+The local `fork` remote points at that personal copy. Push intended branches to
+`fork`, not `origin`, unless you have upstream write access and explicit approval.
+`CLAUDE.md` is a symlink to this file.
+
 ## Contribution preflight
 
 Before every commit or push, read and run the repository-local `$rpce-contribution-check` skill:

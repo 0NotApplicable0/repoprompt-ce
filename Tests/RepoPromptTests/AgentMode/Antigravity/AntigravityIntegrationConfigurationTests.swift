@@ -487,6 +487,52 @@ final class AntigravityIntegrationConfigurationTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: fixture.paths.ownershipMarkerURL.path))
     }
 
+    func testExplicitConnectMigratesOlderCEHelperTimeoutEnvToBackendArgs() throws {
+        let fixture = try makeIntegrationFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let bundledCommand = "/Applications/RepoPrompt CE.app/Contents/MacOS/repoprompt-mcp"
+        let desiredCommand = MCPFilesystemIdentity.repoPromptCE(.release).userSpaceCLIURL().path
+        let recognized = Set([bundledCommand, desiredCommand])
+        let legacyEntry: [String: Any] = [
+            "command": bundledCommand,
+            "args": [],
+            "env": [
+                "MAX_MCP_OUTPUT_TOKENS": "25000",
+                "MCP_TIMEOUT": "30000",
+                "MCP_TOOL_TIMEOUT": "10800000"
+            ]
+        ]
+        let original = data(["mcpServers": [serverName: legacyEntry]])
+        try original.write(to: fixture.paths.configURL)
+
+        let result = try AntigravityIntegrationConfiguration.ensurePersistentMCPConfig(
+            intent: .explicitConnect,
+            paths: fixture.paths,
+            newOwnershipToken: ownershipToken,
+            configuration: RepoPromptMCPServerConfiguration(
+                command: desiredCommand,
+                args: ["--backend", "app"]
+            ),
+            managedCommandIsRecognized: recognized.contains
+        )
+
+        XCTAssertTrue(result.wasMCPServerAlreadyPresent)
+        XCTAssertTrue(result.isEntryOwnedByRepoPrompt)
+        let installed = try XCTUnwrap(configEntry(at: fixture.paths.configURL))
+        XCTAssertEqual(installed["command"] as? String, desiredCommand)
+        XCTAssertEqual(installed["args"] as? [String], ["--backend", "app"])
+        let marker = try XCTUnwrap(AntigravityIntegrationConfiguration.decodedOwnershipMarker(
+            Data(contentsOf: fixture.paths.ownershipMarkerURL)
+        ))
+        XCTAssertEqual(marker.phase, .installed)
+        XCTAssertTrue(jsonEqual(marker.displacedEntry, legacyEntry))
+        XCTAssertEqual(
+            try AntigravityIntegrationConfiguration.removeOwnedInstallEntry(paths: fixture.paths),
+            .restoredPreviousEntry
+        )
+        XCTAssertTrue(try jsonEqual(configEntry(at: fixture.paths.configURL), legacyEntry))
+    }
+
     func testSharedMarkerAllowsExplicitDebugReleaseSwitchWithStableToken() throws {
         let fixture = try makeIntegrationFixture()
         defer { try? FileManager.default.removeItem(at: fixture.root) }
