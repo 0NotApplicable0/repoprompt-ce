@@ -101,13 +101,21 @@ final class OrchestrationGraphSettingsTests: XCTestCase {
         defer { defaults.removePersistentDomain(forName: suiteName) }
         let fileURL = root.appendingPathComponent("globalSettings.json")
 
+        // Hand-write the on-disk document before any GlobalSettingsStore exists: scalarPreferences.ui
+        // exists (via an unrelated key) but has no "orchestrationGraphEnabled" member, so the member is
+        // absent, not merely false.
+        let fileStore = GlobalSettingsFileStore(fileURL: fileURL)
+        try fileStore.save(GlobalSettingsDocument())
+        var rootJSON = try readSettingsJSON(at: fileURL)
+        var scalarPreferences = (rootJSON["scalarPreferences"] as? [String: Any]) ?? [:]
+        scalarPreferences["ui"] = ["showTooltips": false]
+        rootJSON["scalarPreferences"] = scalarPreferences
+        try writeSettingsJSON(rootJSON, to: fileURL)
+
         let store = GlobalSettingsStore(
             defaults: defaults,
             fileStore: GlobalSettingsFileStore(fileURL: fileURL)
         )
-        // Force scalarPreferences.ui to exist (via an unrelated UI setting) without ever
-        // setting orchestrationGraphEnabled, so the member is absent, not merely false.
-        store.setShowTooltips(false)
         XCTAssertFalse(store.orchestrationGraphEnabled())
 
         let reloaded = GlobalSettingsStore(
@@ -115,5 +123,45 @@ final class OrchestrationGraphSettingsTests: XCTestCase {
             fileStore: GlobalSettingsFileStore(fileURL: fileURL)
         )
         XCTAssertFalse(reloaded.orchestrationGraphEnabled())
+    }
+
+    func testPersistedJSONKeyPinsTheFlag() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("OrchestrationGraphSettingsTests-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let suiteName = "OrchestrationGraphSettingsTests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let fileURL = root.appendingPathComponent("globalSettings.json")
+
+        // Before any GlobalSettingsStore exists: produce a valid on-disk document through the
+        // lower-level file store, then hand-write the raw JSON key under test onto it. This is
+        // the assertion an aliased accessor (e.g. pointed at showDatesInMessageTimestamps)
+        // cannot survive: it names the key on disk, not just the typed struct round trip.
+        let fileStore = GlobalSettingsFileStore(fileURL: fileURL)
+        try fileStore.save(GlobalSettingsDocument())
+        var rootJSON = try readSettingsJSON(at: fileURL)
+        var scalarPreferences = (rootJSON["scalarPreferences"] as? [String: Any]) ?? [:]
+        scalarPreferences["ui"] = ["orchestrationGraphEnabled": true]
+        rootJSON["scalarPreferences"] = scalarPreferences
+        try writeSettingsJSON(rootJSON, to: fileURL)
+
+        let store = GlobalSettingsStore(
+            defaults: defaults,
+            fileStore: GlobalSettingsFileStore(fileURL: fileURL)
+        )
+        XCTAssertTrue(store.orchestrationGraphEnabled())
+    }
+
+    private func readSettingsJSON(at url: URL) throws -> [String: Any] {
+        let object = try JSONSerialization.jsonObject(with: Data(contentsOf: url))
+        return try XCTUnwrap(object as? [String: Any])
+    }
+
+    private func writeSettingsJSON(_ object: [String: Any], to url: URL) throws {
+        let data = try JSONSerialization.data(withJSONObject: object, options: [.prettyPrinted, .sortedKeys])
+        try data.write(to: url, options: .atomic)
     }
 }
