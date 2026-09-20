@@ -576,6 +576,117 @@ final class OrchestrationGraphProjectionTests: XCTestCase {
         XCTAssertEqual(projection.isHistoryScanIncomplete, false)
     }
 
+    func testProductionFactoryFlattensWorkspaceKeysInUUIDOrderLastWins() {
+        let projection = OrchestrationGraphProjection.make(
+            workspaces: [
+                .init(id: IDs.workspace1, name: "Workspace One"),
+                .init(id: IDs.workspace2, name: "Workspace Two")
+            ],
+            persistedIndexesByWorkspaceID: [
+                IDs.workspace1: AgentSessionMetadataIndex(entries: [
+                    persistedSession(
+                        id: IDs.child,
+                        name: "From First Workspace",
+                        parentSessionID: nil,
+                        runState: .idle
+                    )
+                ]),
+                IDs.workspace2: AgentSessionMetadataIndex(entries: [
+                    persistedSession(
+                        id: IDs.historyRoot,
+                        name: "Parent",
+                        parentSessionID: nil,
+                        runState: .running
+                    ),
+                    persistedSession(
+                        id: IDs.child,
+                        name: "From Last Workspace",
+                        parentSessionID: IDs.historyRoot,
+                        runState: .completed
+                    )
+                ])
+            ],
+            liveSnapshotsByWorkspaceID: [:],
+            isHistoryScanIncomplete: false
+        )
+
+        let expectedNodes: [OrchestrationGraphProjection.Node] = [
+            .workspace(id: IDs.workspace1, name: "Workspace One"),
+            .workspace(id: IDs.workspace2, name: "Workspace Two"),
+            sessionNode(
+                id: IDs.child,
+                name: "From Last Workspace",
+                workspaceID: IDs.workspace2,
+                runState: .completed
+            ),
+            sessionNode(
+                id: IDs.historyRoot,
+                name: "Parent",
+                workspaceID: IDs.workspace2,
+                runState: .running
+            )
+        ]
+        let expectedEdges: [OrchestrationGraphProjection.Edge] = [
+            edge(.workspace(IDs.workspace2), .session(IDs.historyRoot), .membership),
+            edge(.session(IDs.historyRoot), .session(IDs.child), .dispatch)
+        ]
+
+        assertProjection(projection, nodes: expectedNodes, edges: expectedEdges)
+        XCTAssertEqual(projection.isHistoryScanIncomplete, false)
+    }
+
+    func testProductionFactoryExcludesQuarantinedFiles() {
+        let projection = OrchestrationGraphProjection.make(
+            workspaces: [.init(id: IDs.workspace1, name: "Workspace One")],
+            persistedIndexesByWorkspaceID: [
+                IDs.workspace1: AgentSessionMetadataIndex(
+                    entries: [],
+                    quarantinedFiles: [
+                        AgentSessionMetadataQuarantineRecord(
+                            filename: "AgentSession-\(IDs.root.uuidString).json",
+                            observedFileSize: 100,
+                            observedFileModificationDate: Date(timeIntervalSinceReferenceDate: 2),
+                            errorDescription: "Unreadable fixture",
+                            lastAttemptedAt: Date(timeIntervalSinceReferenceDate: 3)
+                        )
+                    ]
+                )
+            ],
+            liveSnapshotsByWorkspaceID: [:],
+            isHistoryScanIncomplete: false
+        )
+
+        let expectedNodes: [OrchestrationGraphProjection.Node] = [
+            .workspace(id: IDs.workspace1, name: "Workspace One")
+        ]
+
+        assertProjection(projection, nodes: expectedNodes, edges: [])
+        XCTAssertEqual(projection.nodes.count(where: { $0.id == .session(IDs.root) }), 0)
+        XCTAssertEqual(projection.isHistoryScanIncomplete, false)
+    }
+
+    func testWorkspaceOrderingUsesNameThenUUIDString() {
+        let projection = OrchestrationGraphProjection.make(
+            workspaces: [
+                .init(id: IDs.workspace2, name: "Zulu"),
+                .init(id: IDs.unknownWorkspace, name: "Alpha"),
+                .init(id: IDs.workspace1, name: "Zulu")
+            ],
+            persisted: [],
+            live: [],
+            isHistoryScanIncomplete: false
+        )
+
+        let expectedNodes: [OrchestrationGraphProjection.Node] = [
+            .workspace(id: IDs.unknownWorkspace, name: "Alpha"),
+            .workspace(id: IDs.workspace1, name: "Zulu"),
+            .workspace(id: IDs.workspace2, name: "Zulu")
+        ]
+
+        assertProjection(projection, nodes: expectedNodes, edges: [])
+        XCTAssertEqual(projection.isHistoryScanIncomplete, false)
+    }
+
     func testWaitingStatesStayDistinctAcrossBothVocabularies() {
         let persistedRecords = [
             persistedSession(id: IDs.root, name: "Waiting User", parentSessionID: nil, runState: .waitingForUser),
@@ -623,6 +734,38 @@ final class OrchestrationGraphProjectionTests: XCTestCase {
                 status: .waitingForInput,
                 statusText: nil,
                 interaction: interaction(kind: .approval)
+            ),
+            liveSession(
+                id: IDs.liveHookApproval,
+                name: "Live Hook Approval",
+                parentSessionID: nil,
+                status: .waitingForInput,
+                statusText: nil,
+                interaction: interaction(kind: .hookApproval)
+            ),
+            liveSession(
+                id: IDs.liveMCPElicitation,
+                name: "Live MCP Elicitation",
+                parentSessionID: nil,
+                status: .waitingForInput,
+                statusText: nil,
+                interaction: interaction(kind: .mcpElicitation)
+            ),
+            liveSession(
+                id: IDs.liveInstruction,
+                name: "Live Instruction",
+                parentSessionID: nil,
+                status: .waitingForInput,
+                statusText: nil,
+                interaction: interaction(kind: .instruction)
+            ),
+            liveSession(
+                id: IDs.liveInput,
+                name: "Live Input",
+                parentSessionID: nil,
+                status: .waitingForInput,
+                statusText: nil,
+                interaction: interaction(kind: .userInput)
             )
         ]
         let productionProjection = OrchestrationGraphProjection.make(
@@ -696,6 +839,38 @@ final class OrchestrationGraphProjectionTests: XCTestCase {
                     parentSessionID: nil,
                     runState: .waitingForApproval,
                     statusText: nil
+                ),
+                .init(
+                    sessionID: IDs.liveHookApproval,
+                    workspaceID: IDs.workspace1,
+                    name: "Live Hook Approval",
+                    parentSessionID: nil,
+                    runState: .waitingForApproval,
+                    statusText: nil
+                ),
+                .init(
+                    sessionID: IDs.liveMCPElicitation,
+                    workspaceID: IDs.workspace1,
+                    name: "Live MCP Elicitation",
+                    parentSessionID: nil,
+                    runState: .waitingForQuestion,
+                    statusText: nil
+                ),
+                .init(
+                    sessionID: IDs.liveInstruction,
+                    workspaceID: IDs.workspace1,
+                    name: "Live Instruction",
+                    parentSessionID: nil,
+                    runState: .waitingForUser,
+                    statusText: nil
+                ),
+                .init(
+                    sessionID: IDs.liveInput,
+                    workspaceID: IDs.workspace1,
+                    name: "Live Input",
+                    parentSessionID: nil,
+                    runState: .waitingForUser,
+                    statusText: nil
                 )
             ],
             isHistoryScanIncomplete: false
@@ -752,6 +927,34 @@ final class OrchestrationGraphProjectionTests: XCTestCase {
                 workspaceID: IDs.workspace1,
                 runState: .waitingForApproval,
                 isLive: true
+            ),
+            sessionNode(
+                id: IDs.liveHookApproval,
+                name: "Live Hook Approval",
+                workspaceID: IDs.workspace1,
+                runState: .waitingForApproval,
+                isLive: true
+            ),
+            sessionNode(
+                id: IDs.liveMCPElicitation,
+                name: "Live MCP Elicitation",
+                workspaceID: IDs.workspace1,
+                runState: .waitingForQuestion,
+                isLive: true
+            ),
+            sessionNode(
+                id: IDs.liveInstruction,
+                name: "Live Instruction",
+                workspaceID: IDs.workspace1,
+                runState: .waitingForUser,
+                isLive: true
+            ),
+            sessionNode(
+                id: IDs.liveInput,
+                name: "Live Input",
+                workspaceID: IDs.workspace1,
+                runState: .waitingForUser,
+                isLive: true
             )
         ]
         let expectedEdges: [OrchestrationGraphProjection.Edge] = [
@@ -762,7 +965,11 @@ final class OrchestrationGraphProjectionTests: XCTestCase {
             edge(.workspace(IDs.workspace1), .session(IDs.sibling), .membership),
             edge(.workspace(IDs.workspace1), .session(IDs.liveUser), .membership),
             edge(.workspace(IDs.workspace1), .session(IDs.liveQuestion), .membership),
-            edge(.workspace(IDs.workspace1), .session(IDs.liveApproval), .membership)
+            edge(.workspace(IDs.workspace1), .session(IDs.liveApproval), .membership),
+            edge(.workspace(IDs.workspace1), .session(IDs.liveHookApproval), .membership),
+            edge(.workspace(IDs.workspace1), .session(IDs.liveMCPElicitation), .membership),
+            edge(.workspace(IDs.workspace1), .session(IDs.liveInstruction), .membership),
+            edge(.workspace(IDs.workspace1), .session(IDs.liveInput), .membership)
         ]
 
         XCTAssertEqual(
@@ -784,6 +991,22 @@ final class OrchestrationGraphProjectionTests: XCTestCase {
         XCTAssertEqual(
             sessionStatus(in: productionProjection, sessionID: IDs.liveApproval)?.runState,
             .waitingForApproval
+        )
+        XCTAssertEqual(
+            sessionStatus(in: productionProjection, sessionID: IDs.liveHookApproval)?.runState,
+            .waitingForApproval
+        )
+        XCTAssertEqual(
+            sessionStatus(in: productionProjection, sessionID: IDs.liveMCPElicitation)?.runState,
+            .waitingForQuestion
+        )
+        XCTAssertEqual(
+            sessionStatus(in: productionProjection, sessionID: IDs.liveInstruction)?.runState,
+            .waitingForUser
+        )
+        XCTAssertEqual(
+            sessionStatus(in: productionProjection, sessionID: IDs.liveInput)?.runState,
+            .waitingForUser
         )
         assertProjection(productionProjection, nodes: expectedNodes, edges: expectedEdges)
         assertProjection(dtoProjection, nodes: expectedNodes, edges: expectedEdges)
@@ -810,6 +1033,10 @@ final class OrchestrationGraphProjectionTests: XCTestCase {
         static let liveUser = uuid("00000000-0000-0000-0000-000000000301")
         static let liveQuestion = uuid("00000000-0000-0000-0000-000000000302")
         static let liveApproval = uuid("00000000-0000-0000-0000-000000000303")
+        static let liveHookApproval = uuid("00000000-0000-0000-0000-000000000304")
+        static let liveMCPElicitation = uuid("00000000-0000-0000-0000-000000000305")
+        static let liveInstruction = uuid("00000000-0000-0000-0000-000000000306")
+        static let liveInput = uuid("00000000-0000-0000-0000-000000000307")
         static let interaction = uuid("00000000-0000-0000-0000-000000000401")
     }
 

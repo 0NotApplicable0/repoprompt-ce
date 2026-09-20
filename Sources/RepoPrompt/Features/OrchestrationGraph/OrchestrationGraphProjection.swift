@@ -1,6 +1,10 @@
 import Foundation
 import RepoPromptDomainRuntime
 
+/// Every stored property is a value type over `UUID`, `String`, `Bool`, and the nested enums, so this
+/// projection and its nested types are implicitly `Sendable` within the module. SwiftFormat's
+/// `redundantSendable` rule removes an explicit spelling; `AgentSessionMetadataIndex` is only a
+/// factory parameter and is never stored.
 struct OrchestrationGraphProjection: Equatable {
     struct WorkspaceInput: Equatable, Hashable {
         let id: UUID
