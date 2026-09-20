@@ -17,6 +17,11 @@ enum AgentTaskRoutingModelProfileCatalog {
         return "Evidence snapshot 2026-09-19 (provider-published; API list price is a comparison proxy and CLI or subscription billing may differ): \(evidence) \(effort)"
     }
 
+    static func modelDescription(for target: AgentRoutingExecutableTarget) -> String {
+        let modelIdentity = normalizedModelIdentity(for: target)
+        return "Evidence snapshot 2026-09-19 (provider-published; API list price is a comparison proxy and CLI or subscription billing may differ): \(profile(for: modelIdentity))"
+    }
+
     private static func profile(for modelIdentity: String) -> String {
         switch modelIdentity {
         case "gpt-5.6-luna":
@@ -57,7 +62,7 @@ enum AgentTaskRoutingModelProfileCatalog {
         return raw
     }
 
-    private static func effortDescription(for target: AgentRoutingExecutableTarget) -> String {
+    static func effortDescription(for target: AgentRoutingExecutableTarget) -> String {
         let codexEffort = target.reasoningEffortRaw?.lowercased()
         let claudeEffort = target.agentRaw == AgentProviderKind.claudeCode.rawValue
             ? ClaudeModelSpecifier(raw: target.modelRaw).effortLevel?.rawValue

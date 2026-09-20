@@ -71,6 +71,52 @@ final class RouterSettingsViewModelTests: XCTestCase {
         XCTAssertEqual(fixture.viewModel.providerLimit(for: .subagent), .claudeCode)
     }
 
+    func testCompletedProviderValidationWithNoAuthenticatedTargetsDisablesRouter() async throws {
+        let fixture = try makeFixture(
+            availability: .none,
+            verifiedProviders: []
+        )
+        fixture.store.enableModelRouterWithCurrentPolicy(
+            backendID: .jev,
+            roles: Set(AgentModelCatalog.TaskLabelKind.allCases),
+            providers: [.claudeCode, .codexExec]
+        )
+
+        await fixture.viewModel.refresh()
+
+        XCTAssertFalse(fixture.store.modelRouterConfiguration().enabled)
+        XCTAssertFalse(fixture.viewModel.configuration.enabled)
+        XCTAssertFalse(fixture.viewModel.canEnable)
+    }
+
+    func testUnavailableSubagentPreferenceDoesNotBlockAuthenticatedCodex() async throws {
+        let fixture = try makeFixture(
+            availability: AgentModelCatalog.AvailabilityContext(
+                claudeCodeAvailable: false,
+                codexAvailable: true,
+                openCodeAvailable: false
+            ),
+            verifiedProviders: [.codexExec]
+        )
+        fixture.store.enableModelRouterWithCurrentPolicy(
+            backendID: .jev,
+            roles: Set(AgentModelCatalog.TaskLabelKind.allCases),
+            providers: [.claudeCode, .codexExec]
+        )
+        fixture.viewModel.setProviderLimit(.codexExec, scope: .primarySession)
+        fixture.viewModel.setProviderLimit(.claudeCode, scope: .subagent)
+
+        await fixture.viewModel.refresh()
+
+        XCTAssertTrue(fixture.store.modelRouterConfiguration().enabled)
+        XCTAssertTrue(fixture.viewModel.canEnable)
+        XCTAssertEqual(fixture.viewModel.availableProviders, [.codexExec])
+        XCTAssertEqual(
+            fixture.viewModel.unavailableProviderPreferences,
+            [.init(scope: .subagent, provider: .claudeCode)]
+        )
+    }
+
     private struct Fixture {
         let store: GlobalSettingsStore
         let viewModel: RouterSettingsViewModel
@@ -79,7 +125,9 @@ final class RouterSettingsViewModelTests: XCTestCase {
 
     private func makeFixture(
         policyUnavailable: Bool = false,
-        settingsController: (any AgentTaskRouterBackendSettingsController)? = nil
+        settingsController: (any AgentTaskRouterBackendSettingsController)? = nil,
+        availability: AgentModelCatalog.AvailabilityContext = .current,
+        verifiedProviders: Set<AgentProviderKind>? = nil
     ) throws -> Fixture {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("RouterSettings-\(UUID())", isDirectory: true)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
@@ -94,6 +142,9 @@ final class RouterSettingsViewModelTests: XCTestCase {
         let api = APISettingsViewModel(
             aiQueriesService: AIQueriesService(keyManager: keyManager), keyManager: keyManager, loadStoredDataOnInit: false
         )
+        if let verifiedProviders {
+            api.test_completeContextBuilderProviderValidation(verifiedProviders: verifiedProviders)
+        }
         addTeardownBlock { @MainActor in api.prepareForWindowClose() }
         let files = WorkspaceFilesViewModel()
         let prompt = PromptViewModel(
@@ -121,7 +172,7 @@ final class RouterSettingsViewModelTests: XCTestCase {
             runtime: runtime,
             apiSettingsViewModel: api,
             workspaceManager: workspace,
-            availabilityProvider: { .current }
+            availabilityProvider: { availability }
         )
         return Fixture(store: store, viewModel: viewModel, workspace: workspace)
     }

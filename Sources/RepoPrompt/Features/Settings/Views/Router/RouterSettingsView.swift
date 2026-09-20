@@ -73,14 +73,14 @@ struct RouterSettingsView: View {
     private var routingPolicyCard: some View {
         card {
             Label("Routing behavior", systemImage: "slider.horizontal.3").font(.headline)
-            Text("Optionally require one provider for a session type. Leave it automatic to let Jev compare every supported connected provider.")
+            Text("Optionally prefer one provider for a session type. Router uses that provider while it is authenticated, falls back to another connected provider when needed, and resumes the preference after it reconnects.")
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
             providerLimitPicker("Primary sessions", scope: .primarySession)
             providerLimitPicker("Subagents", scope: .subagent)
             Divider()
             Text("Custom guidance").font(.headline)
-            Text("Use this for routing directives such as “Prefer Claude Opus for execution, use GPT Astra sparingly, consult Fable for hard decisions.” Jev follows saved guidance within any required provider and receives it with every routing request.")
+            Text("Use this for routing directives such as “Prefer Claude Opus for execution, use GPT Astra sparingly, consult Fable for hard decisions.” Saved guidance is the highest-priority routing policy within any required provider; Jev receives it before the general quality-and-cost policy on every routing decision.")
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
             TextEditor(text: $customInstructionsDraft)
@@ -125,7 +125,12 @@ struct RouterSettingsView: View {
         )) {
             Text("Automatic (all connected)").tag(AgentProviderKind?.none)
             ForEach(viewModel.visibleProviders, id: \.rawValue) { provider in
-                Text(provider.displayName).tag(Optional(provider))
+                Text(
+                    viewModel.providerIsAvailable(provider)
+                        ? provider.displayName
+                        : "\(provider.displayName) (authentication needed)"
+                )
+                .tag(Optional(provider))
             }
         }
         .pickerStyle(.menu)
@@ -164,16 +169,16 @@ struct RouterSettingsView: View {
     private var candidatesCard: some View {
         card {
             HStack {
-                Label("Automatic model frontier", systemImage: "square.stack.3d.up").font(.headline)
+                Label("Automatic model selection", systemImage: "square.stack.3d.up").font(.headline)
                 Spacer()
                 Text("\(viewModel.distinctTargetCount) current targets")
                     .font(fontPreset.swiftUIFont(sizeAtNormal: 11))
                     .foregroundStyle(.secondary)
             }
-            Text("Router automatically builds a quality-and-cost frontier from the live Claude Code and Codex catalogs. It chooses the complete provider, model, and effort target; Agent Models role settings do not affect Router mode.")
+            Text("Router builds an audited quality-and-cost set from the connected Claude Code and Codex catalogs. It chooses the base model first, then chooses that model's reasoning effort separately. Agent Models role settings are included as reference signals without limiting the choices or forcing a default.")
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
-            if viewModel.visibleProviders.isEmpty {
+            if viewModel.availableProviders.isEmpty {
                 Text("Connect Claude Code or Codex CLI to make automatic targets available.")
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
@@ -181,7 +186,20 @@ struct RouterSettingsView: View {
                 Text("Connected providers: \(viewModel.availableProviders.sorted { $0.displayName < $1.displayName }.map(\.displayName).joined(separator: ", ")).")
                     .foregroundStyle(.secondary)
             }
-            Text("Pricing and capability evidence is versioned and sent with each candidate. Provider requirements and saved custom guidance are applied to every relevant routing request.")
+            ForEach(viewModel.unavailableProviderPreferences) { preference in
+                HStack(alignment: .firstTextBaseline, spacing: 8) {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .foregroundStyle(.orange)
+                    Text("\(preference.provider.displayName) needs authentication for \(preference.scopeDescription). Router will use another connected provider until it reconnects.")
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Spacer(minLength: 8)
+                    if onNavigate != nil {
+                        Button("Authenticate") { onNavigate?(.cliProviders) }
+                    }
+                }
+            }
+            Text("Pricing and capability evidence is versioned and sent with each candidate. Provider preferences are enforced before routing, saved guidance has highest priority, and Agent Models references remain supporting context.")
                 .font(fontPreset.swiftUIFont(sizeAtNormal: 11))
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
@@ -193,7 +211,7 @@ struct RouterSettingsView: View {
             Image(systemName: "hand.raised").foregroundStyle(.secondary)
             VStack(alignment: .leading, spacing: 5) {
                 Text("What gets shared").fontWeight(.medium)
-                Text("For each new routed session, the service receives your task text, custom guidance, and candidate provider/model/effort descriptions. Attached files, workspace context, chat history, and provider credentials are excluded. Anything you type in the task or guidance is shared.")
+                Text("For each new routed session, the service receives your task text, custom guidance, Agent Models role references, and candidate provider/model/effort descriptions. Attached files, workspace context, chat history, and provider credentials are excluded. Anything you type in the task or guidance is shared.")
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
             }
@@ -249,7 +267,9 @@ struct RouterSettingsView: View {
             Task { await viewModel.performBackendAction(.removeStoredSecret) }
         }
         .disabled(viewModel.isPerformingBackendOperation)
-        if viewModel.isPerformingBackendOperation { ProgressView().controlSize(.small) }
+        if viewModel.isPerformingBackendOperation {
+            ProgressView().controlSize(.small)
+        }
     }
 
     @ViewBuilder
@@ -284,14 +304,18 @@ struct RouterSettingsView: View {
 
     private var selectedBackendBinding: Binding<AgentTaskRouterBackendID?> {
         Binding(get: { viewModel.selectedBackendID }, set: { id in
-            if let id { viewModel.selectBackend(id) }
+            if let id {
+                viewModel.selectBackend(id)
+            }
         })
     }
 
     private var readinessTitle: String {
         switch viewModel.readiness {
         case .ready:
-            if !viewModel.policyCanBuildCandidates { return "Connect a supported provider" }
+            if !viewModel.policyCanBuildCandidates {
+                return "Connect a supported provider"
+            }
             return viewModel.configuration.enabled ? "Model Router is on" : "Ready to enable"
         case .validating: return "Checking your API key…"
         case .needsConfiguration: return "Set up a routing service"

@@ -17,6 +17,7 @@ struct AgentTaskRoutingEnvelopeBuilder {
         requestID: UUID,
         text: String,
         scope: AgentTaskRoutingScope = .primarySession,
+        decisionStage: AgentTaskRoutingDecisionStage = .model,
         customInstructions: String? = nil,
         candidates: [AgentTaskRoutingCandidateDescriptor],
         containsAttachments: Bool = false,
@@ -36,6 +37,7 @@ struct AgentTaskRoutingEnvelopeBuilder {
             contractVersion: AgentTaskRoutingRequest.currentContractVersion,
             task: task,
             scope: scope,
+            decisionStage: decisionStage,
             customInstructions: customInstructions?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty,
             candidates: candidates
         )

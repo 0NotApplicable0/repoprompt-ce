@@ -47,6 +47,27 @@ final class JevRouterCredentialServiceTests: XCTestCase {
         XCTAssertEqual(policyVersion, JevRouterCredentialService.routingPolicyVersion)
     }
 
+    func testSavedKeyBootstrapsAReplacementServiceInstance() async {
+        let storage = TestSecureStorageBackend()
+        let first = JevRouterCredentialService(
+            secureKeys: SecureKeysService(secureStorage: storage),
+            client: ImmediateJevClient()
+        )
+        guard case .saved = await first.validateAndSave("persistent", operationID: UUID()) else {
+            return XCTFail("Expected the first service to save the key")
+        }
+
+        let replacement = JevRouterCredentialService(
+            secureKeys: SecureKeysService(secureStorage: storage),
+            client: ImmediateJevClient()
+        )
+        await replacement.bootstrapStoredConfigurationIfNeeded()
+
+        guard case .ready = await replacement.readinessSnapshot() else {
+            return XCTFail("A replacement service must restore readiness from persisted storage")
+        }
+    }
+
     func testMissingStoredKeyInvalidatesPreviouslyValidatedReadiness() async throws {
         let storage = TestSecureStorageBackend(values: [.jevRouterAPIKey: "stored"])
         let service = JevRouterCredentialService(

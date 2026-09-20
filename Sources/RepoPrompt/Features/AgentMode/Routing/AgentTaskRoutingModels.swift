@@ -34,7 +34,9 @@ enum AgentTaskRouterBackendReadiness: Equatable {
     }
 
     var isReady: Bool {
-        if case .ready = self { return true }
+        if case .ready = self {
+            return true
+        }
         return false
     }
 }
@@ -81,15 +83,39 @@ enum AgentTaskRoutingScope: String, Codable, Equatable {
     case subagent
 }
 
+enum AgentTaskRoutingDecisionStage: String, Codable, Equatable {
+    case model
+    case effort
+}
+
 struct AgentTaskRoutingRequest: Equatable {
-    static let currentContractVersion = "rpce.agent-session-router.v2"
+    static let currentContractVersion = "rpce.agent-session-router.v3"
 
     let requestID: UUID
     let contractVersion: String
     let task: String
     let scope: AgentTaskRoutingScope
+    let decisionStage: AgentTaskRoutingDecisionStage
     let customInstructions: String?
     let candidates: [AgentTaskRoutingCandidateDescriptor]
+
+    init(
+        requestID: UUID,
+        contractVersion: String,
+        task: String,
+        scope: AgentTaskRoutingScope,
+        decisionStage: AgentTaskRoutingDecisionStage = .model,
+        customInstructions: String?,
+        candidates: [AgentTaskRoutingCandidateDescriptor]
+    ) {
+        self.requestID = requestID
+        self.contractVersion = contractVersion
+        self.task = task
+        self.scope = scope
+        self.decisionStage = decisionStage
+        self.customInstructions = customInstructions
+        self.candidates = candidates
+    }
 }
 
 struct AgentTaskRoutingDecisionEvidence: Equatable {

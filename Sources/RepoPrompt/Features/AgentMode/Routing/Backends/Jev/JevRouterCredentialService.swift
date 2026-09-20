@@ -9,7 +9,7 @@ actor JevRouterCredentialService: AgentTaskRouterBackendSettingsController {
     }
 
     static let pinnedModel = "jev-1.13.0"
-    static let routingPolicyVersion = "jev-1.13.0-rpce-session-routing-v4-automatic-frontier"
+    static let routingPolicyVersion = "jev-1.13.0-rpce-session-routing-v5-model-then-effort"
 
     private let secureKeys: SecureKeysService
     private let client: any JevRoutingClientProtocol

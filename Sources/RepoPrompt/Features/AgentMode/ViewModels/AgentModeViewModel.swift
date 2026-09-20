@@ -707,11 +707,16 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     private let sessionLifecycleAuthority = AgentSessionLifecycleAuthority()
     var modelRouterSettingsStore: GlobalSettingsStore = .shared
     var modelRouterRuntime: AgentTaskRouterRuntime?
+    struct StagedTaskRoutingResult {
+        let candidates: [AgentTaskRoutingCandidateBuilder.Candidate]
+        let outcome: AgentTaskRoutingBackendOutcome
+    }
+
     struct FreshTaskRoutingOwnership {
         let requestID: UUID
         let sourceTabID: UUID
         let destinationTabID: UUID
-        let task: Task<AgentTaskRoutingBackendOutcome, Never>
+        let task: Task<StagedTaskRoutingResult, Never>
     }
 
     var freshTaskRoutingByTabID: [UUID: FreshTaskRoutingOwnership] = [:]
@@ -1763,6 +1768,10 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         promptManager?.apiSettingsViewModel?.agentModeAvailabilityContext ?? .current
     }
 
+    var modelRouterAvailabilityContext: AgentModelCatalog.AvailabilityContext {
+        promptManager?.apiSettingsViewModel?.modelRouterAvailabilityContext ?? .current
+    }
+
     var hasAvailableAgentProviders: Bool {
         !availableAgents.isEmpty
     }
@@ -2459,7 +2468,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         setupObservers()
         modelRouterRuntime?.objectWillChange
             .receive(on: RunLoop.main)
-            .sink { [weak self] _ in self?.syncAllActiveUIState() }
+            .sink { [weak self] _ in self?.handleModelRouterRuntimeChanged() }
             .store(in: &cancellables)
         modelRouterSettingsStore.objectWillChange
             .receive(on: RunLoop.main)
@@ -3329,6 +3338,15 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                     self?.handleAgentProviderAvailabilityChanged()
                 }
                 .store(in: &cancellables)
+            Publishers.CombineLatest(
+                apiSettingsViewModel.$contextBuilderVerifiedCLIProviders,
+                apiSettingsViewModel.$isContextBuilderProviderValidationComplete
+            )
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in
+                self?.handleModelRouterAvailabilityChanged()
+            }
+            .store(in: &cancellables)
         }
 
         // Observe workspace file-system deltas and invalidate the skill catalog
@@ -3659,18 +3677,42 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
 
     func isComposeTabProtectedFromSidebarArchiveSuggestion(_ tabID: UUID) -> Bool {
         guard let session = sessions[tabID] else { return true }
-        if session.runState.isActive { return true }
-        if tabsWithActiveAgentRun.contains(tabID) { return true }
-        if session.mcpControlContext != nil { return true }
-        if session.hasPendingQuestionUI { return true }
-        if session.pendingApproval != nil { return true }
-        if session.hasPendingCodexHookReviewWait { return true }
-        if session.pendingPermissionsRequest != nil { return true }
-        if session.pendingMCPElicitationRequest != nil { return true }
-        if session.pendingApplyEditsReview != nil { return true }
-        if session.pendingUserInputRequest != nil { return true }
-        if session.waitingPrompt != nil { return true }
-        if session.instructionContinuation != nil { return true }
+        if session.runState.isActive {
+            return true
+        }
+        if tabsWithActiveAgentRun.contains(tabID) {
+            return true
+        }
+        if session.mcpControlContext != nil {
+            return true
+        }
+        if session.hasPendingQuestionUI {
+            return true
+        }
+        if session.pendingApproval != nil {
+            return true
+        }
+        if session.hasPendingCodexHookReviewWait {
+            return true
+        }
+        if session.pendingPermissionsRequest != nil {
+            return true
+        }
+        if session.pendingMCPElicitationRequest != nil {
+            return true
+        }
+        if session.pendingApplyEditsReview != nil {
+            return true
+        }
+        if session.pendingUserInputRequest != nil {
+            return true
+        }
+        if session.waitingPrompt != nil {
+            return true
+        }
+        if session.instructionContinuation != nil {
+            return true
+        }
         return false
     }
 

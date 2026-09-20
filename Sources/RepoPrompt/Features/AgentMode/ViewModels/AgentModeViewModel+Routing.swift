@@ -25,22 +25,49 @@ extension AgentModeViewModel {
 
     func modelRouterPillProps() -> AgentModelRouterPillProps {
         let configuration = modelRouterSettingsStore.modelRouterConfiguration()
-        let backendReady = configuration.selectedBackendID.map {
-            modelRouterRuntime?.isBackendReady($0) == true
-        } ?? false
-        let available = backendReady && (try? AgentTaskRoutingCandidateBuilder().build(
-            allowedProviders: providers(for: .primarySession, configuration: configuration),
-            availability: agentAvailabilityContext
-        )) != nil
+        let available = modelRouterCanRoutePrimarySession(configuration)
         let isRouting = currentTabID.map { freshTaskRoutingByTabID[$0] != nil } ?? false
         return AgentModelRouterPillProps(
-            isOn: configuration.enabled,
+            isOn: configuration.enabled && available,
             isAvailable: available || configuration.enabled,
             isRouting: isRouting,
             disabledReason: available || configuration.enabled
                 ? nil
                 : "Configure a routing service and targets in Model Router Settings."
         )
+    }
+
+    func handleModelRouterRuntimeChanged() {
+        reconcileModelRouterEnabledState()
+    }
+
+    func handleModelRouterAvailabilityChanged() {
+        reconcileModelRouterEnabledState()
+    }
+
+    private func reconcileModelRouterEnabledState() {
+        let configuration = modelRouterSettingsStore.modelRouterConfiguration()
+        guard configuration.enabled else {
+            syncAllActiveUIState()
+            return
+        }
+        let backendReadiness = configuration.selectedBackendID.flatMap {
+            modelRouterRuntime?.backendReadiness($0)
+        }
+        let credentialIsDefinitivelyMissing = if case let .needsConfiguration(generation, _) = backendReadiness {
+            generation > 0
+        } else {
+            false
+        }
+        let providerValidationIsComplete = promptManager?.apiSettingsViewModel?
+            .isContextBuilderProviderValidationComplete == true
+        let verifiedTargetsAreUnavailable = providerValidationIsComplete
+            && backendReadiness?.isReady == true
+            && !modelRouterCanRoutePrimarySession(configuration)
+        if credentialIsDefinitivelyMissing || verifiedTargetsAreUnavailable {
+            modelRouterSettingsStore.setModelRouterEnabled(false)
+        }
+        syncAllActiveUIState()
     }
 
     func toggleGlobalModelRouter() {
@@ -56,7 +83,7 @@ extension AgentModeViewModel {
         else { return }
         guard (try? AgentTaskRoutingCandidateBuilder().build(
             allowedProviders: providers(for: .primarySession, configuration: configuration),
-            availability: agentAvailabilityContext
+            availability: modelRouterAvailabilityContext
         )) != nil else { return }
         modelRouterSettingsStore.setModelRouterEnabled(true)
         syncAllActiveUIState()
@@ -72,7 +99,9 @@ extension AgentModeViewModel {
     }
 
     func isGlobalModelRouterControllingFreshTask(_ session: TabSession) -> Bool {
-        modelRouterSettingsStore.modelRouterConfiguration().enabled
+        let configuration = modelRouterSettingsStore.modelRouterConfiguration()
+        return configuration.enabled
+            && modelRouterCanRoutePrimarySession(configuration)
             && freshTaskRoutingEligibility(session: session, text: nil)
     }
 
@@ -105,27 +134,22 @@ extension AgentModeViewModel {
         }
 
         let providers = providers(for: .primarySession, configuration: configuration)
-        guard let candidates = try? AgentTaskRoutingCandidateBuilder().build(
-            allowedProviders: providers,
-            availability: agentAvailabilityContext
-        ) else {
-            return .blocked(message: "The configured Router policy has no available primary-session targets.")
+        let routeTask = Task {
+            await routeModelThenEffort(
+                requestID: claim.attempt.id,
+                text: text,
+                scope: .primarySession,
+                surface: .general,
+                providers: providers,
+                configuration: configuration,
+                backendID: backendID,
+                runtime: runtime
+            )
         }
-        let request = candidates.count > 1 ? try? AgentTaskRoutingEnvelopeBuilder().build(
-            requestID: claim.attempt.id,
-            text: text,
-            scope: .primarySession,
-            customInstructions: configuration.customInstructions,
-            candidates: candidates.map(\.descriptor)
-        ) : nil
-
-        let outcome: AgentTaskRoutingBackendOutcome
-        if let request {
-            let routeTask = Task {
-                await runtime.coordinator.route(backendID: backendID, request: request)
-            }
+        let stagedResult: StagedTaskRoutingResult
+        do {
             let ownership = FreshTaskRoutingOwnership(
-                requestID: request.requestID,
+                requestID: claim.attempt.id,
                 sourceTabID: claim.attempt.sourceTabID,
                 destinationTabID: destinationTabID,
                 task: routeTask
@@ -134,23 +158,21 @@ extension AgentModeViewModel {
                   freshTaskRoutingByTabID[ownership.destinationTabID] == nil
             else {
                 routeTask.cancel()
-                await runtime.coordinator.cancel(requestID: request.requestID)
+                await runtime.coordinator.cancel(requestID: claim.attempt.id)
                 return .blocked(message: "Model routing is already in progress for this task.")
             }
             freshTaskRoutingByTabID[ownership.sourceTabID] = ownership
             freshTaskRoutingByTabID[ownership.destinationTabID] = ownership
             syncComposerUIState()
             syncStatusPillsUIState()
-            outcome = await routeTask.value
+            stagedResult = await routeTask.value
             guard ownsFreshTaskRouting(ownership) else {
                 return .blocked(message: "Model routing was cancelled.")
             }
             clearFreshTaskRoutingOwnership(ownership)
-        } else if let only = candidates.first {
-            outcome = .selected(opaqueKey: only.opaqueKey, evidence: nil)
-        } else {
-            return .blocked(message: "The configured Router policy has no available primary-session targets.")
         }
+        let candidates = stagedResult.candidates
+        let outcome = stagedResult.outcome
 
         let currentConfiguration = modelRouterSettingsStore.modelRouterConfiguration()
         guard composerSubmitClaimIsCurrent(claim),
@@ -209,32 +231,22 @@ extension AgentModeViewModel {
               let backendID = configuration.selectedBackendID,
               runtime.isBackendReady(backendID)
         else { throw GlobalModelRoutingError.unavailable }
-        let candidates = try AgentTaskRoutingCandidateBuilder().build(
-            allowedProviders: providers(for: .subagent, configuration: configuration),
-            availability: agentAvailabilityContext,
-            surface: surface
-        )
-        guard let first = candidates.first else { throw GlobalModelRoutingError.noTargets }
-        guard candidates.count > 1 else {
-            guard modelRouterConfigurationIsCurrent(configuration, backendID: backendID) else {
-                throw GlobalModelRoutingError.stale
-            }
-            return first.target
-        }
-        let request = try AgentTaskRoutingEnvelopeBuilder().build(
+        let result = await routeModelThenEffort(
             requestID: UUID(),
             text: task,
             scope: .subagent,
-            customInstructions: configuration.customInstructions,
-            candidates: candidates.map(\.descriptor)
+            surface: surface,
+            providers: providers(for: .subagent, configuration: configuration),
+            configuration: configuration,
+            backendID: backendID,
+            runtime: runtime
         )
-        let outcome = await runtime.coordinator.route(backendID: backendID, request: request)
         guard modelRouterConfigurationIsCurrent(configuration, backendID: backendID) else {
             throw GlobalModelRoutingError.stale
         }
-        switch outcome {
+        switch result.outcome {
         case let .selected(opaqueKey, _):
-            guard let selected = candidates.only(where: { $0.opaqueKey == opaqueKey }) else {
+            guard let selected = result.candidates.only(where: { $0.opaqueKey == opaqueKey }) else {
                 throw GlobalModelRoutingError.failed
             }
             return selected.target
@@ -243,6 +255,85 @@ extension AgentModeViewModel {
         case .abstained, .failed:
             throw GlobalModelRoutingError.failed
         }
+    }
+
+    private func routeModelThenEffort(
+        requestID: UUID,
+        text: String,
+        scope: AgentTaskRoutingScope,
+        surface: AgentModelCatalog.AgentSelectionSurface,
+        providers: Set<AgentProviderKind>,
+        configuration: AgentTaskRouterConfiguration,
+        backendID: AgentTaskRouterBackendID,
+        runtime: AgentTaskRouterRuntime
+    ) async -> StagedTaskRoutingResult {
+        let builder = AgentTaskRoutingCandidateBuilder()
+        guard let models = try? builder.build(
+            allowedProviders: providers,
+            availability: modelRouterAvailabilityContext,
+            surface: surface,
+            roleDefaults: agentModelRoleDefaultReferences()
+        ), let firstModel = models.first else {
+            return StagedTaskRoutingResult(
+                candidates: [],
+                outcome: .failed(category: .invalidRequest, retryable: false, evidence: nil)
+            )
+        }
+
+        let selectedModel: AgentTaskRoutingCandidateBuilder.Candidate
+        if models.count == 1 {
+            selectedModel = firstModel
+        } else {
+            guard let modelRequest = try? AgentTaskRoutingEnvelopeBuilder().build(
+                requestID: requestID,
+                text: text,
+                scope: scope,
+                decisionStage: .model,
+                customInstructions: configuration.customInstructions,
+                candidates: models.map(\.descriptor)
+            ) else {
+                return StagedTaskRoutingResult(
+                    candidates: models,
+                    outcome: .failed(category: .invalidRequest, retryable: false, evidence: nil)
+                )
+            }
+            let modelOutcome = await runtime.coordinator.route(backendID: backendID, request: modelRequest)
+            guard case let .selected(modelKey, _) = modelOutcome,
+                  let match = models.only(where: { $0.opaqueKey == modelKey })
+            else { return StagedTaskRoutingResult(candidates: models, outcome: modelOutcome) }
+            selectedModel = match
+        }
+
+        guard let efforts = try? builder.buildEfforts(
+            for: selectedModel,
+            availability: modelRouterAvailabilityContext
+        ), let firstEffort = efforts.first else {
+            return StagedTaskRoutingResult(
+                candidates: models,
+                outcome: .failed(category: .invalidRequest, retryable: false, evidence: nil)
+            )
+        }
+        guard efforts.count > 1 else {
+            return StagedTaskRoutingResult(
+                candidates: efforts,
+                outcome: .selected(opaqueKey: firstEffort.opaqueKey, evidence: nil)
+            )
+        }
+        guard let effortRequest = try? AgentTaskRoutingEnvelopeBuilder().build(
+            requestID: requestID,
+            text: text,
+            scope: scope,
+            decisionStage: .effort,
+            customInstructions: configuration.customInstructions,
+            candidates: efforts.map(\.descriptor)
+        ) else {
+            return StagedTaskRoutingResult(
+                candidates: efforts,
+                outcome: .failed(category: .invalidRequest, retryable: false, evidence: nil)
+            )
+        }
+        let effortOutcome = await runtime.coordinator.route(backendID: backendID, request: effortRequest)
+        return StagedTaskRoutingResult(candidates: efforts, outcome: effortOutcome)
     }
 
     private func modelRouterConfigurationIsCurrent(
@@ -264,15 +355,31 @@ extension AgentModeViewModel {
         case .subagent: configuration.subagentProvider
         }
         let available = AgentTaskRoutingCandidateBuilder.availableProviders(
-            availability: agentAvailabilityContext,
+            availability: modelRouterAvailabilityContext,
             surface: scope == .subagent ? .headless : .general
         )
-        guard let limit else { return available }
-        return available.intersection([limit])
+        return AgentTaskRoutingCandidateBuilder.providers(
+            preferring: limit,
+            from: available
+        )
+    }
+
+    private func agentModelRoleDefaultReferences() -> [AgentTaskRoutingCandidateBuilder.RoleDefaultReference] {
+        MCPAgentRoleDefaultsService.resolutions(
+            availability: modelRouterAvailabilityContext,
+            workspaceID: workspaceManager?.activeWorkspaceID
+        ).map { resolution in
+            AgentTaskRoutingCandidateBuilder.RoleDefaultReference(
+                roleLabel: resolution.roleLabel,
+                provider: resolution.effective.agent,
+                modelRaw: resolution.effective.modelRaw,
+                isUserOverride: resolution.hasStoredOverride
+            )
+        }
     }
 
     private func freshTaskRoutingEligibility(session: TabSession, text: String?) -> Bool {
-        guard isFreshFirstSendDestination(session),
+        guard isModelRouterEligibleFirstSendDestination(session),
               session.providerSessionID == nil,
               session.codexConversationID == nil,
               session.mcpControlContext == nil,
@@ -283,6 +390,30 @@ extension AgentModeViewModel {
         guard let text else { return true }
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         return !trimmed.isEmpty && !trimmed.hasPrefix("/")
+    }
+
+    /// Selected prompt workflows still create a brand-new provider session and therefore remain
+    /// Router-owned. The broader first-send helper excludes workflows because it also guards tab
+    /// creation and cleanup, where an empty destination must not yet carry copied pending state.
+    private func isModelRouterEligibleFirstSendDestination(_ session: TabSession) -> Bool {
+        !session.runState.isActive
+            && !session.hasSentFirstMessage
+            && session.runID == nil
+            && session.activeRunAttemptID == nil
+            && session.items.isEmpty
+            && session.transcript.turns.isEmpty
+            && session.pendingImageAttachments.isEmpty
+            && session.pendingTaggedFileAttachments.isEmpty
+    }
+
+    private func modelRouterCanRoutePrimarySession(_ configuration: AgentTaskRouterConfiguration) -> Bool {
+        guard let backendID = configuration.selectedBackendID,
+              modelRouterRuntime?.isBackendReady(backendID) == true
+        else { return false }
+        return (try? AgentTaskRoutingCandidateBuilder().build(
+            allowedProviders: providers(for: .primarySession, configuration: configuration),
+            availability: modelRouterAvailabilityContext
+        )) != nil
     }
 
     private func executableTarget(for session: TabSession) -> AgentRoutingExecutableTarget {
@@ -296,13 +427,15 @@ extension AgentModeViewModel {
 
     private func applyRoutingTarget(_ target: AgentRoutingExecutableTarget, to session: TabSession) -> Bool {
         guard let agent = AgentProviderKind(rawValue: target.agentRaw),
-              AgentModelCatalog.isAgentAvailable(agent, availability: agentAvailabilityContext)
+              AgentModelCatalog.isAgentAvailable(agent, availability: modelRouterAvailabilityContext)
         else { return false }
         session.selectedAgent = agent
         session.selectedModelRaw = target.modelRaw
         session.selectedReasoningEffortRaw = target.reasoningEffortRaw
         session.acpModelParameterSelections = target.modelParameters
-        if session.tabID == currentTabID { applySessionToBindings(session) }
+        if session.tabID == currentTabID {
+            applySessionToBindings(session)
+        }
         return executableTarget(for: session) == target
     }
 
@@ -312,7 +445,9 @@ extension AgentModeViewModel {
         session.selectedModelRaw = rollback.target.modelRaw
         session.selectedReasoningEffortRaw = rollback.target.reasoningEffortRaw
         session.acpModelParameterSelections = rollback.target.modelParameters
-        if session.tabID == currentTabID { applySessionToBindings(session) }
+        if session.tabID == currentTabID {
+            applySessionToBindings(session)
+        }
     }
 
     private func ownsFreshTaskRouting(_ ownership: FreshTaskRoutingOwnership) -> Bool {

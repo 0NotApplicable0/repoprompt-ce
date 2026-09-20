@@ -32,6 +32,22 @@ final class RouterSettingsViewModel: ObservableObject {
         }
     }
 
+    struct UnavailableProviderPreference: Identifiable, Equatable {
+        let scope: AgentTaskRoutingScope
+        let provider: AgentProviderKind
+
+        var id: String {
+            "\(scope.rawValue):\(provider.rawValue)"
+        }
+
+        var scopeDescription: String {
+            switch scope {
+            case .primarySession: "primary sessions"
+            case .subagent: "subagents"
+            }
+        }
+    }
+
     @Published private(set) var backendOptions: [BackendOption] = []
     @Published private(set) var configuration: AgentTaskRouterConfiguration
     @Published private(set) var readiness: AgentTaskRouterBackendReadiness
@@ -62,7 +78,7 @@ final class RouterSettingsViewModel: ObservableObject {
         self.settingsStore = settingsStore
         self.runtime = runtime
         self.apiSettingsViewModel = apiSettingsViewModel
-        self.availabilityProvider = availabilityProvider ?? { apiSettingsViewModel.agentAvailability }
+        self.availabilityProvider = availabilityProvider ?? { apiSettingsViewModel.modelRouterAvailabilityContext }
         self.workspaceManager = workspaceManager
         configuration = settingsStore.modelRouterConfiguration()
         readiness = .needsConfiguration(generation: 0, reason: "Select and configure a routing backend.")
@@ -75,6 +91,13 @@ final class RouterSettingsViewModel: ObservableObject {
             .receive(on: RunLoop.main)
             .sink { [weak self] _ in self?.scheduleRefresh() }
             .store(in: &cancellables)
+        Publishers.CombineLatest(
+            apiSettingsViewModel.$contextBuilderVerifiedCLIProviders,
+            apiSettingsViewModel.$isContextBuilderProviderValidationComplete
+        )
+        .receive(on: RunLoop.main)
+        .sink { [weak self] _ in self?.scheduleRefresh() }
+        .store(in: &cancellables)
         workspaceManager.$activeWorkspaceID
             .removeDuplicates()
             .receive(on: RunLoop.main)
@@ -105,6 +128,23 @@ final class RouterSettingsViewModel: ObservableObject {
 
     var distinctTargetCount: Int {
         Set(targetPreviews.map(\.target)).count
+    }
+
+    var unavailableProviderPreferences: [UnavailableProviderPreference] {
+        [
+            configuration.primaryProvider.map {
+                UnavailableProviderPreference(scope: .primarySession, provider: $0)
+            },
+            configuration.subagentProvider.map {
+                UnavailableProviderPreference(scope: .subagent, provider: $0)
+            }
+        ]
+        .compactMap(\.self)
+        .filter { !availableProviders.contains($0.provider) }
+    }
+
+    func providerIsAvailable(_ provider: AgentProviderKind) -> Bool {
+        availableProviders.contains(provider)
     }
 
     func providerLimit(for scope: AgentTaskRoutingScope) -> AgentProviderKind? {
@@ -247,6 +287,13 @@ final class RouterSettingsViewModel: ObservableObject {
                     guard self?.observedBackendID == registration.id,
                           self?.settingsStore.modelRouterConfiguration().selectedBackendID == registration.id else { return }
                     self?.readiness = snapshot
+                    if case let .needsConfiguration(generation, _) = snapshot,
+                       generation > 0,
+                       self?.settingsStore.modelRouterConfiguration().enabled == true
+                    {
+                        self?.settingsStore.setModelRouterEnabled(false)
+                        self?.synchronizeConfiguration()
+                    }
                 }
             }
         }
@@ -285,12 +332,15 @@ final class RouterSettingsViewModel: ObservableObject {
                 target: candidate.target
             )
         }
-        let limitedProviders = Set(
-            [configuration.primaryProvider, configuration.subagentProvider]
-                .compactMap(\.self)
-        )
         policyCanBuildCandidates = !targetPreviews.isEmpty
-            && limitedProviders.isSubset(of: Set(targetPreviews.map(\.provider)))
+        if configuration.enabled,
+           apiSettingsViewModel.isContextBuilderProviderValidationComplete,
+           readiness.isReady,
+           !policyCanBuildCandidates
+        {
+            settingsStore.setModelRouterEnabled(false)
+            configuration = settingsStore.modelRouterConfiguration()
+        }
     }
 
     static func effectiveRoles(

@@ -301,9 +301,10 @@ final class KeychainServiceTests: XCTestCase {
             KeychainService.localSelfSignedServiceName(fingerprint: fingerprintA, generation: 1),
             KeychainService.localSelfSignedServiceName(fingerprint: fingerprintA, generation: 2),
             KeychainService.localSelfSignedServiceName(fingerprint: fingerprintB, generation: 1),
-            KeychainService.debugServiceName
+            KeychainService.debugServiceName,
+            KeychainService.appleDevelopmentDebugServiceName(teamIdentifier: "9S455R5DTM")
         ])
-        XCTAssertEqual(names.count, 8)
+        XCTAssertEqual(names.count, 9)
 
         let fake = FakeSecItemClient { _, _ in errSecItemNotFound }
         let legacy = KeychainService.legacyRepairSource(secItemClient: fake)

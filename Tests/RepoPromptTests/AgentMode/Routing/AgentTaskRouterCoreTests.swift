@@ -98,7 +98,15 @@ final class AgentTaskRouterCoreTests: XCTestCase {
         XCTAssertEqual(request.task, "diagnose this")
         XCTAssertEqual(request.contractVersion, AgentTaskRoutingRequest.currentContractVersion)
         XCTAssertEqual(request.scope, .subagent)
+        XCTAssertEqual(request.decisionStage, .model)
         XCTAssertEqual(request.customInstructions, "Prefer Claude for execution.")
+        let effortRequest = try AgentTaskRoutingEnvelopeBuilder().build(
+            requestID: UUID(),
+            text: "diagnose this",
+            decisionStage: .effort,
+            candidates: candidates
+        )
+        XCTAssertEqual(effortRequest.decisionStage, .effort)
         XCTAssertThrowsError(try AgentTaskRoutingEnvelopeBuilder().build(
             requestID: UUID(), text: String(repeating: "a", count: 4001), candidates: candidates
         )) { XCTAssertEqual($0 as? AgentTaskRoutingEnvelopeBuilder.Rejection, .tooManyCharacters) }
@@ -278,18 +286,17 @@ final class AgentTaskRouterCoreTests: XCTestCase {
 
         let request = await client.lastRequest
         XCTAssertEqual(request?.model, JevRouterCredentialService.pinnedModel)
-        XCTAssertEqual(request?.state, "task")
+        XCTAssertEqual(request?.state, "HIGHEST-PRIORITY USER ROUTING DIRECTIVE:\nPrefer b.\n\nTASK:\ntask")
         XCTAssertEqual(request?.questions["route"]?.criteria, [
             "a": "Provider: Test; model: a. Suitable work: rubric",
             "b": "Provider: Test; model: b. Suitable work: rubric"
         ])
         XCTAssertTrue(request?.questions["route"]?.instructions.contains("delegated subagent session") == true)
         XCTAssertTrue(request?.questions["route"]?.instructions.contains("Prefer b.") == true)
-        XCTAssertTrue(request?.questions["route"]?.instructions.contains("best expected utility") == true)
-        XCTAssertTrue(request?.questions["route"]?.instructions.contains("ask avoidable questions") == true)
-        XCTAssertTrue(request?.questions["route"]?.instructions.contains("Do not over-weight the first verb") == true)
-        XCTAssertTrue(request?.questions["route"]?.instructions.contains("guidance is authoritative") == true)
-        XCTAssertFalse(request?.questions["route"]?.instructions.contains("least expensive target") == true)
+        XCTAssertTrue(request?.questions["route"]?.instructions.hasPrefix("HIGHEST-PRIORITY USER ROUTING DIRECTIVE: Prefer b.") == true)
+        XCTAssertTrue(request?.questions["route"]?.instructions.contains("Choose the model first") == true)
+        XCTAssertTrue(request?.questions["route"]?.instructions.contains("No candidate is the ordinary default") == true)
+        XCTAssertTrue(request?.questions["route"]?.instructions.contains("Code and pull-request review") == true)
     }
 
     func testJevBackendRejectsDuplicateOpaqueKeysWithoutCallingService() async {
@@ -419,12 +426,16 @@ private actor BootstrapCountingSettingsController: AgentTaskRouterBackendSetting
     func cancelAndAdvanceGeneration() {}
 
     func waitUntilObserved() async {
-        if observed { return }
+        if observed {
+            return
+        }
         await withCheckedContinuation { observationWaiters.append($0) }
     }
 
     func waitUntilBootstrapped() async {
-        if bootstrapCount > 0 { return }
+        if bootstrapCount > 0 {
+            return
+        }
         await withCheckedContinuation { bootstrapWaiters.append($0) }
     }
 }
@@ -468,7 +479,9 @@ private actor LateCompletionBackend: AgentTaskRouterBackend {
     }
 
     func waitUntilStarted() async {
-        if started { return }
+        if started {
+            return
+        }
         await withCheckedContinuation { startWaiters.append($0) }
     }
 
@@ -501,7 +514,9 @@ private actor SuspendedReadinessBackend: AgentTaskRouterBackend {
     }
 
     func waitUntilReadinessStarted() async {
-        if started { return }
+        if started {
+            return
+        }
         await withCheckedContinuation { waiters.append($0) }
     }
 }
@@ -524,14 +539,16 @@ private actor NeverCompletingRouteBackend: AgentTaskRouterBackend {
     }
 
     func waitUntilStarted() async {
-        if started { return }
+        if started {
+            return
+        }
         await withCheckedContinuation { waiters.append($0) }
     }
 }
 
 @MainActor
 final class AgentTaskRoutingCandidateBuilderPolicyTests: XCTestCase {
-    func testCandidateDescriptionsIncludeAuditedCapabilityPricingAndEffortEvidence() throws {
+    func testModelCandidatesIncludeAuditedCapabilityAndPricingWithoutPreselectedEffort() throws {
         let availability = AgentModelCatalog.AvailabilityContext(
             claudeCodeAvailable: true,
             codexAvailable: true,
@@ -546,22 +563,23 @@ final class AgentTaskRoutingCandidateBuilderPolicyTests: XCTestCase {
         let lunaCandidate = try XCTUnwrap(candidates.first(where: {
             CodexModelSpecifier(raw: $0.target.modelRaw).baseModel == "gpt-5.6-luna"
         }))
-        XCTAssertEqual(lunaCandidate.utilityTier, "economy")
+        XCTAssertEqual(lunaCandidate.utilityTier, "gpt-5.6-luna")
         XCTAssertTrue(lunaCandidate.descriptor.targetDescription.contains("nano-tier"))
         XCTAssertTrue(lunaCandidate.descriptor.targetDescription.contains("$0.20 input / $1.20 output"))
-        XCTAssertTrue(lunaCandidate.descriptor.targetDescription.contains("Effort: low"))
+        XCTAssertNil(lunaCandidate.target.reasoningEffortRaw)
+        XCTAssertFalse(lunaCandidate.descriptor.targetDescription.contains("Effort:"))
         XCTAssertEqual(lunaCandidate.descriptor.rubricVersion, "rpce.automatic-utility-frontier.v1-evidence-2026-09-19")
 
         let fableCandidate = try XCTUnwrap(candidates.first(where: {
             ClaudeModelSpecifier(raw: $0.target.modelRaw).baseModel == AgentModel.claudeFable51.rawValue
         }))
-        XCTAssertEqual(fableCandidate.utilityTier, "frontier")
+        XCTAssertEqual(fableCandidate.utilityTier, "claude-fable")
         XCTAssertTrue(fableCandidate.descriptor.targetDescription.contains("Terminal-Bench 4.0"))
         XCTAssertTrue(fableCandidate.descriptor.targetDescription.contains("$10 input / $50 output"))
-        XCTAssertTrue(fableCandidate.descriptor.targetDescription.contains("Effort: high"))
+        XCTAssertNil(fableCandidate.target.reasoningEffortRaw)
     }
 
-    func testAutomaticFrontierIgnoresManualRoleAssignmentsAndCoversUtilityTiers() throws {
+    func testAutomaticModelCandidatesCoverAvailableBaseModelsWithoutTierDefaults() throws {
         let availability = AgentModelCatalog.AvailabilityContext(
             claudeCodeAvailable: true,
             codexAvailable: true,
@@ -573,7 +591,9 @@ final class AgentTaskRoutingCandidateBuilderPolicyTests: XCTestCase {
             availability: availability
         )
 
-        XCTAssertEqual(Set(candidates.map(\.utilityTier)), ["economy", "balanced", "strong", "frontier"])
+        XCTAssertTrue(Set(candidates.map(\.utilityTier)).isSuperset(of: [
+            "gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-sol"
+        ]))
         XCTAssertEqual(Set(candidates.map(\.target.agentRaw)), [
             AgentProviderKind.claudeCode.rawValue,
             AgentProviderKind.codexExec.rawValue
@@ -581,6 +601,53 @@ final class AgentTaskRoutingCandidateBuilderPolicyTests: XCTestCase {
         XCTAssertFalse(candidates.contains { $0.descriptor.roleLabels.contains("explore") })
         XCTAssertGreaterThan(candidates.count, 4)
         XCTAssertLessThanOrEqual(candidates.count, AgentTaskRoutingEnvelopeBuilder.maximumCandidates)
+    }
+
+    func testEffortCandidatesAreBuiltOnlyAfterModelSelection() throws {
+        let availability = AgentModelCatalog.AvailabilityContext(
+            claudeCodeAvailable: true,
+            codexAvailable: true,
+            openCodeAvailable: false
+        )
+        let builder = AgentTaskRoutingCandidateBuilder()
+        let model = try XCTUnwrap(builder.build(
+            allowedProviders: [.codexExec],
+            availability: availability
+        ).first(where: { $0.target.modelRaw == "gpt-5.6-sol" }))
+
+        let efforts = try builder.buildEfforts(for: model, availability: availability)
+
+        XCTAssertGreaterThan(efforts.count, 1)
+        XCTAssertTrue(efforts.allSatisfy {
+            CodexModelSpecifier(raw: $0.target.modelRaw).baseModel == model.target.modelRaw
+        })
+        XCTAssertTrue(Set(efforts.compactMap(\.target.reasoningEffortRaw)).contains("high"))
+    }
+
+    func testAgentModelDefaultsAreReferenceSignalsWithoutRestrictingCandidates() throws {
+        let availability = AgentModelCatalog.AvailabilityContext(
+            claudeCodeAvailable: true,
+            codexAvailable: true,
+            openCodeAvailable: false
+        )
+        let candidates = try AgentTaskRoutingCandidateBuilder().build(
+            allowedProviders: [.claudeCode, .codexExec],
+            availability: availability,
+            roleDefaults: [
+                .init(
+                    roleLabel: "Engineer",
+                    provider: .codexExec,
+                    modelRaw: "gpt-5.6-sol-high",
+                    isUserOverride: true
+                )
+            ]
+        )
+
+        XCTAssertGreaterThan(candidates.count, 1)
+        let sol = try XCTUnwrap(candidates.first(where: { $0.target.modelRaw == "gpt-5.6-sol" }))
+        XCTAssertTrue(sol.descriptor.targetDescription.contains("Engineer (user-set)"))
+        XCTAssertTrue(sol.descriptor.targetDescription.contains("not constraints or automatic choices"))
+        XCTAssertTrue(candidates.contains { $0.target.modelRaw == "gpt-5.6-terra" })
     }
 
     func testUnknownModelEvidenceMakesCapabilityAndCostUncertaintyExplicit() {
@@ -610,6 +677,26 @@ final class AgentTaskRoutingCandidateBuilderPolicyTests: XCTestCase {
 
         XCTAssertFalse(candidates.isEmpty)
         XCTAssertTrue(candidates.allSatisfy { $0.target.agentRaw == AgentProviderKind.claudeCode.rawValue })
+    }
+
+    func testAvailableProviderPreferenceNarrowsFrontier() {
+        XCTAssertEqual(
+            AgentTaskRoutingCandidateBuilder.providers(
+                preferring: .claudeCode,
+                from: [.claudeCode, .codexExec]
+            ),
+            [.claudeCode]
+        )
+    }
+
+    func testUnavailableProviderPreferenceFallsBackToAuthenticatedProviders() {
+        XCTAssertEqual(
+            AgentTaskRoutingCandidateBuilder.providers(
+                preferring: .claudeCode,
+                from: [.codexExec]
+            ),
+            [.codexExec]
+        )
     }
 
     func testUnavailableProviderPolicyFailsClosed() {

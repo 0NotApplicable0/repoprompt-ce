@@ -40,9 +40,13 @@ final class AgentTaskRouterRuntime: ObservableObject {
     }
 
     func isBackendReady(_ id: AgentTaskRouterBackendID) -> Bool {
+        backendReadiness(id)?.isReady == true
+    }
+
+    func backendReadiness(_ id: AgentTaskRouterBackendID) -> AgentTaskRouterBackendReadiness? {
         readinessLock.lock()
         defer { readinessLock.unlock() }
-        return readinessByBackendID[id]?.isReady == true
+        return readinessByBackendID[id]
     }
 
     func cancelAll() {

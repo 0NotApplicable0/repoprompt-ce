@@ -191,6 +191,38 @@ extension AgentComposerSubmissionAttemptTests {
         XCTAssertEqual(session.selectedModelRaw, AgentModel.claudeHaiku.rawValue)
     }
 
+    func testGlobalRouterOwnsFreshTaskWithSelectedPromptWorkflow() throws {
+        let backend = ComposerRoutingBackend(outcome: .selectLast)
+        let (viewModel, _) = try makeRoutingViewModel(backend: backend)
+        let tabID = UUID()
+        viewModel.test_setCurrentTabIDOverride(tabID)
+        let session = viewModel.session(for: tabID)
+        session.selectedWorkflow = AgentWorkflowDefinition(
+            customID: UUID(),
+            displayName: "Worktree Orchestrate",
+            template: "$ARGUMENTS"
+        )
+
+        let props = viewModel.makeComposerProps(tabID: tabID)
+
+        XCTAssertTrue(props.isGlobalModelRouterControllingFreshTask)
+        XCTAssertTrue(props.areModelControlsDisabled)
+    }
+
+    func testDefinitiveMissingRouterCredentialDisablesPersistedEnablement() throws {
+        let backend = ComposerRoutingBackend(
+            outcome: .selectLast,
+            readiness: .needsConfiguration(generation: 1, reason: "Validate a TypeSafe API key.")
+        )
+        let (viewModel, store) = try makeRoutingViewModel(backend: backend)
+        XCTAssertTrue(store.modelRouterConfiguration().enabled)
+
+        viewModel.handleModelRouterRuntimeChanged()
+
+        XCTAssertFalse(store.modelRouterConfiguration().enabled)
+        XCTAssertFalse(viewModel.modelRouterPillProps().isOn)
+    }
+
     func testFakeReadyRouterCommitsSelectedExecutableTargetAtSubmitBoundary() async throws {
         let backend = ComposerRoutingBackend(outcome: .selectLast)
         let (viewModel, store) = try makeRoutingViewModel(backend: backend)
@@ -263,11 +295,12 @@ extension AgentComposerSubmissionAttemptTests {
         )
 
         XCTAssertNotNil(selected)
-        let request = await backend.lastRequest
-        XCTAssertEqual(request?.scope, .subagent)
-        XCTAssertEqual(request?.customInstructions, "Prefer Claude Opus for execution.")
-        XCTAssertEqual(request?.task, "Implement the parser and tests")
-        XCTAssertTrue(request?.candidates.allSatisfy { !$0.targetDescription.isEmpty } == true)
+        let requests = await backend.requests
+        XCTAssertEqual(requests.map(\.decisionStage), [.model, .effort])
+        XCTAssertTrue(requests.allSatisfy { $0.scope == .subagent })
+        XCTAssertTrue(requests.allSatisfy { $0.customInstructions == "Prefer Claude Opus for execution." })
+        XCTAssertTrue(requests.allSatisfy { $0.task == "Implement the parser and tests" })
+        XCTAssertTrue(requests.allSatisfy { $0.candidates.allSatisfy { !$0.targetDescription.isEmpty } })
     }
 
     func testNewDestinationOwnsVisibleCancelAndRejectsSecondSubmit() async throws {
@@ -381,18 +414,25 @@ private actor ComposerRoutingBackend: AgentTaskRouterBackend {
     nonisolated let id = AgentTaskRouterBackendID(rawValue: "composer-fake")
     nonisolated let displayName = "Composer fake"
     let outcome: Outcome
+    let readiness: AgentTaskRouterBackendReadiness
     private(set) var lastRequest: AgentTaskRoutingRequest?
+    private(set) var requests: [AgentTaskRoutingRequest] = []
 
-    init(outcome: Outcome) {
+    init(
+        outcome: Outcome,
+        readiness: AgentTaskRouterBackendReadiness = .ready(generation: 1, policyVersion: "fake-v1")
+    ) {
         self.outcome = outcome
+        self.readiness = readiness
     }
 
     func readinessSnapshot() -> AgentTaskRouterBackendReadiness {
-        .ready(generation: 1, policyVersion: "fake-v1")
+        readiness
     }
 
     func route(_ request: AgentTaskRoutingRequest) -> AgentTaskRoutingBackendOutcome {
         lastRequest = request
+        requests.append(request)
         return switch outcome {
         case .selectLast:
             .selected(opaqueKey: request.candidates[request.candidates.count - 1].opaqueKey, evidence: nil)
@@ -421,7 +461,9 @@ private actor SuspendedComposerRoutingBackend: AgentTaskRouterBackend {
     }
 
     func waitUntilStarted() async {
-        if request != nil { return }
+        if request != nil {
+            return
+        }
         await withCheckedContinuation { startedWaiters.append($0) }
     }
 
