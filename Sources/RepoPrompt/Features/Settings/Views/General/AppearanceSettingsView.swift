@@ -50,6 +50,13 @@ struct AppearanceSettingsView: View {
         )
     }
 
+    private var orchestrationGraphEnabledBinding: Binding<Bool> {
+        Binding(
+            get: { globalSettings.orchestrationGraphEnabled() },
+            set: { globalSettings.setOrchestrationGraphEnabled($0) }
+        )
+    }
+
     private var experimentalAttributedTextEditorBinding: Binding<Bool> {
         Binding(
             get: { globalSettings.experimentalAttributedTextEditor() },
@@ -137,6 +144,12 @@ struct AppearanceSettingsView: View {
                             title: "Show dates in message timestamps",
                             description: "Add Yesterday, weekday, or date labels to message and tool timestamps.",
                             isOn: showDatesInMessageTimestampsBinding
+                        )
+
+                        SettingToggle(
+                            title: "Orchestration Graph",
+                            description: "Replaces separate one-workspace windows with a single orchestration graph of every workspace and Agent Mode session.",
+                            isOn: orchestrationGraphEnabledBinding
                         )
                     }
                 }
