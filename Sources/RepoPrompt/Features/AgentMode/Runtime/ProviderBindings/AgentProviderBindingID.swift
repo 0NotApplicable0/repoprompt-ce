@@ -8,9 +8,10 @@ enum AgentProviderBindingID: String, CaseIterable, Hashable {
     case antigravity
     case grok
     case grokBuild
+    case devin
 
     /// Keep grokBuild decodable without exposing retired agent permissions.
-    static let allCases: [AgentProviderBindingID] = [.codex, .claude, .openCode, .cursor, .antigravity, .grok]
+    static let allCases: [AgentProviderBindingID] = [.codex, .claude, .openCode, .cursor, .antigravity, .grok, .devin]
 
     var displayName: String {
         switch self {
@@ -28,6 +29,8 @@ enum AgentProviderBindingID: String, CaseIterable, Hashable {
             "Grok CLI"
         case .grokBuild:
             "Grok Build"
+        case .devin:
+            "Devin CLI"
         }
     }
 }
@@ -49,6 +52,8 @@ extension AgentProviderKind {
             .grok
         case .grokBuild:
             .grokBuild
+        case .devin:
+            .devin
         }
     }
 }

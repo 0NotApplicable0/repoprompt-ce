@@ -180,12 +180,28 @@ enum MCPRequestProgressContext {
     case direct(MCPRequestProgressState)
 }
 
+/// The server-error payload delivered to each outstanding JSON-RPC request before an
+/// accepted connection is closed for an unresponsive tool execution.
+///
+/// This is deliberately transport-level context. The handler which exceeded its
+/// deadline cannot be trusted to return a result, while other accepted requests on
+/// the same connection may not yet have reached a handler at all.
+struct MCPExecutionWatchdogTerminalContext {
+    let reason: String
+    let toolName: String
+    let handlerPhase: String
+    let invocationID: UUID
+
+    static let jsonRPCServerErrorCode = -32000
+    static let message = "MCP connection closed after unresponsive tool execution"
+}
+
 protocol MCPServerConnection: MCPDomainProgressTransport {
     func start(approvalHandler: @escaping (MCP.Client.Info) async -> Bool) async throws
     func stop() async
-    /// Immediately severs transport delivery for a tool execution that ignored cancellation.
-    /// This must not await handler/server shutdown.
-    func abortForExecutionWatchdog() async
+    /// Sends terminal JSON-RPC errors for outstanding requests, then severs delivery for
+    /// a tool execution that ignored cancellation. This must not await handler/server shutdown.
+    func abortForExecutionWatchdog(context: MCPExecutionWatchdogTerminalContext) async
     func notifyToolListChanged() async
     func connectionState() -> ConnectionStateSnapshot
     func isViableForRetention() -> Bool
@@ -710,7 +726,14 @@ actor ServerNetworkManager {
 
     private let bootstrapLifecycleTiming: MCPBootstrapLifecycleTiming
     private let bootstrapPeerPIDResolver: (@Sendable (Int32) -> Int?)?
-    private let domainHost: MCPDomainHost
+    private let defaultDomainHost: MCPDomainHost
+    private var domainHost: MCPDomainHost {
+        #if DEBUG
+            if let runtime = AppDomainRuntimeComposition.shared.runtimeForTesting { return runtime.domainHost }
+        #endif
+        return defaultDomainHost
+    }
+
     private var isRunningState: Bool = false
     private var lifecycleGeneration: UInt64 = 0
     private var isEnabledState: Bool = true
@@ -722,7 +745,7 @@ actor ServerNetworkManager {
     ) {
         self.bootstrapLifecycleTiming = bootstrapLifecycleTiming
         self.bootstrapPeerPIDResolver = bootstrapPeerPIDResolver
-        self.domainHost = domainHost
+        defaultDomainHost = domainHost
     }
 
     // Bootstrap socket server. Startup candidates remain separate until bind/listen and
@@ -1514,6 +1537,91 @@ actor ServerNetworkManager {
 
     private nonisolated let codeStructureSettlementRegistry = MCPCodeStructureSettlementRegistry()
     private nonisolated let toolCardOwnershipLedger = MCPToolCardOwnershipLedger()
+
+    /// The registry remains the lease owner. This actor keeps only the identity
+    /// of a warning projected into each window, so healthy calls do not hop to
+    /// the main actor just to inspect or redraw an absent notice.
+    private struct CodeStructureSettlementLimitNoticeProjection {
+        let generation: UInt64
+    }
+
+    private var nextCodeStructureSettlementLimitNoticeGeneration: UInt64 = 0
+    private var codeStructureSettlementLimitNoticeByWindowID: [Int: CodeStructureSettlementLimitNoticeProjection] = [:]
+
+    private func recordCodeStructureSettlementLimitNotice(
+        windowID: Int
+    ) -> CodeStructureSettlementLimitNoticeProjection {
+        nextCodeStructureSettlementLimitNoticeGeneration &+= 1
+        let projection = CodeStructureSettlementLimitNoticeProjection(
+            generation: nextCodeStructureSettlementLimitNoticeGeneration
+        )
+        codeStructureSettlementLimitNoticeByWindowID[windowID] = projection
+        return projection
+    }
+
+    /// Rechecks the registry immediately before UI publication. A stale busy
+    /// result never leaves a warning behind after the cap has recovered.
+    private func presentCodeStructureSettlementLimitNotice(
+        windowID: Int,
+        projection: CodeStructureSettlementLimitNoticeProjection
+    ) async {
+        let registry = codeStructureSettlementRegistry
+        let didPresent = await MainActor.run {
+            guard registry.hasReleasedProviderLimitBlockage(windowID: windowID) else {
+                // A newer projection may have replaced an already-visible warning
+                // before this main-actor hop. Tombstone-clearing this generation
+                // also dismisses that older visible projection without allowing
+                // either delayed presentation to reappear.
+                WindowStatesManager.shared.window(withID: windowID)?
+                    .mcpServer.clearCodeStructureSettlementLimitNotice(generation: projection.generation)
+                return false
+            }
+            WindowStatesManager.shared.window(withID: windowID)?
+                .mcpServer.presentCodeStructureSettlementLimitNotice(generation: projection.generation)
+            return true
+        }
+        guard !didPresent,
+              codeStructureSettlementLimitNoticeByWindowID[windowID]?.generation == projection.generation
+        else { return }
+        codeStructureSettlementLimitNoticeByWindowID.removeValue(forKey: windowID)
+    }
+
+    private func clearCodeStructureSettlementLimitNotice(
+        windowID: Int,
+        projection: CodeStructureSettlementLimitNoticeProjection
+    ) async {
+        await MainActor.run {
+            WindowStatesManager.shared.window(withID: windowID)?
+                .mcpServer.clearCodeStructureSettlementLimitNotice(generation: projection.generation)
+        }
+    }
+
+    /// An admission proves the registry allowed a new provider at that instant.
+    /// Recheck when this actor resumes so a newer blocker cannot lose its warning.
+    /// The ordinary no-warning path returns without a UI actor hop.
+    private func takeCodeStructureSettlementLimitNoticeAfterSuccessfulAdmission(
+        windowID: Int
+    ) -> CodeStructureSettlementLimitNoticeProjection? {
+        guard let projection = codeStructureSettlementLimitNoticeByWindowID[windowID],
+              !codeStructureSettlementRegistry.hasReleasedProviderLimitBlockage(windowID: windowID)
+        else { return nil }
+        codeStructureSettlementLimitNoticeByWindowID.removeValue(forKey: windowID)
+        return projection
+    }
+
+    /// A settlement clears its projection only when the registry's read-only
+    /// state says the released-provider cap no longer blocks the window. The
+    /// projection token fences delayed UI work; it is not an authority signal.
+    private func takeCodeStructureSettlementLimitNoticeAfterSettlement(
+        slot: MCPCodeStructureSettlementRegistry.Slot
+    ) -> CodeStructureSettlementLimitNoticeProjection? {
+        guard let projection = codeStructureSettlementLimitNoticeByWindowID[slot.windowID],
+              !codeStructureSettlementRegistry.hasReleasedProviderLimitBlockage(windowID: slot.windowID)
+        else { return nil }
+        codeStructureSettlementLimitNoticeByWindowID.removeValue(forKey: slot.windowID)
+        return projection
+    }
+
     #if DEBUG
         private var debugAfterDirectAdmissionPendingPublishedForTesting: (@Sendable (UUID) async -> Void)?
         private var debugAfterBootstrapPolicyReadinessForTesting: (@Sendable (String) async -> Void)?
@@ -3007,6 +3115,7 @@ actor ServerNetworkManager {
 
         // Window close authoritatively removes this bucket; deferred exact-ID completions are no-ops.
         removeActiveToolScopesForWindow(windowID)
+        codeStructureSettlementLimitNoticeByWindowID.removeValue(forKey: windowID)
 
         // Remove stale run→window cache entries for the closed window.
         let staleRunIDs = presentationWindowByRun.compactMap { runID, mappedWindowID in
@@ -6133,39 +6242,14 @@ actor ServerNetworkManager {
                                 )
                             }
                         #endif
-                        let readiness = await self.awaitAgentPolicyAdmissionIfNeeded(
+                        guard await self.completeApprovedAgentInitialization(
                             clientName: clientInfo.name,
                             bootstrapClientName: bootstrapClientName,
                             connectionID: connectionID,
-                            sessionKey: sessionToken,
-                            clientPid: clientPid
-                        )
-                        guard self.isCurrentConnection(connectionID, lifecycleGeneration: expectedLifecycleGeneration) else { return false }
-                        if readiness == .timedOut {
-                            self.pendingConnections.removeValue(forKey: connectionID)
-                            return false
-                        }
-
-                        let policyOutcome = await self.applyPendingPolicyIfAvailable(
-                            clientName: clientInfo.name,
-                            connectionID: connectionID,
+                            sessionToken: sessionToken,
                             clientPid: clientPid,
-                            bootstrapClientName: bootstrapClientName,
                             expectedLifecycleGeneration: expectedLifecycleGeneration
-                        )
-                        guard self.isCurrentConnection(connectionID, lifecycleGeneration: expectedLifecycleGeneration) else { return false }
-                        if case let .rejected(runID, reason) = policyOutcome {
-                            mcpPolicyLog(
-                                "rejected MCP initialize after pid-gated policy wait client=\(clientInfo.name) connection=\(connectionID) runID=\(runID?.uuidString ?? "nil") reason=\(reason)"
-                            )
-                            self.pendingConnections.removeValue(forKey: connectionID)
-                            return false
-                        }
-                        self.notifyConnectionWaiters(
-                            connectionID: connectionID,
-                            clientName: clientInfo.name,
-                            lifecycleGeneration: expectedLifecycleGeneration
-                        )
+                        ) else { return false }
 
                         // Do not block MCP initialize on window binding/readiness/cache warming.
                         // Policy admission and waiter notification are complete; finish catalog prep opportunistically.
@@ -7041,7 +7125,12 @@ actor ServerNetworkManager {
             #endif
         }
         guard let connection else { return }
-        await connection.abortForExecutionWatchdog()
+        await connection.abortForExecutionWatchdog(context: MCPExecutionWatchdogTerminalContext(
+            reason: closeContext.reason,
+            toolName: toolName,
+            handlerPhase: handlerPhase?.phase.rawValue ?? "unreported",
+            invocationID: invocationID
+        ))
         Task { [weak self] in
             await self?.removeConnection(id, context: closeContext)
         }
@@ -7653,6 +7742,83 @@ actor ServerNetworkManager {
         mutableArgs["window_id"] = .int(windowID)
         return mutableArgs
     }
+
+    /// Shared post-approval initialize sequence. Routing is still PID/run-admitted and lifecycle fenced.
+    private func completeApprovedAgentInitialization(
+        clientName: String,
+        bootstrapClientName: String?,
+        connectionID: UUID,
+        sessionToken: String,
+        clientPid: Int,
+        expectedLifecycleGeneration: UInt64
+    ) async -> Bool {
+        let readiness = await awaitAgentPolicyAdmissionIfNeeded(
+            clientName: clientName,
+            bootstrapClientName: bootstrapClientName,
+            connectionID: connectionID,
+            sessionKey: sessionToken,
+            clientPid: clientPid
+        )
+        guard isCurrentConnection(connectionID, lifecycleGeneration: expectedLifecycleGeneration) else { return false }
+        if readiness == .timedOut {
+            pendingConnections.removeValue(forKey: connectionID)
+            return false
+        }
+
+        let policyOutcome = await applyPendingPolicyIfAvailable(
+            clientName: clientName,
+            connectionID: connectionID,
+            clientPid: clientPid,
+            bootstrapClientName: bootstrapClientName,
+            expectedLifecycleGeneration: expectedLifecycleGeneration
+        )
+        guard isCurrentConnection(connectionID, lifecycleGeneration: expectedLifecycleGeneration) else { return false }
+        if case let .rejected(runID, reason) = policyOutcome {
+            mcpPolicyLog(
+                "rejected MCP initialize after pid-gated policy wait client=\(clientName) connection=\(connectionID) runID=\(runID?.uuidString ?? "nil") reason=\(reason)"
+            )
+            pendingConnections.removeValue(forKey: connectionID)
+            return false
+        }
+        notifyConnectionWaiters(
+            connectionID: connectionID,
+            clientName: clientName,
+            lifecycleGeneration: expectedLifecycleGeneration
+        )
+        return true
+    }
+
+    #if DEBUG
+        /// Socket fixtures substitute user approval only, never run routing or pending-policy admission.
+        func debugCompleteApprovedAgentInitialization(
+            clientName: String,
+            connectionID: UUID,
+            sessionToken: String,
+            clientPid: Int
+        ) async -> Bool {
+            guard let generation = connectionLifecycleGenerationByID[connectionID],
+                  isCurrentConnection(connectionID, lifecycleGeneration: generation)
+            else { return false }
+            // Direct socket fixtures do not pass through registerAndStartBootstrapConnection.
+            // Carry the registered transport's real peer identity; never synthesize verification.
+            guard let bootstrap = connections[connectionID] as? BootstrapSocketConnectionManager else { return false }
+            let observedPID = await bootstrap.peerPID()
+            let claimedPID = await bootstrap.claimedPID()
+            guard isCurrentConnection(connectionID, lifecycleGeneration: generation) else { return false }
+            bootstrapClaimedPIDByConnectionID[connectionID] = claimedPID
+            bootstrapObservedPeerPIDByConnectionID[connectionID] = observedPID
+            identityContextByConnection[connectionID] = ConnectionIdentityContext(
+                clientName: clientName, capabilityToken: sessionToken, source: .handshake,
+                hasHandshake: true, lastUpdated: Date()
+            )
+            bindSessionToken(sessionToken, to: connectionID)
+            return await completeApprovedAgentInitialization(
+                clientName: clientName, bootstrapClientName: clientName,
+                connectionID: connectionID, sessionToken: sessionToken, clientPid: clientPid,
+                expectedLifecycleGeneration: generation
+            )
+        }
+    #endif
 
     func registerExpectedAgentPID(_ pid: pid_t, for clientName: String, runID: UUID? = nil) {
         let storageKey = Self.clientStorageKey(clientName)
@@ -13307,6 +13473,14 @@ actor ServerNetworkManager {
                                             }
                                         ) {
                                         case let .admitted(slot):
+                                            if let noticeProjection = await self.takeCodeStructureSettlementLimitNoticeAfterSuccessfulAdmission(
+                                                windowID: windowID
+                                            ) {
+                                                await self.clearCodeStructureSettlementLimitNotice(
+                                                    windowID: windowID,
+                                                    projection: noticeProjection
+                                                )
+                                            }
                                             settlementAdmission = (.detachAndSettle, slot)
                                         case let .busy(context):
                                             throw MCPToolExecutionDispatchError.structureSettlementBusy(
@@ -13428,6 +13602,16 @@ actor ServerNetworkManager {
                                     @Sendable func recordSynchronousSettlement(
                                         _ providerSettlement: MCPToolExecutionSettlement
                                     ) async {
+                                        if let slot = settlementAdmission.slot,
+                                           let noticeProjection = await self.takeCodeStructureSettlementLimitNoticeAfterSettlement(
+                                               slot: slot
+                                           )
+                                        {
+                                            await self.clearCodeStructureSettlementLimitNotice(
+                                                windowID: slot.windowID,
+                                                projection: noticeProjection
+                                            )
+                                        }
                                         let outcome = providerSettlement.rawValue
                                         await emitExecutionTrace(.handlerCompleted, cancellationOutcome: outcome)
                                         EditFlowPerf.lifecycleEvent(
@@ -13455,6 +13639,16 @@ actor ServerNetworkManager {
                                     @Sendable func recordDetachedSettlement(
                                         _ providerSettlement: MCPToolExecutionSettlement
                                     ) async {
+                                        if let slot = settlementAdmission.slot,
+                                           let noticeProjection = await self.takeCodeStructureSettlementLimitNoticeAfterSettlement(
+                                               slot: slot
+                                           )
+                                        {
+                                            await self.clearCodeStructureSettlementLimitNotice(
+                                                windowID: slot.windowID,
+                                                projection: noticeProjection
+                                            )
+                                        }
                                         await emitExecutionTrace(
                                             .detachedSettled,
                                             cancellationRequested: true,
@@ -13491,6 +13685,16 @@ actor ServerNetworkManager {
                                     @Sendable func recordAbandonedSettlement(
                                         _ providerSettlement: MCPToolExecutionSettlement
                                     ) async {
+                                        if let slot = settlementAdmission.slot,
+                                           let noticeProjection = await self.takeCodeStructureSettlementLimitNoticeAfterSettlement(
+                                               slot: slot
+                                           )
+                                        {
+                                            await self.clearCodeStructureSettlementLimitNotice(
+                                                windowID: slot.windowID,
+                                                projection: noticeProjection
+                                            )
+                                        }
                                         await emitExecutionTrace(
                                             .handlerCompleted,
                                             cancellationRequested: true,
@@ -13510,6 +13714,16 @@ actor ServerNetworkManager {
                                     @Sendable func recordForceDisconnectedSettlement(
                                         _ providerSettlement: MCPToolExecutionSettlement
                                     ) async {
+                                        if let slot = settlementAdmission.slot,
+                                           let noticeProjection = await self.takeCodeStructureSettlementLimitNoticeAfterSettlement(
+                                               slot: slot
+                                           )
+                                        {
+                                            await self.clearCodeStructureSettlementLimitNotice(
+                                                windowID: slot.windowID,
+                                                projection: noticeProjection
+                                            )
+                                        }
                                         EditFlowPerf.lifecycleEvent(
                                             EditFlowPerf.Lifecycle.MCPToolCall.resolvedProviderEnded,
                                             correlation: lifecycleCorrelation,
@@ -13819,6 +14033,13 @@ actor ServerNetworkManager {
                                         let limitReached = busyContext.reason == .releasedProviderLimitReached
                                         let abandoned = busyContext.reason == .abandoned
                                         if limitReached {
+                                            let noticeProjection = await self.recordCodeStructureSettlementLimitNotice(
+                                                windowID: windowID
+                                            )
+                                            await self.presentCodeStructureSettlementLimitNotice(
+                                                windowID: windowID,
+                                                projection: noticeProjection
+                                            )
                                             message = "Window \(windowID) reached its limit of one released cancellation-ignoring structure provider. Wait for it to settle or restart RepoPrompt CE."
                                         } else if abandoned {
                                             message = "A prior canceled MCP operation for window \(windowID) is still settling. Retry after the bounded recovery wait."

@@ -426,13 +426,17 @@ final class SecureStorageIdentityMigrationTests: XCTestCase {
         let migrationAccounts = SecureStorageAccountCatalog.identityMigrationV2Accounts
         let runtimeAccounts = SecureStorageAccountCatalog.allAccounts
         XCTAssertEqual(migrationAccounts.count, 24)
-        XCTAssertEqual(runtimeAccounts.count, 26)
+        XCTAssertEqual(runtimeAccounts.count, 27)
         XCTAssertEqual(
             Set(runtimeAccounts).subtracting(migrationAccounts),
-            [.agentPermissionAntigravityDocument, .agentPermissionGrokDocument]
+            [.agentPermissionAntigravityDocument, .agentPermissionGrokDocument, .agentPermissionDevinDocument]
         )
         XCTAssertFalse(migrationAccounts.contains(.agentPermissionAntigravityDocument))
         XCTAssertTrue(runtimeAccounts.contains(.agentPermissionAntigravityDocument))
+        XCTAssertFalse(migrationAccounts.contains(.agentPermissionGrokDocument))
+        XCTAssertTrue(runtimeAccounts.contains(.agentPermissionGrokDocument))
+        XCTAssertFalse(migrationAccounts.contains(.agentPermissionDevinDocument))
+        XCTAssertTrue(runtimeAccounts.contains(.agentPermissionDevinDocument))
         XCTAssertFalse(SecureStorageIdentityMigrationBootstrap.preparerCatalogMatchesFrozenCatalog())
 
         let manifest = SecureStorageIdentityMigrationManifest(

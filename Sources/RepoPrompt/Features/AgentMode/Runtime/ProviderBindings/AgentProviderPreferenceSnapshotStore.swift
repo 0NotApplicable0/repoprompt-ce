@@ -155,6 +155,14 @@ final class AgentProviderPreferenceSnapshotStore {
                 autoApproveAllACPToolPermissions: level.launchesWithAlwaysApprove,
                 acceptsPendingACPApprovalWhenActivated: level.launchesWithAlwaysApprove
             )
+        case .devin:
+            let level = effectiveDevinPermissionLevel(profile: profile)
+            // Devin's level becomes a launch-time `--permission-mode` argument. RepoPrompt
+            // does not auto-select Devin permission options, so the auto-approval flags stay
+            // false for every mode.
+            return AgentProviderRuntimePermissionBinding(
+                acpLaunchPermissionMode: level.cliPermissionMode
+            )
         }
     }
 
@@ -175,6 +183,8 @@ final class AgentProviderPreferenceSnapshotStore {
             GrokAgentToolPreferences.setPermissionLevel(level, defaults: defaults, secureStore: securePermissions)
         case let .grokBuild(level):
             GrokBuildAgentToolPreferences.setPermissionLevel(level, defaults: defaults, secureStore: securePermissions)
+        case let .devin(level):
+            DevinAgentToolPreferences.setPermissionLevel(level, defaults: defaults, secureStore: securePermissions)
         }
         bumpRevision(for: id.providerID)
         return id.providerID
@@ -460,6 +470,26 @@ final class AgentProviderPreferenceSnapshotStore {
                     )
                 }
             )
+        case .devin:
+            let effective = effectiveDevinPermissionLevel(profile: profile)
+            return AgentPermissionChromeBinding(
+                providerID: providerID,
+                displayName: effective.displayName,
+                iconName: effective.iconName,
+                isWarning: effective.isWarning,
+                externallyManagedReason: externallyManagedReason,
+                options: DevinAgentToolPreferences.PermissionLevel.allCases.map { level in
+                    AgentPermissionOptionBinding(
+                        id: .devin(level),
+                        title: level.displayName,
+                        iconName: level.iconName,
+                        detailText: level.detailText,
+                        isWarning: level.isWarning,
+                        isSelected: level == effective,
+                        isEnabled: externallyManagedReason == nil
+                    )
+                }
+            )
         }
     }
 
@@ -698,6 +728,17 @@ final class AgentProviderPreferenceSnapshotStore {
         }
     }
 
+    private func effectiveDevinPermissionLevel(
+        profile: AgentProviderPermissionProfile
+    ) -> DevinAgentToolPreferences.PermissionLevel {
+        profile.devinPermissionLevel(
+            userConfigured: DevinAgentToolPreferences.permissionLevel(
+                defaults: defaults,
+                secureStore: securePermissions
+            )
+        )
+    }
+
     private static func representativeAgent(for providerID: AgentProviderBindingID) -> AgentProviderKind {
         switch providerID {
         case .codex: .codexExec
@@ -707,6 +748,7 @@ final class AgentProviderPreferenceSnapshotStore {
         case .antigravity: .antigravity
         case .grok: .grok
         case .grokBuild: .grokBuild
+        case .devin: .devin
         }
     }
 

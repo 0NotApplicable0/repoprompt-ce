@@ -10,6 +10,7 @@ enum CLIPathHints {
     static let antigravity: [String] = CLILaunchProfiles.antigravity.supplementalSearchPaths
     static let grok: [String] = CLILaunchProfiles.grok.supplementalSearchPaths
     static let grokBuild: [String] = CLILaunchProfiles.grokBuildProviderSpecificPaths
+    static let devin: [String] = CLILaunchProfiles.devinProviderSpecificPaths
 
     static func nativeDefaultsSupplemented(with providerSpecificPaths: [String]) -> [String] {
         CLILaunchProfiles.nativeDefaultsSupplemented(with: providerSpecificPaths)

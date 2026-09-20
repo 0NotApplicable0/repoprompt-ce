@@ -365,6 +365,9 @@ public class APISettingsViewModel: ObservableObject {
     private var codexModelsTask: Task<Void, Never>?
     private var openCodeModelsTask: Task<Void, Never>?
     private var cursorModelsTask: Task<Void, Never>?
+    private var devinModelsTask: Task<Void, Never>?
+    @Published private(set) var isDiscoveringDevinModels = false
+    @Published private(set) var devinModelDiscoveryMessage: String?
     private var openRouterModelsTask: Task<Void, Never>?
     private var customModelsTask: Task<Void, Never>?
     private var initialLoadTask: Task<Void, Never>?
@@ -400,6 +403,7 @@ public class APISettingsViewModel: ObservableObject {
             antigravityAvailable: isAntigravityConnected,
             grokAvailable: isGrokConnected,
             grokBuildAvailable: false,
+            devinAvailable: DevinRuntimeLocator.isInstalledSync(),
             zaiConfigured: compatibleBackendIsActive(.glmZAI),
             kimiConfigured: compatibleBackendIsActive(.kimi),
             customClaudeCompatibleConfigured: compatibleBackendIsActive(.custom)
@@ -456,6 +460,7 @@ public class APISettingsViewModel: ObservableObject {
             antigravityAvailable: isVerifiedContextBuilderProvider(.antigravity) && isAntigravityConnected,
             grokAvailable: isVerifiedContextBuilderProvider(.grok) && isGrokConnected,
             grokBuildAvailable: false,
+            devinAvailable: DevinRuntimeLocator.isInstalledSync(),
             zaiConfigured: compatibleBackendIsActive(.glmZAI),
             kimiConfigured: compatibleBackendIsActive(.kimi),
             customClaudeCompatibleConfigured: compatibleBackendIsActive(.custom)
@@ -516,6 +521,8 @@ public class APISettingsViewModel: ObservableObject {
             isGrokConnected
         case .grokBuild:
             isGrokBuildConnected
+        case .devin:
+            DevinRuntimeLocator.isInstalledSync()
         case .claudeCodeGLM, .kimiCode, .customClaudeCompatible:
             false
         }
@@ -1115,6 +1122,10 @@ public class APISettingsViewModel: ObservableObject {
                 guard let self else { return }
                 await loadStoredDataIfNeeded()
                 guard !Task.isCancelled, !hasPreparedForWindowClose else { return }
+                refreshDevinModels()
+                if let devinModelsTask {
+                    await devinModelsTask.value
+                }
                 await validateCachedContextBuilderProvidersIfNeeded()
             }
         }
@@ -1125,6 +1136,8 @@ public class APISettingsViewModel: ObservableObject {
         hasPreparedForWindowClose = true
         initialLoadTask?.cancel()
         initialLoadTask = nil
+        devinModelsTask?.cancel()
+        devinModelsTask = nil
         openAIModelsTask?.cancel()
         openAIModelsTask = nil
         deepSeekModelsTask?.cancel()
@@ -1153,6 +1166,7 @@ public class APISettingsViewModel: ObservableObject {
 
     deinit {
         initialLoadTask?.cancel()
+        devinModelsTask?.cancel()
         openAIModelsTask?.cancel()
         deepSeekModelsTask?.cancel()
         fireworksModelsTask?.cancel()
@@ -2012,6 +2026,31 @@ public class APISettingsViewModel: ObservableObject {
         return host == "api.openai.com" || host.hasSuffix(".openai.com")
     }
 
+    func refreshDevinModels(force: Bool = false) {
+        guard devinModelsTask == nil else { return }
+        isDiscoveringDevinModels = true
+        devinModelDiscoveryMessage = nil
+        devinModelsTask = Task { [weak self] in
+            guard let self else { return }
+            let outcome = await DevinModelDiscoveryService.shared.discoverIfNeeded(force: force)
+            guard !Task.isCancelled, !hasPreparedForWindowClose else { return }
+            isDiscoveringDevinModels = false
+            switch outcome {
+            case .notInstalled:
+                devinModelDiscoveryMessage = "Devin CLI is not installed."
+            case let .discovered(modelCount):
+                devinModelDiscoveryMessage = "\(modelCount) models advertised by Devin."
+            case .noModelsAdvertised:
+                devinModelDiscoveryMessage = "Devin ACP advertised no selectable models."
+            case let .failed(message):
+                devinModelDiscoveryMessage = "Model discovery failed: \(message)"
+            }
+            refreshAgentAvailability()
+            await updateAvailableModels()
+            devinModelsTask = nil
+        }
+    }
+
     func updateAvailableModels() async {
         var modelSet = Set<AIModel>()
 
@@ -2132,6 +2171,10 @@ public class APISettingsViewModel: ObservableObject {
             modelSet.formUnion(AIModel.modelsForProvider(.grokBuild))
         }
 
+        if DevinRuntimeLocator.isInstalledSync() {
+            modelSet.formUnion(AIModel.modelsForProvider(.devin))
+        }
+
         // ── Custom provider (OpenAI compatible) ────────────────────────────────
         if isCustomProviderValid,
            let config = try? CustomProviderConfiguration.load()
@@ -2201,6 +2244,7 @@ public class APISettingsViewModel: ObservableObject {
         case .claudeCode: "claude_code"
         case .codex: "codex"
         case .openCode: "opencode"
+        case .devin: "devin"
         }
     }
 
@@ -2277,6 +2321,8 @@ public class APISettingsViewModel: ObservableObject {
                 break
             case .grokBuild:
                 break
+            case .devin:
+                break
             }
 
             await updateAvailableModels()
@@ -2338,6 +2384,8 @@ public class APISettingsViewModel: ObservableObject {
         case .cursor:
             break
         case .grokBuild:
+            break
+        case .devin:
             break
         }
         await updateAvailableModels()

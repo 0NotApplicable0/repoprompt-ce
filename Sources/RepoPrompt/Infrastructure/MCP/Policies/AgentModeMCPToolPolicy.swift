@@ -73,6 +73,8 @@ enum AgentModeMCPToolPolicy {
             grokGrantedTools
         case .grokBuild:
             grokBuildGrantedTools
+        case .devin:
+            grantedTools
         }
     }
 }

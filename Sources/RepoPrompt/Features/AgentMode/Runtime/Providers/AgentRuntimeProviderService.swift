@@ -43,13 +43,14 @@ enum AgentProviderKind: String, CaseIterable, Hashable {
     case antigravity
     case grok
     case grokBuild
+    case devin
     case claudeCodeGLM
     case kimiCode
     case customClaudeCompatible
 
     /// Retired raw identities remain decodable but never participate in active enumeration.
     static let allCases: [AgentProviderKind] = [
-        .claudeCode, .codexExec, .openCode, .cursor, .antigravity, .grok,
+        .claudeCode, .codexExec, .openCode, .cursor, .antigravity, .grok, .devin,
         .claudeCodeGLM, .kimiCode, .customClaudeCompatible
     ]
 
@@ -63,6 +64,8 @@ enum AgentProviderKind: String, CaseIterable, Hashable {
     static let cursorMCPClientID = "cursor"
     static let antigravityMCPClientID = "antigravity-client"
     static let grokMCPClientID = "grok-client"
+    /// Devin's built-in Rust MCP client reports this exact initialize name.
+    static let devinMCPClientID = "rmcp"
     /// Grok Build presents `grok-shell-<injected server name>` (e.g. `grok-shell-RepoPromptCE`)
     /// to MCP servers. The hint must equal that exact registered name: the pending run-scoped
     /// tab-context store keys are raw client names (no family canonicalization), so a
@@ -84,6 +87,8 @@ enum AgentProviderKind: String, CaseIterable, Hashable {
             "agy"
         case .grok, .grokBuild:
             "grok"
+        case .devin:
+            "devin"
         }
     }
 
@@ -103,6 +108,8 @@ enum AgentProviderKind: String, CaseIterable, Hashable {
             "Grok CLI"
         case .grokBuild:
             "Grok Build"
+        case .devin:
+            "Devin CLI"
         case .claudeCodeGLM:
             ClaudeCodeCompatibleBackendStore.shared.config(for: .glmZAI).normalizedDisplayName
         case .kimiCode:
@@ -128,6 +135,8 @@ enum AgentProviderKind: String, CaseIterable, Hashable {
             Self.grokBuildMCPClientID
         case .antigravity:
             Self.antigravityMCPClientID
+        case .devin:
+            Self.devinMCPClientID
         }
     }
 
@@ -137,6 +146,8 @@ enum AgentProviderKind: String, CaseIterable, Hashable {
             .openCode
         case .cursor:
             .cursor
+        case .devin:
+            .devin
         case .claudeCode, .codexExec, .claudeCodeGLM, .kimiCode, .customClaudeCompatible, .antigravity, .grok, .grokBuild:
             nil
         }
@@ -146,7 +157,7 @@ enum AgentProviderKind: String, CaseIterable, Hashable {
         switch self {
         case .claudeCode, .claudeCodeGLM, .kimiCode, .customClaudeCompatible:
             true
-        case .codexExec, .openCode, .cursor, .antigravity, .grok, .grokBuild:
+        case .codexExec, .openCode, .cursor, .antigravity, .grok, .grokBuild, .devin:
             false
         }
     }
@@ -157,7 +168,7 @@ enum AgentProviderKind: String, CaseIterable, Hashable {
 
     var requiresExpectedPIDOwnedAgentModeMCPRouting: Bool {
         switch self {
-        case .claudeCode, .codexExec, .openCode, .cursor, .claudeCodeGLM, .kimiCode, .customClaudeCompatible, .antigravity, .grok, .grokBuild:
+        case .claudeCode, .codexExec, .openCode, .cursor, .claudeCodeGLM, .kimiCode, .customClaudeCompatible, .antigravity, .grok, .grokBuild, .devin:
             true
         }
     }
@@ -166,7 +177,7 @@ enum AgentProviderKind: String, CaseIterable, Hashable {
         switch self {
         case .cursor, .grokBuild:
             false
-        case .claudeCode, .codexExec, .openCode, .claudeCodeGLM, .kimiCode, .customClaudeCompatible, .antigravity, .grok:
+        case .claudeCode, .codexExec, .openCode, .claudeCodeGLM, .kimiCode, .customClaudeCompatible, .antigravity, .grok, .devin:
             true
         }
     }
@@ -188,6 +199,8 @@ enum AgentProviderKind: String, CaseIterable, Hashable {
             return "xAI's Grok CLI (grok), a Grok-powered terminal coding agent. Runs headless one-shot prompts and uses RepoPrompt MCP tools."
         case .grokBuild:
             return "Retired Agent Mode provider. Grok Build remains available for Chat and Oracle; choose Grok CLI or another active provider for agent tasks."
+        case .devin:
+            return "Installed Devin ACP agent for Agent Mode, Context Builder, and delegated runs. RepoPrompt injects its MCP tools through an isolated configuration overlay."
         case .claudeCodeGLM:
             let config = ClaudeCodeCompatibleBackendStore.shared.config(for: .glmZAI)
             if case let .claudeSlotMapping(mapping) = config.modelBehavior {
@@ -226,6 +239,8 @@ enum AgentProviderKind: String, CaseIterable, Hashable {
             "grok_native"
         case .grokBuild:
             "grok_build_acp"
+        case .devin:
+            "devin_acp"
         }
     }
 
@@ -239,7 +254,7 @@ enum AgentProviderKind: String, CaseIterable, Hashable {
             .kimi
         case .customClaudeCompatible:
             .customCompatible
-        case .codexExec, .openCode, .cursor, .antigravity, .grok, .grokBuild:
+        case .codexExec, .openCode, .cursor, .antigravity, .grok, .grokBuild, .devin:
             nil
         }
     }
@@ -282,7 +297,8 @@ final class AgentRuntimeProviderService {
         runType: AgentRunType = .discover,
         workspacePath: String? = nil,
         antigravityPermissionLevel: AntigravityAgentToolPreferences.PermissionLevel? = nil,
-        grokPermissionLevel: GrokAgentToolPreferences.PermissionLevel? = nil
+        grokPermissionLevel: GrokAgentToolPreferences.PermissionLevel? = nil,
+        modelParameterSelections: [ACPModelParameterSelection] = []
     ) -> HeadlessAgentProvider {
         if Self.enableDebugLogging {
             Self.logger.debug("Creating provider for agent: \(agent.displayName), model: \(modelString ?? "default"), runType: \(String(describing: runType))")
@@ -327,7 +343,8 @@ final class AgentRuntimeProviderService {
             let config = OpenCodeAgentConfig(
                 modelString: modelString,
                 enableDebugLogging: Self.enableDebugLogging,
-                toolProfile: .headless
+                toolProfile: .headless,
+                modelParameterSelections: modelParameterSelections
             )
             if Self.enableDebugLogging {
                 Self.logger.debug("Created OpenCodeACPHeadlessAgentProvider")
@@ -407,6 +424,15 @@ final class AgentRuntimeProviderService {
         case .grokBuild:
             return UnsupportedHeadlessAgentProvider(
                 reason: "Grok Build (grokBuild) is retired for Agent Mode and Context Builder. Choose Grok CLI or another active agent provider. Grok Build remains available for Chat and Oracle."
+            )
+        case .devin:
+            return DevinACPHeadlessAgentProvider(
+                config: DevinAgentConfig(
+                    enableDebugLogging: Self.enableDebugLogging,
+                    includeRepoPromptMCPServer: true,
+                    modelString: modelString
+                ),
+                workspacePath: workspacePath
             )
         }
     }

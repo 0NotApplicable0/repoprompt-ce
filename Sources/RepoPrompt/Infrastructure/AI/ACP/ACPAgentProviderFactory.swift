@@ -27,6 +27,14 @@ enum ACPAgentProviderFactory {
                     modelString: modelString
                 )
             )
+        case .devin:
+            // No permission input here: the per-run `ACPRunRequest.launchPermissionMode`
+            // already reflects the effective profile and is authoritative.
+            DevinACPAgentProvider(
+                config: DevinAgentConfig(
+                    enableDebugLogging: AgentRuntimeProviderService.enableDebugLogging
+                )
+            )
         case .claudeCode, .claudeCodeGLM, .kimiCode, .customClaudeCompatible, .codexExec, .antigravity, .grok, .grokBuild:
             nil
         }

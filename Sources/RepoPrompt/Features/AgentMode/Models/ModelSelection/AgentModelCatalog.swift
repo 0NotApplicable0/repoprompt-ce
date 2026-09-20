@@ -9,6 +9,7 @@ enum AgentModelCatalog {
         let antigravityAvailable: Bool
         let grokAvailable: Bool
         let grokBuildAvailable: Bool
+        let devinAvailable: Bool
         let zaiConfigured: Bool
         let kimiConfigured: Bool
         let customClaudeCompatibleConfigured: Bool
@@ -21,6 +22,7 @@ enum AgentModelCatalog {
             antigravityAvailable: false,
             grokAvailable: false,
             grokBuildAvailable: false,
+            devinAvailable: false,
             zaiConfigured: false,
             kimiConfigured: false,
             customClaudeCompatibleConfigured: false
@@ -35,6 +37,7 @@ enum AgentModelCatalog {
                 antigravityAvailable: false,
                 grokAvailable: false,
                 grokBuildAvailable: grokBuildAvailable && providers.contains(.grokBuild),
+                devinAvailable: false,
                 zaiConfigured: zaiConfigured && providers.contains(.claudeCode),
                 kimiConfigured: kimiConfigured && providers.contains(.claudeCode),
                 customClaudeCompatibleConfigured: customClaudeCompatibleConfigured && providers.contains(.claudeCode)
@@ -51,6 +54,7 @@ enum AgentModelCatalog {
                 antigravityAvailable: true,
                 grokAvailable: true,
                 grokBuildAvailable: false,
+                devinAvailable: DevinRuntimeLocator.isInstalledSync(),
                 zaiConfigured: backendIsAvailable(.glmZAI, store: store),
                 kimiConfigured: backendIsAvailable(.kimi, store: store),
                 customClaudeCompatibleConfigured: backendIsAvailable(.custom, store: store)
@@ -65,6 +69,7 @@ enum AgentModelCatalog {
             antigravityAvailable: Bool = true,
             grokAvailable: Bool = true,
             grokBuildAvailable: Bool = false,
+            devinAvailable: Bool = false,
             zaiConfigured: Bool = false,
             kimiConfigured: Bool = false,
             customClaudeCompatibleConfigured: Bool = false
@@ -76,6 +81,7 @@ enum AgentModelCatalog {
             self.antigravityAvailable = antigravityAvailable
             self.grokAvailable = grokAvailable
             self.grokBuildAvailable = grokBuildAvailable
+            self.devinAvailable = devinAvailable
             self.zaiConfigured = zaiConfigured
             self.kimiConfigured = kimiConfigured
             self.customClaudeCompatibleConfigured = customClaudeCompatibleConfigured
@@ -101,6 +107,7 @@ enum AgentModelCatalog {
                 antigravityAvailable: antigravityAvailable || agentKind == .antigravity,
                 grokAvailable: grokAvailable || agentKind == .grok,
                 grokBuildAvailable: grokBuildAvailable || agentKind == .grokBuild,
+                devinAvailable: devinAvailable || agentKind == .devin,
                 zaiConfigured: zaiConfigured || agentKind == .claudeCodeGLM,
                 kimiConfigured: kimiConfigured || agentKind == .kimiCode,
                 customClaudeCompatibleConfigured: customClaudeCompatibleConfigured || agentKind == .customClaudeCompatible
@@ -213,7 +220,7 @@ enum AgentModelCatalog {
         availability: AvailabilityContext = .current,
         surface: AgentSelectionSurface = .general
     ) -> [AgentProviderKind] {
-        [.codexExec, .claudeCode, .openCode, .cursor, .antigravity, .grok, .claudeCodeGLM, .kimiCode, .customClaudeCompatible]
+        [.codexExec, .claudeCode, .openCode, .cursor, .antigravity, .grok, .devin, .claudeCodeGLM, .kimiCode, .customClaudeCompatible]
             .filter { surface.allows($0) && isAgentAvailable($0, availability: availability) }
     }
 
@@ -249,6 +256,8 @@ enum AgentModelCatalog {
             availability.grokAvailable
         case .grokBuild:
             false
+        case .devin:
+            availability.devinAvailable
         }
     }
 
@@ -265,6 +274,9 @@ enum AgentModelCatalog {
             // Grok's default follows its own configuration.
             return AgentModel.defaultModel.rawValue
         }
+        if agentKind == .devin {
+            return resolvedACPDiscoveredModels(for: agentKind)?.preferredModelRaw ?? ""
+        }
         if isAgentAvailable(agentKind, availability: availability),
            let preferredModelRaw = resolvedACPDiscoveredModels(for: agentKind)?.preferredModelRaw
         {
@@ -278,6 +290,8 @@ enum AgentModelCatalog {
                 ?? AgentModel.defaultModel.rawValue
         case .codexExec, .openCode, .antigravity, .grok, .grokBuild:
             return AgentModel.defaultModel.rawValue
+        case .devin:
+            return ""
         }
     }
 
@@ -360,6 +374,9 @@ enum AgentModelCatalog {
         if agentKind == .cursor {
             return CursorAIModelCatalog.options
         }
+        if agentKind == .devin {
+            return resolvedACPDiscoveredModels(for: agentKind)?.options ?? []
+        }
         if let discoveredOptions = resolvedACPDiscoveredModels(for: agentKind)?.options,
            !discoveredOptions.isEmpty
         {
@@ -386,6 +403,8 @@ enum AgentModelCatalog {
             return AgentModel.modelsForAgent(agentKind)
                 .filter { isAvailable($0, for: agentKind, availability: availability) }
                 .map { staticOption($0, for: agentKind) }
+        case .devin:
+            return []
         }
     }
 
@@ -470,6 +489,9 @@ enum AgentModelCatalog {
         if agentKind == .grok {
             return normalized.caseInsensitiveCompare(AgentModel.defaultModel.rawValue) == .orderedSame
                 || GrokModelRegistry.shared.currentModelLabels().contains(normalized)
+        }
+        if agentKind == .devin {
+            return resolvedACPDiscoveredModels(for: agentKind)?.contains(rawModel: normalized) == true
         }
         if let discoveredModels = resolvedACPDiscoveredModels(for: agentKind) {
             return discoveredModels.contains(rawModel: normalized)
@@ -1473,7 +1495,7 @@ enum AgentModelCatalog {
             .kimi
         case .customClaudeCompatible:
             .custom
-        case .claudeCode, .codexExec, .openCode, .cursor, .antigravity, .grok, .grokBuild:
+        case .claudeCode, .codexExec, .openCode, .cursor, .antigravity, .grok, .grokBuild, .devin:
             nil
         }
     }
@@ -1676,7 +1698,7 @@ enum AgentModelCatalog {
             availability.kimiConfigured
         case .customClaudeCompatible:
             availability.customClaudeCompatibleConfigured
-        case .claudeCode, .codexExec, .openCode, .cursor, .antigravity, .grok, .grokBuild:
+        case .claudeCode, .codexExec, .openCode, .cursor, .antigravity, .grok, .grokBuild, .devin:
             true
         }
     }

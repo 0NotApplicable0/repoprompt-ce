@@ -27,7 +27,7 @@ struct AgentComposerActions {
     let selectAgentModel: (_ agent: AgentProviderKind, _ rawModel: String) -> Void
     let reasoningEffortOptionsForCurrentSelection: () -> [CodexReasoningEffort]
     let selectReasoningEffort: (_ effort: CodexReasoningEffort?) -> Void
-    let selectCursorModelParameter: (_ configID: String, _ valueRaw: String) -> Void
+    let selectACPModelParameter: (_ target: ACPModelParameterSelection, _ openCodeDiscoveryKey: OpenCodeACPModelParameterKey?) -> Void
     let setAutoEditEnabled: (_ enabled: Bool) -> Void
     let setProviderPermissionLevel: (_ id: AgentProviderPermissionLevelID) -> Void
     let applyCodexToolSettingMutation: (_ mutation: CodexToolSettingMutation) -> Void
@@ -139,8 +139,8 @@ struct AgentInputBar: View {
             },
             reasoningEffortOptionsForCurrentSelection: { agentModeVM.reasoningEffortOptionsForCurrentSelection() },
             selectReasoningEffort: { effort in agentModeVM.selectReasoningEffort(effort) },
-            selectCursorModelParameter: { configID, valueRaw in
-                agentModeVM.selectCursorModelParameter(configID: configID, valueRaw: valueRaw)
+            selectACPModelParameter: { target, openCodeDiscoveryKey in
+                agentModeVM.selectACPModelParameter(target, openCodeDiscoveryKey: openCodeDiscoveryKey)
             },
             setAutoEditEnabled: { enabled in agentModeVM.setAutoEditEnabled(enabled) },
             setProviderPermissionLevel: { id in agentModeVM.setProviderPermissionLevel(id) },
@@ -258,6 +258,7 @@ struct AgentComposerView: View, Equatable {
     @FocusState var isFocused: Bool
 
     @State private var localInputText: String = ""
+    @State private var externalTextUpdateTick: Int = 0
     @State private var submissionLatch = AgentComposerSubmissionLatch()
     @State private var lastAppliedDraftRestorationEventIDByTab: [UUID: UUID] = [:]
     @State private var editorTextFieldHeight: CGFloat = ResizableTextField.height(forPresetIndex: 0, preset: .normal)
@@ -540,7 +541,7 @@ struct AgentComposerView: View, Equatable {
                 }
             }
             lastAppliedDraftRestorationEventIDByTab[event.tabID] = event.id
-            setLocalInputText(restoredText, forceRevision: true)
+            setLocalInputText(restoredText, forceRevision: true, isExternalUpdate: true)
             actions.storeDraft(event.tabID, restoredText)
             DispatchQueue.main.async {
                 isSyncingDraftFromSession = false
@@ -620,6 +621,7 @@ struct AgentComposerView: View, Equatable {
                         await actions.slashSkillSuggestions(query)
                     }
                 ),
+                externalUpdateTick: externalTextUpdateTick,
                 onHeightChange: { newHeight in
                     editorTextFieldHeight = newHeight
                 }
@@ -653,7 +655,7 @@ struct AgentComposerView: View, Equatable {
                     }
                     if props.hasAvailableAgentProviders {
                         agentProviderModelPicker
-                        cursorModelParameterPickers
+                        acpModelParameterPickers
                         reasoningEffortPicker
                         claudeEffortPicker
                         codexToolsButton
@@ -996,48 +998,56 @@ struct AgentComposerView: View, Equatable {
         }
     }
 
-    @ViewBuilder
-    private var cursorModelParameterPickers: some View {
-        if props.selectedAgent == .cursor {
-            ForEach(props.cursorModelParameterControls) { control in
-                Menu {
-                    ForEach(control.choices, id: \.rawValue) { choice in
-                        Button {
-                            actions.selectCursorModelParameter(control.configID, choice.rawValue)
-                        } label: {
-                            HStack {
-                                Text(choice.displayName)
-                                if choice.rawValue == control.selectedValueRaw {
-                                    Spacer()
-                                    Image(systemName: "checkmark")
-                                }
+    private var acpModelParameterPickers: some View {
+        ForEach(props.acpModelParameterControls) { control in
+            Menu {
+                ForEach(control.choices, id: \.rawValue) { choice in
+                    Button {
+                        actions.selectACPModelParameter(
+                            ACPModelParameterSelection(
+                                providerID: control.providerID,
+                                baseModelRaw: control.baseModelRaw,
+                                kind: control.kind,
+                                configID: control.configID,
+                                valueRaw: choice.rawValue
+                            ),
+                            control.openCodeDiscoveryKey
+                        )
+                    } label: {
+                        HStack {
+                            Text(choice.displayName)
+                            if choice.rawValue == control.selectedValueRaw {
+                                Spacer()
+                                Image(systemName: "checkmark")
                             }
                         }
                     }
-                } label: {
-                    HStack(spacing: 4) {
-                        Text(control.selectedDisplayName)
-                            .font(fontPreset.swiftUIFont(sizeAtNormal: 11))
-                    }
-                    .foregroundColor(
+                }
+            } label: {
+                HStack(spacing: 4) {
+                    Text(control.selectedDisplayName)
+                        .font(fontPreset.swiftUIFont(sizeAtNormal: 11))
+                }
+                .foregroundColor(
+                    control.isSavedValueUnavailable || (
                         control.kind == .speed
                             && control.selectedDisplayName.caseInsensitiveCompare("fast") == .orderedSame
-                            ? .orange
-                            : .secondary
                     )
-                    .padding(.horizontal, 8)
-                    .padding(.vertical, 4)
-                    .background(pickerChipColor)
-                    .cornerRadius(4)
-                }
-                .menuStyle(.borderlessButton)
-                .accessibilityLabel(Text(control.accessibilityLabel))
-                .accessibilityValue(Text(control.accessibilityValue))
-                .disabled(modelControlsDisabled || control.choices.isEmpty)
-                .opacity(modelControlsDisabled ? 0.55 : 1.0)
-                .hoverTooltip(modelControlsDisabled ? modelControlsDisabledTooltip : "Cursor \(control.displayName)")
-                .fixedSize()
+                        ? .orange
+                        : .secondary
+                )
+                .padding(.horizontal, 8)
+                .padding(.vertical, 4)
+                .background(pickerChipColor)
+                .cornerRadius(4)
             }
+            .menuStyle(.borderlessButton)
+            .accessibilityLabel(Text(control.accessibilityLabel))
+            .accessibilityValue(Text(control.accessibilityValue))
+            .disabled(modelControlsDisabled || control.choices.isEmpty)
+            .opacity(modelControlsDisabled ? 0.55 : 1.0)
+            .hoverTooltip(modelControlsDisabled ? modelControlsDisabledTooltip : control.tooltip)
+            .fixedSize()
         }
     }
 
@@ -1547,7 +1557,7 @@ struct AgentComposerView: View, Equatable {
                     return
                 }
                 if effects.shouldClearInput {
-                    setLocalInputText("")
+                    setLocalInputText("", isExternalUpdate: true)
                     resetTextFieldTrigger.toggle()
                 }
                 if let blockedMessage = effects.blockedMessage {
@@ -1648,7 +1658,8 @@ struct AgentComposerView: View, Equatable {
                     displayName: attachment.displayName,
                     relativePath: attachment.relativePath,
                     from: localInputText
-                )
+                ),
+                isExternalUpdate: true
             )
         }
     }
@@ -1690,7 +1701,14 @@ struct AgentComposerView: View, Equatable {
         value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
     }
 
-    private func setLocalInputText(_ newValue: String, forceRevision: Bool = false) {
+    private func setLocalInputText(
+        _ newValue: String,
+        forceRevision: Bool = false,
+        isExternalUpdate: Bool = false
+    ) {
+        if isExternalUpdate {
+            externalTextUpdateTick &+= 1
+        }
         guard forceRevision || localInputText != newValue else {
             isInputEmpty = newValue.isEmpty
             return
@@ -1702,7 +1720,11 @@ struct AgentComposerView: View, Equatable {
 
     private func loadDraftFromSession(for tabID: UUID) {
         isSyncingDraftFromSession = true
-        setLocalInputText(actions.retrieveDraft(tabID), forceRevision: true)
+        setLocalInputText(
+            actions.retrieveDraft(tabID),
+            forceRevision: true,
+            isExternalUpdate: true
+        )
         DispatchQueue.main.async {
             isSyncingDraftFromSession = false
         }

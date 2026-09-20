@@ -12,6 +12,7 @@ enum AgentPermissionSecureDomain: String, CaseIterable, Hashable {
     case antigravity
     case grok
     case grokBuild
+    case devin
 
     var secureStorageAccount: SecureStorageAccount {
         switch self {
@@ -31,6 +32,8 @@ enum AgentPermissionSecureDomain: String, CaseIterable, Hashable {
             .agentPermissionGrokDocument
         case .grokBuild:
             .agentPermissionGrokBuildDocument
+        case .devin:
+            .agentPermissionDevinDocument
         }
     }
 
@@ -377,6 +380,35 @@ struct SecureGrokBuildPermissionDocument: Codable, Equatable {
     }
 }
 
+struct SecureDevinPermissionDocument: Codable, Equatable {
+    static let currentSchemaVersion = 1
+
+    var schemaVersion: Int
+    var updatedAt: Date
+    var permissionLevelRaw: String?
+
+    init(
+        schemaVersion: Int = currentSchemaVersion,
+        updatedAt: Date = Date(),
+        permissionLevelRaw: String? = DevinAgentToolPreferences.PermissionLevel.providerDefault.rawValue
+    ) {
+        self.schemaVersion = schemaVersion
+        self.updatedAt = updatedAt
+        self.permissionLevelRaw = permissionLevelRaw
+    }
+
+    static func failClosedDocument(now: Date = Date()) -> SecureDevinPermissionDocument {
+        SecureDevinPermissionDocument(
+            updatedAt: now,
+            permissionLevelRaw: DevinAgentToolPreferences.PermissionLevel.normal.rawValue
+        )
+    }
+
+    func permissionLevel() -> DevinAgentToolPreferences.PermissionLevel {
+        DevinAgentToolPreferences.PermissionLevel.from(rawValue: permissionLevelRaw)
+    }
+}
+
 final class AgentPermissionSecureStore {
     static let shared = AgentPermissionSecureStore(secureStrings: SecureKeysService())
 
@@ -395,6 +427,7 @@ final class AgentPermissionSecureStore {
     private var antigravityCache: SecureAntigravityPermissionDocument?
     private var grokCache: SecureGrokPermissionDocument?
     private var grokBuildCache: SecureGrokBuildPermissionDocument?
+    private var devinCache: SecureDevinPermissionDocument?
     private var unpersistedMissingDomains: Set<AgentPermissionSecureDomain> = []
     private var diagnosticsByDomain: [AgentPermissionSecureDomain: AgentPermissionStorageDiagnostic] = [:]
     private let permissionDecisionAccessMode: KeychainAccessMode = .nonInteractive(reason: .permissionDecision)
@@ -450,6 +483,7 @@ final class AgentPermissionSecureStore {
             antigravityCache = nil
             grokCache = nil
             grokBuildCache = nil
+            devinCache = nil
             unpersistedMissingDomains.removeAll()
         }
     }
@@ -503,6 +537,10 @@ final class AgentPermissionSecureStore {
             var grokBuild = SecureGrokBuildPermissionDocument.failClosedDocument(now: resetDate)
             _ = normalizeGrokBuild(&grokBuild)
             record(.grokBuild, resetLocked(grokBuild, domain: .grokBuild, cache: &grokBuildCache, deferred: &effects))
+
+            var devin = SecureDevinPermissionDocument.failClosedDocument(now: resetDate)
+            _ = normalizeDevin(&devin)
+            record(.devin, resetLocked(devin, domain: .devin, cache: &devinCache, deferred: &effects))
 
             return AgentPermissionStorageResetResult(
                 succeededDomains: succeededDomains,
@@ -566,6 +604,12 @@ final class AgentPermissionSecureStore {
     func grokBuildPermissions() -> SecureGrokBuildPermissionDocument {
         withLockAndDeferredSideEffects { effects in
             loadGrokBuildPermissionsLocked(deferred: &effects)
+        }
+    }
+
+    func devinPermissions() -> SecureDevinPermissionDocument {
+        withLockAndDeferredSideEffects { effects in
+            loadDevinPermissionsLocked(deferred: &effects)
         }
     }
 
@@ -825,6 +869,24 @@ final class AgentPermissionSecureStore {
         }
     }
 
+    @discardableResult
+    func updateDevinPermissions(_ mutation: (inout SecureDevinPermissionDocument) -> Void) -> Bool {
+        withLockAndDeferredSideEffects { effects in
+            var document = loadDevinPermissionsLocked(deferred: &effects)
+            mutation(&document)
+            normalizeDevin(&document)
+            document.updatedAt = now()
+            return saveLocked(document, domain: .devin, cache: &devinCache, deferred: &effects)
+        }
+    }
+
+    @discardableResult
+    func setDevinPermissionLevel(_ level: DevinAgentToolPreferences.PermissionLevel) -> Bool {
+        updateDevinPermissions { document in
+            document.permissionLevelRaw = level.rawValue
+        }
+    }
+
     // MARK: - Locked loads
 
     private func loadSubagentPermissionsLocked(deferred effects: inout DeferredSideEffects) -> SecureSubagentPermissionDocument {
@@ -950,6 +1012,17 @@ final class AgentPermissionSecureStore {
             failClosedDocument: SecureGrokBuildPermissionDocument.failClosedDocument(now: now()),
             normalize: { _ in false },
             persistMissingDocument: false,
+            deferred: &effects
+        )
+    }
+
+    private func loadDevinPermissionsLocked(deferred effects: inout DeferredSideEffects) -> SecureDevinPermissionDocument {
+        loadLocked(
+            domain: .devin,
+            cache: &devinCache,
+            missingDocument: SecureDevinPermissionDocument(updatedAt: now()),
+            failClosedDocument: SecureDevinPermissionDocument.failClosedDocument(now: now()),
+            normalize: normalizeDevin,
             deferred: &effects
         )
     }
@@ -1360,6 +1433,21 @@ final class AgentPermissionSecureStore {
         return changed
     }
 
+    @discardableResult
+    private func normalizeDevin(_ document: inout SecureDevinPermissionDocument) -> Bool {
+        var changed = false
+        if document.schemaVersion != SecureDevinPermissionDocument.currentSchemaVersion {
+            document.schemaVersion = SecureDevinPermissionDocument.currentSchemaVersion
+            changed = true
+        }
+        let level = DevinAgentToolPreferences.PermissionLevel.from(rawValue: document.permissionLevelRaw)
+        if document.permissionLevelRaw != level.rawValue {
+            document.permissionLevelRaw = level.rawValue
+            changed = true
+        }
+        return changed
+    }
+
     // MARK: - Helpers
 
     private func supportedSchemaVersion(of document: some Any) -> Int {
@@ -1380,6 +1468,8 @@ final class AgentPermissionSecureStore {
             SecureGrokPermissionDocument.currentSchemaVersion
         case _ as SecureGrokBuildPermissionDocument:
             SecureGrokBuildPermissionDocument.currentSchemaVersion
+        case _ as SecureDevinPermissionDocument:
+            SecureDevinPermissionDocument.currentSchemaVersion
         default:
             1
         }
@@ -1402,6 +1492,8 @@ final class AgentPermissionSecureStore {
         case let value as SecureGrokPermissionDocument:
             value.schemaVersion
         case let value as SecureGrokBuildPermissionDocument:
+            value.schemaVersion
+        case let value as SecureDevinPermissionDocument:
             value.schemaVersion
         default:
             1
@@ -1426,6 +1518,8 @@ final class AgentPermissionSecureStore {
             SecureGrokPermissionDocument.failClosedDocument(now: now())
         case .grokBuild:
             SecureGrokBuildPermissionDocument.failClosedDocument(now: now())
+        case .devin:
+            SecureDevinPermissionDocument.failClosedDocument(now: now())
         }
     }
 

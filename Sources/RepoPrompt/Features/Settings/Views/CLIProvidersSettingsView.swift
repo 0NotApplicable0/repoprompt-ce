@@ -73,6 +73,7 @@ struct CLIProvidersSettingsView: View {
     @State private var isCursorExpanded: Bool = false
     @State private var isAntigravityExpanded = false
     @State private var isGrokExpanded = false
+    @State private var isDevinExpanded: Bool = false
 
     // Per-backend secret text entry buffers (GLM uses viewModel.zaiApiKey directly).
     // SEARCH-HELPER: Claude-Compatible Backends settings, Kimi API key entry, Custom backend key entry
@@ -93,6 +94,7 @@ struct CLIProvidersSettingsView: View {
             || viewModel.isCursorConnected
             || viewModel.isAntigravityConnected
             || viewModel.isGrokConnected
+            || DevinRuntimeLocator.isInstalledSync()
     }
 
     private var codexStatusText: String? {
@@ -125,7 +127,7 @@ struct CLIProvidersSettingsView: View {
                         .font(.title2)
                         .fontWeight(.semibold)
 
-                    Text("Primary way to add Agent Mode model support. Connect Claude Code, Codex, OpenCode, or Cursor to leverage your existing subscriptions — OpenCode can also proxy any API key.")
+                    Text("Primary way to add Agent Mode model support. Connect Claude Code, Codex, OpenCode, Cursor, or Devin to leverage your existing subscriptions — OpenCode can also proxy any API key.")
                         .font(.subheadline)
                         .foregroundColor(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
@@ -154,11 +156,13 @@ struct CLIProvidersSettingsView: View {
                 cursorCard
                 antigravityCard
                 grokCard
+                devinCard
             }
             .padding(16)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .onAppear {
+            viewModel.refreshDevinModels()
             Task {
                 await viewModel.loadCompatibleBackendState()
                 await viewModel.refreshClaudeCodeBinaryStatus()
@@ -2083,6 +2087,54 @@ struct CLIProvidersSettingsView: View {
             return "\(count) models discovered across \(groupedBaseCount) base models."
         }
         return count == 1 ? "1 model discovered." : "\(count) models discovered."
+    }
+
+    // MARK: - Devin Card
+
+    private var devinCard: some View {
+        let isInstalled = DevinRuntimeLocator.isInstalledSync()
+        return providerCard(
+            title: "Devin CLI",
+            subtitle: "Uses the installed `devin acp` runtime for interactive Agent Mode and Oracle.",
+            infoURL: "https://docs.devin.ai/cli/acp/zed",
+            isConnected: isInstalled,
+            isExpanded: $isDevinExpanded
+        ) {
+            VStack(alignment: .leading, spacing: 12) {
+                Text(
+                    isInstalled
+                        ? "Devin owns authentication and internal tools; RepoPrompt controls interactive launch permissions."
+                        : "Install and authenticate Devin, then ensure `devin acp` is available."
+                )
+                .font(.caption)
+                .foregroundColor(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+
+                if isInstalled {
+                    HStack(spacing: 10) {
+                        Button {
+                            viewModel.refreshDevinModels(force: true)
+                        } label: {
+                            if viewModel.isDiscoveringDevinModels {
+                                ProgressView().scaleEffect(0.6).frame(height: 16)
+                            } else {
+                                Label("Refresh Models", systemImage: "arrow.clockwise")
+                            }
+                        }
+                        .disabled(viewModel.isDiscoveringDevinModels)
+                        .buttonStyle(CustomButtonStyle())
+
+                        if let message = viewModel.devinModelDiscoveryMessage {
+                            Text(message)
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                        }
+                    }
+
+                    directProviderInlineControls(for: .devin)
+                }
+            }
+        }
     }
 
     // MARK: - Cursor CLI / ACP card
