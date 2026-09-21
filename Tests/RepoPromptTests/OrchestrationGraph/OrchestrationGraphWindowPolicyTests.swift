@@ -227,6 +227,15 @@ import XCTest
             )
             XCTAssertFalse(groupBody.contains("openMainWindow"), groupBody)
             XCTAssertFalse(groupBody.contains("requestMainWindowFromDock"), groupBody)
+
+            XCTAssertEqual(
+                source.components(separatedBy: "NewWindowCommands()").count - 1,
+                1,
+                "RepoPromptApp.swift must have exactly one NewWindowCommands() call site"
+            )
+            let commandsRange = try XCTUnwrap(source.range(of: ".commands {"))
+            let commandsBody = try commandGroupBody(in: source, startingAt: commandsRange.lowerBound)
+            XCTAssertTrue(commandsBody.contains("NewWindowCommands()"), commandsBody)
         }
 
         // MARK: - MCP open_in_new_window
@@ -271,6 +280,10 @@ import XCTest
                 WindowContentView.rootSurface(policy: policy(graphEnabled: true)),
                 .orchestrationGraphShell
             )
+            XCTAssertEqual(
+                WindowContentView(policy: policy(graphEnabled: true)).storedRootSurfaceForTesting,
+                .orchestrationGraphShell
+            )
 
             let host = NSHostingView(rootView: OrchestrationGraphShell(windowState: windowA))
             host.frame = NSRect(x: 0, y: 0, width: 480, height: 320)
@@ -283,6 +296,10 @@ import XCTest
         func testFlagOffWindowContentViewMountsContentView() {
             XCTAssertEqual(
                 WindowContentView.rootSurface(policy: policy(graphEnabled: false)),
+                .contentView
+            )
+            XCTAssertEqual(
+                WindowContentView(policy: policy(graphEnabled: false)).storedRootSurfaceForTesting,
                 .contentView
             )
         }

@@ -47,6 +47,13 @@ struct WindowContentView: View {
         policy.mountsGraphShell ? .orchestrationGraphShell : .contentView
     }
 
+    #if DEBUG
+        /// The surface `body` switches on, as stored by `init(policy:)`.
+        var storedRootSurfaceForTesting: RootSurface {
+            rootSurface
+        }
+    #endif
+
     var body: some View {
         rootSurfaceView
             .safeAreaInset(edge: .top) { GlobalSettingsPersistenceBlockBanner(allowsSessionDismissal: true) }

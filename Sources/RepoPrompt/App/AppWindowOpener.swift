@@ -86,6 +86,7 @@ final class AppWindowOpener {
         func resetForTesting() {
             openMainWindowImpl = nil
             pendingDockWindowRequestCount = 0
+            policy = .production
         }
     #endif
 }
