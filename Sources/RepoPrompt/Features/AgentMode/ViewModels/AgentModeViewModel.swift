@@ -899,6 +899,10 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     var sidebarSessionRowsCache: (key: SidebarSessionRowsCacheKey, rows: [SidebarSession])?
     var agentChatsSidebarRowsCache: (key: SidebarSessionRowsCacheKey, rows: [SidebarSession])?
     var sidebarListProjectionCache: (key: SidebarListProjectionCacheKey, projection: SidebarListProjection)?
+    /// Memoized normalized search fields, keyed by sidebar row id. Populated only
+    /// while a sidebar search query is active and replaced by the current row set
+    /// on each call, so it stays bounded by the visible sidebar.
+    var sidebarSearchFieldsMemo: [UUID: (source: AgentSessionSearchFieldSource, fields: AgentSessionSearchFields)] = [:]
     private var lastKnownWorkspaceSnapshot: WorkspaceModel?
     var sidebarRuntimeWorkspaceID: UUID? {
         lastKnownWorkspaceSnapshot?.id
@@ -915,6 +919,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         private var test_persistentBindingResolutionSnapshotBuildCount = 0
         var test_sidebarSessionRowsBuildCount = 0
         var test_sidebarListProjectionBuildCount = 0
+        /// Counts rows whose normalized search fields were actually materialized.
+        /// Stays at zero while the sidebar search box is empty.
+        var test_sidebarSearchFieldsMaterializationCount = 0
         private var test_afterMCPStoreEpochBegan: (@MainActor () async -> Void)?
         private var test_afterDurableChildTabCreation: (@MainActor () async -> Void)?
         /// Runs on the `@MainActor` inside `agentSessionLinkTranscriptPage(...)`, after the page has
@@ -945,7 +952,16 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     #endif
     private var hasPreparedForWindowClose = false
     private static let uiRefreshCoalesceDelayNanos: UInt64 = 75_000_000
-    private static let sessionSidebarRestoreBatchSize = 32
+    /// The restore service has already loaded and projected all metadata before
+    /// it begins yielding preferred rows. Publishing those rows in fixed-size
+    /// batches therefore adds no I/O overlap; it only forces the main actor to
+    /// rebuild the complete sidebar once per batch. Yield all preferred rows in
+    /// one bounded batch (at most one per persisted tab), after the separately
+    /// prioritized active-tab result has restored first-paint responsiveness.
+    static func sessionSidebarRestoreBatchSize(forPersistedTabCount count: Int) -> Int {
+        max(count, 1)
+    }
+
     private nonisolated static let sessionSidebarRestoreRetryLimit = 1
     nonisolated static let transcriptVisibleItemLimit = 50
     private nonisolated static let detachedTranscriptVisibleItemBuffer = 5
@@ -14140,7 +14156,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
 
         let prioritizedBuilder = sidebarPrioritizedIndexBuilder
         let streamBuilder = sidebarIndexStreamBuilder
-        let restoreBatchSize = Self.sessionSidebarRestoreBatchSize
+        let restoreBatchSize = Self.sessionSidebarRestoreBatchSize(forPersistedTabCount: persistedTabs.count)
         sessionListCacheTask = Task.detached(priority: .userInitiated) { [weak self] in
             guard let self else { return }
             #if DEBUG
