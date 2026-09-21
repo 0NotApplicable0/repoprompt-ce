@@ -20,8 +20,35 @@ struct WindowContentView: View {
         domainRuntime: AppDomainRuntimeComposition.shared.runtime
     )
 
+    /// Orchestration graph single-window policy; decides the root surface once per window.
+    let policy: OrchestrationGraphWindowPolicy
+
+    /// Fixed when the window is created; a later flag toggle never hot-swaps an open window.
+    @State private var rootSurface: RootSurface
+
+    enum RootSurface: Equatable {
+        case contentView
+        case orchestrationGraphShell
+    }
+
+    @MainActor
+    init() {
+        self.init(policy: .production)
+    }
+
+    @MainActor
+    init(policy: OrchestrationGraphWindowPolicy) {
+        self.policy = policy
+        _rootSurface = State(initialValue: Self.rootSurface(policy: policy))
+    }
+
+    @MainActor
+    static func rootSurface(policy: OrchestrationGraphWindowPolicy) -> RootSurface {
+        policy.mountsGraphShell ? .orchestrationGraphShell : .contentView
+    }
+
     var body: some View {
-        ContentView(windowState: windowState)
+        rootSurfaceView
             .safeAreaInset(edge: .top) { GlobalSettingsPersistenceBlockBanner(allowsSessionDismissal: true) }
             .environmentObject(windowState) // If your subviews need it
             .environmentObject(sparkleManager)
@@ -75,6 +102,16 @@ struct WindowContentView: View {
             .sheet(isPresented: $versionManager.shouldShowVersionPopup) {
                 VersionPopupView(isPresented: $versionManager.shouldShowVersionPopup)
             }
+    }
+
+    @ViewBuilder
+    private var rootSurfaceView: some View {
+        switch rootSurface {
+        case .contentView:
+            ContentView(windowState: windowState)
+        case .orchestrationGraphShell:
+            OrchestrationGraphShell(windowState: windowState)
+        }
     }
 }
 

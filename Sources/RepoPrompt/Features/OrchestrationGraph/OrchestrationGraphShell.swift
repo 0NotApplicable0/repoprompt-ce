@@ -1,4 +1,4 @@
-import Foundation
+import SwiftUI
 
 /// Single-window policy for the orchestration graph.
 ///
@@ -40,5 +40,39 @@ struct OrchestrationGraphWindowPolicy {
     ) {
         guard policy.allowsAdditionalMainWindow else { return }
         openWindow()
+    }
+}
+
+/// Root surface of a main window while the orchestration graph flag is on.
+///
+/// OG-04 only mounts the shell: it renders the layout of an empty projection. Session data and the
+/// inspector arrive in later stories (OG-05).
+struct OrchestrationGraphShell: View {
+    @ObservedObject var windowState: WindowState
+
+    private let layout = OrchestrationGraphLayout.make(
+        projection: OrchestrationGraphProjection.make(
+            workspaces: [],
+            persisted: [],
+            live: [],
+            isHistoryScanIncomplete: false
+        )
+    )
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("Orchestration Graph")
+                .font(.title2.weight(.semibold))
+            if layout.clusters.isEmpty {
+                Text("No sessions yet.")
+                    .foregroundStyle(.secondary)
+            } else {
+                ForEach(layout.clusters, id: \.key) { cluster in
+                    Text(cluster.workspaceName ?? "Unassigned")
+                }
+            }
+        }
+        .padding(24)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
     }
 }

@@ -2,6 +2,7 @@ import Cocoa
 import MCP
 @testable import RepoPromptApp
 @testable import RepoPromptDomainRuntime
+import SwiftUI
 import XCTest
 
 #if DEBUG
@@ -123,6 +124,27 @@ import XCTest
             XCTAssertEqual(WindowStatesManager.shared.allWindows.count, 1)
         }
 
+        func testFlagOnInstallReplaysAtMostOneQueuedDockRequestWhenNoWindowExists() async throws {
+            let closedWindow: WindowState = windowA
+            WindowStatesManager.shared.unregisterWindowState(closedWindow)
+            addedWindows.removeAll { $0 === closedWindow }
+            await closedWindow.tearDown()
+            XCTAssertTrue(WindowStatesManager.shared.allWindows.isEmpty)
+            AppWindowOpener.shared.policy = policy(graphEnabled: true)
+            XCTAssertFalse(AppWindowOpener.shared.isAvailable)
+
+            try sendDockNewWindow()
+            try sendDockNewWindow()
+            try sendDockNewWindow()
+
+            var openCount = 0
+            installProductionOpener { openCount += 1 }
+
+            XCTAssertEqual(openCount, 1)
+            XCTAssertEqual(WindowStatesManager.shared.allWindows.count, 1)
+            XCTAssertFalse(WindowStatesManager.shared.allWindows.first === closedWindow)
+        }
+
         // MARK: - File → New Window (⌘N)
 
         func testFlagOffFileNewWindowCommandAttachesSecondWindow() {
@@ -240,6 +262,29 @@ import XCTest
             XCTAssertEqual(WindowStatesManager.shared.allWindows.count, 1)
             XCTAssertTrue(WindowStatesManager.shared.allWindows.first === windowA)
             XCTAssertEqual(windowA.workspaceManager.activeWorkspaceID, targetWorkspace.id)
+        }
+
+        // MARK: - Window root surface
+
+        func testFlagOnWindowContentViewMountsOrchestrationGraphShell() {
+            XCTAssertEqual(
+                WindowContentView.rootSurface(policy: policy(graphEnabled: true)),
+                .orchestrationGraphShell
+            )
+
+            let host = NSHostingView(rootView: OrchestrationGraphShell(windowState: windowA))
+            host.frame = NSRect(x: 0, y: 0, width: 480, height: 320)
+            host.layoutSubtreeIfNeeded()
+
+            XCTAssertGreaterThan(host.fittingSize.width, 0)
+            XCTAssertGreaterThan(host.fittingSize.height, 0)
+        }
+
+        func testFlagOffWindowContentViewMountsContentView() {
+            XCTAssertEqual(
+                WindowContentView.rootSurface(policy: policy(graphEnabled: false)),
+                .contentView
+            )
         }
 
         // MARK: - Helpers

@@ -38,7 +38,10 @@ final class AppWindowOpener {
         let pendingRequestCount = pendingDockWindowRequestCount
         pendingDockWindowRequestCount = 0
         guard policy.allowsAdditionalMainWindow else { return }
-        for _ in 0 ..< pendingRequestCount {
+        // With the graph flag on, only the first window may open; `openWindow` registers its
+        // `WindowState` asynchronously, so the window count cannot stop later replays.
+        let replayCount = policy.isGraphEnabled() ? min(pendingRequestCount, 1) : pendingRequestCount
+        for _ in 0 ..< replayCount {
             openMainWindow()
         }
     }
