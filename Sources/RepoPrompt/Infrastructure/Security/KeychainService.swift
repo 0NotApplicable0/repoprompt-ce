@@ -496,9 +496,24 @@ final class KeychainService: SecureKeyValueStorageBackend, @unchecked Sendable {
     static let identityMigrationLegacyStateServiceName = "com.pvncher.repoprompt.ce.identity-migration.state.v2"
     static let localSelfSignedServiceNamePrefix = "com.pvncher.repoprompt.ce.local-self-signed."
     static let debugServiceName = "com.pvncher.repoprompt.ce.debug.keychain"
+    static let appleDevelopmentDebugServiceNamePrefix = "com.pvncher.repoprompt.ce.debug.apple-development."
 
     static let officialV2Shared = KeychainService(serviceName: officialV2ServiceName)
     static let debugShared = KeychainService(serviceName: debugServiceName)
+
+    static func appleDevelopmentDebugServiceName(teamIdentifier: String) -> String {
+        let normalizedTeamIdentifier = teamIdentifier.lowercased()
+        precondition(
+            !normalizedTeamIdentifier.isEmpty
+                && normalizedTeamIdentifier.allSatisfy { $0.isASCII && ($0.isLetter || $0.isNumber) },
+            "Apple Development team identifier must be non-empty and alphanumeric"
+        )
+        return "\(appleDevelopmentDebugServiceNamePrefix)\(normalizedTeamIdentifier).keychain.v1"
+    }
+
+    static func appleDevelopmentDebug(teamIdentifier: String) -> KeychainService {
+        KeychainService(serviceName: appleDevelopmentDebugServiceName(teamIdentifier: teamIdentifier))
+    }
 
     static func localSelfSignedServiceName(fingerprint: String, generation: Int) -> String {
         let normalizedFingerprint = fingerprint.filter(\.isHexDigit).lowercased()
