@@ -1,4 +1,5 @@
 import Cocoa
+import Combine
 @testable import RepoPromptApp
 @testable import RepoPromptDomainRuntime
 import SwiftUI
@@ -172,7 +173,7 @@ import XCTest
             XCTAssertEqual(hostWorkspace.stashedTabs.map(\.tab.id), before.stashedTabs)
             XCTAssertEqual(try storedTabIDs(of: workspaceTwo.id).composeTabs, before.composeTabs)
             XCTAssertEqual(try storedTabIDs(of: workspaceTwo.id).stashedTabs, before.stashedTabs)
-            XCTAssertNotEqual(model.mcpBindTargetWorkspaceID, workspaceTwo.id)
+            XCTAssertNil(model.mcpBindTargetWorkspaceID)
             XCTAssertEqual(graphWindow.workspaceManager.activeWorkspaceID, workspaceOne.id)
         }
 
@@ -227,7 +228,7 @@ import XCTest
 
             XCTAssertEqual(model.surface, .failure(target, .workspaceUnavailable))
             XCTAssertEqual(graphWindow.workspaceManager.activeWorkspaceID, workspaceOne.id)
-            XCTAssertNotEqual(model.mcpBindTargetWorkspaceID, workspaceTwo.id)
+            XCTAssertNil(model.mcpBindTargetWorkspaceID)
         }
 
         func testLatestSelectionWins() async {
@@ -240,6 +241,48 @@ import XCTest
 
             XCTAssertEqual(model.surface, .workspace(workspaceTwo.id))
             XCTAssertEqual(model.mcpBindTargetWorkspaceID, workspaceTwo.id)
+        }
+
+        func testSelectionDuringInFlightActivationWinsAndStaleResultIsNeverPublished() async throws {
+            let staleTarget = OrchestrationGraphInspectorTarget.workspace(workspaceID: workspaceTwo.id)
+            let latestTarget = OrchestrationGraphInspectorTarget.workspace(workspaceID: workspaceOne.id)
+            let staleActivationHeld = expectation(description: "stale activation held in flight")
+            var gatedTargets: [OrchestrationGraphInspectorTarget] = []
+            var releaseStaleActivation: CheckedContinuation<Void, Never>?
+            let (shell, model) = makeShell(activationGate: { target in
+                gatedTargets.append(target)
+                guard target == staleTarget else { return }
+                await withCheckedContinuation { continuation in
+                    releaseStaleActivation = continuation
+                    staleActivationHeld.fulfill()
+                }
+            })
+            var surfaces: [OrchestrationGraphInspectorSurface] = []
+            var bindTargets: [UUID?] = []
+            var subscriptions = Set<AnyCancellable>()
+            model.$surface.sink { surfaces.append($0) }.store(in: &subscriptions)
+            model.$mcpBindTargetWorkspaceID.sink { bindTargets.append($0) }.store(in: &subscriptions)
+
+            shell.select(staleTarget)
+            await fulfillment(of: [staleActivationHeld], timeout: 30)
+            let host = try XCTUnwrap(model.hostWindowState)
+            XCTAssertEqual(host.workspaceManager.activeWorkspaceID, workspaceTwo.id)
+
+            shell.select(latestTarget)
+            XCTAssertEqual(model.surface, .loading(latestTarget))
+            releaseStaleActivation?.resume()
+            releaseStaleActivation = nil
+            await model.waitForIdle()
+
+            XCTAssertEqual(gatedTargets, [staleTarget, latestTarget])
+            XCTAssertEqual(model.surface, .workspace(workspaceOne.id))
+            XCTAssertEqual(model.mcpBindTargetWorkspaceID, workspaceOne.id)
+            XCTAssertTrue(model.hostWindowState === host)
+            XCTAssertEqual(host.workspaceManager.activeWorkspaceID, workspaceOne.id)
+            XCTAssertEqual(graphWindow.workspaceManager.activeWorkspaceID, workspaceOne.id)
+            XCTAssertEqual(surfaces, [.empty, .loading(staleTarget), .loading(latestTarget), .workspace(workspaceOne.id)])
+            XCTAssertFalse(bindTargets.contains(workspaceTwo.id))
+            XCTAssertEqual(bindTargets.last, workspaceOne.id)
         }
 
         // MARK: - 6. Flag false
@@ -298,23 +341,32 @@ import XCTest
             shell.select(.workspace(workspaceID: workspaceTwo.id))
             await model.waitForIdle()
 
+            model.requestTearDown()
+            shell.select(.workspace(workspaceID: workspaceOne.id))
+            XCTAssertEqual(model.surface, .workspace(workspaceTwo.id))
             await model.tearDown()
             await model.tearDown()
             shell.select(.workspace(workspaceID: workspaceOne.id))
             await model.waitForIdle()
 
+            XCTAssertEqual(model.surface, .workspace(workspaceTwo.id))
             XCTAssertNil(model.hostWindowState)
             XCTAssertEqual(hostFactoryCallCount, 1)
         }
 
         // MARK: - Helpers
 
-        private func makeShell() -> (OrchestrationGraphShell, OrchestrationGraphInspectorModel) {
+        private func makeShell(
+            activationGate: OrchestrationGraphInspectorModel.ActivationGate? = nil
+        ) -> (OrchestrationGraphShell, OrchestrationGraphInspectorModel) {
             let runtime: MCPDomainRuntime = runtime
-            let model = OrchestrationGraphInspectorModel(hostFactory: { [weak self] in
-                self?.hostFactoryCallCount += 1
-                return WindowState(domainRuntime: runtime)
-            })
+            let model = OrchestrationGraphInspectorModel(
+                hostFactory: { [weak self] in
+                    self?.hostFactoryCallCount += 1
+                    return WindowState(domainRuntime: runtime)
+                },
+                activationGate: activationGate
+            )
             models.append(model)
             let snapshot = makeSnapshot()
             let shell = OrchestrationGraphShell(

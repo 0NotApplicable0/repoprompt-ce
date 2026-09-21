@@ -16,8 +16,7 @@ enum OrchestrationGraphInspectorTarget: Equatable, Hashable {
 enum OrchestrationGraphInspectorFailure: Equatable {
     case workspaceUnavailable
     case workspaceSwitchBlocked(String)
-    /// The session's recorded compose tab is neither open nor stashed. The inspector never
-    /// creates a tab to open it, so inspection cannot mutate the workspace (design D2b).
+    /// The session's compose tab is neither open nor stashed; the inspector never creates one.
     case sessionTabUnavailable
     case sessionUnavailable
     case sessionMismatch
@@ -40,9 +39,12 @@ enum OrchestrationGraphInspectorFailure: Equatable {
         }
     }
 
-    init(_ result: AgentRouteSessionActivationResult) {
+    /// `nil` when the activation succeeded.
+    init?(_ result: AgentRouteSessionActivationResult) {
         switch result {
-        case .ready, .sessionNotFound:
+        case .ready:
+            return nil
+        case .sessionNotFound:
             self = .sessionUnavailable
         case .sessionWorkspaceMismatch, .sessionTabMismatch:
             self = .sessionMismatch
@@ -61,15 +63,14 @@ enum OrchestrationGraphInspectorSurface: Equatable {
     case failure(OrchestrationGraphInspectorTarget, OrchestrationGraphInspectorFailure)
 }
 
-/// Owns the graph inspector's single host `WindowState`.
+/// Owns the graph inspector's single, lazily created host `WindowState`.
 ///
-/// The host is created lazily on the first selection and reused for every later one. It is never
-/// registered with `WindowStatesManager` and never gets an `NSWindow`, so the graph window's own
-/// `WindowState` is never mutated by a selection. Selections are serialized latest-wins: one worker
-/// task drains a single desired target, and a generation check guards every publication.
+/// The host is never registered with `WindowStatesManager` and never gets an `NSWindow`.
+/// Selections are latest-wins: a result is published only if no newer selection arrived meanwhile.
 @MainActor
 final class OrchestrationGraphInspectorModel: ObservableObject {
     typealias HostFactory = @MainActor () -> WindowState
+    typealias ActivationGate = @MainActor (OrchestrationGraphInspectorTarget) async -> Void
 
     let instanceID = UUID()
     @Published private(set) var surface: OrchestrationGraphInspectorSurface = .empty
@@ -77,13 +78,16 @@ final class OrchestrationGraphInspectorModel: ObservableObject {
     @Published private(set) var hostWindowState: WindowState?
 
     private let hostFactory: HostFactory
+    private let activationGate: ActivationGate?
     private var desiredTarget: OrchestrationGraphInspectorTarget?
     private var generation = 0
     private var workerTask: Task<Void, Never>?
+    private var tearDownTask: Task<Void, Never>?
     private var isTornDown = false
 
-    init(hostFactory: @escaping HostFactory) {
+    init(hostFactory: @escaping HostFactory, activationGate: ActivationGate? = nil) {
         self.hostFactory = hostFactory
+        self.activationGate = activationGate
     }
 
     /// Production host: a full window composition on the app's domain runtime.
@@ -111,16 +115,27 @@ final class OrchestrationGraphInspectorModel: ObservableObject {
         }
     }
 
-    /// Cancels selection work and tears the host down once. Later calls and selections are no-ops.
-    func tearDown() async {
-        guard !isTornDown else { return }
+    /// Starts the one-time teardown without waiting for it. Later selections are ignored.
+    func requestTearDown() {
+        guard tearDownTask == nil else { return }
         isTornDown = true
         desiredTarget = nil
         generation += 1
-        if let task = workerTask {
-            task.cancel()
-            await task.value
+        let worker = workerTask
+        worker?.cancel()
+        tearDownTask = Task {
+            await worker?.value
+            await self.releaseHost()
         }
+    }
+
+    /// Starts the teardown if needed and waits until the host is torn down.
+    func tearDown() async {
+        requestTearDown()
+        await tearDownTask?.value
+    }
+
+    private func releaseHost() async {
         guard let host = hostWindowState else { return }
         hostWindowState = nil
         mcpBindTargetWorkspaceID = nil
@@ -193,6 +208,9 @@ final class OrchestrationGraphInspectorModel: ObservableObject {
                 return .failure(.workspaceSwitchBlocked(switchResult.message ?? "Workspace switch was blocked."))
             }
         }
+        if let activationGate {
+            await activationGate(target)
+        }
         guard let activeWorkspace = manager.activeWorkspace, activeWorkspace.id == workspace.id else {
             return .failure(.workspaceUnavailable)
         }
@@ -211,8 +229,7 @@ final class OrchestrationGraphInspectorModel: ObservableObject {
         }
     }
 
-    /// The steps of `WindowState.routeToAgentSession` without app activation, window focus, or its
-    /// `saveState: true` switch; the workspace switch already happened with `saveState: false`.
+    /// `WindowState.routeToAgentSession` without app activation, window focus, or a saved-state switch.
     private func activateSession(
         workspaceID: UUID,
         tabID: UUID,
@@ -231,8 +248,8 @@ final class OrchestrationGraphInspectorModel: ObservableObject {
             sessionID: sessionID,
             workspace: activeWorkspace
         )
-        guard activation == .ready else {
-            return .failure(OrchestrationGraphInspectorFailure(activation))
+        if let failure = OrchestrationGraphInspectorFailure(activation) {
+            return .failure(failure)
         }
 
         if tabIsStashed {
@@ -254,8 +271,8 @@ final class OrchestrationGraphInspectorModel: ObservableObject {
             sessionID: sessionID,
             workspace: finalWorkspace
         )
-        guard finalActivation == .ready else {
-            return .failure(OrchestrationGraphInspectorFailure(finalActivation))
+        if let failure = OrchestrationGraphInspectorFailure(finalActivation) {
+            return .failure(failure)
         }
         return .success(.session(workspaceID: workspaceID, tabID: tabID, sessionID: sessionID))
     }
@@ -266,11 +283,7 @@ final class OrchestrationGraphInspectorModel: ObservableObject {
     }
 }
 
-/// Trailing pane of the orchestration graph: the Agent Mode UI of the inspector's host window.
-///
-/// It never mounts `ContentView` (toolbar and app-wide appearance hooks) or `ContentRootShellView`
-/// (shared approval manager, HUD and approval overlays); both surfaces mount `AgentModeView` for the
-/// host alone.
+/// Trailing pane of the orchestration graph: `AgentModeView` of the inspector's host window only.
 struct OrchestrationGraphInspector: View {
     @ObservedObject var model: OrchestrationGraphInspectorModel
 

@@ -92,8 +92,6 @@ struct OrchestrationGraphSnapshotLoader {
     let load: @MainActor () async -> OrchestrationGraphSnapshot
 
     /// Saved workspaces of the graph window plus the persisted sessions of exactly those workspaces.
-    /// The history scanner is handed their session directories directly, so it never walks the
-    /// whole Application Support `Workspaces` library.
     static func production(windowState: WindowState) -> OrchestrationGraphSnapshotLoader {
         OrchestrationGraphSnapshotLoader { [weak windowState] in
             guard let windowState else { return .empty }
@@ -180,11 +178,8 @@ final class OrchestrationGraphShellGraphState: ObservableObject {
     }
 }
 
-/// Root surface of a main window while the orchestration graph flag is on.
-///
-/// A persistent split: the graph pane leads and exactly one `OrchestrationGraphInspector` trails.
-/// Every node goes through `select(_:)`, which changes only the inspector's content; the graph
-/// window's own `WindowState` is never switched.
+/// Root surface of a main window while the orchestration graph flag is on: the graph pane and
+/// exactly one `OrchestrationGraphInspector`. Selecting a node never switches the graph window.
 struct OrchestrationGraphShell: View {
     @ObservedObject var windowState: WindowState
     @StateObject private var inspectorModel: OrchestrationGraphInspectorModel
@@ -238,8 +233,7 @@ struct OrchestrationGraphShell: View {
         .task { await graph.loadIfNeeded() }
         .onDisappear {
             graph.cancel()
-            let model = inspectorModel
-            Task { await model.tearDown() }
+            inspectorModel.requestTearDown()
         }
     }
 
