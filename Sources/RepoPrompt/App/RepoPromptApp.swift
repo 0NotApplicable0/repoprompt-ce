@@ -148,6 +148,8 @@ struct RepoPromptSwiftUIApp: App {
         .commands {
             UpdateMenu(sparkleManager: appDelegate.sparkleManager)
 
+            NewWindowCommands()
+
             // macOS standard "Settings…" (⌘,) menu item
             CommandGroup(replacing: .appSettings) {
                 Button("Settings…") {
@@ -176,6 +178,22 @@ struct RepoPromptSwiftUIApp: App {
                 HelpMenu()
                     .environmentObject(versionManager)
             }
+        }
+    }
+}
+
+/// File → New Window (⌘N). Replaces SwiftUI's default `.newItem` group so the orchestration graph
+/// single-window policy decides whether the scene opens another main window.
+private struct NewWindowCommands: Commands {
+    @Environment(\.openWindow) private var openWindow
+    var policy = OrchestrationGraphWindowPolicy.production
+
+    var body: some Commands {
+        CommandGroup(replacing: .newItem) {
+            Button("New Window") {
+                OrchestrationGraphWindowPolicy.performNewWindowCommand(policy: policy, openWindow: { openWindow(id: "main") })
+            }
+            .keyboardShortcut("n", modifiers: .command)
         }
     }
 }

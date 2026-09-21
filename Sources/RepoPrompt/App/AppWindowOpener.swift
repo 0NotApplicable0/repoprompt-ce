@@ -25,6 +25,9 @@ final class AppWindowOpener {
     private var openMainWindowImpl: (() -> Void)?
     private var pendingDockWindowRequestCount = 0
 
+    /// Orchestration graph single-window policy, read at each action.
+    var policy = OrchestrationGraphWindowPolicy.production
+
     private init() {}
 
     /// Installs the openWindow action from a SwiftUI view.
@@ -34,6 +37,7 @@ final class AppWindowOpener {
 
         let pendingRequestCount = pendingDockWindowRequestCount
         pendingDockWindowRequestCount = 0
+        guard policy.allowsAdditionalMainWindow else { return }
         for _ in 0 ..< pendingRequestCount {
             openMainWindow()
         }
@@ -42,6 +46,10 @@ final class AppWindowOpener {
     /// Requests a new main window from the Dock menu.
     /// Queues the request until SwiftUI has installed the window-opening action.
     func requestMainWindowFromDock() {
+        guard policy.allowsAdditionalMainWindow else {
+            pendingDockWindowRequestCount = 0
+            return
+        }
         guard let openMainWindowImpl else {
             pendingDockWindowRequestCount += 1
             return
@@ -50,10 +58,14 @@ final class AppWindowOpener {
     }
 
     /// Opens a new main window.
-    /// - Throws: `WindowOpenError.openerUnavailable` if no action has been installed.
+    /// - Throws: `WindowOpenError.openerUnavailable` if no action has been installed, or
+    ///   `WindowOpenError.singleWindowPolicy` if the orchestration graph policy forbids another window.
     func openMainWindow() throws {
         guard let impl = openMainWindowImpl else {
             throw WindowOpenError.openerUnavailable
+        }
+        guard policy.allowsAdditionalMainWindow else {
+            throw WindowOpenError.singleWindowPolicy
         }
         impl()
     }
@@ -78,11 +90,14 @@ final class AppWindowOpener {
 /// Errors that can occur when opening windows programmatically.
 enum WindowOpenError: Error, LocalizedError {
     case openerUnavailable
+    case singleWindowPolicy
 
     var errorDescription: String? {
         switch self {
         case .openerUnavailable:
             "Window opener not available. No SwiftUI view has installed the openWindow action."
+        case .singleWindowPolicy:
+            "The orchestration graph shows a single window; no additional main window was opened."
         }
     }
 }

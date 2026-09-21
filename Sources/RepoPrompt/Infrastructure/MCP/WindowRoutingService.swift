@@ -326,6 +326,9 @@ final class WindowRoutingService: Service {
     private let windowStates: WindowStatesManager
     private let networkMgr: ServerNetworkManager
 
+    /// Orchestration graph single-window policy for `open_in_new_window` routes.
+    var policy = OrchestrationGraphWindowPolicy.production
+
     /// Thread-safe tools storage. Routing definitions are static in M1; disabled-tool
     /// filtering and window selection are applied from live state outside this cache.
     private let toolsCache = ToolsCache()
@@ -1309,6 +1312,12 @@ final class WindowRoutingService: Service {
     }
 
     private func openRoutingWindow(deferringInitialAgentSystemWorkspaceRefresh: Bool = false) async throws -> WindowState {
+        if !policy.allowsAdditionalMainWindow,
+           let existingWindow = windowStates.allWindows.first(where: { $0.isCurrentlyFocused })
+           ?? windowStates.latestWindowState
+        {
+            return existingWindow
+        }
         do {
             return try await windowStates.openNewMainWindow(
                 deferringInitialAgentSystemWorkspaceRefresh: deferringInitialAgentSystemWorkspaceRefresh
