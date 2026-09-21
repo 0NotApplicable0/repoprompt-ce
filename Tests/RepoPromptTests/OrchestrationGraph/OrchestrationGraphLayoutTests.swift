@@ -317,6 +317,15 @@ final class OrchestrationGraphLayoutTests: XCTestCase {
         XCTAssertEqual(layout.placements, [
             .init(sessionID: IDs.root, clusterKey: .unassigned, revealReasons: [.searchMatch])
         ])
+
+        let newlineAndTabLayout = OrchestrationGraphLayout.make(
+            projection: projection,
+            searchQuery: "\n\tsessi\t\n"
+        )
+
+        XCTAssertEqual(newlineAndTabLayout.placements, [
+            .init(sessionID: IDs.root, clusterKey: .unassigned, revealReasons: [.searchMatch])
+        ])
     }
 
     func testNonMatchingSearchDoesNotReveal() {
@@ -514,19 +523,68 @@ final class OrchestrationGraphLayoutTests: XCTestCase {
     }
 
     func testClusterAndPlacementOrderIsDeterministic() {
-        let projection = makeProjection(
-            workspaces: [
-                .init(id: IDs.workspace1, name: "Same"),
-                .init(id: IDs.workspace2, name: "Same"),
-                .init(id: IDs.workspace3, name: "")
+        let projection = OrchestrationGraphProjection(
+            nodes: [
+                .workspace(id: IDs.workspace1, name: "Same"),
+                .session(
+                    .init(
+                        sessionID: IDs.historyChild,
+                        name: "Unknown Nine",
+                        workspaceID: IDs.unknownWorkspace,
+                        status: .init(runState: .completed, statusText: nil, isLive: false),
+                        unresolvedParentSessionID: nil
+                    )
+                ),
+                .workspace(id: IDs.workspace3, name: ""),
+                .session(
+                    .init(
+                        sessionID: IDs.root,
+                        name: "Workspace One",
+                        workspaceID: IDs.workspace1,
+                        status: .init(runState: .completed, statusText: nil, isLive: false),
+                        unresolvedParentSessionID: nil
+                    )
+                ),
+                .workspace(id: IDs.workspace2, name: "Same"),
+                .session(
+                    .init(
+                        sessionID: IDs.historySibling,
+                        name: "Unknown Eight",
+                        workspaceID: IDs.unknownWorkspace8,
+                        status: .init(runState: .completed, statusText: nil, isLive: false),
+                        unresolvedParentSessionID: nil
+                    )
+                ),
+                .session(
+                    .init(
+                        sessionID: IDs.child,
+                        name: "Workspace Two",
+                        workspaceID: IDs.workspace2,
+                        status: .init(runState: .completed, statusText: nil, isLive: false),
+                        unresolvedParentSessionID: nil
+                    )
+                ),
+                .session(
+                    .init(
+                        sessionID: IDs.historyRoot,
+                        name: "Empty Name",
+                        workspaceID: IDs.workspace3,
+                        status: .init(runState: .completed, statusText: nil, isLive: false),
+                        unresolvedParentSessionID: nil
+                    )
+                ),
+                .session(
+                    .init(
+                        sessionID: IDs.sibling,
+                        name: "Unassigned",
+                        workspaceID: nil,
+                        status: .init(runState: .completed, statusText: nil, isLive: false),
+                        unresolvedParentSessionID: nil
+                    )
+                )
             ],
-            persisted: [
-                session(IDs.root, "Workspace One", IDs.workspace1, .completed),
-                session(IDs.child, "Workspace Two", IDs.workspace2, .completed),
-                session(IDs.historyRoot, "Empty Name", IDs.workspace3, .completed),
-                session(IDs.historyChild, "Unknown", IDs.unknownWorkspace, .completed),
-                session(IDs.sibling, "Unassigned", nil, .completed)
-            ]
+            edges: [],
+            isHistoryScanIncomplete: false
         )
 
         let layout = OrchestrationGraphLayout.make(projection: projection)
@@ -551,6 +609,12 @@ final class OrchestrationGraphLayoutTests: XCTestCase {
                 sessionIDs: [IDs.root]
             ),
             .init(
+                key: .workspace(IDs.unknownWorkspace8),
+                workspaceID: IDs.unknownWorkspace8,
+                workspaceName: nil,
+                sessionIDs: [IDs.historySibling]
+            ),
+            .init(
                 key: .workspace(IDs.unknownWorkspace),
                 workspaceID: IDs.unknownWorkspace,
                 workspaceName: nil,
@@ -567,6 +631,11 @@ final class OrchestrationGraphLayoutTests: XCTestCase {
             .init(sessionID: IDs.historyRoot, clusterKey: .workspace(IDs.workspace3), revealReasons: []),
             .init(sessionID: IDs.child, clusterKey: .workspace(IDs.workspace2), revealReasons: []),
             .init(sessionID: IDs.root, clusterKey: .workspace(IDs.workspace1), revealReasons: []),
+            .init(
+                sessionID: IDs.historySibling,
+                clusterKey: .workspace(IDs.unknownWorkspace8),
+                revealReasons: []
+            ),
             .init(
                 sessionID: IDs.historyChild,
                 clusterKey: .workspace(IDs.unknownWorkspace),
@@ -698,12 +767,14 @@ final class OrchestrationGraphLayoutTests: XCTestCase {
         static let workspace1 = uuid("00000000-0000-0000-0000-000000000002")
         static let workspace2 = uuid("00000000-0000-0000-0000-000000000001")
         static let workspace3 = uuid("00000000-0000-0000-0000-000000000003")
+        static let unknownWorkspace8 = uuid("00000000-0000-0000-0000-000000000008")
         static let unknownWorkspace = uuid("00000000-0000-0000-0000-000000000009")
         static let root = uuid("00000000-0000-0000-0000-000000000101")
         static let child = uuid("00000000-0000-0000-0000-000000000102")
         static let historyRoot = uuid("00000000-0000-0000-0000-000000000201")
         static let historyChild = uuid("00000000-0000-0000-0000-000000000202")
         static let sibling = uuid("00000000-0000-0000-0000-000000000203")
+        static let historySibling = uuid("00000000-0000-0000-0000-000000000204")
         static let unknownParent = uuid("00000000-0000-0000-0000-000000000999")
     }
 
