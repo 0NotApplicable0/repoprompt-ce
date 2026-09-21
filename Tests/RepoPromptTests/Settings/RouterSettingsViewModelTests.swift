@@ -55,6 +55,16 @@ final class RouterSettingsViewModelTests: XCTestCase {
         )
     }
 
+    func testUnavailableSettingsControllerClearsBackendOperationProgress() async throws {
+        let fixture = try makeFixture()
+        await fixture.viewModel.refresh()
+
+        await fixture.viewModel.performBackendAction(.revalidateStoredSecret)
+
+        XCTAssertFalse(fixture.viewModel.isPerformingBackendOperation)
+        XCTAssertEqual(fixture.viewModel.backendOperationFeedback, .idle)
+    }
+
     func testScopedProviderLimitsAndCustomGuidancePersistThroughViewModel() throws {
         let fixture = try makeFixture()
         fixture.store.setModelRouterAllowedProviders([.codexExec, .claudeCode])

@@ -303,6 +303,30 @@ extension AgentComposerSubmissionAttemptTests {
         XCTAssertTrue(requests.allSatisfy { $0.candidates.allSatisfy { !$0.targetDescription.isEmpty } })
     }
 
+    func testCancellationAfterModelSelectionDoesNotStartEffortRouting() async throws {
+        let backend = StagedCancellationRoutingBackend()
+        let (viewModel, _) = try makeRoutingViewModel(backend: backend)
+        let routingTask = Task { @MainActor in
+            try await viewModel.routeSubagentTargetIfEnabled(
+                task: "Review the concurrency boundary",
+                surface: .general
+            )
+        }
+        await backend.waitUntilFirstStageStarted()
+
+        routingTask.cancel()
+        await backend.completeFirstStageSelection()
+
+        do {
+            _ = try await routingTask.value
+            XCTFail("Cancelled routing must not produce a target")
+        } catch AgentModeViewModel.GlobalModelRoutingError.cancelled {
+            // Expected.
+        }
+        let requestCount = await backend.requestCount
+        XCTAssertEqual(requestCount, 1)
+    }
+
     func testNewDestinationOwnsVisibleCancelAndRejectsSecondSubmit() async throws {
         let backend = SuspendedComposerRoutingBackend()
         let (viewModel, _) = try makeRoutingViewModel(backend: backend)
@@ -471,5 +495,38 @@ private actor SuspendedComposerRoutingBackend: AgentTaskRouterBackend {
         guard let key = request?.candidates.first?.opaqueKey else { return }
         completion?.resume(returning: .selected(opaqueKey: key, evidence: nil))
         completion = nil
+    }
+}
+
+private actor StagedCancellationRoutingBackend: AgentTaskRouterBackend {
+    nonisolated let id = AgentTaskRouterBackendID(rawValue: "staged-cancellation")
+    nonisolated let displayName = "Staged cancellation"
+    private(set) var requestCount = 0
+    private var firstRequest: AgentTaskRoutingRequest?
+    private var startedWaiters: [CheckedContinuation<Void, Never>] = []
+    private var firstStageCompletion: CheckedContinuation<AgentTaskRoutingBackendOutcome, Never>?
+
+    func readinessSnapshot() -> AgentTaskRouterBackendReadiness {
+        .ready(generation: 1, policyVersion: "fake-v1")
+    }
+
+    func route(_ request: AgentTaskRoutingRequest) async -> AgentTaskRoutingBackendOutcome {
+        requestCount += 1
+        guard requestCount == 1 else { return .cancelled }
+        firstRequest = request
+        startedWaiters.forEach { $0.resume() }
+        startedWaiters.removeAll()
+        return await withCheckedContinuation { firstStageCompletion = $0 }
+    }
+
+    func waitUntilFirstStageStarted() async {
+        if firstRequest != nil { return }
+        await withCheckedContinuation { startedWaiters.append($0) }
+    }
+
+    func completeFirstStageSelection() {
+        guard let key = firstRequest?.candidates.last?.opaqueKey else { return }
+        firstStageCompletion?.resume(returning: .selected(opaqueKey: key, evidence: nil))
+        firstStageCompletion = nil
     }
 }

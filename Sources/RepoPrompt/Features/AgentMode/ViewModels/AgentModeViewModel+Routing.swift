@@ -304,6 +304,9 @@ extension AgentModeViewModel {
             selectedModel = match
         }
 
+        guard !Task.isCancelled else {
+            return StagedTaskRoutingResult(candidates: models, outcome: .cancelled)
+        }
         guard let efforts = try? builder.buildEfforts(
             for: selectedModel,
             availability: modelRouterAvailabilityContext

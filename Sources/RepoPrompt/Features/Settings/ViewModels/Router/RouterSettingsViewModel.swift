@@ -193,7 +193,12 @@ final class RouterSettingsViewModel: ObservableObject {
         guard !isPerformingBackendOperation,
               let id = settingsStore.modelRouterConfiguration().selectedBackendID else { return }
         isPerformingBackendOperation = true
-        defer { isPerformingBackendOperation = false }
+        defer {
+            isPerformingBackendOperation = false
+            if case .running = backendOperationFeedback {
+                backendOperationFeedback = .idle
+            }
+        }
         let progressMessage = switch action {
         case .validateAndSaveSecret: "Verifying and saving the key…"
         case .revalidateStoredSecret: "Checking the saved key…"
