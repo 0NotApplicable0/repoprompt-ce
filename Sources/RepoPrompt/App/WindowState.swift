@@ -525,6 +525,18 @@ class WindowState: ObservableObject {
         )
     }
 
+    /// Inspector host: load workspaces from disk, but do not auto-switch to Default.
+    convenience init(inspectorHostDomainRuntime runtime: MCPDomainRuntime) {
+        self.init(
+            contextBuilderProviderFactory: nil,
+            loadStoredAPISettingsDataOnInit: true,
+            codexModelPollingService: .shared,
+            domainRuntimeOverride: runtime,
+            performInitialWorkspaceActivation: false,
+            workspaceActivityCoordinator: WorkspaceActivityCoordinator()
+        )
+    }
+
     #if DEBUG
         convenience init(
             contextBuilderProviderFactory: @escaping ContextBuilderAgentViewModel.ProviderFactory,
@@ -599,7 +611,9 @@ class WindowState: ObservableObject {
         workspaceFileContextStore injectedWorkspaceFileContextStore: WorkspaceFileContextStore? = nil,
         storedPromptPersistence: (any StoredPromptPersistenceServing)? = nil,
         domainRuntimeOverride: MCPDomainRuntime?,
-        keyManager injectedKeyManager: KeyManager? = nil
+        keyManager injectedKeyManager: KeyManager? = nil,
+        performInitialWorkspaceActivation: Bool = true,
+        workspaceActivityCoordinator: WorkspaceActivityCoordinator? = nil
     ) {
         // Assign a unique window ID
         windowID = WindowState.allocateWindowID()
@@ -623,7 +637,9 @@ class WindowState: ObservableObject {
             workspaceFileContextStore: injectedWorkspaceFileContextStore,
             storedPromptPersistence: storedPromptPersistence,
             loadStoredAPISettingsDataOnInit: loadStoredAPISettingsDataOnInit,
-            codexModelPollingService: codexModelPollingService
+            codexModelPollingService: codexModelPollingService,
+            performInitialWorkspaceActivation: performInitialWorkspaceActivation,
+            workspaceActivityCoordinator: workspaceActivityCoordinator
         )
 
         workspaceFileContextStore = composition.workspaceFileContextStore

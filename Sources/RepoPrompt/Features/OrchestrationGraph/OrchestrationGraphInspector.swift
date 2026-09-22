@@ -21,6 +21,7 @@ enum OrchestrationGraphInspectorFailure: Equatable {
     case sessionUnavailable
     case sessionMismatch
     case blockedByActiveDifferentSession
+    case timedOut
 
     var message: String {
         switch self {
@@ -36,6 +37,8 @@ enum OrchestrationGraphInspectorFailure: Equatable {
             "The session belongs to a different workspace or tab."
         case .blockedByActiveDifferentSession:
             "Another session is running in this tab."
+        case .timedOut:
+            "Opening this workspace took too long. Close and try again."
         }
     }
 
@@ -93,7 +96,7 @@ final class OrchestrationGraphInspectorModel: ObservableObject {
     /// Production host: a full window composition on the app's domain runtime.
     static func production() -> OrchestrationGraphInspectorModel {
         OrchestrationGraphInspectorModel(hostFactory: {
-            WindowState(domainRuntime: AppDomainRuntimeComposition.shared.runtime)
+            WindowState(inspectorHostDomainRuntime: AppDomainRuntimeComposition.shared.runtime)
         })
     }
 
@@ -106,6 +109,22 @@ final class OrchestrationGraphInspectorModel: ObservableObject {
         workerTask = Task { [weak self] in
             await self?.drainSelections()
         }
+    }
+
+    /// Stops an in-flight open so the inspector dialog can dismiss.
+    /// Keeps a warm host so the next click does not rebuild WindowState (disk decode,
+    /// MCP, Agent Mode) on the main thread. Recycle only when a workspace switch is
+    /// still hydrating roots — that reuse used to freeze the second open.
+    func cancelSelection() {
+        generation += 1
+        desiredTarget = nil
+        workerTask?.cancel()
+        workerTask = nil
+        surface = .empty
+        mcpBindTargetWorkspaceID = nil
+        guard let host = hostWindowState, host.workspaceManager.isSwitchingWorkspace else { return }
+        hostWindowState = nil
+        Task { await host.tearDown() }
     }
 
     /// Waits until every queued selection has been applied.
@@ -146,14 +165,26 @@ final class OrchestrationGraphInspectorModel: ObservableObject {
         while let target = desiredTarget, !isTornDown, !Task.isCancelled {
             desiredTarget = nil
             let requestGeneration = generation
+            await Task.yield()
             let host = resolvedHost()
-            let result = await activate(target, on: host)
-            guard requestGeneration == generation, !isTornDown else { continue }
+            let result = if activationGate == nil {
+                await activateWithDeadline(target, on: host)
+            } else {
+                await activate(target, on: host)
+            }
+            guard requestGeneration == generation, !isTornDown, !Task.isCancelled else { continue }
             switch result {
             case let .success(surface):
                 self.surface = surface
-                mcpBindTargetWorkspaceID = activeTabID(of: host).flatMap {
-                    host.workspaceManager.bindingCandidate(forContextID: $0)?.workspaceID
+                switch surface {
+                case let .workspace(workspaceID):
+                    mcpBindTargetWorkspaceID = workspaceID
+                case let .session(workspaceID, _, _):
+                    mcpBindTargetWorkspaceID = workspaceID
+                default:
+                    mcpBindTargetWorkspaceID = activeTabID(of: host).flatMap {
+                        host.workspaceManager.bindingCandidate(forContextID: $0)?.workspaceID
+                    }
                 }
             case let .failure(failure):
                 surface = .failure(target, failure)
@@ -176,9 +207,44 @@ final class OrchestrationGraphInspectorModel: ObservableObject {
         host.promptManager.activeComposeTabID
     }
 
-    private enum ActivationResult {
+    private enum ActivationResult: Sendable {
         case success(OrchestrationGraphInspectorSurface)
         case failure(OrchestrationGraphInspectorFailure)
+    }
+
+    private func activateWithDeadline(
+        _ target: OrchestrationGraphInspectorTarget,
+        on host: WindowState
+    ) async -> ActivationResult {
+        let work = Task { @MainActor in
+            await self.activate(target, on: host)
+        }
+        let timeout = Task {
+            try await Task.sleep(nanoseconds: 3_000_000_000)
+        }
+        let result: ActivationResult = await withTaskGroup(of: ActivationResult?.self) { group in
+            group.addTask {
+                await work.value
+            }
+            group.addTask {
+                _ = try? await timeout.value
+                return nil
+            }
+            var winner: ActivationResult?
+            for await item in group {
+                if let item {
+                    winner = item
+                } else {
+                    winner = .failure(.timedOut)
+                    work.cancel()
+                }
+                group.cancelAll()
+                break
+            }
+            return winner ?? .failure(.timedOut)
+        }
+        timeout.cancel()
+        return result
     }
 
     private func activate(
@@ -186,39 +252,41 @@ final class OrchestrationGraphInspectorModel: ObservableObject {
         on host: WindowState
     ) async -> ActivationResult {
         let manager = host.workspaceManager
-        await manager.awaitInitialized()
+        await waitForWorkspaces(manager, workspaceID: target.workspaceID)
+        guard !Task.isCancelled else { return .failure(.timedOut) }
         guard let workspace = manager.workspace(withID: target.workspaceID) else {
             return .failure(.workspaceUnavailable)
         }
 
-        if case let .session(_, tabID, _) = target,
-           manager.activeWorkspaceID != workspace.id,
-           !Self.workspace(workspace, holdsTab: tabID)
-        {
-            return .failure(.sessionTabUnavailable)
-        }
-
-        if manager.activeWorkspaceID != workspace.id {
-            let switchResult = await manager.switchWorkspace(
-                to: workspace,
-                saveState: false,
-                reason: "orchestrationGraphInspector"
-            )
-            guard switchResult.didSwitch else {
-                return .failure(.workspaceSwitchBlocked(switchResult.message ?? "Workspace switch was blocked."))
-            }
+        // Skip full switchWorkspace: git/root hydration hangs Opening… on the MainActor.
+        let alreadyOpen = manager.activeWorkspaceID == workspace.id
+        manager.activeWorkspace = workspace
+        if !alreadyOpen {
+            host.promptManager.loadComposeTabsFromWorkspace(workspace, syncPromptText: true)
         }
         if let activationGate {
             await activationGate(target)
         }
-        guard let activeWorkspace = manager.activeWorkspace, activeWorkspace.id == workspace.id else {
-            return .failure(.workspaceUnavailable)
-        }
+        guard !Task.isCancelled else { return .failure(.timedOut) }
 
         switch target {
         case let .workspace(workspaceID):
+            if !alreadyOpen {
+                let hostForHydration = host
+                let workspaceForHydration = workspace
+                Task { @MainActor in
+                    await hostForHydration.agentModeViewModel.handleWorkspaceSwitch(workspaceForHydration)
+                }
+            }
             return .success(.workspace(workspaceID))
         case let .session(workspaceID, tabID, sessionID):
+            if !alreadyOpen {
+                await host.agentModeViewModel.handleWorkspaceSwitch(workspace)
+            }
+            guard !Task.isCancelled else { return .failure(.timedOut) }
+            guard let activeWorkspace = manager.activeWorkspace, activeWorkspace.id == workspace.id else {
+                return .failure(.workspaceUnavailable)
+            }
             return await activateSession(
                 workspaceID: workspaceID,
                 tabID: tabID,
@@ -277,13 +345,26 @@ final class OrchestrationGraphInspectorModel: ObservableObject {
         return .success(.session(workspaceID: workspaceID, tabID: tabID, sessionID: sessionID))
     }
 
+    private func waitForWorkspaces(_ manager: WorkspaceManagerViewModel, workspaceID: UUID) async {
+        if manager.isInitialized || manager.workspace(withID: workspaceID) != nil {
+            return
+        }
+        let deadline = Date().addingTimeInterval(2)
+        while Date() < deadline, !Task.isCancelled, !manager.isInitialized {
+            if manager.workspace(withID: workspaceID) != nil {
+                return
+            }
+            try? await Task.sleep(nanoseconds: 50_000_000)
+        }
+    }
+
     private static func workspace(_ workspace: WorkspaceModel, holdsTab tabID: UUID) -> Bool {
         workspace.composeTabs.contains { $0.id == tabID }
             || workspace.stashedTabs.contains { $0.tab.id == tabID }
     }
 }
 
-/// Trailing pane of the orchestration graph: `AgentModeView` of the inspector's host window only.
+/// Trailing pane of the orchestration graph: traditional `ContentView` of the inspector host.
 struct OrchestrationGraphInspector: View {
     @ObservedObject var model: OrchestrationGraphInspectorModel
 
@@ -298,10 +379,17 @@ struct OrchestrationGraphInspector: View {
         case .empty:
             placeholder("Select a workspace or session in the graph.")
         case .loading:
-            ProgressView()
+            VStack(spacing: 12) {
+                ProgressView()
+                Text("Opening…")
+                    .foregroundStyle(.secondary)
+            }
         case .workspace, .session:
             if let host = model.hostWindowState {
-                OrchestrationGraphInspectorHostView(host: host)
+                ContentView(windowState: host)
+                    .environmentObject(host)
+                    .environmentObject(host.workspaceManager)
+                    .environmentObject(host.mcpServer)
             } else {
                 placeholder("Select a workspace or session in the graph.")
             }
@@ -315,20 +403,5 @@ struct OrchestrationGraphInspector: View {
             .foregroundStyle(.secondary)
             .multilineTextAlignment(.center)
             .padding(24)
-    }
-}
-
-private struct OrchestrationGraphInspectorHostView: View {
-    @ObservedObject var host: WindowState
-
-    var body: some View {
-        AgentModeView(
-            windowState: host,
-            agentModeVM: host.agentModeViewModel,
-            promptManager: host.promptManager
-        )
-        .environmentObject(host)
-        .environmentObject(host.workspaceManager)
-        .environmentObject(host.mcpServer)
     }
 }

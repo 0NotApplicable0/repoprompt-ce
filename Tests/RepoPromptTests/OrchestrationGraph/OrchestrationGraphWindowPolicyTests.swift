@@ -124,12 +124,8 @@ import XCTest
             XCTAssertEqual(WindowStatesManager.shared.allWindows.count, 1)
         }
 
-        func testFlagOnInstallReplaysAtMostOneQueuedDockRequestWhenNoWindowExists() async throws {
-            let closedWindow: WindowState = windowA
-            WindowStatesManager.shared.unregisterWindowState(closedWindow)
-            addedWindows.removeAll { $0 === closedWindow }
-            await closedWindow.tearDown()
-            XCTAssertTrue(WindowStatesManager.shared.allWindows.isEmpty)
+        func testFlagOnInstallDoesNotReplayQueuedDockRequestsWhenNoWindowExists() async throws {
+            try await closeRegisteredWindows()
             AppWindowOpener.shared.policy = policy(graphEnabled: true)
             XCTAssertFalse(AppWindowOpener.shared.isAvailable)
 
@@ -138,11 +134,40 @@ import XCTest
             try sendDockNewWindow()
 
             var openCount = 0
-            installProductionOpener { openCount += 1 }
+            AppWindowOpener.shared.install { openCount += 1 }
+
+            XCTAssertEqual(openCount, 0)
+            XCTAssertTrue(WindowStatesManager.shared.allWindows.isEmpty)
+        }
+
+        func testFlagOnTwoSynchronousOpenMainWindowCallsOpenOnce() async throws {
+            try await closeRegisteredWindows()
+            AppWindowOpener.shared.policy = policy(graphEnabled: true)
+            var openCount = 0
+            AppWindowOpener.shared.install { openCount += 1 }
+
+            try AppWindowOpener.shared.openMainWindow()
+            XCTAssertThrowsError(try AppWindowOpener.shared.openMainWindow()) { error in
+                guard case WindowOpenError.singleWindowPolicy = error else {
+                    return XCTFail("expected singleWindowPolicy, got \(error)")
+                }
+            }
 
             XCTAssertEqual(openCount, 1)
-            XCTAssertEqual(WindowStatesManager.shared.allWindows.count, 1)
-            XCTAssertFalse(WindowStatesManager.shared.allWindows.first === closedWindow)
+            XCTAssertTrue(WindowStatesManager.shared.allWindows.isEmpty)
+        }
+
+        func testFlagOnTwoSynchronousDockRequestsOpenOnce() async throws {
+            try await closeRegisteredWindows()
+            AppWindowOpener.shared.policy = policy(graphEnabled: true)
+            var openCount = 0
+            AppWindowOpener.shared.install { openCount += 1 }
+
+            try sendDockNewWindow()
+            try sendDockNewWindow()
+
+            XCTAssertEqual(openCount, 1)
+            XCTAssertTrue(WindowStatesManager.shared.allWindows.isEmpty)
         }
 
         // MARK: - File → New Window (⌘N)
@@ -180,6 +205,23 @@ import XCTest
             XCTAssertEqual(fallbackOpenCount, 0)
             XCTAssertEqual(WindowStatesManager.shared.allWindows.count, 1)
             XCTAssertTrue(WindowStatesManager.shared.allWindows.first === windowA)
+        }
+
+        func testFlagOnTwoSynchronousNewWindowCommandsOpenOnce() async throws {
+            try await closeRegisteredWindows()
+            var openCount = 0
+
+            OrchestrationGraphWindowPolicy.performNewWindowCommand(
+                policy: policy(graphEnabled: true),
+                openWindow: { openCount += 1 }
+            )
+            OrchestrationGraphWindowPolicy.performNewWindowCommand(
+                policy: policy(graphEnabled: true),
+                openWindow: { openCount += 1 }
+            )
+
+            XCTAssertEqual(openCount, 1)
+            XCTAssertTrue(WindowStatesManager.shared.allWindows.isEmpty)
         }
 
         func testFlagOnFileNewWindowCommandOpensFirstWindowWhenNoneExist() async {
@@ -338,6 +380,16 @@ import XCTest
             addedWindows.append(window)
             WindowStatesManager.shared.registerWindowState(window)
             return window
+        }
+
+        private func closeRegisteredWindows() async throws {
+            for window in addedWindows.reversed() {
+                WindowStatesManager.shared.unregisterWindowState(window)
+                await window.tearDown()
+            }
+            addedWindows.removeAll()
+            windowA = nil
+            XCTAssertTrue(WindowStatesManager.shared.allWindows.isEmpty)
         }
 
         private func openMainWindowLikeWindowContentView() {

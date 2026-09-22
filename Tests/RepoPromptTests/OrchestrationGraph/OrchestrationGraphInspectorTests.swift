@@ -123,6 +123,8 @@ import XCTest
             XCTAssertEqual(model.surface, .workspace(workspaceTwo.id))
             let host = try XCTUnwrap(model.hostWindowState)
             XCTAssertEqual(host.workspaceManager.activeWorkspaceID, workspaceTwo.id)
+            XCTAssertEqual(host.promptManager.currentComposeTabs.map(\.id), [workspaceTwoTabID])
+            XCTAssertEqual(host.promptManager.activeComposeTabID, workspaceTwoTabID)
             XCTAssertEqual(graphWindow.workspaceManager.activeWorkspaceID, workspaceOne.id)
             XCTAssertEqual(model.mcpBindTargetWorkspaceID, workspaceTwo.id)
             XCTAssertFalse(host === graphWindow)
@@ -336,6 +338,122 @@ import XCTest
             XCTAssertEqual(model.surface, .workspace(workspaceOne.id))
         }
 
+        func testWorkerWithoutComposeTabInheritsOrchestratorTabRoute() {
+            let workspaceID = UUID()
+            let parentID = UUID()
+            let childID = UUID()
+            let tabID = UUID()
+            let projection = OrchestrationGraphProjection.make(
+                workspaces: [.init(id: workspaceID, name: "W")],
+                persisted: [
+                    .init(
+                        sessionID: parentID,
+                        workspaceID: workspaceID,
+                        name: "ORCHESTRATE",
+                        parentSessionID: nil,
+                        runState: .running,
+                        composeTabID: tabID
+                    ),
+                    .init(
+                        sessionID: childID,
+                        workspaceID: workspaceID,
+                        name: "WORKER",
+                        parentSessionID: parentID,
+                        runState: .completed
+                    )
+                ],
+                live: [],
+                isHistoryScanIncomplete: false
+            )
+            let routes = OrchestrationGraphSnapshot.resolvedSessionRoutes(
+                seed: [parentID: .init(workspaceID: workspaceID, tabID: tabID)],
+                live: [],
+                projection: projection
+            )
+            XCTAssertEqual(routes[childID]?.tabID, tabID)
+            let snapshot = OrchestrationGraphSnapshot(projection: projection, sessionRoutes: routes)
+            XCTAssertEqual(
+                snapshot.target(forSessionID: childID),
+                .session(workspaceID: workspaceID, tabID: tabID, sessionID: childID)
+            )
+            XCTAssertEqual(
+                snapshot.target(forSessionID: parentID),
+                .session(workspaceID: workspaceID, tabID: tabID, sessionID: parentID)
+            )
+        }
+
+        func testCancelSelectionKeepsWarmHostForReopen() async throws {
+            let (shell, model) = makeShell()
+            shell.select(.workspace(workspaceID: workspaceTwo.id))
+            await model.waitForIdle()
+            let host = try XCTUnwrap(model.hostWindowState)
+
+            model.cancelSelection()
+            XCTAssertTrue(model.hostWindowState === host)
+            XCTAssertEqual(model.surface, .empty)
+
+            shell.select(.workspace(workspaceID: workspaceTwo.id))
+            await model.waitForIdle()
+
+            XCTAssertEqual(hostFactoryCallCount, 1)
+            XCTAssertTrue(model.hostWindowState === host)
+            XCTAssertEqual(model.surface, .workspace(workspaceTwo.id))
+            XCTAssertEqual(host.promptManager.currentComposeTabs.map(\.id), [workspaceTwoTabID])
+        }
+
+        func testProductionLoaderListsPersistedSessionsAfterWorkspaceInit() async {
+            let (shell, _) = makeShell(snapshotLoader: .production(windowState: graphWindow))
+            await shell.loadSnapshotIfNeeded()
+
+            let nodes = shell.snapshotForTesting.projection.nodes
+            XCTAssertTrue(nodes.contains { $0.id == .workspace(workspaceOne.id) })
+            XCTAssertTrue(nodes.contains { $0.id == .workspace(workspaceTwo.id) })
+            XCTAssertTrue(nodes.contains { $0.id == .session(workspaceTwoSessionID) })
+            XCTAssertFalse(shell.snapshotForTesting.projection.nodes.isEmpty)
+        }
+
+        func testProductionLoaderMergesLiveSessionStatus() async {
+            let liveID = UUID()
+            let tab = AgentTabSession(tabID: workspaceOneTabID)
+            tab.runState = .running
+            tab.runningStatusText = "thinking"
+            tab.parentSessionID = nil
+            graphWindow.agentModeViewModel.test_installLiveSession(tab)
+            _ = graphWindow.agentModeViewModel.test_installPersistentSessionBinding(
+                sessionID: liveID,
+                on: tab
+            )
+
+            let (shell, _) = makeShell(snapshotLoader: .production(windowState: graphWindow))
+            await shell.loadSnapshotIfNeeded()
+
+            let session = shell.snapshotForTesting.projection.nodes.compactMap { node -> OrchestrationGraphProjection.SessionNode? in
+                if case let .session(session) = node, session.sessionID == liveID { return session }
+                return nil
+            }.first
+            XCTAssertNotNil(session)
+            XCTAssertEqual(session?.status.runState, .running)
+            XCTAssertEqual(session?.status.statusText, "thinking")
+            XCTAssertEqual(session?.status.isLive, true)
+            XCTAssertEqual(
+                shell.snapshotForTesting.sessionRoutes[liveID]?.tabID,
+                workspaceOneTabID
+            )
+        }
+
+        func testSnapshotReloadsWhenLoaderResultChanges() async {
+            let box = SnapshotBox(snapshot: .empty)
+            let (shell, _) = makeShell(snapshotLoader: OrchestrationGraphSnapshotLoader { box.snapshot })
+            await shell.loadSnapshotIfNeeded()
+            XCTAssertTrue(shell.snapshotForTesting.layout.clusters.isEmpty)
+
+            box.snapshot = makeSnapshot()
+            await shell.reloadSnapshot()
+            XCTAssertTrue(
+                shell.snapshotForTesting.projection.nodes.contains { $0.id == .session(workspaceOneSessionID) }
+            )
+        }
+
         func testTearDownIsIdempotentAndIgnoresLaterSelections() async {
             let (shell, model) = makeShell()
             shell.select(.workspace(workspaceID: workspaceTwo.id))
@@ -357,7 +475,8 @@ import XCTest
         // MARK: - Helpers
 
         private func makeShell(
-            activationGate: OrchestrationGraphInspectorModel.ActivationGate? = nil
+            activationGate: OrchestrationGraphInspectorModel.ActivationGate? = nil,
+            snapshotLoader: OrchestrationGraphSnapshotLoader? = nil
         ) -> (OrchestrationGraphShell, OrchestrationGraphInspectorModel) {
             let runtime: MCPDomainRuntime = runtime
             let model = OrchestrationGraphInspectorModel(
@@ -372,9 +491,16 @@ import XCTest
             let shell = OrchestrationGraphShell(
                 windowState: graphWindow,
                 inspectorModel: model,
-                snapshotLoader: OrchestrationGraphSnapshotLoader { snapshot }
+                snapshotLoader: snapshotLoader ?? OrchestrationGraphSnapshotLoader { snapshot }
             )
             return (shell, model)
+        }
+
+        private final class SnapshotBox: @unchecked Sendable {
+            var snapshot: OrchestrationGraphSnapshot
+            init(snapshot: OrchestrationGraphSnapshot) {
+                self.snapshot = snapshot
+            }
         }
 
         private func makeSnapshot() -> OrchestrationGraphSnapshot {

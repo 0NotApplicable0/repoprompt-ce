@@ -17,6 +17,7 @@ struct OrchestrationGraphProjection: Equatable {
         let name: String
         let parentSessionID: UUID?
         let runState: SessionRunState
+        var composeTabID: UUID? = nil
     }
 
     struct LiveSessionInput: Equatable, Hashable {
@@ -26,6 +27,7 @@ struct OrchestrationGraphProjection: Equatable {
         let parentSessionID: UUID?
         let runState: SessionRunState
         let statusText: String?
+        var composeTabID: UUID? = nil
     }
 
     enum SessionRunState: Equatable, Hashable {
@@ -164,6 +166,7 @@ struct OrchestrationGraphProjection: Equatable {
         let workspaceID: UUID?
         let name: String
         let parentSessionID: UUID?
+        let composeTabID: UUID?
         let status: SessionStatus
     }
 
@@ -185,6 +188,7 @@ struct OrchestrationGraphProjection: Equatable {
                 workspaceID: session.workspaceID,
                 name: session.name,
                 parentSessionID: session.parentSessionID,
+                composeTabID: session.composeTabID,
                 status: SessionStatus(runState: session.runState, statusText: nil, isLive: false)
             )
         }
@@ -195,6 +199,7 @@ struct OrchestrationGraphProjection: Equatable {
                 workspaceID: session.workspaceID,
                 name: session.name,
                 parentSessionID: session.parentSessionID,
+                composeTabID: session.composeTabID,
                 status: SessionStatus(runState: session.runState, statusText: session.statusText, isLive: true)
             )
         }
@@ -222,16 +227,17 @@ struct OrchestrationGraphProjection: Equatable {
 
         var edges: [Edge] = []
         for session in sessionsByID.values {
-            if let parentSessionID = session.parentSessionID {
-                if parentSessionID != session.sessionID, sessionsByID[parentSessionID] != nil {
-                    edges.append(
-                        Edge(
-                            source: .session(parentSessionID),
-                            target: .session(session.sessionID),
-                            kind: .dispatch
-                        )
+            if let parentSessionID = session.parentSessionID,
+               parentSessionID != session.sessionID,
+               sessionsByID[parentSessionID] != nil
+            {
+                edges.append(
+                    Edge(
+                        source: .session(parentSessionID),
+                        target: .session(session.sessionID),
+                        kind: .dispatch
                     )
-                }
+                )
             } else if let workspaceID = session.workspaceID, workspaceByID[workspaceID] != nil {
                 edges.append(
                     Edge(
@@ -265,7 +271,8 @@ struct OrchestrationGraphProjection: Equatable {
                         workspaceID: workspaceID,
                         name: record.name,
                         parentSessionID: record.parentSessionID,
-                        runState: .fromPersistedRaw(record.lastRunStateRaw)
+                        runState: .fromPersistedRaw(record.lastRunStateRaw),
+                        composeTabID: record.composeTabID
                     )
                 }
             }
@@ -282,7 +289,8 @@ struct OrchestrationGraphProjection: Equatable {
                             status: snapshot.status,
                             interactionKind: snapshot.interaction?.kind
                         ),
-                        statusText: snapshot.statusText
+                        statusText: snapshot.statusText,
+                        composeTabID: snapshot.tabID
                     )
                 }
             }

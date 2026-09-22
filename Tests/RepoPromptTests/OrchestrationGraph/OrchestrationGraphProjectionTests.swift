@@ -69,6 +69,107 @@ final class OrchestrationGraphProjectionTests: XCTestCase {
         )
     }
 
+    func testParentSessionIDCreatesDispatchEvenWhenComposeTabsDiffer() {
+        let orchestrateTab = UUID()
+        let reviewTab = UUID()
+        let projection = OrchestrationGraphProjection.make(
+            workspaces: [.init(id: IDs.workspace1, name: "Workspace One")],
+            persisted: [
+                .init(
+                    sessionID: IDs.root,
+                    workspaceID: IDs.workspace1,
+                    name: "WF - ORCHESTRATE",
+                    parentSessionID: nil,
+                    runState: .running,
+                    composeTabID: orchestrateTab
+                ),
+                .init(
+                    sessionID: IDs.child,
+                    workspaceID: IDs.workspace1,
+                    name: "WF - REVIEW",
+                    parentSessionID: IDs.root,
+                    runState: .running,
+                    composeTabID: reviewTab
+                )
+            ],
+            live: [],
+            isHistoryScanIncomplete: false
+        )
+        XCTAssertTrue(projection.edges.contains {
+            $0.kind == .membership && $0.source == .workspace(IDs.workspace1) && $0.target == .session(IDs.root)
+        })
+        XCTAssertTrue(projection.edges.contains {
+            $0.kind == .dispatch && $0.source == .session(IDs.root) && $0.target == .session(IDs.child)
+        })
+        XCTAssertFalse(projection.edges.contains {
+            $0.kind == .membership && $0.target == .session(IDs.child)
+        })
+    }
+
+    func testChildWithoutComposeTabStillDispatchesToParent() {
+        let projection = OrchestrationGraphProjection.make(
+            workspaces: [.init(id: IDs.workspace1, name: "Workspace One")],
+            persisted: [
+                .init(
+                    sessionID: IDs.root,
+                    workspaceID: IDs.workspace1,
+                    name: "WF - ORCHESTRATE",
+                    parentSessionID: nil,
+                    runState: .running,
+                    composeTabID: UUID()
+                ),
+                .init(
+                    sessionID: IDs.child,
+                    workspaceID: IDs.workspace1,
+                    name: "WF - REVIEW",
+                    parentSessionID: IDs.root,
+                    runState: .completed
+                )
+            ],
+            live: [],
+            isHistoryScanIncomplete: false
+        )
+        XCTAssertTrue(projection.edges.contains {
+            $0.kind == .dispatch && $0.source == .session(IDs.root) && $0.target == .session(IDs.child)
+        })
+        XCTAssertFalse(projection.edges.contains {
+            $0.kind == .membership && $0.target == .session(IDs.child)
+        })
+    }
+
+    func testNestedThreadOnSameComposeTabKeepsDispatch() {
+        let tab = UUID()
+        let projection = OrchestrationGraphProjection.make(
+            workspaces: [.init(id: IDs.workspace1, name: "Workspace One")],
+            persisted: [
+                .init(
+                    sessionID: IDs.root,
+                    workspaceID: IDs.workspace1,
+                    name: "TL",
+                    parentSessionID: nil,
+                    runState: .running,
+                    composeTabID: tab
+                ),
+                .init(
+                    sessionID: IDs.child,
+                    workspaceID: IDs.workspace1,
+                    name: "WORKER",
+                    parentSessionID: IDs.root,
+                    runState: .running,
+                    composeTabID: tab
+                )
+            ],
+            live: [],
+            isHistoryScanIncomplete: false
+        )
+        XCTAssertTrue(projection.edges.contains {
+            $0.kind == .dispatch && $0.source == .session(IDs.root) && $0.target == .session(IDs.child)
+        })
+        XCTAssertFalse(projection.edges.contains {
+            $0.kind == .membership && $0.target == .session(IDs.child)
+        })
+    }
+
     func testLiveEntryReplacesStalePersistedEntryForSameSessionID() {
         let projection = OrchestrationGraphProjection.make(
             workspaces: [.init(id: IDs.workspace1, name: "Workspace One")],
@@ -303,7 +404,11 @@ final class OrchestrationGraphProjectionTests: XCTestCase {
             )
         ]
 
-        assertProjection(projection, nodes: expectedNodes, edges: [])
+        assertProjection(
+            projection,
+            nodes: expectedNodes,
+            edges: [edge(.workspace(IDs.workspace1), .session(IDs.child), .membership)]
+        )
         XCTAssertEqual(projection.isHistoryScanIncomplete, false)
         XCTAssertEqual(projection.nodes.count(where: { $0.id == .session(IDs.unknownParent) }), 0)
     }
@@ -336,7 +441,11 @@ final class OrchestrationGraphProjectionTests: XCTestCase {
             )
         ]
 
-        assertProjection(projection, nodes: expectedNodes, edges: [])
+        assertProjection(
+            projection,
+            nodes: expectedNodes,
+            edges: [edge(.workspace(IDs.workspace1), .session(IDs.root), .membership)]
+        )
         XCTAssertEqual(projection.isHistoryScanIncomplete, false)
         XCTAssertEqual(
             projection.edges.count(where: {

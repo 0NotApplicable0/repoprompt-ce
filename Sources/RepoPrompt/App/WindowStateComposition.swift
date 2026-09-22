@@ -40,7 +40,9 @@ enum WindowStateCompositionFactory {
         storedPromptPersistence: (any StoredPromptPersistenceServing)? = nil,
         workspaceSwitchTimingPolicy: WorkspaceSwitchTimingPolicy = .production,
         loadStoredAPISettingsDataOnInit: Bool = true,
-        codexModelPollingService: CodexModelPollingService = .shared
+        codexModelPollingService: CodexModelPollingService = .shared,
+        performInitialWorkspaceActivation: Bool = true,
+        workspaceActivityCoordinator: WorkspaceActivityCoordinator? = nil
     ) -> WindowStateComposition {
         // 1) Workspace file context store + visible file-tree UI adapter
         #if DEBUG
@@ -89,7 +91,9 @@ enum WindowStateCompositionFactory {
             promptViewModel: promptManager,
             workspaceSearchService: workspaceSearchService,
             domainWorkspaceAuthorityClient: domainWorkspaceClient,
-            switchTimingPolicy: workspaceSwitchTimingPolicy
+            workspaceActivityCoordinator: workspaceActivityCoordinator,
+            switchTimingPolicy: workspaceSwitchTimingPolicy,
+            performInitialWorkspaceActivation: performInitialWorkspaceActivation
         )
         let domainWorkspacePresentationBridge = domainWorkspaceClient.map {
             DomainWorkspacePresentationBridge(workspaceManager: workspaceManager, client: $0)

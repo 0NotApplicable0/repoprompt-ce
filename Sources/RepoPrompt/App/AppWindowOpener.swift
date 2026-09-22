@@ -24,6 +24,9 @@ final class AppWindowOpener {
 
     private var openMainWindowImpl: (() -> Void)?
     private var pendingDockWindowRequestCount = 0
+    /// Occupies the graph single-window slot until `registerWindowState` runs.
+    /// `openWindow` does not increment `allWindows` until `WindowContentView.onAppear`.
+    private(set) var isGraphWindowOpenInFlight = false
 
     /// Orchestration graph single-window policy, read at each action.
     var policy = OrchestrationGraphWindowPolicy.production
@@ -37,11 +40,10 @@ final class AppWindowOpener {
 
         let pendingRequestCount = pendingDockWindowRequestCount
         pendingDockWindowRequestCount = 0
-        guard policy.allowsAdditionalMainWindow else { return }
-        // With the graph flag on, only the first window may open; `openWindow` registers its
-        // `WindowState` asynchronously, so the window count cannot stop later replays.
-        let replayCount = policy.isGraphEnabled() ? min(pendingRequestCount, 1) : pendingRequestCount
-        for _ in 0 ..< replayCount {
+        // Production `install` runs after `registerWindowState`, so the graph flag already
+        // forbids another window. Flag-off still flushes Dock clicks queued before the first view.
+        guard !policy.isGraphEnabled() else { return }
+        for _ in 0 ..< pendingRequestCount {
             openMainWindow()
         }
     }
@@ -49,14 +51,15 @@ final class AppWindowOpener {
     /// Requests a new main window from the Dock menu.
     /// Queues the request until SwiftUI has installed the window-opening action.
     func requestMainWindowFromDock() {
-        guard policy.allowsAdditionalMainWindow else {
-            pendingDockWindowRequestCount = 0
-            return
-        }
         guard let openMainWindowImpl else {
-            pendingDockWindowRequestCount += 1
+            if policy.allowsAdditionalMainWindow {
+                pendingDockWindowRequestCount += 1
+            } else {
+                pendingDockWindowRequestCount = 0
+            }
             return
         }
+        guard tryBeginGraphWindowOpen() else { return }
         openMainWindowImpl()
     }
 
@@ -67,10 +70,25 @@ final class AppWindowOpener {
         guard let impl = openMainWindowImpl else {
             throw WindowOpenError.openerUnavailable
         }
-        guard policy.allowsAdditionalMainWindow else {
+        guard tryBeginGraphWindowOpen() else {
             throw WindowOpenError.singleWindowPolicy
         }
         impl()
+    }
+
+    /// Claims the graph single-window slot before `openWindow`. Returns false when a window
+    /// already exists or another open is already in flight.
+    func tryBeginGraphWindowOpen(policy: OrchestrationGraphWindowPolicy? = nil) -> Bool {
+        let policy = policy ?? self.policy
+        guard policy.allowsAdditionalMainWindow else { return false }
+        if policy.isGraphEnabled() {
+            isGraphWindowOpenInFlight = true
+        }
+        return true
+    }
+
+    func clearGraphWindowOpenInFlight() {
+        isGraphWindowOpenInFlight = false
     }
 
     /// Checks if the opener is ready to create windows.
@@ -86,6 +104,7 @@ final class AppWindowOpener {
         func resetForTesting() {
             openMainWindowImpl = nil
             pendingDockWindowRequestCount = 0
+            isGraphWindowOpenInFlight = false
             policy = .production
         }
     #endif
