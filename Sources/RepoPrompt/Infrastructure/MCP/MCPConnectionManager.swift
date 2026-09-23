@@ -1636,6 +1636,12 @@ actor ServerNetworkManager {
         private var debugAfterPromptExportHostCompletionForTesting: (@Sendable (UUID, String, Duration) -> Void)?
         private var debugBeforeAdmissionEvictionCloseForTesting: (@Sendable (UUID) async -> Void)?
         private var debugBeforeActiveToolCancellationScanForTesting: (@Sendable (UUID, [UUID]) async -> Void)?
+        private struct DebugConnectionRemovalOperation {
+            let token: UUID
+            var waiters: [CheckedContinuation<Void, Never>] = []
+        }
+
+        private var debugConnectionRemovalOperations: [UUID: DebugConnectionRemovalOperation] = [:]
         private var debugAllocatedActiveToolScopeIDsForTesting: Set<UUID> = []
         private var debugDuringAdmissionEvictionCloseForTesting: (@Sendable (UUID) async -> Void)?
         private var debugAfterAdmissionEvictionRemovalCommittedForTesting: (@Sendable (UUID) async -> Void)?
@@ -5821,6 +5827,14 @@ actor ServerNetworkManager {
     private func rollbackCommittedConnectionRemoval(
         _ committedRemoval: CommittedConnectionRemoval
     ) -> Bool {
+        #if DEBUG
+            defer {
+                debugFinishConnectionRemoval(
+                    committedRemoval.connectionID,
+                    token: committedRemoval.debugOperationToken
+                )
+            }
+        #endif
         guard connectionsBeingRemoved.contains(committedRemoval.connectionID),
               connectionLifecycleGenerationByID[committedRemoval.connectionID] == committedRemoval.lifecycleGeneration,
               let connection = connections[committedRemoval.connectionID],
@@ -7142,6 +7156,9 @@ actor ServerNetworkManager {
         let connectionIdentity: ObjectIdentifier
         let lifecycleGeneration: UInt64
         let connection: any MCPServerConnection
+        #if DEBUG
+            let debugOperationToken = UUID()
+        #endif
     }
 
     private func commitConnectionRemoval(
@@ -7156,12 +7173,18 @@ actor ServerNetworkManager {
         else { return nil }
         connectionsBeingRemoved.insert(connectionID)
         invalidateBootstrapReplacementCredits(predecessorConnectionID: connectionID)
-        return CommittedConnectionRemoval(
+        let removal = CommittedConnectionRemoval(
             connectionID: connectionID,
             connectionIdentity: expectedIdentity,
             lifecycleGeneration: expectedLifecycleGeneration,
             connection: connection
         )
+        #if DEBUG
+            debugConnectionRemovalOperations[connectionID] = DebugConnectionRemovalOperation(
+                token: removal.debugOperationToken
+            )
+        #endif
+        return removal
     }
 
     @MainActor
@@ -7264,6 +7287,9 @@ actor ServerNetworkManager {
                   let connection = connections[id],
                   ObjectIdentifier(connection as AnyObject) == committedRemoval.connectionIdentity
             else {
+                #if DEBUG
+                    debugFinishConnectionRemoval(id, token: committedRemoval.debugOperationToken)
+                #endif
                 return false
             }
         } else {
@@ -7281,6 +7307,11 @@ actor ServerNetworkManager {
         else {
             connectionLog("removeConnection: \(id) already removed; ignoring duplicate call")
             connectionsBeingRemoved.remove(id)
+            #if DEBUG
+                if let committedRemoval {
+                    debugFinishConnectionRemoval(id, token: committedRemoval.debugOperationToken)
+                }
+            #endif
             return false
         }
 
@@ -7288,7 +7319,18 @@ actor ServerNetworkManager {
             connectionsBeingRemoved.insert(id)
             invalidateBootstrapReplacementCredits(predecessorConnectionID: id)
         }
-        defer { connectionsBeingRemoved.remove(id) }
+        #if DEBUG
+            let debugRemovalToken = committedRemoval?.debugOperationToken ?? UUID()
+            if committedRemoval == nil {
+                debugConnectionRemovalOperations[id] = DebugConnectionRemovalOperation(token: debugRemovalToken)
+            }
+        #endif
+        defer {
+            connectionsBeingRemoved.remove(id)
+            #if DEBUG
+                debugFinishConnectionRemoval(id, token: debugRemovalToken)
+            #endif
+        }
 
         MCPLifecycleDiagnostics.shared.record(.removalStarted, connectionID: id)
 
@@ -9984,7 +10026,9 @@ actor ServerNetworkManager {
             saveRoutingState()
         }
 
-        func debugRemoveConnection(_ id: UUID) async {
+        /// Test cleanup must join the existing removal owner, not merely request removal.
+        /// Keep production duplicate-removal calls non-joining: an owner can depend on them.
+        func debugRemoveConnection(_ id: UUID, onJoiningRemoval: (@Sendable () -> Void)? = nil) async {
             #if DEBUG
                 debugExecutionWatchdogAbortTargets.removeValue(forKey: id)
             #endif
@@ -9995,6 +10039,28 @@ actor ServerNetworkManager {
                     initiator: .app
                 )
             )
+            // Joining the exact operation also covers the committed-before-body interval.
+            // A bare removal flag can outlive an invalidated commit and is not a completion owner.
+            guard debugConnectionRemovalOperations[id] != nil else { return }
+            await withCheckedContinuation { continuation in
+                debugConnectionRemovalOperations[id]?.waiters.append(continuation)
+                onJoiningRemoval?()
+            }
+        }
+
+        private func debugFinishConnectionRemoval(_ id: UUID, token: UUID) {
+            guard debugConnectionRemovalOperations[id]?.token == token,
+                  let operation = debugConnectionRemovalOperations.removeValue(forKey: id)
+            else { return }
+            operation.waiters.forEach { $0.resume() }
+        }
+
+        func debugConnectionRemovalWaiterCount(for id: UUID) -> Int {
+            debugConnectionRemovalOperations[id]?.waiters.count ?? 0
+        }
+
+        func debugHasConnectionRemovalOperation(for id: UUID) -> Bool {
+            debugConnectionRemovalOperations[id] != nil
         }
 
         #if DEBUG
