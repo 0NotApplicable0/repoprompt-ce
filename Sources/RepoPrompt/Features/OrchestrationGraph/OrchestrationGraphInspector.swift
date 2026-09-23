@@ -66,6 +66,45 @@ enum OrchestrationGraphInspectorSurface: Equatable {
     case failure(OrchestrationGraphInspectorTarget, OrchestrationGraphInspectorFailure)
 }
 
+/// One session's live run state as the inspector chrome shows it.
+struct OrchestrationGraphLiveStatusRow: Equatable {
+    let sessionID: UUID
+    let name: String
+    let runState: OrchestrationGraphProjection.SessionRunState
+
+    /// A distinct, non-empty label for every `SessionRunState` case.
+    static func label(for runState: OrchestrationGraphProjection.SessionRunState) -> String {
+        switch runState {
+        case .idle: "Idle"
+        case .running: "Running"
+        case .waitingForUser: "Waiting for input"
+        case .waitingForQuestion: "Waiting for a question"
+        case .waitingForApproval: "Waiting for approval"
+        case .completed: "Completed"
+        case .failed: "Failed"
+        case .cancelled: "Cancelled"
+        case .expired: "Expired"
+        case .unknown: "Unknown"
+        case .unspecified: "Unspecified"
+        }
+    }
+
+    var text: String {
+        "\(name) — \(Self.label(for: runState))"
+    }
+}
+
+#if DEBUG
+    /// Captures the labels `OrchestrationGraphLiveStatusStrip` last rendered, for tests only.
+    final class OrchestrationGraphLiveStatusStripRenderRecorder {
+        private(set) var labels: [String] = []
+
+        func record(_ labels: [String]) {
+            self.labels = labels
+        }
+    }
+#endif
+
 /// Owns the graph inspector's single, lazily created host `WindowState`.
 ///
 /// The host is never registered with `WindowStatesManager` and never gets an `NSWindow`.
@@ -79,6 +118,14 @@ final class OrchestrationGraphInspectorModel: ObservableObject {
     @Published private(set) var surface: OrchestrationGraphInspectorSurface = .empty
     @Published private(set) var mcpBindTargetWorkspaceID: UUID?
     @Published private(set) var hostWindowState: WindowState?
+    /// Live wins over persisted; the inspector host is never an input.
+    @Published private(set) var liveRunStates: [UUID: OrchestrationGraphProjection.SessionRunState] = [:]
+    /// `liveRunStates` plus display names, sorted by name then session id.
+    @Published private(set) var liveStatusRows: [OrchestrationGraphLiveStatusRow] = []
+    #if DEBUG
+        /// Written only by `OrchestrationGraphLiveStatusStrip.body`; the model never writes it.
+        let liveStatusStripRenderRecorderForTesting = OrchestrationGraphLiveStatusStripRenderRecorder()
+    #endif
 
     private let hostFactory: HostFactory
     private let activationGate: ActivationGate?
@@ -101,13 +148,42 @@ final class OrchestrationGraphInspectorModel: ObservableObject {
     }
 
     func select(_ target: OrchestrationGraphInspectorTarget) {
+        select(target, liveRunStates: [:], sessionNames: [:])
+    }
+
+    /// The shell publishes the graph window's live run states in the same call that selects a target.
+    func select(
+        _ target: OrchestrationGraphInspectorTarget,
+        liveRunStates: [UUID: OrchestrationGraphProjection.SessionRunState],
+        sessionNames: [UUID: String] = [:]
+    ) {
         guard !isTornDown else { return }
+        self.liveRunStates = liveRunStates
+        liveStatusRows = Self.makeLiveStatusRows(liveRunStates: liveRunStates, sessionNames: sessionNames)
         generation += 1
         desiredTarget = target
         surface = .loading(target)
         guard workerTask == nil else { return }
         workerTask = Task { [weak self] in
             await self?.drainSelections()
+        }
+    }
+
+    private static func makeLiveStatusRows(
+        liveRunStates: [UUID: OrchestrationGraphProjection.SessionRunState],
+        sessionNames: [UUID: String]
+    ) -> [OrchestrationGraphLiveStatusRow] {
+        liveRunStates.map { sessionID, runState in
+            let name = sessionNames[sessionID]
+            return OrchestrationGraphLiveStatusRow(
+                sessionID: sessionID,
+                name: (name?.isEmpty == false) ? name! : "Untitled session",
+                runState: runState
+            )
+        }.sorted { lhs, rhs in
+            lhs.name == rhs.name
+                ? lhs.sessionID.uuidString < rhs.sessionID.uuidString
+                : lhs.name < rhs.name
         }
     }
 
@@ -122,6 +198,8 @@ final class OrchestrationGraphInspectorModel: ObservableObject {
         workerTask = nil
         surface = .empty
         mcpBindTargetWorkspaceID = nil
+        liveRunStates = [:]
+        liveStatusRows = []
         guard let host = hostWindowState, host.workspaceManager.isSwitchingWorkspace else { return }
         hostWindowState = nil
         Task { await host.tearDown() }
@@ -140,6 +218,8 @@ final class OrchestrationGraphInspectorModel: ObservableObject {
         isTornDown = true
         desiredTarget = nil
         generation += 1
+        liveRunStates = [:]
+        liveStatusRows = []
         let worker = workerTask
         worker?.cancel()
         tearDownTask = Task {
@@ -271,13 +351,6 @@ final class OrchestrationGraphInspectorModel: ObservableObject {
 
         switch target {
         case let .workspace(workspaceID):
-            if !alreadyOpen {
-                let hostForHydration = host
-                let workspaceForHydration = workspace
-                Task { @MainActor in
-                    await hostForHydration.agentModeViewModel.handleWorkspaceSwitch(workspaceForHydration)
-                }
-            }
             return .success(.workspace(workspaceID))
         case let .session(workspaceID, tabID, sessionID):
             if !alreadyOpen {

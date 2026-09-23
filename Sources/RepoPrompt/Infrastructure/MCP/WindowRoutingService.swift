@@ -329,6 +329,13 @@ final class WindowRoutingService: Service {
     /// Orchestration graph single-window policy for `open_in_new_window` routes.
     var policy = OrchestrationGraphWindowPolicy.production
 
+    #if DEBUG
+        /// Test-only interleave point in `admitStoredWorkspace`, awaited after
+        /// `prepareGraphAdmission` and before its post-await revalidation, for deterministic
+        /// TOCTOU regression coverage. `nil` in production.
+        var debugGraphAdmissionInterleaveHook: (() async -> Void)?
+    #endif
+
     /// Thread-safe tools storage. Routing definitions are static in M1; disabled-tool
     /// filtering and window selection are applied from live state outside this cache.
     private let toolsCache = ToolsCache()
@@ -1937,6 +1944,239 @@ final class WindowRoutingService: Service {
             )
         }
         try await networkMgr.setActiveWindowForCurrentConnection(target.windowID)
+        if !bindingAlreadyMatches {
+            await networkMgr.releaseGraphAdmission(connectionID: connectionID)
+        }
+    }
+
+    /// Admits `workspace`'s stored saved compose tab on the graph window `window` for
+    /// connection `connectionID`, with exact connection-scoped root authority over its roots —
+    /// without ever calling `requestWorkspaceSwitch`, `openNewWindowShowingWorkspace`,
+    /// `resolveActiveTabBindTarget`, or `ensureResolvedWorkspaceIsLoaded`. `window`'s
+    /// `activeWorkspace` and active tab are never mutated. `justCreated` registers the workspace
+    /// as a domain-routing read authority before binding, for a workspace created moments earlier
+    /// in this same call (its durable creation publishes asynchronously and would not otherwise be
+    /// visible to the routing coordinator yet).
+    private func admitStoredWorkspace(
+        workspace: WorkspaceModel,
+        window: WindowState,
+        connectionID: UUID,
+        justCreated: Bool = false
+    ) async throws -> Int {
+        guard let candidate = window.workspaceManager.storedBindingCandidate(forWorkspaceID: workspace.id) else {
+            throw MCPError.invalidRequest(
+                "Workspace '\(workspace.name)' is no longer available in window \(window.windowID). Retry after inventory refresh."
+            )
+        }
+        guard policy.mountsGraphShell else {
+            throw MCPError.invalidRequest("Orchestration graph mode is no longer enabled; retry the request.")
+        }
+
+        let snapshot = try window.mcpServer.makeTabContextSnapshot(
+            tabID: candidate.tabID,
+            workspaceID: candidate.workspaceID,
+            windowID: window.windowID,
+            runID: nil,
+            explicitlyBound: true,
+            captureActiveUIState: false,
+            flushActiveSelection: false
+        )
+        // A worktree-bound Agent session already claims exclusive root authority over this tab;
+        // substituting canonical R2 here would silently redirect its file tools mid-run. Fail
+        // fast here; the authoritative check is the no-await revalidation right before install.
+        guard snapshot.activeAgentSessionID == nil else {
+            throw MCPError.invalidRequest(
+                "Workspace '\(workspace.name)' saved tab in window \(window.windowID) has an active Agent session and cannot be admitted."
+            )
+        }
+
+        if justCreated, let authorityClient = window.mcpServer.domainWorkspaceAuthorityClient {
+            let fileURL = window.workspaceManager.workspaceFileURL(for: workspace)
+            _ = try await authorityClient.registerForRead(workspace, fileURL: fileURL)
+        }
+
+        let ticket = try await networkMgr.prepareGraphAdmission(
+            connectionID: connectionID,
+            window: window,
+            workspaceID: candidate.workspaceID,
+            tabID: candidate.tabID,
+            repoPaths: candidate.repoPaths
+        )
+
+        #if DEBUG
+            if let hook = debugGraphAdmissionInterleaveHook {
+                await hook()
+            }
+        #endif
+
+        do {
+            // Revalidate with no await between this point and `installFrozenTabContext`: the
+            // awaits above (domain registration, `prepareGraphAdmission`) reenter the
+            // `@MainActor`, so another connection can start an Agent session on this same stored
+            // tab in between. Re-fetching the candidate and rebuilding the snapshot here closes
+            // that window instead of installing the now-stale one captured before the awaits.
+            guard
+                let revalidatedCandidate = window.workspaceManager.storedBindingCandidate(forWorkspaceID: workspace.id),
+                revalidatedCandidate.tabID == candidate.tabID
+            else {
+                throw MCPError.invalidRequest(
+                    "Workspace '\(workspace.name)' is no longer available in window \(window.windowID). Retry after inventory refresh."
+                )
+            }
+            guard policy.mountsGraphShell else {
+                throw MCPError.invalidRequest("Orchestration graph mode is no longer enabled; retry the request.")
+            }
+            var revalidatedSnapshot = try window.mcpServer.makeTabContextSnapshot(
+                tabID: revalidatedCandidate.tabID,
+                workspaceID: revalidatedCandidate.workspaceID,
+                windowID: window.windowID,
+                runID: nil,
+                explicitlyBound: true,
+                captureActiveUIState: false,
+                flushActiveSelection: false
+            )
+            guard revalidatedSnapshot.activeAgentSessionID == nil else {
+                throw MCPError.invalidRequest(
+                    "Workspace '\(workspace.name)' saved tab in window \(window.windowID) has an active Agent session and cannot be admitted."
+                )
+            }
+            revalidatedSnapshot.frozenLookupContext = ticket.lookupContext
+            window.mcpServer.installFrozenTabContext(
+                clientID: connectionID.uuidString,
+                clientName: nil,
+                context: revalidatedSnapshot
+            )
+
+            let binding = window.mcpServer.connectionBindingSnapshot(forConnection: connectionID)
+            guard binding.windowID == window.windowID,
+                  binding.workspaceID == candidate.workspaceID,
+                  binding.tabID == candidate.tabID
+            else {
+                throw MCPError.internalError(
+                    "Graph admission binding verification failed for workspace '\(workspace.name)' in window \(window.windowID)."
+                )
+            }
+
+            if let publishTask = window.mcpServer.domainRoutingPublishTask {
+                await publishTask.value
+            }
+            if let coordinator = window.mcpServer.domainRoutingCoordinator {
+                let expectedBinding = DomainBinding.context(
+                    DomainContextIdentity(workspaceID: candidate.workspaceID, contextID: candidate.tabID),
+                    explicit: true
+                )
+                let actualBinding = await coordinator.snapshot().connections.first {
+                    $0.registration.connectionID == connectionID
+                }?.binding
+                guard actualBinding == expectedBinding else {
+                    throw MCPError.internalError(
+                        "Domain routing authority rejected graph admission binding for workspace '\(workspace.name)' in window \(window.windowID)."
+                    )
+                }
+            }
+
+            try await networkMgr.setActiveWindowForCurrentConnection(window.windowID)
+            await networkMgr.publishGraphAdmission(ticket)
+
+            window.focusWindowIfPossible()
+            return window.windowID
+        } catch {
+            await networkMgr.abortGraphAdmission(ticket)
+            throw error
+        }
+    }
+
+    /// Graph-on `working_dirs` admission (covers both plain `bind` and
+    /// `create_if_missing`). Returns `nil` when graph mode is off, or the single-graph-window
+    /// invariant does not hold (zero or multiple main windows) — the caller falls through to the
+    /// existing active-workspace resolution/switch path unchanged. Never enters
+    /// `resolveExistingWorkingDirsMatch`, `ensureResolvedWorkspaceIsLoaded`,
+    /// `resolveActiveTabBindTarget`, or `ensureWorkingDirsRootProjectionIsLoaded` — `admitStoredWorkspace`
+    /// verifies root authority itself.
+    private func resolveGraphOnWorkingDirsAdmission(
+        normalizedWorkingDirs: [String],
+        windowID requestedWindowID: Int?,
+        createIfMissing: Bool,
+        tabName: String?,
+        connectionID: UUID
+    ) async throws -> WorkingDirsBindResolution? {
+        guard policy.mountsGraphShell else { return nil }
+        let windows = windowStates.allWindows
+        guard windows.count == 1, let window = windows.first else { return nil }
+        if let requestedWindowID, requestedWindowID != window.windowID {
+            let validIDs = windows.map { String($0.windowID) }.joined(separator: ", ")
+            throw MCPError.invalidParams("Unknown window_id \(requestedWindowID). Valid window IDs: \(validIDs)")
+        }
+
+        let diskWorkspaces = try await loadWorkspaceDiskSnapshot()
+        let exactMatches = WorkspaceManagerViewModel.exactWorkspaceMatches(
+            forNormalizedWorkingDirs: normalizedWorkingDirs,
+            workspaces: diskWorkspaces,
+            includeHidden: true
+        )
+        let candidates = exactMatches.isEmpty
+            ? WorkspaceManagerViewModel.supersetWorkspaceMatches(
+                forNormalizedWorkingDirs: normalizedWorkingDirs,
+                workspaces: diskWorkspaces,
+                includeHidden: true
+            )
+            : exactMatches
+        let matchedBy = exactMatches.isEmpty ? "working_dirs (matched by workspace repo_paths superset)" : "working_dirs"
+
+        let targetWorkspace: WorkspaceModel
+        var createdWorkspace = false
+        if candidates.count > 1 {
+            let ids = candidates.sorted { $0.id.uuidString < $1.id.uuidString }
+                .map { "\($0.name) (\($0.id.uuidString))" }
+                .joined(separator: ", ")
+            throw MCPError.invalidParams(
+                "working_dirs [\(normalizedWorkingDirs.joined(separator: ", "))] matches multiple workspaces: \(ids). Bind by context_id, or pass the full workspace repo_paths set to get an exact match."
+            )
+        } else if let onlyMatch = candidates.first {
+            targetWorkspace = onlyMatch
+        } else {
+            guard createIfMissing else {
+                throw MCPError.invalidParams(
+                    "No existing workspace exactly matches working_dirs [\(normalizedWorkingDirs.joined(separator: ", "))] and no workspace repo_paths superset contains those roots. Retry with create_if_missing=true to create one."
+                )
+            }
+            let workspaceName = derivedWorkspaceName(
+                normalizedWorkingDirs: normalizedWorkingDirs,
+                creationNameHint: tabName,
+                existingWorkspaces: diskWorkspaces
+            )
+            let clientID = await networkMgr.currentClientIdentifier() ?? "unknown-client"
+            let approvalResult = await WorkspaceApprovalManager.shared.requestCreateWorkspaceApproval(
+                clientID: clientID,
+                workspaceName: workspaceName,
+                windowID: window.windowID
+            )
+            guard approvalResult.isApproved else {
+                throw MCPError.invalidRequest("Workspace creation was denied by the user.")
+            }
+            targetWorkspace = window.workspaceManager.createWorkspace(
+                name: workspaceName,
+                repoPaths: normalizedWorkingDirs,
+                savedInLibrary: false
+            )
+            createdWorkspace = true
+        }
+
+        let admittedWindowID = try await admitStoredWorkspace(
+            workspace: targetWorkspace,
+            window: window,
+            connectionID: connectionID,
+            justCreated: createdWorkspace
+        )
+        return WorkingDirsBindResolution(
+            windowID: admittedWindowID,
+            workspaceID: targetWorkspace.id,
+            workspaceName: targetWorkspace.name,
+            repoPaths: targetWorkspace.repoPaths,
+            matchedBy: createdWorkspace ? "working_dirs" : matchedBy,
+            createdWorkspace: createdWorkspace,
+            normalizedWorkingDirs: normalizedWorkingDirs
+        )
     }
 
     private func staleWorkingDirsTargetError() -> MCPError {
@@ -2174,6 +2414,28 @@ final class WindowRoutingService: Service {
                             note: note
                         )
                     case .workingDirs:
+                        let normalizedWorkingDirsForGraphCheck = WorkspaceManagerViewModel.normalizedExactWorkspaceDirectorySet(request.workingDirs)
+                        let graphAdmission = normalizedWorkingDirsForGraphCheck.isEmpty ? nil : try await resolveGraphOnWorkingDirsAdmission(
+                            normalizedWorkingDirs: normalizedWorkingDirsForGraphCheck,
+                            windowID: request.windowID,
+                            createIfMissing: request.createIfMissing,
+                            tabName: request.tabName,
+                            connectionID: connectionID
+                        )
+                        if let graphResolution = graphAdmission {
+                            let binding = await currentBindingSummary(for: connectionID)
+                            let note = await MainActor.run { self.bindContextWindowNote(windowID: binding.windowID) }
+                            return BindContextResponse(
+                                binding: binding,
+                                changed: binding != previousBinding,
+                                matchedBy: graphResolution.matchedBy,
+                                createdTab: false,
+                                createdWorkspace: graphResolution.createdWorkspace,
+                                normalizedWorkingDirs: graphResolution.normalizedWorkingDirs,
+                                note: note
+                            )
+                        }
+
                         let target = try await resolveWorkingDirsBindTarget(
                             workingDirs: request.workingDirs,
                             windowID: request.windowID,
@@ -2291,7 +2553,7 @@ final class WindowRoutingService: Service {
                 - focus: boolean                                (optional for 'select_tab' or 'create_tab'; if true, also switches the UI to show the tab)
                 - allow_active: boolean                         (optional for 'close_tab'; default false)
                 - window_id: integer                            (optional; target window, defaults to selected or only window)
-                - open_in_new_window: boolean                   (optional for 'switch' or 'create'; when true, opens workspace in a new window and binds the connection to it)
+                - open_in_new_window: boolean                   (optional for 'switch' or 'create'; when true, opens workspace in a new window and binds the connection to it. When the orchestration graph window is enabled, this instead admits the saved workspace on the existing single graph window without replacing its visible workspace.)
                 - switch_to_created: boolean                    (optional for 'create'; when true, switches to the newly created workspace)
                 - close_window: boolean                         (optional for 'delete'; when true, switches away without saving, deletes the workspace, then requests window close)
                 - include_hidden: boolean                       (optional; default false. For 'list', includes hidden workspaces. For name-based 'switch'/'delete', allows hidden matches. UUID lookup remains explicit and can resolve hidden workspaces.)
@@ -2320,7 +2582,7 @@ final class WindowRoutingService: Service {
                         "window_id": .integer(description: "Optional window ID; defaults to selected or only window"),
                         "focus": .boolean(description: "For 'select_tab' or 'create_tab': if true, also switches the UI to show the tab"),
                         "allow_active": .boolean(description: "For 'close_tab': allow closing the currently active visible tab"),
-                        "open_in_new_window": .boolean(description: "For 'switch' or 'create': when true, opens workspace in a new window and binds connection to it. Returns window_id in response."),
+                        "open_in_new_window": .boolean(description: "For 'switch' or 'create': when true, opens workspace in a new window and binds connection to it. Returns window_id in response. When the orchestration graph window is enabled, this instead admits the saved workspace's stored compose tab on the existing single graph window, with exact root authority over its roots — the visible workspace is never replaced."),
                         "switch_to_created": .boolean(description: "For 'create': when true, switches to the newly created workspace in the target window."),
                         "close_window": .boolean(description: "For 'delete': when true, switches away without saving, deletes the workspace, then requests window close."),
                         "include_hidden": .boolean(description: "Default false. For list, includes hidden workspaces. For name-based switch/delete, allows hidden matches; UUID lookup remains explicit.")
@@ -2406,12 +2668,37 @@ final class WindowRoutingService: Service {
                     let includeHidden = args["include_hidden"]?.boolValue ?? false
 
                     if openInNewWindow {
+                        // First, resolve the workspace model from disk (don't require an existing window)
+                        let targetWorkspace = try await routingService.resolveWorkspaceForSwitch(rawWorkspaceParam: rawWorkspaceParam, includeHidden: includeHidden)
+
+                        // ═══════════════════════════════════════════════════════════════
+                        // Graph-on admission mode: reuse the single graph window without
+                        // switching its visible workspace.
+                        // ═══════════════════════════════════════════════════════════════
+                        if let graphWindow = await MainActor.run(body: {
+                            routingService.policy.mountsGraphShell
+                                ? routingService.windowStates.allWindows.only
+                                : nil
+                        }) {
+                            guard let connectionID = await routingService.networkMgr.currentConnectionUUID() else {
+                                throw MCPError.internalError("No active connection context")
+                            }
+                            let admittedWindowID = try await routingService.admitStoredWorkspace(
+                                workspace: targetWorkspace,
+                                window: graphWindow,
+                                connectionID: connectionID
+                            )
+                            return ManageWorkspacesResponse(
+                                action: "switch",
+                                workspaces: nil,
+                                status: "ok",
+                                windowID: admittedWindowID
+                            )
+                        }
+
                         // ═══════════════════════════════════════════════════════════════
                         // OPEN IN NEW WINDOW MODE
                         // ═══════════════════════════════════════════════════════════════
-
-                        // First, resolve the workspace model from disk (don't require an existing window)
-                        let targetWorkspace = try await routingService.resolveWorkspaceForSwitch(rawWorkspaceParam: rawWorkspaceParam, includeHidden: includeHidden)
 
                         // Open a new window
                         let newWindow: WindowState
@@ -2567,6 +2854,37 @@ final class WindowRoutingService: Service {
                     }
 
                     if openInNewWindow {
+                        // ═══════════════════════════════════════════════════════════════
+                        // Graph-on admission mode: create on the single graph window without
+                        // switching its visible workspace.
+                        // ═══════════════════════════════════════════════════════════════
+                        if await routingService.policy.mountsGraphShell, windows.count == 1, let graphWindow = windows.first {
+                            let newWorkspace = await MainActor.run {
+                                graphWindow.workspaceManager.createWorkspace(name: workspaceName, repoPaths: initialRepoPaths, savedInLibrary: false)
+                            }
+                            guard let connectionID = await routingService.networkMgr.currentConnectionUUID() else {
+                                throw MCPError.internalError("No active connection context")
+                            }
+                            let admittedWindowID = try await routingService.admitStoredWorkspace(
+                                workspace: newWorkspace,
+                                window: graphWindow,
+                                connectionID: connectionID,
+                                justCreated: true
+                            )
+                            let summary = MCPWorkspaceSummary(
+                                id: newWorkspace.id,
+                                name: newWorkspace.name,
+                                allRepoPaths: newWorkspace.repoPaths,
+                                showingWindowIDs: []
+                            )
+                            return ManageWorkspacesResponse(
+                                action: "create",
+                                workspaces: [summary],
+                                status: "ok",
+                                windowID: admittedWindowID
+                            )
+                        }
+
                         // Open a new window for the workspace
                         let newWindow: WindowState
                         do {

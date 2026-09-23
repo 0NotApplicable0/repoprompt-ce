@@ -17,7 +17,7 @@ struct OrchestrationGraphProjection: Equatable {
         let name: String
         let parentSessionID: UUID?
         let runState: SessionRunState
-        var composeTabID: UUID? = nil
+        var composeTabID: UUID?
     }
 
     struct LiveSessionInput: Equatable, Hashable {
@@ -27,7 +27,7 @@ struct OrchestrationGraphProjection: Equatable {
         let parentSessionID: UUID?
         let runState: SessionRunState
         let statusText: String?
-        var composeTabID: UUID? = nil
+        var composeTabID: UUID?
     }
 
     enum SessionRunState: Equatable, Hashable {
@@ -160,6 +160,43 @@ struct OrchestrationGraphProjection: Equatable {
     let nodes: [Node]
     let edges: [Edge]
     let isHistoryScanIncomplete: Bool
+
+    func sessionNode(id: UUID) -> SessionNode? {
+        for node in nodes {
+            if case let .session(session) = node, session.sessionID == id { return session }
+        }
+        return nil
+    }
+
+    func applyingLive(_ live: [LiveSessionInput]) -> OrchestrationGraphProjection {
+        var pending = Dictionary(uniqueKeysWithValues: live.map { ($0.sessionID, $0) })
+        var updated = nodes.map { node -> Node in
+            guard case let .session(session) = node, let item = pending.removeValue(forKey: session.sessionID) else {
+                return node
+            }
+            return .session(SessionNode(
+                sessionID: session.sessionID,
+                name: item.name,
+                workspaceID: item.workspaceID ?? session.workspaceID,
+                status: SessionStatus(runState: item.runState, statusText: item.statusText, isLive: true),
+                unresolvedParentSessionID: session.unresolvedParentSessionID
+            ))
+        }
+        for item in pending.values {
+            updated.append(.session(SessionNode(
+                sessionID: item.sessionID,
+                name: item.name,
+                workspaceID: item.workspaceID,
+                status: SessionStatus(runState: item.runState, statusText: item.statusText, isLive: true),
+                unresolvedParentSessionID: item.parentSessionID
+            )))
+        }
+        return OrchestrationGraphProjection(
+            nodes: updated,
+            edges: edges,
+            isHistoryScanIncomplete: isHistoryScanIncomplete
+        )
+    }
 
     private struct ResolvedSession {
         let sessionID: UUID

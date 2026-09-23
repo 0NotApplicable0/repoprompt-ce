@@ -115,6 +115,7 @@ struct OrchestrationGraphCanvasLayout: Equatable {
 
         var drafts: [SimNode] = []
         for (clusterIndex, cluster) in clusters.enumerated() {
+            let hiddenCount = cluster.sessionIDs.count(where: { !snapshot.layout.isRevealed(sessionID: $0) })
             if let workspaceID = cluster.workspaceID {
                 drafts.append(
                     SimNode(
@@ -123,14 +124,14 @@ struct OrchestrationGraphCanvasLayout: Equatable {
                         isWorkspace: true,
                         runState: nil,
                         isLive: false,
-                        collapsedCount: 0,
+                        collapsedCount: hiddenCount,
                         target: .workspace(workspaceID: workspaceID),
                         radius: workspaceHubRadius,
                         clusterIndex: clusterIndex
                     )
                 )
             }
-            for sessionID in cluster.sessionIDs {
+            for sessionID in cluster.sessionIDs where snapshot.layout.isRevealed(sessionID: sessionID) {
                 let session = sessionByID[sessionID]
                 let live = session?.status.isLive ?? false
                 let runState = session?.status.runState
@@ -304,11 +305,10 @@ struct OrchestrationGraphCanvasLayout: Equatable {
         }
 
         let hubCount = hubIndices.count
-        let hubRadius: Double
-        if hubCount <= 1 {
-            hubRadius = 0
+        let hubRadius: Double = if hubCount <= 1 {
+            0
         } else {
-            hubRadius = max(
+            max(
                 Double(minWorkspaceHubSeparation) / (2 * sin(.pi / Double(hubCount))),
                 120
             )
@@ -398,6 +398,7 @@ struct OrchestrationGraphCanvas: View {
     var isSystemWorkspace: (UUID) -> Bool = { _ in false }
     var onRenameWorkspace: (UUID) -> Void = { _ in }
     var onDeleteWorkspace: (UUID) -> Void = { _ in }
+    var onZoomChange: (CGFloat) -> Void = { _ in }
 
     @State private var layout = OrchestrationGraphCanvasLayout.empty
     @State private var pan = CGSize.zero
@@ -467,6 +468,9 @@ struct OrchestrationGraphCanvas: View {
             .onAppear {
                 rebuildLayout()
                 fit(layout, in: geo.size)
+            }
+            .onChange(of: zoom) { _, newZoom in
+                onZoomChange(newZoom)
             }
             .onChange(of: snapshot) { _, newSnapshot in
                 layout = OrchestrationGraphCanvasLayout.make(
@@ -723,7 +727,6 @@ struct OrchestrationGraphCanvas: View {
             }
         }
     }
-
 }
 
 /// AppKit pinch and scroll-wheel zoom. SwiftUI MagnificationGesture does not fire reliably on macOS.
@@ -791,34 +794,34 @@ private struct GraphCanvasEventCatcher: NSViewRepresentable {
         func install() {
             guard monitor == nil else { return }
             monitor = NSEvent.addLocalMonitorForEvents(matching: [.magnify, .scrollWheel, .leftMouseDown, .leftMouseUp]) { [weak self] event in
-                guard let self, self.contains(event) else { return event }
+                guard let self, contains(event) else { return event }
                 switch event.type {
                 case .magnify:
-                    self.applyZoom(factor: 1 + event.magnification, anchor: self.location(in: event))
+                    applyZoom(factor: 1 + event.magnification, anchor: location(in: event))
                     return nil
                 case .scrollWheel:
                     let vertical = event.hasPreciseScrollingDeltas ? event.scrollingDeltaY : event.deltaY * 4
                     let horizontal = event.hasPreciseScrollingDeltas ? event.scrollingDeltaX : event.deltaX * 4
                     guard abs(vertical) >= abs(horizontal), abs(vertical) > 0.05 else { return event }
-                    self.applyZoom(
+                    applyZoom(
                         factor: GraphCanvasZoomMath.scrollZoomFactor(
                             verticalDelta: vertical,
                             hasPreciseScrollingDeltas: event.hasPreciseScrollingDeltas
                         ),
-                        anchor: self.location(in: event)
+                        anchor: location(in: event)
                     )
                     return nil
                 case .leftMouseDown:
-                    self.mouseDownPoint = self.location(in: event)
+                    mouseDownPoint = location(in: event)
                     return event
                 case .leftMouseUp:
-                    let up = self.location(in: event)
-                    if self.clicksEnabled, let down = self.mouseDownPoint,
+                    let up = location(in: event)
+                    if clicksEnabled, let down = mouseDownPoint,
                        hypot(up.x - down.x, up.y - down.y) < 6
                     {
-                        self.onClick?(up)
+                        onClick?(up)
                     }
-                    self.mouseDownPoint = nil
+                    mouseDownPoint = nil
                     return event
                 default:
                     return event

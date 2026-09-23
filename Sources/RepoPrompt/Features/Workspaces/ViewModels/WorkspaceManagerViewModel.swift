@@ -7453,6 +7453,94 @@ class WorkspaceManagerViewModel: ObservableObject {
         )
     }
 
+    /// OG-06 §3.1: a loaded workspace's saved active tab (else its first tab), independent of
+    /// `activeWorkspaceID`. Rejects system, ephemeral, and consolidated-recovery records; a hidden
+    /// workspace is allowed because the caller resolved it explicitly (graph admission by id).
+    func storedBindingCandidate(forWorkspaceID workspaceID: UUID) -> ComposeTabBindingCandidate? {
+        guard let workspace = workspaces.first(where: { $0.id == workspaceID }),
+              Self.isEligibleForGraphStoredBinding(workspace)
+        else { return nil }
+        let tab = workspace.composeTabs.first(where: { $0.id == workspace.activeComposeTabID }) ?? workspace.composeTabs.first
+        guard let tab else { return nil }
+        return ComposeTabBindingCandidate(
+            tabID: tab.id,
+            workspaceID: workspace.id,
+            workspaceName: workspace.name,
+            isActiveInWorkspace: workspace.activeComposeTabID == tab.id,
+            repoPaths: workspace.repoPaths
+        )
+    }
+
+    /// OG-06 §3.1: eligible loaded workspaces (not only the active one) whose roots match
+    /// `dirs` — exact root-set matches first, strict superset only when no exact match exists,
+    /// mirroring `bind_context`'s existing precedence. Excludes system, ephemeral,
+    /// consolidated-recovery, and hidden workspaces unless `includeHidden`. Dedupes by
+    /// `(workspaceID, tabID)`; sorted by case-insensitive name, name, workspace UUID, tab UUID.
+    /// Never mutates `activeWorkspace`, the active tab, or file-tree roots.
+    func storedBindingCandidates(matchingWorkingDirs dirs: [String], includeHidden: Bool = false) -> [ComposeTabBindingCandidate] {
+        Self.storedBindingCandidates(
+            matchingWorkingDirs: dirs,
+            workspaces: workspaces,
+            includeHidden: includeHidden
+        )
+    }
+
+    nonisolated static func test_storedBindingCandidates(
+        matchingWorkingDirs dirs: [String],
+        workspaces: [WorkspaceModel],
+        includeHidden: Bool = false
+    ) -> [ComposeTabBindingCandidate] {
+        storedBindingCandidates(matchingWorkingDirs: dirs, workspaces: workspaces, includeHidden: includeHidden)
+    }
+
+    private nonisolated static func isEligibleForGraphStoredBinding(_ workspace: WorkspaceModel) -> Bool {
+        !workspace.isSystemWorkspace && !workspace.isEphemeral && workspace.consolidatedIntoWorkspaceID == nil
+    }
+
+    private nonisolated static func storedBindingCandidates(
+        matchingWorkingDirs dirs: [String],
+        workspaces: [WorkspaceModel],
+        includeHidden: Bool = false
+    ) -> [ComposeTabBindingCandidate] {
+        let normalizedDirs = normalizedBindingDirs(dirs)
+        guard !normalizedDirs.isEmpty else { return [] }
+
+        let eligible = workspaces.filter { workspace in
+            isEligibleForGraphStoredBinding(workspace)
+                && (includeHidden || !workspace.isHiddenInMenus)
+                && workspaceMatchesWorkingDirs(workspace, normalizedDirs: normalizedDirs)
+        }
+        guard !eligible.isEmpty else { return [] }
+
+        let requestedRootSetKey = WorkspaceRootSetKey(paths: normalizedDirs)
+        let exact = eligible.filter { WorkspaceRootSetKey(paths: $0.repoPaths) == requestedRootSetKey }
+        let selected = exact.isEmpty ? eligible : exact
+
+        var seen = Set<AnyHashable>()
+        var candidates: [ComposeTabBindingCandidate] = []
+        for workspace in sortedWorkspaceMatches(selected) {
+            let tab = workspace.composeTabs.first(where: { $0.id == workspace.activeComposeTabID }) ?? workspace.composeTabs.first
+            guard let tab else { continue }
+            let key = AnyHashable([workspace.id, tab.id])
+            guard seen.insert(key).inserted else { continue }
+            candidates.append(ComposeTabBindingCandidate(
+                tabID: tab.id,
+                workspaceID: workspace.id,
+                workspaceName: workspace.name,
+                isActiveInWorkspace: workspace.activeComposeTabID == tab.id,
+                repoPaths: workspace.repoPaths
+            ))
+        }
+        return candidates.sorted { lhs, rhs in
+            let lhsName = lhs.workspaceName.lowercased()
+            let rhsName = rhs.workspaceName.lowercased()
+            if lhsName != rhsName { return lhsName < rhsName }
+            if lhs.workspaceName != rhs.workspaceName { return lhs.workspaceName < rhs.workspaceName }
+            if lhs.workspaceID != rhs.workspaceID { return lhs.workspaceID.uuidString < rhs.workspaceID.uuidString }
+            return lhs.tabID.uuidString < rhs.tabID.uuidString
+        }
+    }
+
     func hasAnyWorkspaceMatch(matchingWorkingDirs dirs: [String]) -> Bool {
         Self.hasAnyWorkspaceMatch(matchingWorkingDirs: dirs, workspaces: workspaces)
     }

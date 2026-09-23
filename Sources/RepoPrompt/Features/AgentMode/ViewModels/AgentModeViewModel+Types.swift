@@ -507,6 +507,7 @@ extension AgentModeViewModel {
         let recoveryClaim: AgentProvisionalAdmissionClaim?
         let discardAuthorityID: UUID?
         let discardRestoreIndexEntry: AgentSessionIndexEntry?
+        let dispatcherTitleLocked: Bool
 
         init(
             tabID: UUID,
@@ -515,7 +516,8 @@ extension AgentModeViewModel {
             lifecycleIdentity: AgentSessionLifecycleAuthority.Identity? = nil,
             recoveryClaim: AgentProvisionalAdmissionClaim? = nil,
             discardAuthorityID: UUID? = nil,
-            discardRestoreIndexEntry: AgentSessionIndexEntry? = nil
+            discardRestoreIndexEntry: AgentSessionIndexEntry? = nil,
+            dispatcherTitleLocked: Bool = false
         ) {
             self.tabID = tabID
             self.sessionID = sessionID
@@ -524,6 +526,7 @@ extension AgentModeViewModel {
             self.recoveryClaim = recoveryClaim
             self.discardAuthorityID = discardAuthorityID
             self.discardRestoreIndexEntry = discardRestoreIndexEntry
+            self.dispatcherTitleLocked = dispatcherTitleLocked
         }
 
         func withDiscardAuthorityID(_ discardAuthorityID: UUID) -> MCPSessionTarget {
@@ -534,7 +537,21 @@ extension AgentModeViewModel {
                 lifecycleIdentity: lifecycleIdentity,
                 recoveryClaim: recoveryClaim,
                 discardAuthorityID: discardAuthorityID,
-                discardRestoreIndexEntry: discardRestoreIndexEntry
+                discardRestoreIndexEntry: discardRestoreIndexEntry,
+                dispatcherTitleLocked: dispatcherTitleLocked
+            )
+        }
+
+        func withDispatcherTitleLocked(_ locked: Bool) -> MCPSessionTarget {
+            MCPSessionTarget(
+                tabID: tabID,
+                sessionID: sessionID,
+                origin: origin,
+                lifecycleIdentity: lifecycleIdentity,
+                recoveryClaim: recoveryClaim,
+                discardAuthorityID: discardAuthorityID,
+                discardRestoreIndexEntry: discardRestoreIndexEntry,
+                dispatcherTitleLocked: locked
             )
         }
     }

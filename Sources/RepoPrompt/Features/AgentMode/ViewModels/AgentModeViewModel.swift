@@ -8071,7 +8071,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 selector,
                 expectedWorkspaceID: expectedWorkspaceID
             )
-            let target = try await mcpResolveOrCreateSessionTargetWithoutDiscardFence(
+            let resolvedTarget = try await mcpResolveOrCreateSessionTargetWithoutDiscardFence(
                 selector: selector,
                 discardAuthorityID: discardAuthorityID,
                 createIfNeeded: createIfNeeded,
@@ -8080,6 +8080,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 inheritWorktreeBindings: inheritWorktreeBindings,
                 expectedWorkspaceID: expectedWorkspaceID
             )
+            let target = lockDispatcherTitle(on: resolvedTarget, sessionName: sessionName)
             guard let resolvedSessionID = target.sessionID else { return target }
             guard target.recoveryClaim != nil else {
                 if reservedSessionID != nil {
@@ -20309,6 +20310,36 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             updateBindingsFromSession(session)
         }
         scheduleSave(for: tabID)
+    }
+
+    private var dispatcherTitleLockedNames: [UUID: String] = [:]
+
+    func lockDispatcherTitle(on target: MCPSessionTarget, sessionName: String?) -> MCPSessionTarget {
+        let trimmed = sessionName?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        guard !trimmed.isEmpty, let sessionID = target.sessionID else { return target }
+        dispatcherTitleLockedNames[sessionID] = trimmed
+        return target.withDispatcherTitleLocked(true)
+    }
+
+    func keepsDispatcherTitle(sessionID: UUID, proposed: String) -> Bool {
+        guard let locked = dispatcherTitleLockedNames[sessionID] else { return false }
+        let current = locked.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let next = proposed.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return current != next
+    }
+
+    func applySetStatusSessionName(
+        target: AgentSessionLifecycleAuthority.MutationTarget,
+        proposed: String?
+    ) throws -> (applied: Bool, message: String?) {
+        let trimmed = proposed?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        guard !trimmed.isEmpty else { return (false, nil) }
+        let sessionID = target.identity?.sessionID ?? boundSessionID(for: target.tabID)
+        if let sessionID, keepsDispatcherTitle(sessionID: sessionID, proposed: trimmed) {
+            return (false, "The dispatcher title was kept.")
+        }
+        try renameSession(target: target, to: trimmed)
+        return (true, nil)
     }
 
     /// Rename the visible agent session for a tab.

@@ -148,7 +148,7 @@ struct AppearanceSettingsView: View {
 
                         SettingToggle(
                             title: "Orchestration Graph",
-                            description: "Replaces separate one-workspace windows with a single orchestration graph of every workspace and Agent Mode session.",
+                            description: "Switches the open window to a single orchestration graph of every workspace and Agent Mode session. Turn off to return to the workspace view.",
                             isOn: orchestrationGraphEnabledBinding
                         )
                     }

@@ -33,10 +33,10 @@ final class OrchestrationGraphCanvasLayoutTests: XCTestCase {
         )
 
         let canvas = OrchestrationGraphCanvasLayout.make(snapshot: snapshot)
-        XCTAssertEqual(canvas.nodes.count, 3)
-        XCTAssertTrue(canvas.nodes.contains { $0.id == .workspace(workspaceID) && $0.isWorkspace })
+        XCTAssertEqual(canvas.nodes.count, 2)
+        XCTAssertTrue(canvas.nodes.contains { $0.id == .workspace(workspaceID) && $0.isWorkspace && $0.collapsedCount == 1 })
         XCTAssertTrue(canvas.nodes.contains { $0.id == .session(liveID) })
-        XCTAssertTrue(canvas.nodes.contains { $0.id == .session(doneID) })
+        XCTAssertFalse(canvas.nodes.contains { $0.id == .session(doneID) })
         XCTAssertTrue(canvas.edges.contains { $0.kind == .membership && $0.source == .workspace(workspaceID) })
         let xs = canvas.nodes.map(\.center.x)
         let ys = canvas.nodes.map(\.center.y)
@@ -162,7 +162,7 @@ final class OrchestrationGraphCanvasLayoutTests: XCTestCase {
                 isHistoryScanIncomplete: false
             )
         )
-        let canvas = OrchestrationGraphCanvasLayout.make(snapshot: snapshot)
+        let canvas = OrchestrationGraphCanvasLayout.make(snapshot: Self.revealingHiddenSessions(snapshot))
         let hub = try XCTUnwrap(canvas.nodes.first { $0.id == .workspace(workspaceID) }?.center)
         let parent = try XCTUnwrap(canvas.nodes.first { $0.id == .session(parentID) }?.center)
         let child = try XCTUnwrap(canvas.nodes.first { $0.id == .session(childID) }?.center)
@@ -209,7 +209,7 @@ final class OrchestrationGraphCanvasLayoutTests: XCTestCase {
                 isHistoryScanIncomplete: false
             )
         )
-        let canvas = OrchestrationGraphCanvasLayout.make(snapshot: snapshot)
+        let canvas = OrchestrationGraphCanvasLayout.make(snapshot: Self.revealingHiddenSessions(snapshot))
         for i in canvas.nodes.indices {
             for j in (i + 1) ..< canvas.nodes.count {
                 let left = canvas.nodes[i]
@@ -324,7 +324,7 @@ final class OrchestrationGraphCanvasLayoutTests: XCTestCase {
                 isHistoryScanIncomplete: false
             )
         )
-        let canvas = OrchestrationGraphCanvasLayout.make(snapshot: snapshot)
+        let canvas = OrchestrationGraphCanvasLayout.make(snapshot: Self.revealingHiddenSessions(snapshot))
         let membershipToParent = canvas.edges.first {
             $0.kind == .membership && $0.target == .session(parentID)
         }
@@ -403,6 +403,17 @@ final class OrchestrationGraphCanvasLayoutTests: XCTestCase {
             $0.kind == .membership && $0.source == .workspace(workspaceID) && $0.target == .session(parentID)
         })
         XCTAssertFalse(canvas.edges.contains { $0.kind == .membership && $0.target == .session(childID) })
+    }
+
+    private static func revealingHiddenSessions(_ snapshot: OrchestrationGraphSnapshot) -> OrchestrationGraphSnapshot {
+        OrchestrationGraphSnapshot(
+            projection: snapshot.projection,
+            sessionRoutes: snapshot.sessionRoutes,
+            layout: OrchestrationGraphLayout.make(
+                projection: snapshot.projection,
+                zoom: OrchestrationGraphLayout.revealZoomThreshold
+            )
+        )
     }
 
     func testEmptyDefaultWorkspacesAreOmitted() {

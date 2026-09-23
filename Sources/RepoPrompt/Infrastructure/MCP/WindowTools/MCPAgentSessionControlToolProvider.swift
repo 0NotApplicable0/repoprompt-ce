@@ -70,7 +70,7 @@ final class MCPAgentSessionControlToolProvider: MCPAppToolProviding {
             description: """
             Rename the current agent session/tab.
 
-            Use this tool near session start to set a helpful session title.
+            If the session already has a dispatcher title, leave it unchanged and do not call this tool to set a helpful title at start. Only an untitled session may be named once.
             """,
             annotations: .repoPromptLocalEphemeralState,
             inputSchema: .object(
@@ -167,22 +167,24 @@ final class MCPAgentSessionControlToolProvider: MCPAppToolProviding {
         let target = try await dependencies.resolveAgentModeTabID(args, connectionID, .setStatus)
 
         // Invariant: background status updates are tab-scoped and must not steal tab focus.
-        try await MainActor.run {
-            if let sessionNameToApply {
-                try targetWindow.agentModeViewModel.renameSession(
-                    target: target,
-                    to: sessionNameToApply
-                )
-            }
+        let status = try await MainActor.run {
+            try targetWindow.agentModeViewModel.applySetStatusSessionName(
+                target: target,
+                proposed: sessionNameToApply
+            )
         }
 
         var result: [String: Value] = [
             "ok": .bool(true),
             "context_id": .string(target.tabID.uuidString),
-            "session_name_applied": .bool(sessionNameToApply != nil)
+            "session_name_applied": .bool(status.applied)
         ]
-        if let sessionNameToApply {
+        if status.applied, let sessionNameToApply {
             result["session_name"] = .string(sessionNameToApply)
+        }
+        if let message = status.message {
+            result["dispatcher_title_kept"] = .bool(true)
+            result["message"] = .string(message)
         }
         return .object(result)
     }

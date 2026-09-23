@@ -1528,6 +1528,26 @@ actor ServerNetworkManager {
     private var presentationWindowByConnection: [UUID: Int] = [:]
     private var runIDByConnectionID: [UUID: UUID] = [:]
 
+    /// `OrchestrationGraphWindowPolicy` is a `@MainActor` type, so this property is pinned to the
+    /// main actor instead of this actor's own isolation domain. Read per resolution, never cached,
+    /// so a live flag toggle takes effect on the next call. Tests inject a closure policy;
+    /// production keeps the default and never mutates the shared setting through this property.
+    @MainActor
+    var graphPolicy = OrchestrationGraphWindowPolicy.production
+
+    /// One connection-scoped graph admission lease per connection. Presence means the connection
+    /// has exact root authority over `workspaceID`'s roots on `windowID`, owned under `ownerID`
+    /// in that window's `WorkspaceFileContextStore`.
+    private struct GraphAdmissionLease {
+        let windowID: Int
+        let workspaceID: UUID
+        let tabID: UUID
+        let ownerID: UUID
+        let store: WorkspaceFileContextStore
+    }
+
+    private var graphAdmissionLeaseByConnectionID: [UUID: GraphAdmissionLease] = [:]
+
     // Connection-lane ownership lives in RepoPromptDomainRuntime.
 
     // 🆕 Admission control
@@ -3111,6 +3131,10 @@ actor ServerNetworkManager {
             presentationWindowByConnection[cid] = nil
             resolvedPresentationWindowByConnection[cid] = nil // Keep both maps consistent
             runIDByConnectionID[cid] = nil
+        }
+
+        Task { [weak self] in
+            await self?.releaseGraphAdmissionLeases(forWindowID: windowID)
         }
 
         // Window close authoritatively removes this bucket; deferred exact-ID completions are no-ops.
@@ -7256,6 +7280,7 @@ actor ServerNetworkManager {
         connectionAlreadyStopped: Bool,
         context: MCPConnectionCloseContext
     ) async -> Bool {
+        await releaseGraphAdmission(connectionID: id)
         if let committedRemoval {
             guard committedRemoval.connectionID == id,
                   connectionsBeingRemoved.contains(id),
@@ -7559,19 +7584,13 @@ actor ServerNetworkManager {
                     }
                 }
             },
-            collectMatchesForWorkingDirs: { workingDirs in
+            collectMatchesForWorkingDirs: { [self] workingDirs in
                 await MainActor.run {
-                    WindowStatesManager.shared.allWindows.flatMap { windowState in
-                        windowState.workspaceManager.bindingCandidates(matchingWorkingDirs: workingDirs, includeHidden: false).map { candidate in
-                            MCPContextBindingMatch(
-                                windowID: windowState.windowID,
-                                tabID: candidate.tabID,
-                                workspaceID: candidate.workspaceID,
-                                workspaceName: candidate.workspaceName,
-                                repoPaths: candidate.repoPaths
-                            )
-                        }
-                    }
+                    Self.collectWorkingDirectoryMatches(
+                        workingDirs: workingDirs,
+                        windows: WindowStatesManager.shared.allWindows,
+                        admitsStoredGraphWorkspaces: graphPolicy.mountsGraphShell
+                    )
                 }
             },
             collectActiveMatchForWindowID: { windowID in
@@ -7610,6 +7629,374 @@ actor ServerNetworkManager {
             }
         )
     }
+
+    /// Production `working_dirs` match collector, extracted from `bindingResolver`'s
+    /// `collectMatchesForWorkingDirs` closure so tests can exercise the exact production decision.
+    @MainActor
+    static func collectWorkingDirectoryMatches(
+        workingDirs: [String],
+        windows: [WindowState],
+        admitsStoredGraphWorkspaces: Bool
+    ) -> [MCPContextBindingMatch] {
+        // Graph-on anchors discovery to exactly one main window so saved inventory is not
+        // duplicated across windows. When more than one main window is registered, the
+        // single-graph-window invariant does not hold, so fall through to the active-only
+        // collection below rather than guessing an anchor.
+        if admitsStoredGraphWorkspaces, windows.count == 1, let anchorWindow = windows.first {
+            return anchorWindow.workspaceManager.storedBindingCandidates(matchingWorkingDirs: workingDirs, includeHidden: false).map { candidate in
+                MCPContextBindingMatch(
+                    windowID: anchorWindow.windowID,
+                    tabID: candidate.tabID,
+                    workspaceID: candidate.workspaceID,
+                    workspaceName: candidate.workspaceName,
+                    repoPaths: candidate.repoPaths
+                )
+            }
+        }
+        return windows.flatMap { windowState in
+            windowState.workspaceManager.bindingCandidates(matchingWorkingDirs: workingDirs, includeHidden: false).map { candidate in
+                MCPContextBindingMatch(
+                    windowID: windowState.windowID,
+                    tabID: candidate.tabID,
+                    workspaceID: candidate.workspaceID,
+                    workspaceName: candidate.workspaceName,
+                    repoPaths: candidate.repoPaths
+                )
+            }
+        }
+    }
+
+    #if DEBUG
+        /// Test-only entry point for the production `working_dirs` collector. Tests must call
+        /// this instead of reimplementing the collection logic, so a red/green result reflects the
+        /// exact production decision.
+        static func test_collectWorkingDirectoryMatches(
+            workingDirs: [String],
+            windows: [WindowState],
+            admitsStoredGraphWorkspaces: Bool
+        ) async -> [MCPContextBindingMatch] {
+            await MainActor.run {
+                collectWorkingDirectoryMatches(
+                    workingDirs: workingDirs,
+                    windows: windows,
+                    admitsStoredGraphWorkspaces: admitsStoredGraphWorkspaces
+                )
+            }
+        }
+    #endif
+
+    // MARK: - Graph admission
+
+    /// Provisional root authority for one graph admission attempt. Not yet published; the caller
+    /// must verify installation before calling `publishGraphAdmission`.
+    struct GraphAdmissionTicket {
+        let connectionID: UUID
+        let windowID: Int
+        let workspaceID: UUID
+        let tabID: UUID
+        let ownerID: UUID
+        let lookupContext: WorkspaceLookupContext
+        let store: WorkspaceFileContextStore
+    }
+
+    /// Prepares connection-scoped, exact root authority for `workspaceID`'s `repoPaths` as hidden
+    /// `.sessionWorktree` roots in `window`'s store, under a fresh owner. On any failure the
+    /// provisional ownership is discarded and the prior binding/lease are left untouched.
+    func prepareGraphAdmission(
+        connectionID: UUID,
+        window: WindowState,
+        workspaceID: UUID,
+        tabID: UUID,
+        repoPaths: [String]
+    ) async throws -> GraphAdmissionTicket {
+        let ownerID = UUID()
+        let store = window.workspaceFileContextStore
+        let bindingFingerprint = "og06-graph-admission:\(connectionID.uuidString):\(workspaceID.uuidString)"
+        let existingRepoPaths = repoPaths.filter { path in
+            var isDirectory: ObjCBool = false
+            let expanded = (path as NSString).expandingTildeInPath
+            return FileManager.default.fileExists(atPath: expanded, isDirectory: &isDirectory) && isDirectory.boolValue
+        }
+        guard existingRepoPaths.count == repoPaths.count else {
+            let missing = Set(repoPaths).subtracting(existingRepoPaths).sorted()
+            throw MCPError.invalidRequest(
+                "Graph admission requires every declared workspace root to exist on disk. Missing: \(missing.joined(separator: ", "))"
+            )
+        }
+        guard !existingRepoPaths.isEmpty else {
+            return GraphAdmissionTicket(
+                connectionID: connectionID,
+                windowID: window.windowID,
+                workspaceID: workspaceID,
+                tabID: tabID,
+                ownerID: ownerID,
+                lookupContext: WorkspaceLookupContext(
+                    rootScope: .validatedSessionBoundWorkspace(canonicalRoots: [], physicalRoots: []),
+                    bindingProjection: nil
+                ),
+                store: store
+            )
+        }
+        let preparation = try await store.prepareSessionWorktreeOwnership(
+            ownerID: ownerID,
+            bindingFingerprint: bindingFingerprint,
+            physicalRootPaths: existingRepoPaths
+        )
+        do {
+            try await store.commitSessionWorktreeOwnership(preparation)
+        } catch {
+            await store.abortSessionWorktreeOwnership(preparation)
+            throw error
+        }
+        // From here, ownership is committed under ownerID; any further failure must release
+        // (not abort) so the already-installed record is torn down rather than ignored.
+        let physicalRefs = Set(preparation.roots.map {
+            WorkspaceRootRef(id: $0.rootID, name: ($0.standardizedPhysicalPath as NSString).lastPathComponent, fullPath: $0.standardizedPhysicalPath)
+        })
+        let lookupContext = WorkspaceLookupContext(
+            rootScope: .validatedSessionBoundWorkspace(canonicalRoots: [], physicalRoots: physicalRefs),
+            bindingProjection: nil
+        )
+        // An empty root scope (every requested repo path was missing on disk) is trivially
+        // consistent: there is nothing to verify, and `rootScopeAvailability`/`rootRefs` treat an
+        // empty selector as unavailable rather than "available with zero roots".
+        if !physicalRefs.isEmpty {
+            let availability = await store.rootScopeAvailability(lookupContext.rootScope)
+            guard availability == .available else {
+                await store.releaseSessionWorktreeOwnership(ownerID: ownerID)
+                throw MCPError.invalidRequest("Graph admission root authority is unavailable for workspace roots.")
+            }
+            let expectedPaths = Set(existingRepoPaths.map { StandardizedPath.absolute(($0 as NSString).expandingTildeInPath) })
+            let scopedPaths = await Set(store.rootRefs(scope: lookupContext.rootScope).map(\.standardizedFullPath))
+            guard scopedPaths == expectedPaths else {
+                await store.releaseSessionWorktreeOwnership(ownerID: ownerID)
+                throw MCPError.invalidRequest("Graph admission root scope did not match the requested workspace roots exactly.")
+            }
+        }
+        return GraphAdmissionTicket(
+            connectionID: connectionID,
+            windowID: window.windowID,
+            workspaceID: workspaceID,
+            tabID: tabID,
+            ownerID: ownerID,
+            lookupContext: lookupContext,
+            store: store
+        )
+    }
+
+    /// Records the lease for `ticket.connectionID` after its frozen tab binding has been
+    /// installed and verified, releasing that connection's preceding graph lease (if any and
+    /// distinct from this one).
+    func publishGraphAdmission(_ ticket: GraphAdmissionTicket) async {
+        let previous = graphAdmissionLeaseByConnectionID[ticket.connectionID]
+        graphAdmissionLeaseByConnectionID[ticket.connectionID] = GraphAdmissionLease(
+            windowID: ticket.windowID,
+            workspaceID: ticket.workspaceID,
+            tabID: ticket.tabID,
+            ownerID: ticket.ownerID,
+            store: ticket.store
+        )
+        if let previous, previous.ownerID != ticket.ownerID {
+            await releaseGraphAdmissionOwnership(previous)
+        }
+    }
+
+    /// Discards a provisional ticket that was never published. Releases exactly `ticket.ownerID`'s ownership — never the connection's current published
+    /// lease, which this ticket never replaced.
+    func abortGraphAdmission(_ ticket: GraphAdmissionTicket) async {
+        await releaseGraphAdmissionOwnership(GraphAdmissionLease(
+            windowID: ticket.windowID,
+            workspaceID: ticket.workspaceID,
+            tabID: ticket.tabID,
+            ownerID: ticket.ownerID,
+            store: ticket.store
+        ))
+    }
+
+    /// Releases `connectionID`'s graph admission lease, if any: a later non-graph explicit
+    /// rebind, connection removal, or replacement by another admission (see `publishGraphAdmission`).
+    @discardableResult
+    func releaseGraphAdmission(connectionID: UUID) async -> Bool {
+        guard let lease = graphAdmissionLeaseByConnectionID.removeValue(forKey: connectionID) else { return false }
+        await releaseGraphAdmissionOwnership(lease)
+        return true
+    }
+
+    /// Releases every graph admission lease bound to `windowID`, e.g. on window close, while the
+    /// lease's captured store reference is still usable (never re-resolved through `allWindows`,
+    /// where a closing window is already absent).
+    func releaseGraphAdmissionLeases(forWindowID windowID: Int) async {
+        let connectionIDs = graphAdmissionLeaseByConnectionID.compactMap { connectionID, lease in
+            lease.windowID == windowID ? connectionID : nil
+        }
+        for connectionID in connectionIDs {
+            guard let lease = graphAdmissionLeaseByConnectionID.removeValue(forKey: connectionID) else { continue }
+            await releaseGraphAdmissionOwnership(lease)
+        }
+    }
+
+    private func releaseGraphAdmissionOwnership(_ lease: GraphAdmissionLease) async {
+        await lease.store.releaseSessionWorktreeOwnership(ownerID: lease.ownerID)
+    }
+
+    #if DEBUG
+        func debugHasGraphAdmissionLease(connectionID: UUID) -> Bool {
+            graphAdmissionLeaseByConnectionID[connectionID] != nil
+        }
+    #endif
+
+    /// This connection's currently published graph admission tab, if `windowID` matches. Used
+    /// only by `resolveLogicalContextPreResolution`'s `_windowID`-only branch.
+    private func publishedGraphAdmissionHint(connectionID: UUID, windowID: Int) -> MCPServerViewModel.TabContextHint? {
+        guard let lease = graphAdmissionLeaseByConnectionID[connectionID], lease.windowID == windowID else {
+            return nil
+        }
+        return MCPServerViewModel.TabContextHint(tabID: lease.tabID, workspaceID: lease.workspaceID, windowID: lease.windowID)
+    }
+
+    /// Outcome of `resolveLogicalContextPreResolution`: either a resolved dispatch hint (`nil` hint
+    /// means the tool has no logical-context binding for this call) or a pre-built tool error result
+    /// that `tools/call` returns directly.
+    private enum LogicalContextPreResolutionOutcome {
+        case resolved(hint: MCPServerViewModel.TabContextHint?, windowID: Int?)
+        case error(CallTool.Result)
+    }
+
+    /// The `tools/call` logical-context pre-resolution decision: given the dispatch-extracted
+    /// `_windowID`/`context_id`/`_tabID` fields, decides which tab/window `toolName` dispatches
+    /// against. `tools/call` calls this directly below; the DEBUG entry point calls the exact same
+    /// function so tests exercise the production decision, never a parallel one.
+    private func resolveLogicalContextPreResolution(
+        toolName: String,
+        connectionID: UUID,
+        extractedContextID: UUID?,
+        extractedTabID: UUID?,
+        extractedWindowID: Int?,
+        capturedRawJSON: Bool
+    ) async -> LogicalContextPreResolutionOutcome {
+        guard !Self.shouldBypassLogicalContextPreResolution(for: toolName) else {
+            return .resolved(hint: nil, windowID: nil)
+        }
+        // A `_windowID`-only call from a connection holding a published graph admission on that
+        // exact window resolves to the admitted tab, not the window's active tab — every other
+        // case (context_id/_tabID present, no admission, different window) is unchanged.
+        if extractedContextID == nil,
+           extractedTabID == nil,
+           let extractedWindowID,
+           let admittedHint = publishedGraphAdmissionHint(connectionID: connectionID, windowID: extractedWindowID)
+        {
+            return .resolved(hint: admittedHint, windowID: extractedWindowID)
+        }
+        do {
+            let logicalBinding: MCPLogicalContextBindingResolution? = if extractedContextID == nil,
+                                                                         extractedTabID == nil,
+                                                                         let extractedWindowID
+            {
+                try await bindingResolver.resolvePresentationWindowBinding(
+                    connectionID: connectionID,
+                    requestedWindowID: extractedWindowID
+                )
+            } else {
+                try await bindingResolver.resolveLogicalContextBinding(
+                    connectionID: connectionID,
+                    explicitContextID: extractedContextID,
+                    legacyTabID: extractedTabID,
+                    workingDirs: [],
+                    requestedWindowID: extractedWindowID
+                )
+            }
+            guard let logicalBinding else {
+                return .resolved(hint: nil, windowID: nil)
+            }
+            let hint = MCPServerViewModel.TabContextHint(
+                tabID: logicalBinding.logicalContext.tabID,
+                workspaceID: logicalBinding.logicalContext.workspaceID,
+                windowID: logicalBinding.windowID
+            )
+            if Self.shouldPersistResolvedLogicalContextWindowMapping(for: toolName) {
+                await setConnectionWindowMapping(connectionID, windowID: logicalBinding.windowID)
+            }
+            connectionLog(
+                "Tool call: resolved logical context_id=\(logicalBinding.logicalContext.tabID) workspace=\(logicalBinding.logicalContext.workspaceName) window=\(logicalBinding.windowID)"
+            )
+            return .resolved(hint: hint, windowID: logicalBinding.windowID)
+        } catch {
+            let routePolicy = await effectivePolicyState(for: connectionID)
+            if routePolicy.purpose == .agentModeRun || routePolicy.restricted.contains("bind_context") {
+                return .error(Self.toolErrorResult(
+                    rawJSON: capturedRawJSON,
+                    message: "Unable to resolve the requested RepoPrompt context for this restricted connection. " +
+                        Self.multiWindowSelectionGuidance(
+                            purpose: routePolicy.purpose,
+                            restrictedTools: routePolicy.restricted
+                        )
+                ))
+            }
+            return .error(Self.toolErrorResult(rawJSON: capturedRawJSON, message: error.localizedDescription))
+        }
+    }
+
+    #if DEBUG
+        /// Test-only probe for the `tools/call` pre-resolution seam. Calls the exact
+        /// function `tools/call` calls with the given extracted `_windowID`/`context_id`/`_tabID`
+        /// fields, then resolves the file-tool lookup scope for the resulting hint through the same
+        /// `MCPServerViewModel.RequestMetadata` shape a real file-tool dispatch receives — so tests
+        /// observe the production decision, not a parallel one.
+        struct LogicalContextPreResolutionDispatchProbe {
+            let hint: MCPServerViewModel.TabContextHint?
+            let windowID: Int?
+            let errorResult: CallTool.Result?
+            let lookupContext: WorkspaceLookupContext?
+        }
+
+        func test_resolveLogicalContextPreResolutionAndDispatchFileTool(
+            toolName: String = "read_file",
+            connectionID: UUID,
+            extractedContextID: UUID? = nil,
+            extractedTabID: UUID? = nil,
+            extractedWindowID: Int?
+        ) async -> LogicalContextPreResolutionDispatchProbe {
+            switch await resolveLogicalContextPreResolution(
+                toolName: toolName,
+                connectionID: connectionID,
+                extractedContextID: extractedContextID,
+                extractedTabID: extractedTabID,
+                extractedWindowID: extractedWindowID,
+                capturedRawJSON: false
+            ) {
+            case let .error(result):
+                return LogicalContextPreResolutionDispatchProbe(
+                    hint: nil, windowID: nil, errorResult: result, lookupContext: nil
+                )
+            case let .resolved(hint, windowID):
+                let dispatchWindowID = hint?.windowID ?? windowID ?? extractedWindowID
+                guard let dispatchWindowID else {
+                    return LogicalContextPreResolutionDispatchProbe(
+                        hint: hint, windowID: windowID, errorResult: nil, lookupContext: nil
+                    )
+                }
+                guard let windowState = await MainActor.run(body: {
+                    WindowStatesManager.shared.allWindows.first { $0.windowID == dispatchWindowID }
+                }) else {
+                    return LogicalContextPreResolutionDispatchProbe(
+                        hint: hint, windowID: windowID, errorResult: nil, lookupContext: nil
+                    )
+                }
+                let metadata = MCPServerViewModel.RequestMetadata(
+                    connectionID: connectionID,
+                    clientName: clientIdentifier(forConnection: connectionID),
+                    windowID: extractedWindowID,
+                    runPurpose: nil,
+                    tabContextHint: hint,
+                    explicitWindowRoutingHint: nil
+                )
+                let lookupContext = await windowState.mcpServer.resolveFileToolLookupContext(from: metadata)
+                return LogicalContextPreResolutionDispatchProbe(
+                    hint: hint, windowID: windowID, errorResult: nil, lookupContext: lookupContext
+                )
+            }
+        }
+    #endif
 
     private func cachedSchema(for name: String, schema: Value, purpose: MCPRunPurpose) async throws -> Value {
         let cacheKey = ToolSchemaCacheKey(name: name, purpose: purpose)
@@ -12436,53 +12823,19 @@ actor ServerNetworkManager {
                     EditFlowPerf.Dimensions(toolName: toolName)
                 )
                 defer { EditFlowPerf.end(EditFlowPerf.Stage.MCPToolCall.logicalContextResolution, logicalContextState) }
-                if !Self.shouldBypassLogicalContextPreResolution(for: toolName) {
-                    do {
-                        let logicalBinding: MCPLogicalContextBindingResolution? = if extractedContextID == nil,
-                                                                                     extractedTabID == nil,
-                                                                                     let extractedWindowID
-                        {
-                            try await bindingResolver.resolvePresentationWindowBinding(
-                                connectionID: connectionID,
-                                requestedWindowID: extractedWindowID
-                            )
-                        } else {
-                            try await bindingResolver.resolveLogicalContextBinding(
-                                connectionID: connectionID,
-                                explicitContextID: extractedContextID,
-                                legacyTabID: extractedTabID,
-                                workingDirs: [],
-                                requestedWindowID: extractedWindowID
-                            )
-                        }
-                        if let logicalBinding {
-                            dispatchTabContextHint = MCPServerViewModel.TabContextHint(
-                                tabID: logicalBinding.logicalContext.tabID,
-                                workspaceID: logicalBinding.logicalContext.workspaceID,
-                                windowID: logicalBinding.windowID
-                            )
-                            preResolvedWindowID = logicalBinding.windowID
-                            if Self.shouldPersistResolvedLogicalContextWindowMapping(for: toolName) {
-                                await setConnectionWindowMapping(connectionID, windowID: logicalBinding.windowID)
-                            }
-                            connectionLog(
-                                "Tool call: resolved logical context_id=\(logicalBinding.logicalContext.tabID) workspace=\(logicalBinding.logicalContext.workspaceName) window=\(logicalBinding.windowID)"
-                            )
-                        }
-                    } catch {
-                        let routePolicy = await effectivePolicyState(for: connectionID)
-                        if routePolicy.purpose == .agentModeRun || routePolicy.restricted.contains("bind_context") {
-                            return Self.toolErrorResult(
-                                rawJSON: capturedRawJSON,
-                                message: "Unable to resolve the requested RepoPrompt context for this restricted connection. " +
-                                    Self.multiWindowSelectionGuidance(
-                                        purpose: routePolicy.purpose,
-                                        restrictedTools: routePolicy.restricted
-                                    )
-                            )
-                        }
-                        return Self.toolErrorResult(rawJSON: capturedRawJSON, message: error.localizedDescription)
-                    }
+                switch await resolveLogicalContextPreResolution(
+                    toolName: toolName,
+                    connectionID: connectionID,
+                    extractedContextID: extractedContextID,
+                    extractedTabID: extractedTabID,
+                    extractedWindowID: extractedWindowID,
+                    capturedRawJSON: capturedRawJSON
+                ) {
+                case let .resolved(hint, windowID):
+                    dispatchTabContextHint = hint
+                    preResolvedWindowID = windowID
+                case let .error(result):
+                    return result
                 }
             }
             if let admissionTimeout = promptExportAdmissionTimeoutResultIfExpired() {

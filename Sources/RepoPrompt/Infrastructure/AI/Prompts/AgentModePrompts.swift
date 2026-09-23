@@ -374,25 +374,25 @@ enum AgentModePrompts {
         /// Tool-list item for session naming (provider-aware).
         static func setStatusToolListItem(agentKind: AgentProviderKind?) -> String {
             if agentKind == .codexExec {
-                return "\n- `set_status` - RepoPrompt MCP tool call for setting or renaming the session title (call once at session start)"
+                return "\n- `set_status` - RepoPrompt MCP tool call that names an untitled session. If the session already has a title, do not call `set_status`."
             }
-            return "\n- `set_status` - Set or rename the session title (call once at session start)"
+            return "\n- `set_status` - Names an untitled session. If the session already has a title, do not call `set_status`."
         }
 
         /// Session-start instruction for role prompts that use inline numbered steps.
         static func setStatusStartSentence(agentKind: AgentProviderKind?) -> String {
             if agentKind == .codexExec {
-                return "Call `set_status` with `session_name` as a RepoPrompt MCP tool call to name this session at the start."
+                return "If this session already has a title, do not call `set_status`. Only an untitled session may be named once, with `session_name` as a RepoPrompt MCP tool call."
             }
-            return "Call `set_status` to name this session at the start."
+            return "If this session already has a title, do not call `set_status`. Only an untitled session may be named once."
         }
 
         /// Session-start bullet for standard workflow guidance.
         static func setStatusStartupBullet(agentKind: AgentProviderKind?) -> String {
             if agentKind == .codexExec {
-                return "\t- Immediately call `set_status` with `session_name` as a RepoPrompt MCP tool call to name the current chat/session"
+                return "\t- If this session already has a title, do not call `set_status`. Only an untitled session may be named once, with `session_name` as a RepoPrompt MCP tool call."
             }
-            return "\t- Immediately call `set_status` with `session_name` to name the current chat/session"
+            return "\t- If this session already has a title, do not call `set_status`. Only an untitled session may be named once."
         }
 
         /// Keep set_status title-only wording aligned with provider-specific tool naming.

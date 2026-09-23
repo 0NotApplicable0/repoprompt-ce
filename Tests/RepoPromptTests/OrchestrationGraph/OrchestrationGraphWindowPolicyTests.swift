@@ -40,6 +40,11 @@ import XCTest
             await AgentSessionDataService.shared.test_setWorkspaceRootOverride(agentWorkspaceRoot)
             await ChatDataService.test_setWorkspaceRootOverride(chatWorkspaceRoot)
             targetWorkspace = makeTargetWorkspace()
+            for repoPath in targetWorkspace.repoPaths {
+                try FileManager.default.createDirectory(
+                    at: URL(fileURLWithPath: repoPath), withIntermediateDirectories: true
+                )
+            }
             try writeWorkspace(targetWorkspace)
             try writeLegacyIndex([targetWorkspace])
             runtime = MCPDomainRuntime(configuration: .init(
@@ -303,6 +308,8 @@ import XCTest
             var openCount = 0
             installProductionOpener { openCount += 1 }
             let service = makeRoutingService(graphEnabled: true)
+            await windowA.workspaceManager.awaitInitialized()
+            let activeWorkspaceIDBeforeCall = windowA.workspaceManager.activeWorkspaceID
 
             let response = try await callSwitchInNewWindow(service)
 
@@ -312,7 +319,9 @@ import XCTest
             XCTAssertEqual(openCount, 0)
             XCTAssertEqual(WindowStatesManager.shared.allWindows.count, 1)
             XCTAssertTrue(WindowStatesManager.shared.allWindows.first === windowA)
-            XCTAssertEqual(windowA.workspaceManager.activeWorkspaceID, targetWorkspace.id)
+            // OG-06 DW-1: graph-on admission binds W2's saved tab on the existing window without
+            // making it the visible workspace, so W1 stays active instead of becoming W2.
+            XCTAssertEqual(windowA.workspaceManager.activeWorkspaceID, activeWorkspaceIDBeforeCall)
         }
 
         // MARK: - Window root surface

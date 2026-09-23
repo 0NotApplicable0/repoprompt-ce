@@ -54,9 +54,13 @@ rpce-cli -w <window_id> -e 'tree --type roots'
 **If no match** → the codebase isn't loaded. Find and open the workspace:
 ```json
 {"tool":"manage_workspaces","args":{"action":"list"}}
+```
+**If the orchestration graph is enabled**: do not open another main window. Retry `bind_context` with `working_dirs` equal to the target roots, or call `manage_workspaces` `switch` with `open_in_new_window:true`; both bind the saved workspace on the existing graph window and keep its visible workspace. Do not use `manage_workspaces switch` without `open_in_new_window:true`.
+**If the orchestration graph is disabled**:
+```json
 {"tool":"manage_workspaces","args":{"action":"switch","workspace":"<workspace_name>","open_in_new_window":true}}
 ```
-Then retry the `working_dirs` bind.
+`open_in_new_window:true` opens a new window; then retry the `working_dirs` bind.
 """ : """
 **Check the output:**
 - If your target root appears in a window → note the window ID and proceed to \(nextStep)
