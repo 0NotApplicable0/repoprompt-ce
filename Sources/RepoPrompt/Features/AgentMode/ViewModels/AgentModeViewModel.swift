@@ -967,7 +967,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     private nonisolated static let detachedTranscriptVisibleItemBuffer = 5
     private nonisolated static let detachedTranscriptEvictionChunkSize = 5
     private nonisolated static let pendingToolFinalizationNonToolBoundary = 200
-    private nonisolated static let staleComposerSubmitTargetMessage = "This composer changed before the message could be sent. Please try again."
+    nonisolated static let staleComposerSubmitTargetMessage = "This composer changed before the message could be sent. Please try again."
     private nonisolated static let childAgentRunWaitDrainTimeoutSeconds: TimeInterval = 2.0
 
     #if DEBUG
@@ -2431,7 +2431,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             },
             hasActiveChildAgentRunWaits: { [weak mcpServer] runID in
                 mcpServer?.hasActiveChildAgentRunWaits(runID: runID) ?? false
-            }
+            },
+            autoEffortEnabledProvider: { [modelRouterSettingsStore] in modelRouterSettingsStore.autoEffortEnabled() }
         )
         self.clearConsumedAttachmentsAfterProviderConsumption = clearConsumedAttachmentsAfterProviderConsumption
         workspaceSwitchProvider = AgentModeWorkspaceSwitchCleanupProvider(
@@ -2566,13 +2567,15 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             testCodexStallWatchdogInactivityThreshold: TimeInterval? = nil,
             testCodexTransportClosedRecoveryGraceInterval: TimeInterval? = nil,
             testUsesProductionAgentDefaultsAndModelPolling: Bool = false,
-            testOpenCodeModelParameterStreamProvider: ((String?, String) async -> AsyncStream<OpenCodeACPModelParameterSnapshot>)? = nil
+            testOpenCodeModelParameterStreamProvider: ((String?, String) async -> AsyncStream<OpenCodeACPModelParameterSnapshot>)? = nil,
+            testModelRouterSettingsStore: GlobalSettingsStore = .shared
         ) {
             windowID = testWindowID
             promptManager = nil
             workspaceFileContextStore = testWorkspaceFileContextStore
             workspaceManager = nil
             mcpServer = testMCPServer
+            modelRouterSettingsStore = testModelRouterSettingsStore
             self.applyEditsApprovalStore = applyEditsApprovalStore
             self.skillCatalog = skillCatalog ?? AgentSkillCatalog()
             attachmentWorkspaceDirectoryProvider = {
@@ -2666,7 +2669,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 },
                 hasActiveChildAgentRunWaits: { [weak testMCPServer] runID in
                     testMCPServer?.hasActiveChildAgentRunWaits(runID: runID) ?? false
-                }
+                },
+                autoEffortEnabledProvider: { [testModelRouterSettingsStore] in testModelRouterSettingsStore.autoEffortEnabled() }
             )
             self.clearConsumedAttachmentsAfterProviderConsumption = clearConsumedAttachmentsAfterProviderConsumption
             workspaceSwitchProvider = AgentModeWorkspaceSwitchCleanupProvider(
@@ -16029,7 +16033,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         text: String,
         tabID: UUID,
         codexAttemptID: UUID? = nil,
-        rawDraftText: String? = nil
+        rawDraftText: String? = nil,
+        autoEffortSelection: AutoEffortTurnSelection? = nil
     ) -> UserTurnSubmissionResult {
         let session = session(for: tabID)
         let trimmedText = text.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -16146,6 +16151,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                     nativePreparedTurn: nativePreparedTurn,
                     codexAttemptID: codexAttemptID,
                     rawDraftText: rawDraftText,
+                    autoEffortSelection: autoEffortSelection,
                     restorationSelectedWorkflow: activeWorkflow,
                     restorationSelectedWorkflowMutationGeneration: restorationSelectedWorkflowMutationGeneration
                 )
@@ -16163,6 +16169,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             nativePreparedTurn: nativePreparedTurn,
             codexAttemptID: codexAttemptID,
             rawDraftText: rawDraftText,
+            autoEffortSelection: autoEffortSelection,
             restorationSelectedWorkflow: activeWorkflow,
             restorationSelectedWorkflowMutationGeneration: restorationSelectedWorkflowMutationGeneration
         )
@@ -16177,6 +16184,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         nativePreparedTurn: NativeSlashPreparedUserTurn? = nil,
         codexAttemptID: UUID? = nil,
         rawDraftText: String? = nil,
+        autoEffortSelection: AutoEffortTurnSelection? = nil,
         restorationSelectedWorkflow: AgentWorkflowDefinition? = nil,
         restorationSelectedWorkflowMutationGeneration: UInt64? = nil
     ) async {
@@ -16206,6 +16214,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             nativePreparedTurn: nativePreparedTurn,
             codexAttemptID: codexAttemptID,
             rawDraftText: rawDraftText,
+            autoEffortSelection: autoEffortSelection,
             restorationSelectedWorkflow: restorationSelectedWorkflow,
             restorationSelectedWorkflowMutationGeneration: restorationSelectedWorkflowMutationGeneration
         )
@@ -16505,6 +16514,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         nativePreparedTurn: NativeSlashPreparedUserTurn? = nil,
         codexAttemptID: UUID? = nil,
         rawDraftText: String? = nil,
+        autoEffortSelection: AutoEffortTurnSelection? = nil,
         restorationSelectedWorkflow: AgentWorkflowDefinition? = nil,
         restorationSelectedWorkflowMutationGeneration: UInt64? = nil
     ) -> UserTurnSubmissionResult {
@@ -16717,7 +16727,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                         initialMessage: wrappedText,
                         attachments: attachmentsToSend,
                         taggedFileAttachments: taggedFilesToSend,
-                        codexFallbackContext: fallbackContext
+                        codexFallbackContext: fallbackContext,
+                        autoEffortSelection: autoEffortSelection
                     )
                 } else {
                     .preDispatchRejected(
@@ -16822,7 +16833,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                         tabID: tabID,
                         initialMessage: wrappedText,
                         attachments: attachmentsToSend,
-                        taggedFileAttachments: taggedFilesToSend
+                        taggedFileAttachments: taggedFilesToSend,
+                        autoEffortSelection: autoEffortSelection
                     )
                 }
                 return UserTurnSubmissionResult.submitted
@@ -16853,7 +16865,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                     tabID: tabID,
                     initialMessage: wrappedText,
                     attachments: attachmentsToSend,
-                    taggedFileAttachments: taggedFilesToSend
+                    taggedFileAttachments: taggedFilesToSend,
+                    autoEffortSelection: autoEffortSelection
                 )
             }
         } else if let route = activeProviderSteeringRoute(for: session, attachments: attachmentsToSend) {
@@ -18111,6 +18124,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         attachments: [AgentImageAttachment] = [],
         taggedFileAttachments: [AgentTaggedFileAttachment] = [],
         codexFallbackContext: TabSession.CodexFallbackSubmissionContext? = nil,
+        autoEffortSelection: AutoEffortTurnSelection? = nil,
         directStartOptions: AgentDirectRunStartOptions = .default,
         startOutcome: AgentRunStartOutcomeRecorder? = nil
     ) async -> CodexAgentModeCoordinator.NativeSendOutcome? {
@@ -18221,6 +18235,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             initialMessageForRun: initialMessageForRun,
             attachments: attachments,
             codexFallbackContext: preparedCodexFallbackContext,
+            autoEffortSelection: autoEffortSelection,
             startOutcome: startOutcome
         )
     }

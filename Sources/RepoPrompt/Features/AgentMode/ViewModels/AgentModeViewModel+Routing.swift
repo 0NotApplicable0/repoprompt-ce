@@ -99,18 +99,14 @@ extension AgentModeViewModel {
         destinationTabID: UUID
     ) async -> UserTurnSubmissionResult {
         let configuration = modelRouterSettingsStore.modelRouterConfiguration()
-        guard configuration.enabled else {
-            return submitUserTurn(
+        guard configuration.enabled,
+              freshTaskRoutingEligibility(session: session, text: text)
+        else {
+            return await submitUserTurnAfterAutoEffort(
                 text: text,
-                tabID: destinationTabID,
-                rawDraftText: claim.attempt.rawDraftSnapshot
-            )
-        }
-        guard freshTaskRoutingEligibility(session: session, text: text) else {
-            return submitUserTurn(
-                text: text,
-                tabID: destinationTabID,
-                rawDraftText: claim.attempt.rawDraftSnapshot
+                claim: claim,
+                session: session,
+                destinationTabID: destinationTabID
             )
         }
         guard let runtime = modelRouterRuntime,
@@ -206,6 +202,90 @@ extension AgentModeViewModel {
         case .cancelled:
             return .blocked(message: "Model routing was cancelled.")
         }
+    }
+
+    /// Independent composer-only effort decision. A routed fresh task already received its
+    /// initial effort from Model Router; established sessions can use this path with either toggle.
+    private func submitUserTurnAfterAutoEffort(
+        text: String,
+        claim: AgentComposerSubmitClaim,
+        session: TabSession,
+        destinationTabID: UUID
+    ) async -> UserTurnSubmissionResult {
+        func submit(_ selection: AutoEffortTurnSelection? = nil) -> UserTurnSubmissionResult {
+            submitUserTurn(
+                text: text,
+                tabID: destinationTabID,
+                rawDraftText: claim.attempt.rawDraftSnapshot,
+                autoEffortSelection: selection
+            )
+        }
+        guard modelRouterSettingsStore.autoEffortEnabled(),
+              !session.runState.isActive,
+              !text.trimmingCharacters(in: .whitespacesAndNewlines).hasPrefix("/"),
+              let maskedExcerpt = AutoEffortTaskSummary.make(from: claim.attempt.rawDraftSnapshot),
+              let runtime = modelRouterRuntime,
+              runtime.isBackendReady(.jev)
+        else { return submit() }
+
+        let provider = session.selectedAgent
+        let modelRaw = session.selectedModelRaw
+        let modelID: String
+        let efforts: [String]
+        let manualEffortRaw: String?
+        switch provider {
+        case .codexExec:
+            guard let base = CodexModelSpecifier(raw: modelRaw).baseModel else { return submit() }
+            let option = codexCoordinator.modelOptions(for: .codexExec).first {
+                CodexModelSpecifier(raw: $0.rawValue).baseModel?.caseInsensitiveCompare(base) == .orderedSame
+            }
+            modelID = base
+            efforts = AutoEffortModelPolicy.codexEfforts(
+                modelRaw: modelRaw,
+                advertised: option?.supportedReasoningEfforts ?? []
+            )
+            manualEffortRaw = codexCoordinator.effectiveCodexSelection(for: session).reasoningEffort
+        case .claudeCode:
+            guard let base = ClaudeModelSpecifier(raw: modelRaw).baseModel else { return submit() }
+            modelID = base
+            efforts = AutoEffortModelPolicy.claudeEfforts(
+                modelRaw: modelRaw,
+                advertised: AgentModelCatalog.supportedClaudeEfforts(
+                    forSelectedModelRaw: modelRaw,
+                    agentKind: provider
+                )
+            )
+            manualEffortRaw = claudeCoordinator.currentClaudeEffortLevel(for: session).rawValue
+        default:
+            return submit()
+        }
+        guard efforts.count >= 2 else { return submit() }
+        let chosen = await runtime.chooseAutoEffort(
+            maskedTaskExcerpt: maskedExcerpt,
+            selectedModelID: modelID,
+            efforts: efforts
+        )
+        guard composerSubmitClaimIsCurrent(claim),
+              sessions[destinationTabID] === session
+        else { return .blocked(message: Self.staleComposerSubmitTargetMessage) }
+        guard modelRouterSettingsStore.autoEffortEnabled(),
+              session.selectedAgent == provider,
+              session.selectedModelRaw == modelRaw,
+              !session.runState.isActive,
+              let chosen, efforts.contains(chosen)
+        else { return submit() }
+        let currentManualEffortRaw: String? = switch provider {
+        case .codexExec: codexCoordinator.effectiveCodexSelection(for: session).reasoningEffort
+        case .claudeCode: claudeCoordinator.currentClaudeEffortLevel(for: session).rawValue
+        default: nil
+        }
+        guard currentManualEffortRaw == manualEffortRaw else { return submit() }
+        return submit(AutoEffortTurnSelection(
+            provider: provider,
+            selectedModelRaw: modelRaw,
+            manualEffortRaw: manualEffortRaw,
+            effortRaw: chosen
+        ))
     }
 
     func routeSubagentTargetIfEnabled(

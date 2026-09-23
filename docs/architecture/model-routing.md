@@ -1,6 +1,14 @@
 # Model Routing Architecture
 
-Current as of 2026-09-23.
+Current as of 2026-09-24.
+
+## Auto effort (independent opt-in)
+
+`Auto effort` is a separate persisted setting under `scalarPreferences.agentMode`, default off. It does not enable Model Router or change its policy. On an eligible settled composer user turn, Jev chooses only the effort for the already-selected exact Codex or Claude model. Model Router retains its fresh-session model-and-effort decision when both settings are enabled; subsequent eligible turns may use Auto effort. Steering, subagent starts, MCP sends, slash controls, and unsupported models retain their existing effort behavior. A failed or unavailable Jev judgment falls back to the current manual effort.
+
+The Auto effort request contains only a short, locally best-effort-masked excerpt of the current user message, the selected model ID, and the effort choices. It does not attach files, tool results, or earlier conversation. Masking is not a promise of anonymization: sensitive prose can remain. Settings disclose the TypeSafe transfer and privacy policy before opt-in. The provider send rechecks the model, manual effort, and setting after the asynchronous judgment; the choice is ephemeral and does not update saved model or effort preferences. The selected runtime applies effort before the user turn, not within an autonomous tool loop.
+
+Cache preservation is **not guaranteed** by this feature. The Codex app-server and Claude Code controls used by RPCE are distinct from their providers' direct API mechanisms; actual request-level behavior and savings require separate measurement.
 
 ## Status
 
@@ -61,7 +69,7 @@ The bundled adapter uses TypeSafe's documented HTTP surface directly; there is n
 
 The Jev key uses the dedicated `JevRouterAPIKey` secure-storage account. It is included in the complete repair inventory but excluded from provider/CLI, Claude-compatible, and frozen identity-migration inventories. The app-global credential service is shared across windows; each Settings window owns only its view model and observes live `APISettingsViewModel.agentAvailability`.
 
-Startup readiness observation is noninteractive. For an explicitly selected, enabled backend, the runtime reads the stored credential noninteractively and validates it through the Jev model-list endpoint; inactive and disabled backends are not contacted. A transient or definitive readiness failure does not erase the persisted enablement intent. Selecting a backend while routing remains disabled also does not validate it—validation is an explicit Settings action.
+Startup readiness observation is noninteractive. For an explicitly selected, enabled routing backend—or Jev when Auto effort alone is enabled—the runtime reads the stored credential noninteractively and validates it through the Jev model-list endpoint; inactive and disabled backends are not contacted. A transient or definitive readiness failure does not erase the persisted enablement intent. Selecting a backend while both features remain disabled does not validate it—validation is an explicit Settings action.
 
 ## Adding a bundled backend
 
