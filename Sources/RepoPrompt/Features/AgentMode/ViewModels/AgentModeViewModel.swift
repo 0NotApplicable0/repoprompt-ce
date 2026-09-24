@@ -10535,7 +10535,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             isNativePreparedTurn: nativePreparedTurn != nil
         )
         let autoEffortSelection = judgesUserTurn
-            ? await chooseAutoEffortForUserTurn(text: trimmedText, session: session)
+            ? await chooseAutoEffortForUserTurn(text: trimmedText, session: session, workflow: workflow)
             : nil
         try Task.checkCancellation()
         guard mcpControlledSession(sessionID: sessionID) === session else {

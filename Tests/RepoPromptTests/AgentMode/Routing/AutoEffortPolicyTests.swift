@@ -107,6 +107,16 @@ final class AutoEffortPolicyTests: XCTestCase {
         ).isEmpty)
     }
 
+    func testWorkflowAdmissionKeepsCustomTemplateLocal() {
+        XCTAssertTrue(AutoEffortModelPolicy.shouldJudgeWorkflow(nil))
+        XCTAssertTrue(AutoEffortModelPolicy.shouldJudgeWorkflow(.init(builtIn: .review)))
+        XCTAssertFalse(AutoEffortModelPolicy.shouldJudgeWorkflow(.init(
+            customID: UUID(),
+            displayName: "Private review",
+            template: "Inspect internal customer data"
+        )))
+    }
+
     func testEphemeralChoiceRejectsToggleModelAndManualEffortChanges() {
         let selection = AutoEffortTurnSelection(
             provider: .codexExec,
@@ -162,6 +172,7 @@ final class AutoEffortPolicyTests: XCTestCase {
         let chosen = await JevAutoEffortJudge(credentials: credentials).chooseEffort(
             maskedTaskExcerpt: masked,
             selectedModelID: "gpt-6-sol",
+            builtInWorkflow: nil,
             efforts: ["low", "medium"]
         )
         XCTAssertEqual(chosen, "medium")
@@ -173,6 +184,29 @@ final class AutoEffortPolicyTests: XCTestCase {
         )
         XCTAssertFalse(request?.state.contains("private123") == true)
         XCTAssertEqual(request.map { Set($0.questions.keys) }, Set(["effort"]))
+    }
+
+    func testJevWireRequestIncludesOnlyFixedBuiltInWorkflowCategory() async {
+        let client = CapturingAutoEffortJevClient()
+        let credentials = JevRouterCredentialService(
+            secureKeys: SecureKeysService(secureStorage: TestSecureStorageBackend(values: [.jevRouterAPIKey: "stored"])),
+            client: client
+        )
+        guard case .saved = await credentials.validateStoredKey(operationID: UUID()) else {
+            return XCTFail("Stored Jev key did not validate")
+        }
+        let chosen = await JevAutoEffortJudge(credentials: credentials).chooseEffort(
+            maskedTaskExcerpt: "Check the change",
+            selectedModelID: "gpt-6-sol",
+            builtInWorkflow: .review,
+            efforts: ["low", "medium"]
+        )
+        XCTAssertEqual(chosen, "medium")
+        let request = await client.lastRequest
+        XCTAssertEqual(
+            request?.state,
+            "SELECTED_MODEL_ID:\ngpt-6-sol\n\nBUILT_IN_WORKFLOW_CATEGORY:\nreview\n\nMASKED_CURRENT_USER_TURN_EXCERPT:\nCheck the change"
+        )
     }
 }
 

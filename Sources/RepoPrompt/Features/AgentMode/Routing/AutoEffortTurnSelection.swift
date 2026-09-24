@@ -59,6 +59,12 @@ enum AutoEffortModelPolicy {
         "claude-opus-5", "claude-opus-5-5", "claude-fable-5-1", "claude-mythos-5-1"
     ]
 
+    /// Custom workflow templates are user-authored and may contain private content. The
+    /// built-in category is fixed application metadata; never send the template itself.
+    static func shouldJudgeWorkflow(_ workflow: AgentWorkflowDefinition?) -> Bool {
+        workflow == nil || workflow?.builtInWorkflow != nil
+    }
+
     static func shouldJudgeMCPUserTurn(
         isEnabled: Bool,
         startsNewRun: Bool,

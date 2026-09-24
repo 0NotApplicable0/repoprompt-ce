@@ -242,7 +242,8 @@ extension AgentModeViewModel {
         }
         let selection = await chooseAutoEffortForUserTurn(
             text: claim.attempt.rawDraftSnapshot,
-            session: session
+            session: session,
+            workflow: session.selectedWorkflow
         )
         guard composerSubmitClaimIsCurrent(claim), sessions[destinationTabID] === session
         else { return .blocked(message: Self.staleComposerSubmitTargetMessage) }
@@ -260,9 +261,14 @@ extension AgentModeViewModel {
 
     /// Shared pre-turn judgment. MCP calls this only before an inactive run starts, never to
     /// change effort in the middle of an active provider turn or override an initial routed start.
-    func chooseAutoEffortForUserTurn(text: String, session: TabSession) async -> AutoEffortTurnSelection? {
+    func chooseAutoEffortForUserTurn(
+        text: String,
+        session: TabSession,
+        workflow: AgentWorkflowDefinition?
+    ) async -> AutoEffortTurnSelection? {
         guard modelRouterSettingsStore.autoEffortEnabled(),
               !session.runState.isActive,
+              AutoEffortModelPolicy.shouldJudgeWorkflow(workflow),
               !text.trimmingCharacters(in: .whitespacesAndNewlines).hasPrefix("/"),
               let maskedExcerpt = AutoEffortTaskSummary.make(from: text),
               let runtime = modelRouterRuntime,
@@ -271,6 +277,8 @@ extension AgentModeViewModel {
 
         let provider = session.selectedAgent
         let modelRaw = session.selectedModelRaw
+        let selectedWorkflow = session.selectedWorkflow
+        let workflowMutationGeneration = session.userWorkflowSelectionMutationGeneration
         let modelID: String
         let efforts: [String]
         let manualEffortRaw: String?
@@ -313,11 +321,14 @@ extension AgentModeViewModel {
         let chosen = await runtime.chooseAutoEffort(
             maskedTaskExcerpt: maskedExcerpt,
             selectedModelID: modelID,
+            builtInWorkflow: workflow?.builtInWorkflow,
             efforts: efforts
         )
         guard modelRouterSettingsStore.autoEffortEnabled(),
               sessions[session.tabID] === session,
               session.autoEffortJudgmentID == judgmentID,
+              session.selectedWorkflow == selectedWorkflow,
+              session.userWorkflowSelectionMutationGeneration == workflowMutationGeneration,
               session.selectedAgent == provider,
               session.selectedModelRaw == modelRaw,
               !session.runState.isActive,

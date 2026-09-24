@@ -226,7 +226,7 @@ struct AgentAutoEffortPill: View {
             Button("Enable Auto effort", action: onToggle)
             Button("Cancel", role: .cancel) {}
         } message: {
-            Text("For eligible user turns, TypeSafe Jev receives a short, best-effort masked excerpt of your message, the selected model ID, and effort choices. This includes settled MCP follow-ups. Masking may miss sensitive information. Files, tool results, and earlier conversation are not added. See Model Router Settings for the privacy policy.")
+            Text("For eligible user turns, TypeSafe Jev receives a short, best-effort masked excerpt of your message, the selected model ID, effort choices, and any built-in workflow category. This includes settled MCP follow-ups. Masking may miss sensitive information. Workflow templates, files, tool results, and earlier conversation are not added. Custom workflows keep manual effort. See Model Router Settings for the privacy policy.")
         }
     }
 }

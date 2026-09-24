@@ -97,7 +97,7 @@ struct RouterSettingsView: View {
             Text("Only explicitly selected supported models with multiple advertised effort levels are eligible. Default and alias selections keep manual effort.")
                 .font(fontPreset.swiftUIFont(sizeAtNormal: 11))
                 .foregroundStyle(.secondary)
-            Text("For each eligible composer or MCP user turn, TypeSafe Jev receives a short, best-effort masked excerpt of the message, the selected model ID, and available effort choices. Attached files, tool results, and earlier conversation are not added. Masking can miss secrets or sensitive prose; turn this off for private tasks.")
+            Text("For each eligible composer or MCP user turn, TypeSafe Jev receives a short, best-effort masked excerpt of the message, the selected model ID, available effort choices, and the category of any selected built-in workflow. Workflow templates, attached files, tool results, and earlier conversation are not added. Custom workflows keep manual effort. Masking can miss secrets or sensitive prose; turn this off for private tasks.")
                 .font(fontPreset.swiftUIFont(sizeAtNormal: 11))
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)

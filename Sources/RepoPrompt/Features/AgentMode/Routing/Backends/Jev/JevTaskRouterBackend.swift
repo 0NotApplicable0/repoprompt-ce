@@ -26,10 +26,16 @@ struct JevTaskRouterBackend: AgentTaskRouterBackend {
         )
     }
 
-    func chooseAutoEffort(maskedTaskExcerpt: String, selectedModelID: String, efforts: [String]) async -> String? {
+    func chooseAutoEffort(
+        maskedTaskExcerpt: String,
+        selectedModelID: String,
+        builtInWorkflow: AgentWorkflow?,
+        efforts: [String]
+    ) async -> String? {
         await JevAutoEffortJudge(credentials: credentialService).chooseEffort(
             maskedTaskExcerpt: maskedTaskExcerpt,
             selectedModelID: selectedModelID,
+            builtInWorkflow: builtInWorkflow,
             efforts: efforts
         )
     }

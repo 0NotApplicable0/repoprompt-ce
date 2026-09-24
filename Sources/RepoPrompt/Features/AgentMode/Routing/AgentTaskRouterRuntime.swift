@@ -53,13 +53,19 @@ final class AgentTaskRouterRuntime: ObservableObject {
         return readinessByBackendID[id]
     }
 
-    func chooseAutoEffort(maskedTaskExcerpt: String, selectedModelID: String, efforts: [String]) async -> String? {
+    func chooseAutoEffort(
+        maskedTaskExcerpt: String,
+        selectedModelID: String,
+        builtInWorkflow: AgentWorkflow?,
+        efforts: [String]
+    ) async -> String? {
         guard isBackendReady(.jev),
               let backend = await registry.registration(for: .jev)?.backend as? JevTaskRouterBackend
         else { return nil }
         return await backend.chooseAutoEffort(
             maskedTaskExcerpt: maskedTaskExcerpt,
             selectedModelID: selectedModelID,
+            builtInWorkflow: builtInWorkflow,
             efforts: efforts
         )
     }
