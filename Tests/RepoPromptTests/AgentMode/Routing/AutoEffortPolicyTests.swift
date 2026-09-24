@@ -2,6 +2,75 @@
 import XCTest
 
 final class AutoEffortPolicyTests: XCTestCase {
+    func testMCPAdmissionAllowsSettledFollowUpsButPreservesFirstStartAndActiveSteering() {
+        XCTAssertTrue(AutoEffortModelPolicy.shouldJudgeMCPUserTurn(
+            isEnabled: true,
+            startsNewRun: true,
+            hasPriorUserTurn: true,
+            isNativePreparedTurn: false
+        ))
+        XCTAssertFalse(AutoEffortModelPolicy.shouldJudgeMCPUserTurn(
+            isEnabled: true,
+            startsNewRun: true,
+            hasPriorUserTurn: false,
+            isNativePreparedTurn: false
+        ))
+        XCTAssertFalse(AutoEffortModelPolicy.shouldJudgeMCPUserTurn(
+            isEnabled: true,
+            startsNewRun: true,
+            hasPriorUserTurn: false,
+            isNativePreparedTurn: false
+        ))
+        XCTAssertFalse(AutoEffortModelPolicy.shouldJudgeMCPUserTurn(
+            isEnabled: true,
+            startsNewRun: false,
+            hasPriorUserTurn: true,
+            isNativePreparedTurn: false
+        ))
+        XCTAssertFalse(AutoEffortModelPolicy.shouldJudgeMCPUserTurn(
+            isEnabled: true,
+            startsNewRun: true,
+            hasPriorUserTurn: true,
+            isNativePreparedTurn: true
+        ))
+        XCTAssertFalse(AutoEffortModelPolicy.shouldJudgeMCPUserTurn(
+            isEnabled: false,
+            startsNewRun: true,
+            hasPriorUserTurn: true,
+            isNativePreparedTurn: false
+        ))
+    }
+
+    func testTurnFeedbackTracksBothEffortDirectionsWithoutChangingManualSelection() {
+        let high = AutoEffortTurnSelection(
+            provider: .codexExec,
+            selectedModelRaw: "gpt-6-sol-low",
+            manualEffortRaw: "low",
+            effortRaw: "high"
+        )
+        let first = AutoEffortTurnFeedback(selection: high, previous: nil)
+        XCTAssertEqual(first.direction, .up)
+        XCTAssertEqual(first.effortRaw, "high")
+        XCTAssertEqual(high.manualEffortRaw, "low")
+
+        let low = AutoEffortTurnSelection(
+            provider: .codexExec,
+            selectedModelRaw: "gpt-6-sol-low",
+            manualEffortRaw: "low",
+            effortRaw: "low"
+        )
+        XCTAssertEqual(AutoEffortTurnFeedback(selection: low, previous: first).direction, .down)
+        XCTAssertEqual(AutoEffortTurnFeedback(selection: low, previous: nil).direction, .unchanged)
+        XCTAssertEqual(AutoEffortTurnFeedback(selection: high, previous: .init(
+            selection: .init(provider: .codexExec, selectedModelRaw: "gpt-6-sol-low", manualEffortRaw: "minimal", effortRaw: "minimal"),
+            previous: nil
+        )).direction, .unknown)
+        XCTAssertEqual(AutoEffortTurnFeedback(selection: low, previous: .init(
+            selection: .init(provider: .claudeCode, selectedModelRaw: "claude-opus-5-5", manualEffortRaw: "high", effortRaw: "high"),
+            previous: nil
+        )).direction, .unchanged)
+    }
+
     func testCodexAdmissionRequiresExactFamilyAndAdvertisedEfforts() {
         XCTAssertEqual(
             AutoEffortModelPolicy.codexEfforts(

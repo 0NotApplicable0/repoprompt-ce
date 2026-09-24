@@ -10509,6 +10509,10 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         guard let session = mcpControlledSession(sessionID: sessionID) else {
             throw MCPError.invalidParams("The requested agent run is no longer active.")
         }
+        guard session.autoEffortJudgmentID == nil else {
+            throw MCPError.invalidParams("Auto effort is already choosing effort for this session. Retry after that turn starts.")
+        }
+        try Task.checkCancellation()
         let trimmedText = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmedText.isEmpty else {
             throw MCPError.invalidParams("message is required.")
@@ -10521,6 +10525,26 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             )
         }
 
+        // Preserve the effort chosen by the MCP caller or Model Router for a first start.
+        // Only a settled follow-up can be rejudged; active steering keeps its effort.
+        let judgesUserTurn = AutoEffortModelPolicy.shouldJudgeMCPUserTurn(
+            isEnabled: modelRouterSettingsStore.autoEffortEnabled(),
+            startsNewRun: allowStartingRun && !session.runState.isActive
+                && !(session.runState == .waitingForUser && session.instructionContinuation != nil),
+            hasPriorUserTurn: session.hasSentFirstMessage,
+            isNativePreparedTurn: nativePreparedTurn != nil
+        )
+        let autoEffortSelection = judgesUserTurn
+            ? await chooseAutoEffortForUserTurn(text: trimmedText, session: session)
+            : nil
+        try Task.checkCancellation()
+        guard mcpControlledSession(sessionID: sessionID) === session else {
+            throw MCPError.invalidParams("The session changed while choosing effort. Retry the turn.")
+        }
+
+        // Classify after the async judgment: a composer turn may have started the run
+        // while Jev was deciding. In that case this MCP message is steering, not a
+        // second start, and the now-stale effort choice is not applied.
         var delivery: MCPInstructionDispatch
         let codexAttemptID: UUID?
         let signalsDeliveryAfterDispatch: Bool
@@ -10541,6 +10565,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             codexAttemptID = nil
             signalsDeliveryAfterDispatch = false
         }
+        let submittedAutoEffortSelection = delivery == .startedRun ? autoEffortSelection : nil
 
         let activeDispatchWakeIdentity = delivery.isActiveRunDispatch
             ? mcpActiveDispatchWakeIdentity(for: session, sessionID: sessionID)
@@ -10576,11 +10601,15 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 return submitUserTurn(
                     text: trimmedText,
                     tabID: session.tabID,
-                    codexAttemptID: codexAttemptID
+                    codexAttemptID: codexAttemptID,
+                    autoEffortSelection: submittedAutoEffortSelection
                 )
             }
             switch submission {
             case .submitted:
+                if let submittedAutoEffortSelection {
+                    recordSubmittedAutoEffort(submittedAutoEffortSelection, for: session)
+                }
                 Self.steeringDebugLog("[AgentRunSteeringWake] mcpDispatch submitted sessionID=\(sessionID) delivery=\(delivery.rawValue) runState=\(session.runState.rawValue) isActiveDispatch=\(delivery.isActiveRunDispatch) runID=\(String(describing: session.runID))")
                 if let codexAttemptID {
                     try await startQueuedProviderSteeringForMCPDispatch(delivery: delivery, session: session)

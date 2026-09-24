@@ -42,6 +42,27 @@ extension AgentModeViewModel {
         )
     }
 
+    func autoEffortPillProps() -> AgentAutoEffortPillProps {
+        let session = activeSession
+        let feedback = session?.autoEffortFeedback.flatMap { feedback in
+            feedback.provider == session?.selectedAgent && feedback.selectedModelRaw == session?.selectedModelRaw
+                ? feedback : nil
+        }
+        return AgentAutoEffortPillProps(
+            isOn: modelRouterSettingsStore.autoEffortEnabled(),
+            isAvailable: modelRouterRuntime?.isBackendReady(.jev) == true,
+            isJudging: session?.autoEffortJudgmentID != nil,
+            feedback: feedback
+        )
+    }
+
+    func toggleAutoEffort() {
+        let enabled = modelRouterSettingsStore.autoEffortEnabled()
+        guard enabled || modelRouterRuntime?.isBackendReady(.jev) == true else { return }
+        modelRouterSettingsStore.setAutoEffortEnabled(!enabled)
+        syncStatusPillsUIState()
+    }
+
     func handleModelRouterRuntimeChanged() {
         reconcileModelRouterEnabledState()
     }
@@ -204,29 +225,49 @@ extension AgentModeViewModel {
         }
     }
 
-    /// Independent composer-only effort decision. A routed fresh task already received its
-    /// initial effort from Model Router; established sessions can use this path with either toggle.
+    /// A routed fresh task already received its initial effort from Model Router. All other
+    /// eligible user turns use the same decision path, whether sent by the composer or MCP.
     private func submitUserTurnAfterAutoEffort(
         text: String,
         claim: AgentComposerSubmitClaim,
         session: TabSession,
         destinationTabID: UUID
     ) async -> UserTurnSubmissionResult {
-        func submit(_ selection: AutoEffortTurnSelection? = nil) -> UserTurnSubmissionResult {
-            submitUserTurn(
+        guard modelRouterSettingsStore.autoEffortEnabled() else {
+            return submitUserTurn(
                 text: text,
                 tabID: destinationTabID,
-                rawDraftText: claim.attempt.rawDraftSnapshot,
-                autoEffortSelection: selection
+                rawDraftText: claim.attempt.rawDraftSnapshot
             )
         }
+        let selection = await chooseAutoEffortForUserTurn(
+            text: claim.attempt.rawDraftSnapshot,
+            session: session
+        )
+        guard composerSubmitClaimIsCurrent(claim), sessions[destinationTabID] === session
+        else { return .blocked(message: Self.staleComposerSubmitTargetMessage) }
+        let result = submitUserTurn(
+            text: text,
+            tabID: destinationTabID,
+            rawDraftText: claim.attempt.rawDraftSnapshot,
+            autoEffortSelection: selection
+        )
+        if result == .submitted, let selection {
+            recordSubmittedAutoEffort(selection, for: session)
+        }
+        return result
+    }
+
+    /// Shared pre-turn judgment. MCP calls this only before an inactive run starts, never to
+    /// change effort in the middle of an active provider turn or override an initial routed start.
+    func chooseAutoEffortForUserTurn(text: String, session: TabSession) async -> AutoEffortTurnSelection? {
         guard modelRouterSettingsStore.autoEffortEnabled(),
               !session.runState.isActive,
               !text.trimmingCharacters(in: .whitespacesAndNewlines).hasPrefix("/"),
-              let maskedExcerpt = AutoEffortTaskSummary.make(from: claim.attempt.rawDraftSnapshot),
+              let maskedExcerpt = AutoEffortTaskSummary.make(from: text),
               let runtime = modelRouterRuntime,
               runtime.isBackendReady(.jev)
-        else { return submit() }
+        else { return nil }
 
         let provider = session.selectedAgent
         let modelRaw = session.selectedModelRaw
@@ -235,7 +276,7 @@ extension AgentModeViewModel {
         let manualEffortRaw: String?
         switch provider {
         case .codexExec:
-            guard let base = CodexModelSpecifier(raw: modelRaw).baseModel else { return submit() }
+            guard let base = CodexModelSpecifier(raw: modelRaw).baseModel else { return nil }
             let option = codexCoordinator.modelOptions(for: .codexExec).first {
                 CodexModelSpecifier(raw: $0.rawValue).baseModel?.caseInsensitiveCompare(base) == .orderedSame
             }
@@ -246,7 +287,7 @@ extension AgentModeViewModel {
             )
             manualEffortRaw = codexCoordinator.effectiveCodexSelection(for: session).reasoningEffort
         case .claudeCode:
-            guard let base = ClaudeModelSpecifier(raw: modelRaw).baseModel else { return submit() }
+            guard let base = ClaudeModelSpecifier(raw: modelRaw).baseModel else { return nil }
             modelID = base
             efforts = AutoEffortModelPolicy.claudeEfforts(
                 modelRaw: modelRaw,
@@ -257,35 +298,52 @@ extension AgentModeViewModel {
             )
             manualEffortRaw = claudeCoordinator.currentClaudeEffortLevel(for: session).rawValue
         default:
-            return submit()
+            return nil
         }
-        guard efforts.count >= 2 else { return submit() }
+        guard efforts.count >= 2 else { return nil }
+        let judgmentID = UUID()
+        session.autoEffortJudgmentID = judgmentID
+        if currentTabID == session.tabID { syncStatusPillsUIState() }
+        defer {
+            if session.autoEffortJudgmentID == judgmentID {
+                session.autoEffortJudgmentID = nil
+                if currentTabID == session.tabID { syncStatusPillsUIState() }
+            }
+        }
         let chosen = await runtime.chooseAutoEffort(
             maskedTaskExcerpt: maskedExcerpt,
             selectedModelID: modelID,
             efforts: efforts
         )
-        guard composerSubmitClaimIsCurrent(claim),
-              sessions[destinationTabID] === session
-        else { return .blocked(message: Self.staleComposerSubmitTargetMessage) }
         guard modelRouterSettingsStore.autoEffortEnabled(),
+              sessions[session.tabID] === session,
+              session.autoEffortJudgmentID == judgmentID,
               session.selectedAgent == provider,
               session.selectedModelRaw == modelRaw,
               !session.runState.isActive,
               let chosen, efforts.contains(chosen)
-        else { return submit() }
+        else { return nil }
         let currentManualEffortRaw: String? = switch provider {
         case .codexExec: codexCoordinator.effectiveCodexSelection(for: session).reasoningEffort
         case .claudeCode: claudeCoordinator.currentClaudeEffortLevel(for: session).rawValue
         default: nil
         }
-        guard currentManualEffortRaw == manualEffortRaw else { return submit() }
-        return submit(AutoEffortTurnSelection(
+        guard currentManualEffortRaw == manualEffortRaw else { return nil }
+        return AutoEffortTurnSelection(
             provider: provider,
             selectedModelRaw: modelRaw,
             manualEffortRaw: manualEffortRaw,
             effortRaw: chosen
-        ))
+        )
+    }
+
+    func recordSubmittedAutoEffort(_ selection: AutoEffortTurnSelection, for session: TabSession) {
+        guard sessions[session.tabID] === session else { return }
+        session.autoEffortFeedback = AutoEffortTurnFeedback(
+            selection: selection,
+            previous: session.autoEffortFeedback
+        )
+        if currentTabID == session.tabID { syncStatusPillsUIState() }
     }
 
     func routeSubagentTargetIfEnabled(

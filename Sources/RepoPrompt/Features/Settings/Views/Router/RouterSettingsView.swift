@@ -76,7 +76,7 @@ struct RouterSettingsView: View {
             HStack(alignment: .top, spacing: 12) {
                 VStack(alignment: .leading, spacing: 5) {
                     Label("Auto effort", systemImage: "brain.head.profile").font(.headline)
-                    Text("Let Jev choose reasoning effort for the model you already selected, before an eligible user turn. Model Router does not need to be on.")
+                    Text("Let Jev choose reasoning effort for the model you already selected, before an eligible user turn. Includes settled MCP follow-ups; first MCP starts and active steering keep their requested effort. Model Router does not need to be on.")
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
                 }
@@ -97,7 +97,7 @@ struct RouterSettingsView: View {
             Text("Only explicitly selected supported models with multiple advertised effort levels are eligible. Default and alias selections keep manual effort.")
                 .font(fontPreset.swiftUIFont(sizeAtNormal: 11))
                 .foregroundStyle(.secondary)
-            Text("For each eligible user turn, TypeSafe Jev receives a short, best-effort masked excerpt of your message, the selected model ID, and available effort choices. Attached files, tool results, and earlier conversation are not added. Masking can miss secrets or sensitive prose you type; turn this off for private tasks.")
+            Text("For each eligible composer or MCP user turn, TypeSafe Jev receives a short, best-effort masked excerpt of the message, the selected model ID, and available effort choices. Attached files, tool results, and earlier conversation are not added. Masking can miss secrets or sensitive prose; turn this off for private tasks.")
                 .font(fontPreset.swiftUIFont(sizeAtNormal: 11))
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
