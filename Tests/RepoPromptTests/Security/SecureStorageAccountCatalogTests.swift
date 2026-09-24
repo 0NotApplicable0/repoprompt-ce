@@ -25,6 +25,7 @@ final class SecureStorageAccountCatalogTests: XCTestCase {
                 "ZAIAPI",
                 "ClaudeCompatibleBackend.kimi.apiKey",
                 "ClaudeCompatibleBackend.custom.apiKey",
+                "JevRouterAPIKey",
                 "rp.agent.permissions.subagent.v1",
                 "rp.agent.permissions.codex.v1",
                 "rp.agent.permissions.claude.v1",

@@ -47,6 +47,16 @@ struct AgentStatusPillsRow: View {
                     onToggle: { agentModeVM.toggleInterviewFirst() }
                 )
 
+                AgentModelRouterPill(
+                    props: snapshot.modelRouter,
+                    onToggle: { agentModeVM.toggleGlobalModelRouter() }
+                )
+
+                AgentAutoEffortPill(
+                    props: snapshot.autoEffort,
+                    onToggle: { agentModeVM.toggleAutoEffort() }
+                )
+
                 if let stagedSlashCommand = snapshot.stagedSlashCommand {
                     AgentStagedSlashCommandPill(staged: stagedSlashCommand)
                 }

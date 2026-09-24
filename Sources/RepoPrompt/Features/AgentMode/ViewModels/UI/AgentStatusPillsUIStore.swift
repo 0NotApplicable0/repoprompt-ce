@@ -12,6 +12,20 @@ struct AgentExecutionLocationProps: Equatable {
     let disabledReason: String?
 }
 
+struct AgentModelRouterPillProps: Equatable {
+    let isOn: Bool
+    let isAvailable: Bool
+    let isRouting: Bool
+    let disabledReason: String?
+}
+
+struct AgentAutoEffortPillProps: Equatable {
+    let isOn: Bool
+    let isAvailable: Bool
+    let isJudging: Bool
+    let feedback: AutoEffortTurnFeedback?
+}
+
 struct AgentStatusPillsSnapshot: Equatable {
     let currentTabID: UUID?
     let selectedWorkflow: AgentWorkflowDefinition?
@@ -21,6 +35,8 @@ struct AgentStatusPillsSnapshot: Equatable {
     let runState: AgentSessionRunState
     let autoEditEnabled: Bool
     let interviewFirst: Bool
+    let modelRouter: AgentModelRouterPillProps
+    let autoEffort: AgentAutoEffortPillProps
     let executionLocation: AgentExecutionLocationProps?
     let activeAgentSessionID: UUID?
     let activeRunID: UUID?
@@ -39,6 +55,18 @@ struct AgentStatusPillsSnapshot: Equatable {
         runState: .idle,
         autoEditEnabled: ApplyEditsApprovalStore.globalDefaultAutoEditEnabled(),
         interviewFirst: false,
+        modelRouter: AgentModelRouterPillProps(
+            isOn: false,
+            isAvailable: false,
+            isRouting: false,
+            disabledReason: "Configure Model Router in Settings."
+        ),
+        autoEffort: AgentAutoEffortPillProps(
+            isOn: false,
+            isAvailable: false,
+            isJudging: false,
+            feedback: nil
+        ),
         executionLocation: nil,
         activeAgentSessionID: nil,
         activeRunID: nil,

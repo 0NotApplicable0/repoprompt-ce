@@ -10,7 +10,7 @@ import SystemPackage
 // MARK: - Version Constants
 
 /// Update this when releasing new versions
-let CLI_VERSION = "1.4.1"
+let CLI_VERSION = "1.5.0"
 
 /// CLI verbose mode - controls debug output (enabled by --verbose flag)
 var cliVerboseMode = false
@@ -3429,7 +3429,7 @@ func printVersion() {
 }
 
 private let repoPromptCEReleaseBundleIdentifier = "com.repoprompt.ce"
-private let repoPromptCEDebugBundleIdentifier = "com.pvncher.repoprompt.ce.debug"
+private let repoPromptCEDebugBundleIdentifier = "com.repoprompt.ce.debug"
 private let repoPromptCEBundleIdentifier: String = {
     #if DEBUG
         return repoPromptCEDebugBundleIdentifier

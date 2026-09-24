@@ -426,10 +426,17 @@ final class SecureStorageIdentityMigrationTests: XCTestCase {
         let migrationAccounts = SecureStorageAccountCatalog.identityMigrationV2Accounts
         let runtimeAccounts = SecureStorageAccountCatalog.allAccounts
         XCTAssertEqual(migrationAccounts.count, 24)
-        XCTAssertEqual(runtimeAccounts.count, 27)
+        XCTAssertEqual(runtimeAccounts.count, 28)
+        XCTAssertFalse(migrationAccounts.contains(.jevRouterAPIKey))
+        XCTAssertTrue(runtimeAccounts.contains(.jevRouterAPIKey))
         XCTAssertEqual(
             Set(runtimeAccounts).subtracting(migrationAccounts),
-            [.agentPermissionAntigravityDocument, .agentPermissionGrokDocument, .agentPermissionDevinDocument]
+            [
+                .jevRouterAPIKey,
+                .agentPermissionAntigravityDocument,
+                .agentPermissionGrokDocument,
+                .agentPermissionDevinDocument
+            ]
         )
         XCTAssertFalse(migrationAccounts.contains(.agentPermissionAntigravityDocument))
         XCTAssertTrue(runtimeAccounts.contains(.agentPermissionAntigravityDocument))
@@ -437,7 +444,7 @@ final class SecureStorageIdentityMigrationTests: XCTestCase {
         XCTAssertTrue(runtimeAccounts.contains(.agentPermissionGrokDocument))
         XCTAssertFalse(migrationAccounts.contains(.agentPermissionDevinDocument))
         XCTAssertTrue(runtimeAccounts.contains(.agentPermissionDevinDocument))
-        XCTAssertFalse(SecureStorageIdentityMigrationBootstrap.preparerCatalogMatchesFrozenCatalog())
+        XCTAssertTrue(SecureStorageIdentityMigrationBootstrap.preparerCatalogSupportsFrozenCatalog())
 
         let manifest = SecureStorageIdentityMigrationManifest(
             version: SecureStorageIdentityMigrationManifest.currentVersion,
@@ -699,14 +706,26 @@ final class SecureStorageIdentityMigrationTests: XCTestCase {
         XCTAssertNil(SecureStorageIdentityMigrationBootstrap.configuredPhase(from: 1))
     }
 
-    func testPreparerCatalogGateRejectsDriftFromFrozenMigrationCatalog() {
-        XCTAssertTrue(SecureStorageIdentityMigrationBootstrap.preparerCatalogMatchesFrozenCatalog(
+    func testPreparerCatalogGateAllowsNewRuntimeAccountsButRejectsMissingOrDuplicateIdentifiers() {
+        XCTAssertTrue(SecureStorageIdentityMigrationBootstrap.preparerCatalogSupportsFrozenCatalog(
             currentAccounts: [.openAIAPI],
             migrationAccounts: [.openAIAPI]
         ))
-        XCTAssertFalse(SecureStorageIdentityMigrationBootstrap.preparerCatalogMatchesFrozenCatalog(
+        XCTAssertTrue(SecureStorageIdentityMigrationBootstrap.preparerCatalogSupportsFrozenCatalog(
             currentAccounts: [.openAIAPI, .anthropicAPI],
             migrationAccounts: [.openAIAPI]
+        ))
+        XCTAssertFalse(SecureStorageIdentityMigrationBootstrap.preparerCatalogSupportsFrozenCatalog(
+            currentAccounts: [.anthropicAPI],
+            migrationAccounts: [.openAIAPI]
+        ))
+        XCTAssertFalse(SecureStorageIdentityMigrationBootstrap.preparerCatalogSupportsFrozenCatalog(
+            currentAccounts: [.openAIAPI, .openAIAPI],
+            migrationAccounts: [.openAIAPI]
+        ))
+        XCTAssertFalse(SecureStorageIdentityMigrationBootstrap.preparerCatalogSupportsFrozenCatalog(
+            currentAccounts: [.openAIAPI],
+            migrationAccounts: [.openAIAPI, .openAIAPI]
         ))
     }
 

@@ -242,6 +242,7 @@ class WindowState: ObservableObject {
     let promptManager: PromptViewModel
     let oracleViewModel: OracleViewModel
     let apiSettingsViewModel: APISettingsViewModel
+    let routerSettingsViewModel: RouterSettingsViewModel
     let contextBuilderAgentViewModel: ContextBuilderAgentViewModel
     let agentModeViewModel: AgentModeViewModel
     #if DEBUG
@@ -650,6 +651,7 @@ class WindowState: ObservableObject {
         promptManager = composition.promptManager
         oracleViewModel = composition.oracleViewModel
         apiSettingsViewModel = composition.apiSettingsViewModel
+        routerSettingsViewModel = composition.routerSettingsViewModel
         contextBuilderAgentViewModel = composition.contextBuilderAgentViewModel
         agentModeViewModel = composition.agentModeViewModel
         #if DEBUG
