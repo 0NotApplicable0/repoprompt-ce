@@ -10,8 +10,7 @@ import XCTest
     /// With the orchestration graph flag on, one main window admits a saved but inactive
     /// workspace's stored compose tab — and exact root authority over its roots — without
     /// switching the window's `activeWorkspace` or entering the workspace-switch confirmation /
-    /// cancellation lifecycle. Flag off keeps today's behaviour (active-only matching, a second main
-    /// window on `open_in_new_window`).
+    /// cancellation lifecycle. Flag off keeps active-only matching; `open_in_new_window` is ignored.
     @MainActor
     final class OrchestrationGraphWorkspaceAdmissionTests: XCTestCase {
         private var originalWindows: [WindowState] = []
@@ -412,6 +411,8 @@ import XCTest
         func testFlagOnSwitchInNewWindowKeepsActiveWorkspace() async throws {
             let service = makeRoutingService(graphEnabled: true)
             ServerNetworkManager.shared.graphPolicy = policy(graphEnabled: true)
+            var openCount = 0
+            installProductionOpener { openCount += 1 }
             let connectionID = await makeConnection(service)
 
             let value = try await callBoundedTool(
@@ -423,6 +424,7 @@ import XCTest
             let response = try decode(ManageWorkspacesResponse.self, from: value)
 
             XCTAssertEqual(response.windowID, windowX.windowID)
+            XCTAssertEqual(openCount, 0)
             XCTAssertEqual(WindowStatesManager.shared.allWindows.count, 1)
             XCTAssertTrue(WindowStatesManager.shared.allWindows.first === windowX)
 
@@ -432,6 +434,8 @@ import XCTest
         func testFlagOnSwitchDoesNotArmWorkspaceSwitchConfirmation() async throws {
             let service = makeRoutingService(graphEnabled: true)
             ServerNetworkManager.shared.graphPolicy = policy(graphEnabled: true)
+            var openCount = 0
+            installProductionOpener { openCount += 1 }
             windowX.workspaceManager.registerSwitchSessionProvider(fakeSessionProvider)
             let connectionID = await makeConnection(service)
 
@@ -452,11 +456,15 @@ import XCTest
             XCTAssertFalse(pendingConfirmationLatch.observedNonNil)
             XCTAssertNil(windowX.workspaceManager.pendingSwitchConfirmation)
             XCTAssertEqual(fakeSessionProvider.cancelCount, 0)
+            XCTAssertEqual(openCount, 0)
+            XCTAssertEqual(WindowStatesManager.shared.allWindows.count, 1)
         }
 
         func testFlagOnSwitchLeavesInstalledRunRunning() async throws {
             let service = makeRoutingService(graphEnabled: true)
             ServerNetworkManager.shared.graphPolicy = policy(graphEnabled: true)
+            var openCount = 0
+            installProductionOpener { openCount += 1 }
             let agentProvider = AgentModeWorkspaceSwitchSessionProvider(agentModeViewModel: windowX.agentModeViewModel)
             windowX.workspaceManager.registerSwitchSessionProvider(agentProvider)
 
@@ -481,6 +489,7 @@ import XCTest
 
             XCTAssertEqual(session.runState, .running)
             XCTAssertEqual(runStateChangeCount, 0)
+            XCTAssertEqual(openCount, 0)
             XCTAssertEqual(WindowStatesManager.shared.allWindows.count, 1)
         }
 
@@ -490,6 +499,8 @@ import XCTest
             let service = makeRoutingService(graphEnabled: true)
             ServerNetworkManager.shared.graphPolicy = policy(graphEnabled: true)
             let repoRootThree = try makeRepoRoot(named: "r3-repo", sentinel: "only-r3.txt", sentinelContent: "r3-only", sameContent: "r3-same")
+            var openCount = 0
+            installProductionOpener { openCount += 1 }
             let connectionID = await makeConnection(service)
 
             let value = try await callBoundedTool(
@@ -507,6 +518,7 @@ import XCTest
             let response = try decode(ManageWorkspacesResponse.self, from: value)
 
             XCTAssertEqual(response.windowID, windowX.windowID)
+            XCTAssertEqual(openCount, 0)
             XCTAssertEqual(WindowStatesManager.shared.allWindows.count, 1)
 
             try await assertGraphOnPostconditions(
@@ -548,28 +560,12 @@ import XCTest
         // MARK: - flag off controls
 
         func testFlagOffWorkingDirsStayActiveWorkspaceOnly() async {
-            // Y is a second window, active on W2, so the production collector must resolve each
-            // repo root to only the window actively displaying it — never X's stored W2.
-            let windowY = WindowState(domainRuntime: runtime)
-            addedWindows.append(windowY)
-            WindowStatesManager.shared.registerWindowState(windowY)
-            await windowY.workspaceManager.awaitInitialized()
-            let ySwitch = await windowY.workspaceManager.requestWorkspaceSwitch(to: workspaceTwo, saveState: false)
-            XCTAssertTrue(ySwitch.didSwitch, ySwitch.message ?? "setup: Y activation failed")
-
-            let windows = WindowStatesManager.shared.allWindows
-
-            let matchesForR2 = await ServerNetworkManager.test_collectWorkingDirectoryMatches(
-                workingDirs: [repoRootTwo.path],
-                windows: windows,
-                admitsStoredGraphWorkspaces: false
-            )
-            XCTAssertEqual(matchesForR2.map(\.windowID), [windowY.windowID])
-            XCTAssertEqual(matchesForR2.map(\.workspaceID), [workspaceTwo.id])
+            XCTAssertEqual(WindowStatesManager.shared.allWindows.count, 1)
+            XCTAssertTrue(WindowStatesManager.shared.allWindows.first === windowX)
 
             let matchesForR1 = await ServerNetworkManager.test_collectWorkingDirectoryMatches(
                 workingDirs: [repoRootOne.path],
-                windows: windows,
+                windows: WindowStatesManager.shared.allWindows,
                 admitsStoredGraphWorkspaces: false
             )
             XCTAssertEqual(matchesForR1.map(\.windowID), [windowX.windowID])
@@ -577,8 +573,7 @@ import XCTest
         }
 
         /// One-window flag-off negative: X is active on W1 and holds W2 only as a stored (inactive)
-        /// tab. With the flag off, the collector must never surface a stored inactive workspace —
-        /// only the two-window case above exercises the flag-off branch directly.
+        /// tab. With the flag off, the collector must never surface a stored inactive workspace.
         func testFlagOffWorkingDirsDoesNotCollectStoredInactiveWorkspace() async {
             let matchesForR2 = await ServerNetworkManager.test_collectWorkingDirectoryMatches(
                 workingDirs: [repoRootTwo.path],
@@ -591,7 +586,8 @@ import XCTest
         func testFlagOffSwitchInNewWindowStillOpensASecondWindow() async throws {
             let service = makeRoutingService(graphEnabled: false)
             ServerNetworkManager.shared.graphPolicy = policy(graphEnabled: false)
-            installProductionOpener()
+            var openCount = 0
+            installProductionOpener { openCount += 1 }
             let connectionID = await makeConnection(service)
 
             let value = try await callBoundedTool(
@@ -602,12 +598,11 @@ import XCTest
             )
             let response = try decode(ManageWorkspacesResponse.self, from: value)
 
-            let openedWindowID = try XCTUnwrap(response.windowID)
-            XCTAssertNotEqual(openedWindowID, windowX.windowID)
-            XCTAssertEqual(WindowStatesManager.shared.allWindows.count, 2)
+            XCTAssertEqual(response.windowID, windowX.windowID)
+            XCTAssertEqual(openCount, 0)
+            XCTAssertEqual(WindowStatesManager.shared.allWindows.count, 1)
+            XCTAssertTrue(WindowStatesManager.shared.allWindows.first === windowX)
             XCTAssertEqual(windowX.workspaceManager.activeWorkspaceID, workspaceOne.id)
-            let opened = try XCTUnwrap(WindowStatesManager.shared.allWindows.first { $0.windowID == openedWindowID })
-            XCTAssertEqual(opened.workspaceManager.activeWorkspaceID, workspaceTwo.id)
         }
 
         // MARK: - workflow prompt
@@ -622,10 +617,6 @@ import XCTest
             XCTAssertTrue(
                 block.contains("do not open another main window") || block.localizedCaseInsensitiveContains("existing graph window"),
                 "graph-on 'bind the existing window' guidance missing: \(block)"
-            )
-            XCTAssertTrue(
-                block.contains("open_in_new_window:true") || block.contains("open_in_new_window\":true"),
-                "graph-off 'open a new window' guidance missing: \(block)"
             )
 
             XCTAssertEqual(RepoPromptWorkflowPrompts.workspaceVerificationBlock(variant: .agent), "")

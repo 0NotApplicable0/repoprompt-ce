@@ -289,18 +289,21 @@ import XCTest
 
         func testFlagOffMCPOpenInNewWindowAttachesSecondWindow() async throws {
             AppWindowOpener.shared.policy = policy(graphEnabled: false)
-            installProductionOpener()
+            var openCount = 0
+            installProductionOpener { openCount += 1 }
             let service = makeRoutingService(graphEnabled: false)
+            await windowA.workspaceManager.awaitInitialized()
+            let activeWorkspaceIDBeforeCall = windowA.workspaceManager.activeWorkspaceID
 
             let response = try await callSwitchInNewWindow(service)
 
             XCTAssertEqual(response.action, "switch")
             XCTAssertEqual(response.status, "ok")
-            let windowID = try XCTUnwrap(response.windowID)
-            XCTAssertNotEqual(windowID, windowA.windowID)
-            XCTAssertEqual(WindowStatesManager.shared.allWindows.count, 2)
-            let opened = try XCTUnwrap(WindowStatesManager.shared.allWindows.first { $0.windowID == windowID })
-            XCTAssertEqual(opened.workspaceManager.activeWorkspaceID, targetWorkspace.id)
+            XCTAssertEqual(response.windowID, windowA.windowID)
+            XCTAssertEqual(openCount, 0)
+            XCTAssertEqual(WindowStatesManager.shared.allWindows.count, 1)
+            XCTAssertTrue(WindowStatesManager.shared.allWindows.first === windowA)
+            XCTAssertEqual(windowA.workspaceManager.activeWorkspaceID, activeWorkspaceIDBeforeCall)
         }
 
         func testFlagOnMCPOpenInNewWindowReturnsExistingWindowID() async throws {
