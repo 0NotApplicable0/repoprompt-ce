@@ -1,7 +1,7 @@
 import Foundation
 
 /// Provider-local authority for stream creation and producer ownership. A replacement request can
-/// arrive while its predecessor is still preparing, parked on the app-wide AGY run gate, or between
+/// arrive while its predecessor is still preparing, waiting on this provider's run gate, or between
 /// gate acquisition and producer activation. Keeping the generation and exact producer task in one
 /// actor makes those transitions atomic: invalidation can never miss a producer that activates later.
 actor AntigravityStreamRequestCoordinator {

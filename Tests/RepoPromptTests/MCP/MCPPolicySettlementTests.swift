@@ -20,11 +20,9 @@ final class MCPPolicySettlementTests: XCTestCase {
             let runA = UUID()
             let runB = UUID()
             let childA = try Self.launchSleeper()
+            defer { Self.stop(childA) }
             let childB = try Self.launchSleeper()
-            defer {
-                childA.terminate()
-                childB.terminate()
-            }
+            defer { Self.stop(childB) }
             await manager.registerExpectedAgentPID(childA.processIdentifier, for: clientName, runID: runA)
             await manager.registerExpectedAgentPID(childB.processIdentifier, for: clientName, runID: runB)
             for runID in [runA, runB] {
@@ -81,7 +79,7 @@ final class MCPPolicySettlementTests: XCTestCase {
         for other in [
             AgentProviderKind.codexMCPClientID,
             AgentProviderKind.claudeMCPClientID,
-            AgentProviderKind.grokMCPClientID,
+            AgentProviderKind.grokMCPClientID
         ] {
             XCTAssertFalse(
                 MCPPolicySettlement.prunesOnlyAfterSettlement(clientName: other, purpose: .agentModeRun),
@@ -101,10 +99,19 @@ final class MCPPolicySettlementTests: XCTestCase {
             let antigravityRunID = UUID()
             let codexRunID = UUID()
             let claudeRunID = UUID()
+            addTeardownBlock {
+                for (clientName, runID) in [
+                    (AgentProviderKind.antigravityMCPClientID, antigravityRunID),
+                    (AgentProviderKind.codexMCPClientID, codexRunID),
+                    (AgentProviderKind.claudeMCPClientID, claudeRunID)
+                ] {
+                    await manager.clearClientConnectionPolicy(for: clientName, windowID: windowID, runID: runID)
+                }
+            }
             for (clientName, runID) in [
                 (AgentProviderKind.antigravityMCPClientID, antigravityRunID),
                 (AgentProviderKind.codexMCPClientID, codexRunID),
-                (AgentProviderKind.claudeMCPClientID, claudeRunID),
+                (AgentProviderKind.claudeMCPClientID, claudeRunID)
             ] {
                 await AgentModeViewModel.defaultConnectionPolicyInstaller(
                     clientName: clientName,
@@ -153,6 +160,11 @@ final class MCPPolicySettlementTests: XCTestCase {
         process.arguments = ["30"]
         try process.run()
         return process
+    }
+
+    private static func stop(_ process: Process) {
+        process.terminate()
+        process.waitUntilExit()
     }
 }
 
