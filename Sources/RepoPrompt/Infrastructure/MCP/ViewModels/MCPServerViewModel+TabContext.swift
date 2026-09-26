@@ -2532,6 +2532,9 @@ extension MCPServerViewModel {
         if let frozenAuthority = resolved.snapshot.frozenFileToolAuthority {
             return frozenAuthority.lookupContext
         }
+        if let frozenLookupContext = resolved.snapshot.frozenLookupContext {
+            return frozenLookupContext
+        }
 
         let source = AgentWorkspaceLookupContextSource(
             activeAgentSessionID: resolved.snapshot.activeAgentSessionID,

@@ -431,7 +431,7 @@ import XCTest
             try await assertGraphOnPostconditions(connectionID: connectionID)
         }
 
-        func testFlagOnInactiveSwitchAllowsFileToolCalls() async throws {
+        func testFlagOnInactiveSwitchFailsFileToolCalls() async throws {
             let service = makeRoutingService(graphEnabled: true)
             ServerNetworkManager.shared.graphPolicy = policy(graphEnabled: true)
             var openCount = 0
@@ -453,12 +453,15 @@ import XCTest
                 tabContextHint: nil,
                 explicitWindowRoutingHint: nil
             )
-            let admittedAuthority = try await windowX.mcpServer.requiredFileToolLookupContext(from: fileToolMetadata)
-            XCTAssertNil(admittedAuthority.rootCatalogSnapshot)
-            try await admittedAuthority.validate(
-                workspaceManager: windowX.workspaceManager,
-                store: windowX.workspaceFileContextStore
-            )
+
+            do {
+                _ = try await windowX.mcpServer.requiredFileToolLookupContext(from: fileToolMetadata)
+                XCTFail("Expected requiredFileToolLookupContext to throw superseded/workspaceNotActive")
+            } catch MCPServerViewModel.FileToolAuthorityFailure.superseded {
+                // Expected
+            } catch {
+                XCTFail("Expected superseded, got \(error)")
+            }
 
             let readValue = try await ServerNetworkManager.$currentConnectionID.withValue(connectionID) {
                 try await windowX.mcpServer.fileToolProvider.executeDomainRead(
@@ -474,12 +477,10 @@ import XCTest
                     sideEffects: MCPDomainReadSideEffectEmitter(submit: { _, _, _, _, _ in })
                 )
             }
-
             let reply = try decode(ToolResultDTOs.ReadFileReply.self, from: readValue)
-            XCTAssertFalse(reply.content.isEmpty)
-            XCTAssertEqual(reply.displayPath, "only-r2.txt")
-            XCTAssertEqual(reply.errorCode, nil)
-            XCTAssertEqual(reply.errorMessage, nil)
+            XCTAssertNotNil(reply.errorMessage)
+            XCTAssertTrue(reply.errorMessage?.contains("superseded") == true || reply.errorMessage?.contains("no longer active") == true || reply.errorMessage?.contains("not active") == true || reply.errorMessage?.contains("changed") == true, "Expected superseded or inactive error, got: \(reply.errorMessage ?? "")")
+            XCTAssertEqual(reply.content, "")
         }
 
         func testFlagOnSwitchDoesNotArmWorkspaceSwitchConfirmation() async throws {

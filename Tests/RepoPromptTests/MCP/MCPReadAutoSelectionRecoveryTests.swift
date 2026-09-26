@@ -469,7 +469,7 @@ final class MCPReadAutoSelectionRecoveryTests: XCTestCase {
     ) -> MCPReadFileAutoSelectionCoordinator.ContextKey {
         MCPReadFileAutoSelectionCoordinator.ContextKey(
             windowID: 1,
-            workspaceID: authority.rootCatalogSnapshot!.workspaceID,
+            workspaceID: authority.rootCatalogSnapshot.workspaceID,
             tabID: tabID,
             route: .bound(connectionID: UUID(), runID: UUID()),
             bindingGeneration: bindingGeneration

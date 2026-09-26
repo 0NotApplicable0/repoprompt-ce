@@ -459,6 +459,11 @@ import XCTest
             let args = createArguments(legacy: legacy, windowID: explicitWindowID ? window.windowID : nil)
             let response = try await call(service, connectionID: connectionID, arguments: args)
             let created = try XCTUnwrap(response.workspaces?.first)
+
+            let createdWorkspaceModel = try XCTUnwrap(window.workspaceManager.workspaces.first { $0.id == created.id })
+            XCTAssertEqual(createdWorkspaceModel.isSavedWorkspace, false)
+            XCTAssertTrue(createdWorkspaceModel.isTemporaryWorkspace)
+
             XCTAssertEqual(response.windowID, window.windowID)
             XCTAssertEqual(response.deprecatedArguments, legacy ? ["open_in_new_window"] : nil)
             if legacy { try assertDeprecatedArgumentsJSONKey(response) }
