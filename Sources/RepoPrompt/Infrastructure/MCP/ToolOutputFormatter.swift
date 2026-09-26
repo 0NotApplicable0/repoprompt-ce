@@ -4293,70 +4293,34 @@ extension ToolOutputFormatter {
                 }
 
             case "switch":
-                var out: [String] = []
-                // Check if this was an open_in_new_window request
-                let openedNewWindow = args["open_in_new_window"]?.boolValue ?? false
-                // Get window_id from response (new window case) or args (explicit target)
-                let responseWindowID = obj["window_id"]?.intValue
-                let argsWindowID = args["window_id"]?.intValue
-
-                if openedNewWindow, let newWindowID = responseWindowID {
-                    out.append("## Workspace Opened in New Window ✅")
-                    if let wsName = args["workspace"]?.stringValue {
-                        out.append("- **Workspace**: \(wsName)")
-                    }
-                    out.append("- **New Window ID**: `\(newWindowID)`")
-                    out.append("")
-                    out.append("### Connection Binding")
-                    out.append("Your connection has been automatically bound to the new window (ID: \(newWindowID)).")
-                    out.append("All subsequent tool calls will target this window.")
-                    out.append("")
-                    out.append("### Next Steps")
-                    out.append("- Use `bind_context` with `op=list` to see compose tabs and context_id values.")
-                    out.append("- Use `-w \(newWindowID)` when invoking CLI commands to target this window.")
-                } else {
-                    out.append("## Workspace Switch ✅")
-                    if let wsName = args["workspace"]?.stringValue {
-                        out.append("- **Workspace**: \(wsName)")
-                    }
-                    if let windowID = argsWindowID {
-                        out.append("- **Window**: \(windowID)")
-                    }
-                    out.append("")
-                    out.append("### Next Steps")
-                    out.append("- Your tools now operate in the switched workspace context.")
-                    out.append("- Use `bind_context` with `op=list` to see compose tabs and context_id values.")
+                var out = ["## Workspace Bound on existing window ✅"]
+                if let name = args["workspace"]?.stringValue {
+                    out.append("- **Workspace**: \(name)")
                 }
+                if let windowID = obj["window_id"]?.intValue {
+                    out.append("- **Window ID**: `\(windowID)`")
+                }
+                if obj["deprecated_arguments"] != nil {
+                    out.append("- **Deprecated argument ignored**: `open_in_new_window`")
+                }
+                out.append("- Use `bind_context` with `op=list` to see compose tabs and context_id values.")
                 return [.text(out.joined(separator: "\n"))]
 
             case "create":
-                var out: [String] = []
-                let openedNewWindow = args["open_in_new_window"]?.boolValue ?? false
-                let switchToCreated = args["switch_to_created"]?.boolValue ?? true
-                let responseWindowID = obj["window_id"]?.intValue
-                let argsWindowID = args["window_id"]?.intValue
-
-                if openedNewWindow, let newWindowID = responseWindowID {
-                    out.append("## Workspace Created in New Window ✅")
-                    if let name = args["name"]?.stringValue {
-                        out.append("- **Name**: \(name)")
-                    }
-                    out.append("- **New Window ID**: `\(newWindowID)`")
-                    out.append("")
-                    out.append("### Connection Binding")
-                    out.append("Your connection has been automatically bound to the new window (ID: \(newWindowID)).")
-                    out.append("All subsequent tool calls will target this window.")
+                var out = ["## Workspace Created on existing window ✅"]
+                if let name = args["name"]?.stringValue {
+                    out.append("- **Name**: \(name)")
+                }
+                if let windowID = obj["window_id"]?.intValue {
+                    out.append("- **Window ID**: `\(windowID)`")
+                }
+                if args["switch_to_created"]?.boolValue ?? true {
+                    out.append("- **Connection**: bound to the created workspace")
                 } else {
-                    out.append("## Workspace Created ✅")
-                    if let name = args["name"]?.stringValue {
-                        out.append("- **Name**: \(name)")
-                    }
-                    if let windowID = argsWindowID {
-                        out.append("- **Window**: \(windowID)")
-                    }
-                    if switchToCreated {
-                        out.append("- **Switched**: active workspace is now the new workspace")
-                    }
+                    out.append("- **Connection**: binding unchanged")
+                }
+                if obj["deprecated_arguments"] != nil {
+                    out.append("- **Deprecated argument ignored**: `open_in_new_window`")
                 }
                 return [.text(out.joined(separator: "\n"))]
 

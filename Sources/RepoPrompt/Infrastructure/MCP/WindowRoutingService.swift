@@ -22,7 +22,7 @@ public struct MCPWorkspaceSummary: Codable, Hashable, Sendable {
     public let rootCount: Int
     /// First 3 root folder paths (full paths for context)
     public let repoPaths: [String]
-    /// Window IDs currently showing this workspace (active in those windows)
+    /// Window IDs hosting this workspace through focus or a connection binding.
     public let showingWindowIDs: [Int]
     /// True when this workspace is recoverable but hidden from default menus/lists.
     public let isHidden: Bool
@@ -105,7 +105,8 @@ public struct ManageWorkspacesResponse: Codable, Sendable {
     public let workspaces: [MCPWorkspaceSummary]?
     public let tabs: [MCPComposeTabSummary]? // For create_tab / close_tab actions
     public let status: String?
-    public let windowID: Int? // For switch/create with open_in_new_window
+    public let windowID: Int?
+    public let deprecatedArguments: [String]?
     public let closedWindowID: Int? // For delete with close_window
 
     public init(
@@ -114,6 +115,7 @@ public struct ManageWorkspacesResponse: Codable, Sendable {
         tabs: [MCPComposeTabSummary]? = nil,
         status: String?,
         windowID: Int? = nil,
+        deprecatedArguments: [String]? = nil,
         closedWindowID: Int? = nil
     ) {
         self.action = action
@@ -121,12 +123,14 @@ public struct ManageWorkspacesResponse: Codable, Sendable {
         self.tabs = tabs
         self.status = status
         self.windowID = windowID
+        self.deprecatedArguments = deprecatedArguments
         self.closedWindowID = closedWindowID
     }
 
     private enum CodingKeys: String, CodingKey {
         case action, workspaces, tabs, status
         case windowID = "window_id"
+        case deprecatedArguments = "deprecated_arguments"
         case closedWindowID = "closed_window_id"
     }
 }
@@ -330,10 +334,6 @@ final class WindowRoutingService: Service {
         )
     }
 
-    nonisolated static func shouldBindConnectionAfterStandardWorkspaceSwitch(explicitWindowIDProvided: Bool) -> Bool {
-        explicitWindowIDProvided
-    }
-
     // ---------------------------------------------------------------------
 
     // MARK: Stored references
@@ -419,12 +419,21 @@ final class WindowRoutingService: Service {
         from referenceManager: WorkspaceManagerViewModel,
         includeHidden: Bool
     ) async -> [WorkspaceModel] {
-        let workspaces = await referenceManager.loadWorkspaceSnapshotFromDisk()
+        var workspacesByID: [UUID: WorkspaceModel] = [:]
+        for model in await referenceManager.loadWorkspaceSnapshotFromDisk() {
+            workspacesByID[model.id] = model
+        }
+        let inMemory = await MainActor.run {
+            self.windowStates.allWindows.flatMap(\.workspaceManager.workspaces)
+        }
+        for model in inMemory where workspacesByID[model.id] == nil {
+            workspacesByID[model.id] = model
+        }
         let incompleteIDs = await MainActor.run {
             referenceManager.pendingConsolidatedRestoreIDs
         }
         return Self.workspaceInventoryModels(
-            workspaces,
+            Array(workspacesByID.values),
             authorityIncompleteWorkspaceIDs: incompleteIDs,
             includeHidden: includeHidden
         )
@@ -591,6 +600,17 @@ final class WindowRoutingService: Service {
             throw MCPError.invalidParams("No valid target window found")
         }
         return targetWindow
+    }
+
+    private func resolveWorkspaceHost(windowID: Int?) async throws -> WindowState {
+        guard let connectionID = await networkMgr.currentConnectionUUID() else {
+            throw MCPError.internalError("No active connection context")
+        }
+        let boundWindowID = await currentBindingSnapshot(for: connectionID).windowID
+        if let boundWindowID, let windowID, windowID != boundWindowID {
+            throw MCPError.invalidParams("window_id \(windowID) conflicts with the connection's bound window \(boundWindowID).")
+        }
+        return try await resolveTargetWindow(windowID: boundWindowID ?? windowID)
     }
 
     private func resolveComposeTab(rawTabParam: String, tabs: [ComposeTabState]) throws -> ComposeTabState {
@@ -1991,8 +2011,8 @@ final class WindowRoutingService: Service {
         return didChangeBinding
     }
 
-    /// Admits `workspace`'s stored saved compose tab on the graph window `window` for
-    /// connection `connectionID`, with exact connection-scoped root authority over its roots —
+    /// Admits `workspace`'s stored compose tab on `window` for `connectionID`,
+    /// with exact connection-scoped root authority over its roots —
     /// without ever calling `requestWorkspaceSwitch`, `openNewWindowShowingWorkspace`,
     /// `resolveActiveTabBindTarget`, or `ensureResolvedWorkspaceIsLoaded`. `window`'s
     /// `activeWorkspace` and active tab are never mutated. `justCreated` registers the workspace
@@ -2010,10 +2030,6 @@ final class WindowRoutingService: Service {
                 "Workspace '\(workspace.name)' is no longer available in window \(window.windowID). Retry after inventory refresh."
             )
         }
-        guard policy.mountsGraphShell else {
-            throw MCPError.invalidRequest("Orchestration graph mode is no longer enabled; retry the request.")
-        }
-
         let snapshot = try window.mcpServer.makeTabContextSnapshot(
             tabID: candidate.tabID,
             workspaceID: candidate.workspaceID,
@@ -2064,9 +2080,6 @@ final class WindowRoutingService: Service {
                 throw MCPError.invalidRequest(
                     "Workspace '\(workspace.name)' is no longer available in window \(window.windowID). Retry after inventory refresh."
                 )
-            }
-            guard policy.mountsGraphShell else {
-                throw MCPError.invalidRequest("Orchestration graph mode is no longer enabled; retry the request.")
             }
             var revalidatedSnapshot = try window.mcpServer.makeTabContextSnapshot(
                 tabID: revalidatedCandidate.tabID,
@@ -2739,15 +2752,24 @@ final class WindowRoutingService: Service {
                         includeHidden: includeHidden
                     )
 
-                    // Build map of which windows are showing each workspace
-                    let windowsByWorkspaceID: [UUID: Set<Int>] = await MainActor.run {
-                        var result: [UUID: Set<Int>] = [:]
-                        for ws in routingService.windowStates.allWindows {
-                            if let activeID = ws.workspaceManager.activeWorkspace?.id {
-                                result[activeID, default: []].insert(ws.windowID)
+                    var windowsByWorkspaceID: [UUID: Set<Int>] = [:]
+                    let allWindows = await MainActor.run { routingService.windowStates.allWindows }
+                    for window in allWindows {
+                        let activeID = await MainActor.run { window.workspaceManager.activeWorkspace?.id }
+                        let windowID = await MainActor.run { window.windowID }
+                        if let activeID {
+                            windowsByWorkspaceID[activeID, default: []].insert(windowID)
+                        }
+                        let coordinator = await MainActor.run { window.mcpServer.domainRoutingCoordinator }
+                        if let coordinator {
+                            let connectionIDs = await coordinator.snapshot().connections.map(\.registration.connectionID)
+                            for connectionID in connectionIDs {
+                                let binding = await MainActor.run { window.mcpServer.connectionBindingSnapshot(forConnection: connectionID) }
+                                if binding.windowID == windowID, let workspaceID = binding.workspaceID {
+                                    windowsByWorkspaceID[workspaceID, default: []].insert(windowID)
+                                }
                             }
                         }
-                        return result
                     }
 
                     // Build summaries from disk data with window visibility overlay.
@@ -2782,121 +2804,24 @@ final class WindowRoutingService: Service {
                         throw MCPError.invalidParams("Missing required 'workspace' parameter (UUID or name) for 'switch' action.")
                     }
 
-                    // Check if we should open in a new window
-                    let openInNewWindow = args["open_in_new_window"]?.boolValue ?? false
                     let includeHidden = args["include_hidden"]?.boolValue ?? false
-
-                    if openInNewWindow {
-                        // First, resolve the workspace model from disk (don't require an existing window)
-                        let targetWorkspace = try await routingService.resolveWorkspaceForSwitch(rawWorkspaceParam: rawWorkspaceParam, includeHidden: includeHidden)
-
-                        // ═══════════════════════════════════════════════════════════════
-                        // Graph-on admission mode: reuse the single graph window without
-                        // switching its visible workspace.
-                        // ═══════════════════════════════════════════════════════════════
-                        if let graphWindow = await MainActor.run(body: {
-                            routingService.policy.mountsGraphShell
-                                ? routingService.windowStates.allWindows.only
-                                : nil
-                        }) {
-                            guard let connectionID = await routingService.networkMgr.currentConnectionUUID() else {
-                                throw MCPError.internalError("No active connection context")
-                            }
-                            let admittedWindowID = try await routingService.admitStoredWorkspace(
-                                workspace: targetWorkspace,
-                                window: graphWindow,
-                                connectionID: connectionID
-                            )
-                            return ManageWorkspacesResponse(
-                                action: "switch",
-                                workspaces: nil,
-                                status: "ok",
-                                windowID: admittedWindowID
-                            )
-                        }
-
-                        // ═══════════════════════════════════════════════════════════════
-                        // OPEN IN NEW WINDOW MODE
-                        // ═══════════════════════════════════════════════════════════════
-
-                        // Open a new window
-                        let newWindow: WindowState
-                        do {
-                            newWindow = try await routingService.openRoutingWindow(deferringInitialAgentSystemWorkspaceRefresh: true)
-                        } catch let error as WindowOpenError {
-                            throw MCPError.internalError("Failed to open new window: \(error.localizedDescription)")
-                        } catch {
-                            throw MCPError.internalError("Failed to open new window: \(error)")
-                        }
-
-                        defer {
-                            Task { @MainActor [newWindow] in
-                                newWindow.agentModeViewModel.finishInitialSystemWorkspaceSessionListRefreshDeferral()
-                            }
-                        }
-
-                        // Wait for initial workspace setup before switching
-                        await newWindow.workspaceManager.awaitInitialized()
-
-                        // Switch the new window to the target workspace
-                        let switchResult = await newWindow.workspaceManager.requestWorkspaceSwitch(to: targetWorkspace, saveState: true)
-                        if !switchResult.didSwitch {
-                            throw MCPError.invalidRequest(switchResult.message ?? "Workspace switch was cancelled.")
-                        }
-
-                        // Bind this MCP connection to the new window
-                        try await routingService.networkMgr.setActiveWindowForCurrentConnection(newWindow.windowID)
-
-                        // Return success with the new window ID
-                        return ManageWorkspacesResponse(
-                            action: "switch",
-                            workspaces: nil,
-                            status: "ok",
-                            windowID: newWindow.windowID
-                        )
+					let targetWindow = try await routingService.resolveWorkspaceHost(windowID: args["window_id"]?.intValue)
+					let targetModel = try await routingService.resolveWorkspaceForSwitch(rawWorkspaceParam: rawWorkspaceParam, includeHidden: includeHidden)
+					guard let connectionID = await routingService.networkMgr.currentConnectionUUID() else {
+						throw MCPError.internalError("No active connection context")
                     }
-
-                    // ═══════════════════════════════════════════════════════════════
-                    // STANDARD SWITCH MODE (switch existing window)
-                    // ═══════════════════════════════════════════════════════════════
-
-                    // Determine target window
-                    let targetWindowIDArg = args["window_id"]?.intValue
-                    let windows = await MainActor.run { routingService.windowStates.allWindows }
-
-                    // Safe target window selection (no force-unwrap)
-                    let targetWindowOpt: WindowState? = if let wid = targetWindowIDArg {
-                        windows.first(where: { $0.windowID == wid })
-                    } else {
-                        windows.only
-                    }
-
-                    // Validate window selection or guide the client
-                    if let wid = targetWindowIDArg, targetWindowOpt == nil {
-                        let validIDs = windows.map { String($0.windowID) }.joined(separator: ", ")
-                        throw MCPError.invalidParams("Unknown window_id \(wid). Valid window IDs: \(validIDs)")
-                    }
-                    if targetWindowIDArg == nil, windows.count != 1 {
-                        throw MCPError.invalidParams(Self.bindContextWindowSelectionMessage)
-                    }
-                    guard let targetWindow = targetWindowOpt else {
-                        throw MCPError.invalidParams("No valid target window found")
-                    }
-
-                    // Resolve the target workspace model using hidden-aware UUID-or-name logic.
-                    let targetModel = try await routingService.resolveWorkspaceForSwitch(rawWorkspaceParam: rawWorkspaceParam, includeHidden: includeHidden)
-
-                    // Perform the switch on the target window
-                    let switchResult = await targetWindow.workspaceManager.requestWorkspaceSwitch(to: targetModel, saveState: true)
-                    if !switchResult.didSwitch {
-                        throw MCPError.invalidRequest(switchResult.message ?? "Workspace switch was cancelled.")
-                    }
-
-                    if Self.shouldBindConnectionAfterStandardWorkspaceSwitch(explicitWindowIDProvided: targetWindowIDArg != nil) {
-                        try await routingService.networkMgr.setActiveWindowForCurrentConnection(targetWindow.windowID)
-                    }
-
-                    return ManageWorkspacesResponse(action: "switch", workspaces: nil, status: "ok")
+					let admittedWindowID = try await routingService.admitStoredWorkspace(
+						workspace: targetModel,
+						window: targetWindow,
+						connectionID: connectionID
+					)
+					return ManageWorkspacesResponse(
+						action: "switch",
+						workspaces: nil,
+						status: "ok",
+						windowID: admittedWindowID,
+						deprecatedArguments: args["open_in_new_window"] == nil ? nil : ["open_in_new_window"]
+					)
 
                 case "create":
                     // Create a new workspace
@@ -2922,41 +2847,8 @@ final class WindowRoutingService: Service {
                         initialRepoPaths = []
                     }
 
-                    // Check if we should open in a new window
-                    let openInNewWindow = args["open_in_new_window"]?.boolValue ?? false
                     let switchToCreated = args["switch_to_created"]?.boolValue ?? true
-
-                    // Determine target window for approval
-                    let targetWindowIDArg = args["window_id"]?.intValue
-                    let (windows, focusedWindowID) = await MainActor.run { () -> ([WindowState], Int?) in
-                        let allWindows = routingService.windowStates.allWindows
-                        let focusedID = allWindows.first(where: { $0.isCurrentlyFocused })?.windowID
-                        return (allWindows, focusedID)
-                    }
-
-                    let approvalWindowOpt: WindowState? = {
-                        if let wid = targetWindowIDArg {
-                            return windows.first(where: { $0.windowID == wid })
-                        }
-                        if openInNewWindow {
-                            if let focusedID = focusedWindowID {
-                                return windows.first(where: { $0.windowID == focusedID })
-                            }
-                            return windows.last ?? windows.first
-                        }
-                        return windows.only
-                    }()
-
-                    if let wid = targetWindowIDArg, approvalWindowOpt == nil {
-                        let validIDs = windows.map { String($0.windowID) }.joined(separator: ", ")
-                        throw MCPError.invalidParams("Unknown window_id \(wid). Valid window IDs: \(validIDs)")
-                    }
-                    if !openInNewWindow, targetWindowIDArg == nil, windows.count != 1 {
-                        throw MCPError.invalidParams(Self.bindContextWindowSelectionMessage)
-                    }
-                    guard let approvalWindow = approvalWindowOpt else {
-                        throw MCPError.invalidParams("No windows available to create workspace. Open at least one window first.")
-                    }
+					let hostWindow = try await routingService.resolveWorkspaceHost(windowID: args["window_id"]?.intValue)
 
                     // Get client ID for approval
                     let clientID = await routingService.networkMgr.currentClientIdentifier() ?? "unknown-client"
@@ -2965,112 +2857,42 @@ final class WindowRoutingService: Service {
                     let approvalResult = await WorkspaceApprovalManager.shared.requestCreateWorkspaceApproval(
                         clientID: clientID,
                         workspaceName: workspaceName,
-                        windowID: approvalWindow.windowID
+						windowID: hostWindow.windowID
                     )
 
                     guard approvalResult.isApproved else {
                         throw MCPError.invalidRequest("Workspace creation was denied by the user.")
                     }
-
-                    if openInNewWindow {
-                        // ═══════════════════════════════════════════════════════════════
-                        // Graph-on admission mode: create on the single graph window without
-                        // switching its visible workspace.
-                        // ═══════════════════════════════════════════════════════════════
-                        if await routingService.policy.mountsGraphShell, windows.count == 1, let graphWindow = windows.first {
-                            let newWorkspace = await MainActor.run {
-                                graphWindow.workspaceManager.createWorkspace(name: workspaceName, repoPaths: initialRepoPaths, savedInLibrary: false)
-                            }
-                            guard let connectionID = await routingService.networkMgr.currentConnectionUUID() else {
-                                throw MCPError.internalError("No active connection context")
-                            }
-                            let admittedWindowID = try await routingService.admitStoredWorkspace(
-                                workspace: newWorkspace,
-                                window: graphWindow,
-                                connectionID: connectionID,
-                                justCreated: true
-                            )
-                            let summary = MCPWorkspaceSummary(
-                                id: newWorkspace.id,
-                                name: newWorkspace.name,
-                                allRepoPaths: newWorkspace.repoPaths,
-                                showingWindowIDs: []
-                            )
-                            return ManageWorkspacesResponse(
-                                action: "create",
-                                workspaces: [summary],
-                                status: "ok",
-                                windowID: admittedWindowID
-                            )
+					let newWorkspace = await MainActor.run {
+						hostWindow.workspaceManager.createWorkspace(
+							name: workspaceName,
+							repoPaths: initialRepoPaths
+						)
+					}
+					if switchToCreated {
+						guard let connectionID = await routingService.networkMgr.currentConnectionUUID() else {
+							throw MCPError.internalError("No active connection context")
                         }
-
-                        // Open a new window for the workspace
-                        let newWindow: WindowState
-                        do {
-                            newWindow = try await routingService.openRoutingWindow(deferringInitialAgentSystemWorkspaceRefresh: switchToCreated)
-                        } catch let error as WindowOpenError {
-                            throw MCPError.internalError("Failed to open new window: \(error.localizedDescription)")
-                        } catch {
-                            throw MCPError.internalError("Failed to open new window: \(error)")
-                        }
-                        defer {
-                            Task { @MainActor [newWindow] in
-                                newWindow.agentModeViewModel.finishInitialSystemWorkspaceSessionListRefreshDeferral()
-                            }
-                        }
-
-                        // Wait for initial workspace setup before creating
-                        await newWindow.workspaceManager.awaitInitialized()
-
-                        // Create the workspace in the new window
-                        let newWorkspace = await MainActor.run {
-                            newWindow.workspaceManager.createWorkspace(name: workspaceName, repoPaths: initialRepoPaths, savedInLibrary: false)
-                        }
-                        if switchToCreated {
-                            let switchResult = await newWindow.workspaceManager.requestWorkspaceSwitch(to: newWorkspace, saveState: true)
-                            if !switchResult.didSwitch {
-                                throw MCPError.invalidRequest(switchResult.message ?? "Workspace switch was cancelled.")
-                            }
-                        }
-
-                        // Bind this MCP connection to the new window
-                        try await routingService.networkMgr.setActiveWindowForCurrentConnection(newWindow.windowID)
-
-                        let summary = MCPWorkspaceSummary(
-                            id: newWorkspace.id,
-                            name: newWorkspace.name,
-                            allRepoPaths: newWorkspace.repoPaths,
-                            showingWindowIDs: switchToCreated ? [newWindow.windowID] : []
-                        )
-
-                        return ManageWorkspacesResponse(
-                            action: "create",
-                            workspaces: [summary],
-                            status: "ok",
-                            windowID: newWindow.windowID
+						_ = try await routingService.admitStoredWorkspace(
+							workspace: newWorkspace,
+							window: hostWindow,
+							connectionID: connectionID,
+							justCreated: true
                         )
                     }
-
-                    // Create the workspace in the target window
-                    let newWorkspace = await MainActor.run {
-                        approvalWindow.workspaceManager.createWorkspace(name: workspaceName, repoPaths: initialRepoPaths, savedInLibrary: false)
-                    }
-
-                    if switchToCreated {
-                        let switchResult = await approvalWindow.workspaceManager.requestWorkspaceSwitch(to: newWorkspace, saveState: true)
-                        if !switchResult.didSwitch {
-                            throw MCPError.invalidRequest(switchResult.message ?? "Workspace switch was cancelled.")
-                        }
-                    }
-
                     let summary = MCPWorkspaceSummary(
                         id: newWorkspace.id,
                         name: newWorkspace.name,
                         allRepoPaths: newWorkspace.repoPaths,
-                        showingWindowIDs: switchToCreated ? [approvalWindow.windowID] : []
+						showingWindowIDs: switchToCreated ? [hostWindow.windowID] : []
                     )
-
-                    return ManageWorkspacesResponse(action: "create", workspaces: [summary], status: "ok")
+					return ManageWorkspacesResponse(
+						action: "create",
+						workspaces: [summary],
+						status: "ok",
+						windowID: hostWindow.windowID,
+						deprecatedArguments: args["open_in_new_window"] == nil ? nil : ["open_in_new_window"]
+					)
 
                 case "hide", "unhide":
                     guard let rawWorkspaceParam = args["workspace"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines),
