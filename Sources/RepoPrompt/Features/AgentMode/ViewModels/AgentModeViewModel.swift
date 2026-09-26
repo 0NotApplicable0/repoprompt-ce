@@ -2144,7 +2144,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         )
     }
 
-    private nonisolated static func defaultConnectionPolicyInstaller(
+    nonisolated static func defaultConnectionPolicyInstaller(
         clientName: String,
         windowID: Int,
         restrictedTools: Set<String>,
@@ -2172,7 +2172,11 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             purpose: purpose,
             taskLabelKind: taskLabelKind,
             allowsAgentExternalControlTools: allowsAgentExternalControlTools,
-            requiresExpectedAgentPID: requiresExpectedAgentPID
+            requiresExpectedAgentPID: requiresExpectedAgentPID,
+            prunesOnlyAfterSettlement: MCPPolicySettlement.prunesOnlyAfterSettlement(
+                clientName: clientName,
+                purpose: purpose
+            )
         )
     }
 
