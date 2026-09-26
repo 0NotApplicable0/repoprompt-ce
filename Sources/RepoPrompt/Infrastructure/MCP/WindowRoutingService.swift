@@ -2096,16 +2096,18 @@ final class WindowRoutingService: Service {
                 )
             }
             revalidatedSnapshot.frozenLookupContext = ticket.lookupContext
-            // ponytail: FrozenFileToolAuthority.capture requires visible-workspace roots; graph admission only has the session-worktree lookupContext already on the ticket. Lookup returns frozenFileToolAuthority.lookupContext and never that capture path.
+            let lifetime: WorkspaceSessionRootLifetimeSnapshot? = if case let .validatedSessionBoundWorkspace(_, physicalRoots, _) = ticket.lookupContext.rootScope {
+                await window.workspaceFileContextStore.sessionBoundRootScopeValidationSnapshot(
+                    ticket.lookupContext.rootScope,
+                    expectedPhysicalRoots: Array(physicalRoots)
+                )
+            } else {
+                nil
+            }
             revalidatedSnapshot.frozenFileToolAuthority = MCPServerViewModel.FrozenFileToolAuthority(
                 lookupContext: ticket.lookupContext,
-                rootCatalogSnapshot: WorkspaceRootCatalogSnapshot(
-                    ticket: WorkspaceSearchReadinessTicket(workspaceID: candidate.workspaceID, generation: 0),
-                    workspaceID: candidate.workspaceID,
-                    configuredRootPaths: candidate.repoPaths,
-                    primaryRoots: []
-                ),
-                sessionRootLifetimeSnapshot: nil,
+                rootCatalogSnapshot: nil,
+                sessionRootLifetimeSnapshot: lifetime,
                 sourceIdentity: nil
             )
             window.mcpServer.installFrozenTabContext(
@@ -2817,23 +2819,23 @@ final class WindowRoutingService: Service {
                     }
 
                     let includeHidden = args["include_hidden"]?.boolValue ?? false
-					let targetWindow = try await routingService.resolveWorkspaceHost(windowID: args["window_id"]?.intValue)
-					let targetModel = try await routingService.resolveWorkspaceForSwitch(rawWorkspaceParam: rawWorkspaceParam, includeHidden: includeHidden)
-					guard let connectionID = await routingService.networkMgr.currentConnectionUUID() else {
-						throw MCPError.internalError("No active connection context")
+                    let targetWindow = try await routingService.resolveWorkspaceHost(windowID: args["window_id"]?.intValue)
+                    let targetModel = try await routingService.resolveWorkspaceForSwitch(rawWorkspaceParam: rawWorkspaceParam, includeHidden: includeHidden)
+                    guard let connectionID = await routingService.networkMgr.currentConnectionUUID() else {
+                        throw MCPError.internalError("No active connection context")
                     }
-					let admittedWindowID = try await routingService.admitStoredWorkspace(
-						workspace: targetModel,
-						window: targetWindow,
-						connectionID: connectionID
-					)
-					return ManageWorkspacesResponse(
-						action: "switch",
-						workspaces: nil,
-						status: "ok",
-						windowID: admittedWindowID,
-						deprecatedArguments: args["open_in_new_window"] == nil ? nil : ["open_in_new_window"]
-					)
+                    let admittedWindowID = try await routingService.admitStoredWorkspace(
+                        workspace: targetModel,
+                        window: targetWindow,
+                        connectionID: connectionID
+                    )
+                    return ManageWorkspacesResponse(
+                        action: "switch",
+                        workspaces: nil,
+                        status: "ok",
+                        windowID: admittedWindowID,
+                        deprecatedArguments: args["open_in_new_window"] == nil ? nil : ["open_in_new_window"]
+                    )
 
                 case "create":
                     // Create a new workspace
@@ -2860,7 +2862,7 @@ final class WindowRoutingService: Service {
                     }
 
                     let switchToCreated = args["switch_to_created"]?.boolValue ?? true
-					let hostWindow = try await routingService.resolveWorkspaceHost(windowID: args["window_id"]?.intValue)
+                    let hostWindow = try await routingService.resolveWorkspaceHost(windowID: args["window_id"]?.intValue)
 
                     // Get client ID for approval
                     let clientID = await routingService.networkMgr.currentClientIdentifier() ?? "unknown-client"
@@ -2869,42 +2871,43 @@ final class WindowRoutingService: Service {
                     let approvalResult = await WorkspaceApprovalManager.shared.requestCreateWorkspaceApproval(
                         clientID: clientID,
                         workspaceName: workspaceName,
-						windowID: hostWindow.windowID
+                        windowID: hostWindow.windowID
                     )
 
                     guard approvalResult.isApproved else {
                         throw MCPError.invalidRequest("Workspace creation was denied by the user.")
                     }
-					let newWorkspace = await MainActor.run {
-						hostWindow.workspaceManager.createWorkspace(
-							name: workspaceName,
-							repoPaths: initialRepoPaths
-						)
-					}
-					if switchToCreated {
-						guard let connectionID = await routingService.networkMgr.currentConnectionUUID() else {
-							throw MCPError.internalError("No active connection context")
+                    let newWorkspace = await MainActor.run {
+                        hostWindow.workspaceManager.createWorkspace(
+                            name: workspaceName,
+                            repoPaths: initialRepoPaths,
+                            savedInLibrary: false
+                        )
+                    }
+                    if switchToCreated {
+                        guard let connectionID = await routingService.networkMgr.currentConnectionUUID() else {
+                            throw MCPError.internalError("No active connection context")
                         }
-						_ = try await routingService.admitStoredWorkspace(
-							workspace: newWorkspace,
-							window: hostWindow,
-							connectionID: connectionID,
-							justCreated: true
+                        _ = try await routingService.admitStoredWorkspace(
+                            workspace: newWorkspace,
+                            window: hostWindow,
+                            connectionID: connectionID,
+                            justCreated: true
                         )
                     }
                     let summary = MCPWorkspaceSummary(
                         id: newWorkspace.id,
                         name: newWorkspace.name,
                         allRepoPaths: newWorkspace.repoPaths,
-						showingWindowIDs: switchToCreated ? [hostWindow.windowID] : []
+                        showingWindowIDs: switchToCreated ? [hostWindow.windowID] : []
                     )
-					return ManageWorkspacesResponse(
-						action: "create",
-						workspaces: [summary],
-						status: "ok",
-						windowID: hostWindow.windowID,
-						deprecatedArguments: args["open_in_new_window"] == nil ? nil : ["open_in_new_window"]
-					)
+                    return ManageWorkspacesResponse(
+                        action: "create",
+                        workspaces: [summary],
+                        status: "ok",
+                        windowID: hostWindow.windowID,
+                        deprecatedArguments: args["open_in_new_window"] == nil ? nil : ["open_in_new_window"]
+                    )
 
                 case "hide", "unhide":
                     guard let rawWorkspaceParam = args["workspace"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines),

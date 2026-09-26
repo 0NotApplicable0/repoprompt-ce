@@ -431,6 +431,57 @@ import XCTest
             try await assertGraphOnPostconditions(connectionID: connectionID)
         }
 
+        func testFlagOnInactiveSwitchAllowsFileToolCalls() async throws {
+            let service = makeRoutingService(graphEnabled: true)
+            ServerNetworkManager.shared.graphPolicy = policy(graphEnabled: true)
+            var openCount = 0
+            installProductionOpener { openCount += 1 }
+            let connectionID = await makeConnection(service)
+
+            _ = try await callBoundedTool(
+                service: service,
+                tool: MCPGlobalToolName.manageWorkspaces,
+                arguments: switchArguments(workspace: workspaceTwo, openInNewWindow: true),
+                connectionID: connectionID
+            )
+
+            let fileToolMetadata = MCPServerViewModel.RequestMetadata(
+                connectionID: connectionID,
+                clientName: nil,
+                windowID: nil,
+                runPurpose: nil,
+                tabContextHint: nil,
+                explicitWindowRoutingHint: nil
+            )
+            let admittedAuthority = try await windowX.mcpServer.requiredFileToolLookupContext(from: fileToolMetadata)
+            XCTAssertNil(admittedAuthority.rootCatalogSnapshot)
+            try await admittedAuthority.validate(
+                workspaceManager: windowX.workspaceManager,
+                store: windowX.workspaceFileContextStore
+            )
+
+            let readValue = try await ServerNetworkManager.$currentConnectionID.withValue(connectionID) {
+                try await windowX.mcpServer.fileToolProvider.executeDomainRead(
+                    toolName: MCPWindowToolName.readFile,
+                    context: RepoPromptDomainRuntime.DomainReadInvocationContext(
+                        handle: nil,
+                        connectionID: connectionID
+                    ),
+                    appContext: nil,
+                    args: [
+                        "path": .string(repoRootTwo.path.appending("/only-r2.txt"))
+                    ],
+                    sideEffects: MCPDomainReadSideEffectEmitter(submit: { _, _, _, _, _ in })
+                )
+            }
+
+            let reply = try decode(ToolResultDTOs.ReadFileReply.self, from: readValue)
+            XCTAssertFalse(reply.content.isEmpty)
+            XCTAssertEqual(reply.displayPath, "only-r2.txt")
+            XCTAssertEqual(reply.errorCode, nil)
+            XCTAssertEqual(reply.errorMessage, nil)
+        }
+
         func testFlagOnSwitchDoesNotArmWorkspaceSwitchConfirmation() async throws {
             let service = makeRoutingService(graphEnabled: true)
             ServerNetworkManager.shared.graphPolicy = policy(graphEnabled: true)
@@ -520,6 +571,11 @@ import XCTest
             XCTAssertEqual(response.windowID, windowX.windowID)
             XCTAssertEqual(openCount, 0)
             XCTAssertEqual(WindowStatesManager.shared.allWindows.count, 1)
+
+            let createdWorkspaceID = try XCTUnwrap(response.workspaces?.first?.id)
+            let createdWorkspace = try XCTUnwrap(windowX.workspaceManager.workspaces.first { $0.id == createdWorkspaceID })
+            XCTAssertEqual(createdWorkspace.isSavedWorkspace, false)
+            XCTAssertTrue(createdWorkspace.isTemporaryWorkspace)
 
             try await assertGraphOnPostconditions(
                 connectionID: connectionID,

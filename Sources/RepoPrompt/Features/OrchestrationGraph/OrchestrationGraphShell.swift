@@ -1125,7 +1125,7 @@ struct OrchestrationGraphShell: View {
                 .background(.black.opacity(0.55), in: Circle())
         }
         .buttonStyle(.plain)
-        .help("Refresh graph")
+        .hoverTooltip("Refresh graph")
         .disabled(isRefreshing)
     }
 

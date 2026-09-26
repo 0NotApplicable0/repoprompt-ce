@@ -618,7 +618,7 @@ import XCTest
                 workspaceID: fixture.workspace.id
             )
 
-            XCTAssertTrue(authority.rootCatalogSnapshot.isGenuinelyRootless)
+            XCTAssertTrue(authority.isGenuinelyRootless)
             XCTAssertEqual(authority.lookupContext.bindingProjection, nil)
         }
 

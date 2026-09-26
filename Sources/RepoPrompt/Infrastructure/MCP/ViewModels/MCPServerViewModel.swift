@@ -190,9 +190,23 @@ final class MCPServerViewModel: ObservableObject {
 
     struct FrozenFileToolAuthority {
         let lookupContext: WorkspaceLookupContext
-        let rootCatalogSnapshot: WorkspaceRootCatalogSnapshot
+        let rootCatalogSnapshot: WorkspaceRootCatalogSnapshot?
         var canonicalRoots: Set<WorkspaceRootRef> {
-            Set(rootCatalogSnapshot.primaryRoots)
+            if let rootCatalogSnapshot {
+                Set(rootCatalogSnapshot.primaryRoots)
+            } else if case let .validatedSessionBoundWorkspace(canonical, _, _) = lookupContext.rootScope {
+                canonical
+            } else {
+                []
+            }
+        }
+
+        var isGenuinelyRootless: Bool {
+            if let rootCatalogSnapshot {
+                rootCatalogSnapshot.isGenuinelyRootless
+            } else {
+                canonicalRoots.isEmpty
+            }
         }
 
         let sessionRootLifetimeSnapshot: WorkspaceSessionRootLifetimeSnapshot?
@@ -201,26 +215,44 @@ final class MCPServerViewModel: ObservableObject {
         @MainActor
         static func capture(
             lookupContext: WorkspaceLookupContext,
-            rootCatalogSnapshot: WorkspaceRootCatalogSnapshot,
+            rootCatalogSnapshot: WorkspaceRootCatalogSnapshot?,
             store: WorkspaceFileContextStore,
             sourceIdentity: AgentWorkspaceLookupContextIdentity? = nil
         ) async throws -> FrozenFileToolAuthority {
             try Task.checkCancellation()
             let lifetime: WorkspaceSessionRootLifetimeSnapshot?
             if let projection = lookupContext.bindingProjection {
-                guard Set(projection.visibleLogicalRootRefs) == Set(rootCatalogSnapshot.primaryRoots) else {
+                let canonical: Set<WorkspaceRootRef> = if let rootCatalogSnapshot {
+                    Set(rootCatalogSnapshot.primaryRoots)
+                } else if case let .validatedSessionBoundWorkspace(canonicalRoots, _, _) = lookupContext.rootScope {
+                    canonicalRoots
+                } else {
+                    []
+                }
+                guard Set(projection.visibleLogicalRootRefs) == canonical else {
                     throw FileToolAuthorityFailure.mismatchedProjection
                 }
                 lifetime = await store.sessionBoundRootScopeValidationSnapshot(
                     lookupContext.rootScope,
                     expectedPhysicalRoots: projection.physicalRootRefs
                 )
+            } else if rootCatalogSnapshot == nil {
+                if case let .validatedSessionBoundWorkspace(_, physicalRoots, _) = lookupContext.rootScope {
+                    lifetime = await store.sessionBoundRootScopeValidationSnapshot(
+                        lookupContext.rootScope,
+                        expectedPhysicalRoots: Array(physicalRoots)
+                    )
+                } else {
+                    throw FileToolAuthorityFailure.mismatchedProjection
+                }
             } else {
                 lifetime = nil
             }
-            let canonicalRoots = Set(rootCatalogSnapshot.primaryRoots)
-            guard await Set(store.rootRefs(scope: .visibleWorkspace)) == canonicalRoots else {
-                throw FileToolAuthorityFailure.mismatchedProjection
+            if let rootCatalogSnapshot {
+                let canonicalRoots = Set(rootCatalogSnapshot.primaryRoots)
+                guard await Set(store.rootRefs(scope: .visibleWorkspace)) == canonicalRoots else {
+                    throw FileToolAuthorityFailure.mismatchedProjection
+                }
             }
             try Task.checkCancellation()
             if lookupContext.bindingProjection != nil, lifetime == nil {
@@ -242,25 +274,24 @@ final class MCPServerViewModel: ObservableObject {
             workspaceManager: WorkspaceManagerViewModel,
             store: WorkspaceFileContextStore
         ) async throws {
-            guard rootCatalogSnapshot.workspaceID == rootCatalogSnapshot.ticket.workspaceID else {
-                throw FileToolAuthorityFailure.superseded
-            }
-            do {
-                try workspaceManager.validateWorkspaceSearchReadiness(
-                    rootCatalogSnapshot.ticket,
-                    admission: .rootCatalog
-                )
-            } catch {
-                throw FileToolAuthorityFailure.superseded
-            }
-            guard await Set(store.rootRefs(scope: .visibleWorkspace)) == canonicalRoots else {
-                throw FileToolAuthorityFailure.mismatchedProjection
-            }
-            if lookupContext.bindingProjection != nil {
-                guard let sessionRootLifetimeSnapshot else {
-                    throw FileToolAuthorityFailure.worktreeScopeUnavailable
+            if let rootCatalogSnapshot {
+                guard rootCatalogSnapshot.workspaceID == rootCatalogSnapshot.ticket.workspaceID else {
+                    throw FileToolAuthorityFailure.superseded
                 }
-                guard await sessionRootLifetimeSnapshot.isCurrent() else {
+                do {
+                    try workspaceManager.validateWorkspaceSearchReadiness(
+                        rootCatalogSnapshot.ticket,
+                        admission: .rootCatalog
+                    )
+                } catch {
+                    throw FileToolAuthorityFailure.superseded
+                }
+                guard await Set(store.rootRefs(scope: .visibleWorkspace)) == canonicalRoots else {
+                    throw FileToolAuthorityFailure.mismatchedProjection
+                }
+            }
+            if lookupContext.bindingProjection != nil || rootCatalogSnapshot == nil {
+                guard let sessionRootLifetimeSnapshot, await sessionRootLifetimeSnapshot.isCurrent() else {
                     throw FileToolAuthorityFailure.worktreeScopeUnavailable
                 }
             }
@@ -272,21 +303,30 @@ final class MCPServerViewModel: ObservableObject {
             operation: @MainActor () throws -> Void
         ) throws -> Bool {
             if let projection = lookupContext.bindingProjection {
-                guard Set(projection.visibleLogicalRootRefs) == Set(rootCatalogSnapshot.primaryRoots) else {
+                let canonical: Set<WorkspaceRootRef> = if let rootCatalogSnapshot {
+                    Set(rootCatalogSnapshot.primaryRoots)
+                } else if case let .validatedSessionBoundWorkspace(canonicalRoots, _, _) = lookupContext.rootScope {
+                    canonicalRoots
+                } else {
+                    []
+                }
+                guard Set(projection.visibleLogicalRootRefs) == canonical else {
                     throw FileToolAuthorityFailure.mismatchedProjection
                 }
             }
 
             var operationError: Error?
-            do {
-                try workspaceManager.validateWorkspaceSearchReadiness(
-                    rootCatalogSnapshot.ticket,
-                    admission: .rootCatalog
-                )
-            } catch {
-                return false
+            if let rootCatalogSnapshot {
+                do {
+                    try workspaceManager.validateWorkspaceSearchReadiness(
+                        rootCatalogSnapshot.ticket,
+                        admission: .rootCatalog
+                    )
+                } catch {
+                    return false
+                }
             }
-            if lookupContext.bindingProjection != nil {
+            if lookupContext.bindingProjection != nil || rootCatalogSnapshot == nil {
                 guard let sessionRootLifetimeSnapshot else { return false }
                 let performed = sessionRootLifetimeSnapshot.performIfGenerationCurrent {
                     do {
@@ -2006,7 +2046,7 @@ final class MCPServerViewModel: ObservableObject {
     )
 
     @MainActor
-    private lazy var fileToolProvider = MCPFileToolProvider(
+    lazy var fileToolProvider = MCPFileToolProvider(
         runtime: windowToolRuntime,
         context: windowToolContextCapabilities,
         selection: windowToolSelectionCapabilities,

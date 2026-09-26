@@ -49,8 +49,13 @@ import XCTest
             try writeWorkspace(workspaceOne)
             try writeWorkspace(workspaceTwo)
             let index = [workspaceOne, workspaceTwo].map {
-                WorkspaceIndexEntry(id: $0.id, name: $0.name, customStoragePath: $0.customStoragePath,
-                                    isSystemWorkspace: $0.isSystemWorkspace, isHiddenInMenus: $0.isHiddenInMenus)
+                WorkspaceIndexEntry(
+                    id: $0.id,
+                    name: $0.name,
+                    customStoragePath: $0.customStoragePath,
+                    isSystemWorkspace: $0.isSystemWorkspace,
+                    isHiddenInMenus: $0.isHiddenInMenus
+                )
             }
             try JSONEncoder().encode(index).write(to: storageRoot.appendingPathComponent("workspacesIndex.json"), options: .atomic)
             runtime = MCPDomainRuntime(configuration: .init(
@@ -480,7 +485,7 @@ import XCTest
         }
 
         private func assertDeprecatedArgumentsJSONKey(_ response: ManageWorkspacesResponse) throws {
-            let json = String(data: try JSONEncoder().encode(response), encoding: .utf8)
+            let json = try String(data: JSONEncoder().encode(response), encoding: .utf8)
             XCTAssertTrue(json?.contains("\"deprecated_arguments\"") == true)
         }
 

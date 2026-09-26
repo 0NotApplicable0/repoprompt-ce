@@ -452,7 +452,7 @@ final class MCPFileToolProvider: MCPAppToolProviding {
                 )
                 try await validate(authority)
                 if snapshot.roots.isEmpty {
-                    guard authority.frozen.rootCatalogSnapshot.isGenuinelyRootless else {
+                    guard authority.frozen.isGenuinelyRootless else {
                         throw MCPServerViewModel.FileToolAuthorityFailure.mismatchedProjection
                     }
                     await MCPToolExecutionHandlerPhaseContext.report(.getFileTreeConstruction, transition: .completed)
@@ -500,7 +500,7 @@ final class MCPFileToolProvider: MCPAppToolProviding {
                 await MCPToolExecutionHandlerPhaseContext.report(.getFileTreeConstruction, transition: .completed)
                 try await validate(authority)
                 if resultAndRootCount.emptyReason == .rootProjectionEmpty,
-                   !authority.frozen.rootCatalogSnapshot.isGenuinelyRootless
+                   !authority.frozen.isGenuinelyRootless
                 {
                     throw MCPServerViewModel.FileToolAuthorityFailure.mismatchedProjection
                 }

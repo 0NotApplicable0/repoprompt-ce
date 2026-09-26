@@ -287,7 +287,7 @@ final class OrchestrationGraphInspectorModel: ObservableObject {
         host.promptManager.activeComposeTabID
     }
 
-    private enum ActivationResult: Sendable {
+    private enum ActivationResult {
         case success(OrchestrationGraphInspectorSurface)
         case failure(OrchestrationGraphInspectorFailure)
     }
