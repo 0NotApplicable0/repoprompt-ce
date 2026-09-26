@@ -1,10 +1,10 @@
 @testable import RepoPromptApp
 import XCTest
 
-/// Contract: `AntigravityRunGate` and the request coordinator enforce the single-run-at-a-time
-/// invariant that agy conversation-DB attribution depends on. A second `lock()` must park FIFO, and
-/// cancellation/replacement/disposal must either atomically transfer ownership to a registered
-/// producer or release the gate without launching stale work.
+/// Contract: an `AntigravityRunGate` instance (one per provider, so one per run) parks a second
+/// `lock()` FIFO, and cancellation/replacement/disposal must either atomically transfer ownership to
+/// a registered producer or release the gate without launching stale work. Cross-run independence
+/// is pinned in `AntigravityAgentProviderRunGateScopeTests`.
 final class AntigravityRunGateTests: XCTestCase {
     private actor EventLog {
         private(set) var events: [String] = []

@@ -144,6 +144,13 @@ final class AntigravityAgentProvider: HeadlessAgentProvider {
     private let toolTracking = AgentToolTrackingController()
     private let streamRequests = AntigravityStreamRequestCoordinator()
 
+    /// This run's permit. Production builds one provider per run, so runs never share it.
+    private let runGate = AntigravityRunGate()
+
+    var runGateForTesting: AntigravityRunGate {
+        runGate
+    }
+
     private var enableDebugLogging: Bool {
         config.enableDebugLogging
     }
@@ -363,12 +370,12 @@ final class AntigravityAgentProvider: HeadlessAgentProvider {
         guard await streamRequests.isCurrent(streamRequest) else {
             throw CancellationError()
         }
-        // Acquire the single-run slot before stream construction signals provider readiness. If a
-        // queued run returned a stream first, the runner's bounded MCP-routing lease could expire
-        // while another long AGY run still held this gate, dropping the queued run's routing policy
-        // before it ever launched.
+        // Acquire this run's permit before stream construction signals provider readiness. The permit
+        // belongs to this provider, so it orders permit transfer and cleanup on this instance only and
+        // never waits on another Antigravity run.
+        let runGate = runGate
         try await Self.acquireRunGate(
-            AntigravityRunGate.shared,
+            runGate,
             requestIsCurrent: { [streamRequests] in
                 await streamRequests.isCurrent(streamRequest)
             }
@@ -380,11 +387,11 @@ final class AntigravityAgentProvider: HeadlessAgentProvider {
                 producerTask = try await Self.activateProducer(
                     requests: streamRequests,
                     request: streamRequest,
-                    runGate: AntigravityRunGate.shared
+                    runGate: runGate
                 ) { [weak self] in
                     guard let self else {
                         continuation.finish()
-                        await AntigravityRunGate.shared.unlock()
+                        await runGate.unlock()
                         return
                     }
                     var runGateLocked = true
@@ -506,7 +513,7 @@ final class AntigravityAgentProvider: HeadlessAgentProvider {
                         if finalFailureKind == .conversationContextLost {
                             throw AIProviderError.invalidConfiguration(detail: Self.conversationContextLostMessage)
                         }
-                        await Self.releaseRunGateAfterCleanup(AntigravityRunGate.shared) {
+                        await Self.releaseRunGateAfterCleanup(runGate) {
                             await self.toolTracking.stopTracking(ifTracking: context.runID)
                             continuation.yield(
                                 AIStreamResult(
@@ -525,7 +532,7 @@ final class AntigravityAgentProvider: HeadlessAgentProvider {
                         await runner.cancelAll()
                         _ = await Self.cancelAndAwaitToolLogTask(toolLogTask)
                         if runGateLocked {
-                            await Self.releaseRunGateAfterCleanup(AntigravityRunGate.shared) {
+                            await Self.releaseRunGateAfterCleanup(runGate) {
                                 await self.toolTracking.stopTracking(ifTracking: context.runID)
                                 continuation.finish(throwing: AIProviderError.invalidConfiguration(detail: "Antigravity run cancelled."))
                             }
@@ -538,7 +545,7 @@ final class AntigravityAgentProvider: HeadlessAgentProvider {
                             finalTrajectoryFailureKind: finalFailureKind
                         )
                         if runGateLocked {
-                            await Self.releaseRunGateAfterCleanup(AntigravityRunGate.shared) {
+                            await Self.releaseRunGateAfterCleanup(runGate) {
                                 await self.toolTracking.stopTracking(ifTracking: context.runID)
                                 continuation.finish(throwing: terminalError)
                             }

@@ -1,16 +1,16 @@
 import Foundation
 
-/// Serializes `agy --print` runs within this process.
+/// Orders one Antigravity run's `agy --print` turns on its own provider instance.
+///
+/// Each `AntigravityAgentProvider` owns one gate, and production builds one provider per run, so
+/// separate runs never wait on each other. On one instance the gate hands its permit to the
+/// registered stream producer and releases it only after that producer's cleanup, so a replacement
+/// request on the same instance cannot launch before its cancelled predecessor has cleaned up.
 ///
 /// agy auto-assigns conversation ids. `AntigravityTrajectoryToolLog` binds each turn to the exact id
-/// announced in that turn's unique `--log-file`, so an external agy process cannot cross-wire tool
+/// announced in that turn's unique `--log-file`, so concurrent agy processes cannot cross-wire tool
 /// cards or the auto-resume `--conversation` id.
-///
-/// This actor still serializes in-process runs (FIFO), bounding AGY resource use and preserving the
-/// existing provider lifecycle ordering independently of that filesystem correlation.
 actor AntigravityRunGate {
-    static let shared = AntigravityRunGate()
-
     private struct Waiter {
         let id: UUID
         let continuation: CheckedContinuation<Bool, Never>
