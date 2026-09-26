@@ -2096,6 +2096,18 @@ final class WindowRoutingService: Service {
                 )
             }
             revalidatedSnapshot.frozenLookupContext = ticket.lookupContext
+            // ponytail: FrozenFileToolAuthority.capture requires visible-workspace roots; graph admission only has the session-worktree lookupContext already on the ticket. Lookup returns frozenFileToolAuthority.lookupContext and never that capture path.
+            revalidatedSnapshot.frozenFileToolAuthority = MCPServerViewModel.FrozenFileToolAuthority(
+                lookupContext: ticket.lookupContext,
+                rootCatalogSnapshot: WorkspaceRootCatalogSnapshot(
+                    ticket: WorkspaceSearchReadinessTicket(workspaceID: candidate.workspaceID, generation: 0),
+                    workspaceID: candidate.workspaceID,
+                    configuredRootPaths: candidate.repoPaths,
+                    primaryRoots: []
+                ),
+                sessionRootLifetimeSnapshot: nil,
+                sourceIdentity: nil
+            )
             window.mcpServer.installFrozenTabContext(
                 clientID: connectionID.uuidString,
                 clientName: nil,
