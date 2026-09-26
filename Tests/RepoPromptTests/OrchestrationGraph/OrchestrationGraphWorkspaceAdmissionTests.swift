@@ -29,15 +29,20 @@ import XCTest
         private var fakeSessionProvider: CountingWorkspaceSwitchSessionProvider!
         private var pendingConfirmationLatch: PendingConfirmationLatch!
         private var switchPhaseEvents: [WorkspaceSwitchPhase] = []
+        private var originalStoragePath: String?
 
         override func setUp() async throws {
             try await super.setUp()
             AppWindowOpener.shared.resetForTesting()
             AppWindowOpener.shared.policy = .production
+            ServerNetworkManager.shared.graphPolicy = .production
+            await ServerNetworkManager.shared.debugClearPersistedRoutingState()
             originalMCPAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
             GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)
+
             originalGraphPolicy = ServerNetworkManager.shared.graphPolicy
             originalApprovalSettings = WorkspaceApprovalManager.shared.settings
+            originalStoragePath = UserDefaults.standard.string(forKey: "GlobalCustomStorageURL")
             WorkspaceApprovalManager.shared.setAutoApproveOperation(.createWorkspace, enabled: true)
             originalWindows = WindowStatesManager.shared.allWindows
             WindowStatesManager.shared.allWindows = []
@@ -45,6 +50,7 @@ import XCTest
             storageRoot = FileManager.default.temporaryDirectory
                 .appendingPathComponent("OrchestrationGraphWorkspaceAdmissionTests-\(UUID().uuidString)", isDirectory: true)
             try FileManager.default.createDirectory(at: storageRoot, withIntermediateDirectories: true)
+            UserDefaults.standard.set(storageRoot.path, forKey: "GlobalCustomStorageURL")
             let agentWorkspaceRoot = storageRoot.appendingPathComponent("AgentWorkspaces", isDirectory: true)
             let chatWorkspaceRoot = storageRoot.appendingPathComponent("ChatWorkspaces", isDirectory: true)
             try FileManager.default.createDirectory(at: agentWorkspaceRoot, withIntermediateDirectories: true)
@@ -130,6 +136,12 @@ import XCTest
                 try? FileManager.default.removeItem(at: storageRoot)
             }
             GlobalSettingsStore.shared.setMCPAutoStart(originalMCPAutoStart, commit: false)
+            if let originalStoragePath {
+                UserDefaults.standard.set(originalStoragePath, forKey: "GlobalCustomStorageURL")
+            } else {
+                UserDefaults.standard.removeObject(forKey: "GlobalCustomStorageURL")
+            }
+
             try await super.tearDown()
         }
 

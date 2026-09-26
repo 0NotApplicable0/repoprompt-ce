@@ -22,6 +22,7 @@ import XCTest
         private var connectionIDs: [UUID] = []
         private var openerCount = 0
         private var runStateChangeCount = 0
+        private var originalStoragePath: String?
 
         override func setUp() async throws {
             try await super.setUp()
@@ -30,14 +31,19 @@ import XCTest
             originalGraphPolicy = ServerNetworkManager.shared.graphPolicy
             originalOpenerPolicy = AppWindowOpener.shared.policy
             originalApprovalSettings = WorkspaceApprovalManager.shared.settings
+            originalStoragePath = UserDefaults.standard.string(forKey: "GlobalCustomStorageURL")
             GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)
             WorkspaceApprovalManager.shared.setAutoApproveOperation(.createWorkspace, enabled: true)
             WindowStatesManager.shared.allWindows = []
             AppWindowOpener.shared.resetForTesting()
+            AppWindowOpener.shared.policy = .production
+            ServerNetworkManager.shared.graphPolicy = .production
+            await ServerNetworkManager.shared.debugClearPersistedRoutingState()
 
             storageRoot = FileManager.default.temporaryDirectory
                 .appendingPathComponent("OneWindowHostTests-\(UUID().uuidString)", isDirectory: true)
             try FileManager.default.createDirectory(at: storageRoot, withIntermediateDirectories: true)
+            UserDefaults.standard.set(storageRoot.path, forKey: "GlobalCustomStorageURL")
             let agentRoot = storageRoot.appendingPathComponent("AgentWorkspaces", isDirectory: true)
             let chatRoot = storageRoot.appendingPathComponent("ChatWorkspaces", isDirectory: true)
             try FileManager.default.createDirectory(at: agentRoot, withIntermediateDirectories: true)
@@ -100,6 +106,11 @@ import XCTest
             await ChatDataService.test_setWorkspaceRootOverride(nil)
             if let storageRoot { try? FileManager.default.removeItem(at: storageRoot) }
             GlobalSettingsStore.shared.setMCPAutoStart(originalMCPAutoStart, commit: false)
+            if let originalStoragePath {
+                UserDefaults.standard.set(originalStoragePath, forKey: "GlobalCustomStorageURL")
+            } else {
+                UserDefaults.standard.removeObject(forKey: "GlobalCustomStorageURL")
+            }
             try await super.tearDown()
         }
 

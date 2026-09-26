@@ -20,19 +20,24 @@ import XCTest
         private var windowA: WindowState!
         private var addedWindows: [WindowState] = []
         private var connectionIDs: [UUID] = []
+        private var originalStoragePath: String?
 
         override func setUp() async throws {
             try await super.setUp()
             AppWindowOpener.shared.resetForTesting()
             AppWindowOpener.shared.policy = .production
+            ServerNetworkManager.shared.graphPolicy = .production
+            await ServerNetworkManager.shared.debugClearPersistedRoutingState()
             originalMCPAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
             GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)
             originalWindows = WindowStatesManager.shared.allWindows
+            originalStoragePath = UserDefaults.standard.string(forKey: "GlobalCustomStorageURL")
             WindowStatesManager.shared.allWindows = []
 
             storageRoot = FileManager.default.temporaryDirectory
                 .appendingPathComponent("OrchestrationGraphWindowPolicyTests-\(UUID().uuidString)", isDirectory: true)
             try FileManager.default.createDirectory(at: storageRoot, withIntermediateDirectories: true)
+            UserDefaults.standard.set(storageRoot.path, forKey: "GlobalCustomStorageURL")
             let agentWorkspaceRoot = storageRoot.appendingPathComponent("AgentWorkspaces", isDirectory: true)
             let chatWorkspaceRoot = storageRoot.appendingPathComponent("ChatWorkspaces", isDirectory: true)
             try FileManager.default.createDirectory(at: agentWorkspaceRoot, withIntermediateDirectories: true)
@@ -46,7 +51,12 @@ import XCTest
                 )
             }
             try writeWorkspace(targetWorkspace)
-            try writeLegacyIndex([targetWorkspace])
+            var defaultWorkspace = WorkspaceModel(
+                name: "Default",
+                repoPaths: []
+            )
+            defaultWorkspace.isSystemWorkspace = true
+            try writeLegacyIndex([defaultWorkspace, targetWorkspace])
             runtime = MCPDomainRuntime(configuration: .init(
                 mode: .app,
                 profileIdentifier: "orchestration-graph-window-policy-\(UUID().uuidString)",
@@ -85,6 +95,12 @@ import XCTest
                 try? FileManager.default.removeItem(at: storageRoot)
             }
             GlobalSettingsStore.shared.setMCPAutoStart(originalMCPAutoStart, commit: false)
+            if let originalStoragePath {
+                UserDefaults.standard.set(originalStoragePath, forKey: "GlobalCustomStorageURL")
+            } else {
+                UserDefaults.standard.removeObject(forKey: "GlobalCustomStorageURL")
+            }
+
             try await super.tearDown()
         }
 
