@@ -2096,20 +2096,7 @@ final class WindowRoutingService: Service {
                 )
             }
             revalidatedSnapshot.frozenLookupContext = ticket.lookupContext
-            let lifetime: WorkspaceSessionRootLifetimeSnapshot? = if case let .validatedSessionBoundWorkspace(_, physicalRoots, _) = ticket.lookupContext.rootScope {
-                await window.workspaceFileContextStore.sessionBoundRootScopeValidationSnapshot(
-                    ticket.lookupContext.rootScope,
-                    expectedPhysicalRoots: Array(physicalRoots)
-                )
-            } else {
-                nil
-            }
-            revalidatedSnapshot.frozenFileToolAuthority = MCPServerViewModel.FrozenFileToolAuthority(
-                lookupContext: ticket.lookupContext,
-                rootCatalogSnapshot: nil,
-                sessionRootLifetimeSnapshot: lifetime,
-                sourceIdentity: nil
-            )
+
             window.mcpServer.installFrozenTabContext(
                 clientID: connectionID.uuidString,
                 clientName: nil,
