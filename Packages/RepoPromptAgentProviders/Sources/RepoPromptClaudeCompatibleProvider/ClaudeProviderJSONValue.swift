@@ -58,6 +58,16 @@ public enum ClaudeProviderJSONValue: Sendable, Equatable, Codable {
         case let value as NSNumber:
             if CFGetTypeID(value) == CFBooleanGetTypeID() {
                 self = .bool(value.boolValue)
+            } else if CFNumberIsFloatType(value as CFNumber) {
+                let double = value.doubleValue
+                guard double.isFinite else {
+                    throw JSONValueError.unsupportedValue(value.stringValue)
+                }
+                if let exactInteger = Int(exactly: double) {
+                    self = .integer(exactInteger)
+                } else {
+                    self = .double(double)
+                }
             } else if let exactInteger = Int(value.stringValue) {
                 self = .integer(exactInteger)
             } else {
