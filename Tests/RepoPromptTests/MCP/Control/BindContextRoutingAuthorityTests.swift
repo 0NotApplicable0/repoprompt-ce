@@ -126,7 +126,7 @@ final class BindContextRoutingAuthorityTests: XCTestCase {
         let targetWindow = try await makeWindow(activeWorkspace: target)
         let service = installWindows([staleWindow, targetWindow])
 
-        let resolved = try service.test_resolveContextIDBindTarget(
+        let resolved = try await service.test_resolveContextIDBindTarget(
             contextID: contextID,
             connectionPreferredWindowID: staleWindow.windowID
         )
@@ -155,7 +155,7 @@ final class BindContextRoutingAuthorityTests: XCTestCase {
         )
         let expectedWorkspace = expectedWindow.windowID == firstTargetWindow.windowID ? firstTarget : secondTarget
 
-        let resolved = try service.test_resolveContextIDBindTarget(
+        let resolved = try await service.test_resolveContextIDBindTarget(
             contextID: contextID,
             connectionPreferredWindowID: nil
         )
@@ -175,10 +175,13 @@ final class BindContextRoutingAuthorityTests: XCTestCase {
         let staleWindow = try await makeWindow(activeWorkspace: unrelated, savedWorkspaces: [target])
         let service = installWindows([staleWindow])
 
-        XCTAssertThrowsError(try service.test_resolveContextIDBindTarget(
-            contextID: contextID,
-            connectionPreferredWindowID: staleWindow.windowID
-        )) { error in
+        do {
+            _ = try await service.test_resolveContextIDBindTarget(
+                contextID: contextID,
+                connectionPreferredWindowID: staleWindow.windowID
+            )
+            XCTFail("Expected test_resolveContextIDBindTarget to throw")
+        } catch {
             let message = String(describing: error)
             XCTAssertTrue(message.contains("No open RepoPrompt window actively shows context_id"), message)
         }

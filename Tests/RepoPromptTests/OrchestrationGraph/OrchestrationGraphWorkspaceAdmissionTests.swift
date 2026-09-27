@@ -298,14 +298,6 @@ import XCTest
                 connectionID: connectionID
             )
 
-            // A second window drops the single-graph-window invariant, so the next working_dirs
-            // bind on this connection falls through to the ordinary explicit-rebind path
-            // (`bindTarget`) instead of `admitStoredWorkspace`.
-            let windowY = WindowState(domainRuntime: runtime)
-            addedWindows.append(windowY)
-            WindowStatesManager.shared.registerWindowState(windowY)
-            await windowY.workspaceManager.awaitInitialized()
-
             let w1TabID = try XCTUnwrap(workspaceOne.activeComposeTabID)
             windowX.mcpServer.setAfterFileToolLookupContextRootValidationForTesting { [windowX, workspaceOne] in
                 guard let windowX, let workspaceOne else { return }

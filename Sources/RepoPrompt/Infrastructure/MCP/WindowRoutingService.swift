@@ -537,6 +537,15 @@ final class WindowRoutingService: Service {
         )
     }
 
+    private func resolveWorkspaceForBind(rawWorkspaceParam: String) async throws -> WorkspaceModel {
+        let diskWorkspaces = try await loadWorkspaceDiskSnapshot()
+        return try Self.resolveWorkspaceReference(
+            rawWorkspaceParam,
+            in: diskWorkspaces,
+            mode: .visibleNameByDefault(action: "bind_context", includeHidden: false)
+        )
+    }
+
     private func resolveWorkspaceForDelete(rawWorkspaceParam: String, includeHidden: Bool) async throws -> WorkspaceModel {
         let diskWorkspaces = try await loadWorkspaceDiskSnapshot()
         return try Self.resolveWorkspaceReference(
@@ -739,12 +748,14 @@ final class WindowRoutingService: Service {
         }
 
         enum MatchKind: String {
+            case workspace
             case contextID = "context_id"
             case workingDirs = "working_dirs"
             case windowID = "window_id"
         }
 
         let op: Operation
+        let workspace: String?
         let contextID: UUID?
         let workingDirs: [String]
         let windowID: Int?
@@ -752,6 +763,7 @@ final class WindowRoutingService: Service {
         let tabName: String?
 
         var matchKind: MatchKind? {
+            if workspace != nil { return .workspace }
             if contextID != nil { return .contextID }
             if !workingDirs.isEmpty { return .workingDirs }
             if windowID != nil { return .windowID }
@@ -905,6 +917,13 @@ final class WindowRoutingService: Service {
             throw MCPError.invalidParams("bind_context requires op='list', 'status', or 'bind'.")
         }
 
+        let workspace: String? = if let ws = args["workspace"]?.stringValue?
+            .trimmingCharacters(in: .whitespacesAndNewlines), !ws.isEmpty
+        {
+            ws
+        } else {
+            nil
+        }
         let contextID = try parseContextID(args["context_id"], action: "bind_context")
         let workingDirs = try parseWorkingDirs(args["working_dirs"])
         let windowID = args["window_id"]?.intValue
@@ -912,23 +931,30 @@ final class WindowRoutingService: Service {
         let tabName = args["tab_name"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines)
 
         if op == .bind {
-            if contextID != nil, !workingDirs.isEmpty {
-                throw MCPError.invalidParams("bind_context op='bind' accepts exactly one primary selector: context_id, working_dirs, or window_id.")
-            }
-            if createIfMissing, workingDirs.isEmpty {
-                throw MCPError.invalidParams("create_if_missing is only valid when binding by working_dirs.")
-            }
-            if tabName != nil, workingDirs.isEmpty || !createIfMissing {
-                throw MCPError.invalidParams("tab_name is only valid when bind_context creates a blank tab via working_dirs + create_if_missing=true.")
-            }
-            let selectorCount = (contextID != nil ? 1 : 0) + (!workingDirs.isEmpty ? 1 : 0) + ((windowID != nil && contextID == nil && workingDirs.isEmpty) ? 1 : 0)
-            guard selectorCount == 1 else {
-                throw MCPError.invalidParams("bind_context op='bind' requires exactly one primary selector: context_id, working_dirs, or window_id.")
+            if workspace != nil {
+                if contextID != nil || !workingDirs.isEmpty || createIfMissing || tabName != nil {
+                    throw MCPError.invalidParams("workspace is exclusive with context_id, working_dirs, create_if_missing, and tab_name.")
+                }
+            } else {
+                if contextID != nil, !workingDirs.isEmpty {
+                    throw MCPError.invalidParams("bind_context op='bind' accepts exactly one primary selector: workspace, context_id, working_dirs, or window_id.")
+                }
+                if createIfMissing, workingDirs.isEmpty {
+                    throw MCPError.invalidParams("create_if_missing is only valid when binding by working_dirs.")
+                }
+                if tabName != nil, workingDirs.isEmpty || !createIfMissing {
+                    throw MCPError.invalidParams("tab_name is only valid when bind_context creates a blank tab via working_dirs + create_if_missing=true.")
+                }
+                let selectorCount = (contextID != nil ? 1 : 0) + (!workingDirs.isEmpty ? 1 : 0) + ((windowID != nil && contextID == nil && workingDirs.isEmpty) ? 1 : 0)
+                guard selectorCount == 1 else {
+                    throw MCPError.invalidParams("bind_context op='bind' requires exactly one primary selector: workspace, context_id, working_dirs, or window_id.")
+                }
             }
         }
 
         return BindContextRequest(
             op: op,
+            workspace: workspace,
             contextID: contextID,
             workingDirs: workingDirs,
             windowID: windowID,
@@ -1570,10 +1596,15 @@ final class WindowRoutingService: Service {
 
             if let targetWindow = windowStates.allWindows.first(where: { $0.windowID == preferredWindowID }) {
                 if targetWindow.workspaceManager.activeWorkspace?.id != match.workspace.id {
-                    let switchResult = await targetWindow.workspaceManager.requestWorkspaceSwitch(to: match.workspace, saveState: true)
-                    if !switchResult.didSwitch {
-                        throw MCPError.invalidRequest(switchResult.message ?? "Workspace switch was cancelled.")
+                    guard let connectionID else {
+                        throw MCPError.invalidParams(Self.bindContextWindowSelectionMessage)
                     }
+                    _ = try await admitStoredWorkspace(
+                        workspace: match.workspace,
+                        window: targetWindow,
+                        connectionID: connectionID,
+                        justCreated: createdWorkspace
+                    )
                 }
                 return workingDirsResolution(
                     windowID: targetWindow.windowID,
@@ -1585,14 +1616,7 @@ final class WindowRoutingService: Service {
             }
         }
 
-        let newWindow = try await openNewWindowShowingWorkspace(match.workspace)
-        return workingDirsResolution(
-            windowID: newWindow.windowID,
-            workspace: match.workspace,
-            normalizedWorkingDirs: normalizedWorkingDirs,
-            matchedBy: matchedBy,
-            createdWorkspace: createdWorkspace
-        )
+        throw MCPError.invalidParams(Self.bindContextWindowSelectionMessage)
     }
 
     private func resolveExistingWorkingDirsMatch(
@@ -1619,10 +1643,15 @@ final class WindowRoutingService: Service {
                 )
             }
             if requestedWindow.workspaceManager.activeWorkspace?.id != match.workspace.id {
-                let switchResult = await requestedWindow.workspaceManager.requestWorkspaceSwitch(to: match.workspace, saveState: true)
-                if !switchResult.didSwitch {
-                    throw MCPError.invalidRequest(switchResult.message ?? "Workspace switch was cancelled.")
+                guard let connectionID else {
+                    throw MCPError.invalidParams(Self.bindContextWindowSelectionMessage)
                 }
+                _ = try await admitStoredWorkspace(
+                    workspace: match.workspace,
+                    window: requestedWindow,
+                    connectionID: connectionID,
+                    justCreated: createdWorkspace
+                )
             }
             return workingDirsResolution(
                 windowID: requestedWindow.windowID,
@@ -1800,7 +1829,7 @@ final class WindowRoutingService: Service {
     func test_resolveContextIDBindTarget(
         contextID: UUID,
         connectionPreferredWindowID: Int?
-    ) throws -> (windowID: Int, workspaceID: UUID, tabID: UUID, repoPaths: [String]) {
+    ) async throws -> (windowID: Int, workspaceID: UUID, tabID: UUID, repoPaths: [String]) {
         let target = try resolveContextIDBindTarget(
             contextID: contextID,
             windowID: nil,
@@ -1836,58 +1865,8 @@ final class WindowRoutingService: Service {
             return resolution
         }
 
-        guard createIfMissing else {
-            throw MCPError.invalidParams(
-                "No existing workspace exactly matches working_dirs [\(normalizedWorkingDirs.joined(separator: ", "))] and no workspace repo_paths superset contains those roots. Exact matching uses the full workspace repo_paths set (order-insensitive); superset fallback uses root-set membership only, not descendant paths. Retry with create_if_missing=true to create one."
-            )
-        }
-
-        let approvalWindow = try await resolveWorkspaceApprovalWindow(requestedWindowID: windowID, openInNewWindow: true)
-        let existingWorkspaces = await loadWorkspaceInventorySnapshot(
-            from: approvalWindow.workspaceManager,
-            includeHidden: true
-        )
-        let workspaceName = derivedWorkspaceName(
-            normalizedWorkingDirs: normalizedWorkingDirs,
-            creationNameHint: tabName,
-            existingWorkspaces: existingWorkspaces
-        )
-        let clientID = await networkMgr.currentClientIdentifier() ?? "unknown-client"
-        let approvalResult = await WorkspaceApprovalManager.shared.requestCreateWorkspaceApproval(
-            clientID: clientID,
-            workspaceName: workspaceName,
-            windowID: approvalWindow.windowID
-        )
-        guard approvalResult.isApproved else {
-            throw MCPError.invalidRequest("Workspace creation was denied by the user.")
-        }
-
-        if let resolution = try await resolveExistingWorkingDirsBindResolution(
-            normalizedWorkingDirs: normalizedWorkingDirs,
-            windowID: windowID,
-            connectionID: connectionID,
-            afterApproval: true
-        ) {
-            return resolution
-        }
-
-        let newWindow = try await openRoutingWindow(deferringInitialAgentSystemWorkspaceRefresh: true)
-        defer { newWindow.agentModeViewModel.finishInitialSystemWorkspaceSessionListRefreshDeferral() }
-        await newWindow.workspaceManager.awaitInitialized()
-        let newWorkspace = try await createWorkspace(
-            in: newWindow,
-            name: workspaceName,
-            repoPaths: normalizedWorkingDirs,
-            switchToCreated: true
-        )
-        return WorkingDirsBindResolution(
-            windowID: newWindow.windowID,
-            workspaceID: newWorkspace.id,
-            workspaceName: newWorkspace.name,
-            repoPaths: newWorkspace.repoPaths,
-            matchedBy: "working_dirs",
-            createdWorkspace: true,
-            normalizedWorkingDirs: normalizedWorkingDirs
+        throw MCPError.invalidParams(
+            "No existing workspace exactly matches working_dirs [\(normalizedWorkingDirs.joined(separator: ", "))] and no workspace repo_paths superset contains those roots. Exact matching uses the full workspace repo_paths set (order-insensitive); superset fallback uses root-set membership only, not descendant paths. Retry with create_if_missing=true to create one."
         )
     }
 
@@ -2156,13 +2135,7 @@ final class WindowRoutingService: Service {
         tabName: String?,
         connectionID: UUID
     ) async throws -> WorkingDirsBindResolution? {
-        guard policy.mountsGraphShell else { return nil }
-        let windows = windowStates.allWindows
-        guard windows.count == 1, let window = windows.first else { return nil }
-        if let requestedWindowID, requestedWindowID != window.windowID {
-            let validIDs = windows.map { String($0.windowID) }.joined(separator: ", ")
-            throw MCPError.invalidParams("Unknown window_id \(requestedWindowID). Valid window IDs: \(validIDs)")
-        }
+        let window = try await resolveWorkspaceHost(windowID: requestedWindowID)
 
         let diskWorkspaces = try await loadWorkspaceDiskSnapshot()
         let exactMatches = WorkspaceManagerViewModel.exactWorkspaceMatches(
@@ -2614,8 +2587,55 @@ final class WindowRoutingService: Service {
                                 normalizedWorkingDirs: target.normalizedWorkingDirs,
                                 note: note
                             )
+                        case .workspace:
+                            let workspace = try await resolveWorkspaceForBind(rawWorkspaceParam: request.workspace!)
+                            let hostWindow = try await resolveWorkspaceHost(windowID: request.windowID)
+                            let isWorkspaceActive = await MainActor.run { hostWindow.workspaceManager.activeWorkspace?.id == workspace.id }
+                            if isWorkspaceActive {
+                                let target = try await MainActor.run {
+                                    try self.resolveActiveTabBindTarget(
+                                        windowID: hostWindow.windowID,
+                                        expectedWorkspaceID: workspace.id,
+                                        matchedBy: BindContextRequest.MatchKind.workspace.rawValue
+                                    )
+                                }
+                                let authority = try await ensureBindTargetFileAuthority(target)
+                                let changed = try await bindTarget(
+                                    target,
+                                    connectionID: connectionID,
+                                    clientName: clientName,
+                                    expectedFileAuthority: authority,
+                                    currentness: .activeTab
+                                )
+                                let binding = await currentBindingSummary(for: connectionID)
+                                let note = await MainActor.run { self.bindContextWindowNote(windowID: binding.windowID) }
+                                return BindContextResponse(
+                                    binding: binding,
+                                    changed: changed,
+                                    matchedBy: target.matchedBy,
+                                    createdTab: false,
+                                    note: note
+                                )
+                            }
+
+                            _ = try await admitStoredWorkspace(
+                                workspace: workspace,
+                                window: hostWindow,
+                                connectionID: connectionID,
+                                justCreated: false
+                            )
+                            let binding = await currentBindingSummary(for: connectionID)
+                            let note = await MainActor.run { self.bindContextWindowNote(windowID: binding.windowID) }
+                            return BindContextResponse(
+                                binding: binding,
+                                changed: binding != previousBinding,
+                                matchedBy: BindContextRequest.MatchKind.workspace.rawValue,
+                                createdTab: false,
+                                note: note
+                            )
                         case .windowID:
-                            let windowID = request.windowID!
+                            let hostWindow = try await resolveWorkspaceHost(windowID: request.windowID)
+                            let windowID = hostWindow.windowID
                             let target = try await MainActor.run {
                                 try self.resolveActiveTabBindTarget(
                                     windowID: windowID,
@@ -2640,7 +2660,7 @@ final class WindowRoutingService: Service {
                                 note: note
                             )
                         case .none:
-                            throw MCPError.invalidParams("bind_context op='bind' requires context_id, working_dirs, or window_id.")
+                            throw MCPError.invalidParams("bind_context op='bind' requires workspace, context_id, working_dirs, or window_id.")
                         }
                     } catch let failure as MCPServerViewModel.FileToolAuthorityFailure {
                         return await bindAuthorityFailureResponse(failure, connectionID: connectionID)
