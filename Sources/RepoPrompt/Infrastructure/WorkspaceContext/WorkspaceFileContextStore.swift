@@ -183,6 +183,8 @@ struct WorkspaceSessionRootLifetimeSnapshot: @unchecked Sendable {
 }
 
 actor WorkspaceFileContextStore {
+    static let codemapCleanupFlightUnloadBound: Duration = .seconds(10)
+
     enum CodemapGraphIndexBuildStoreEventKind: String, Hashable {
         case rootInventoryAndSearchReady
         case scheduled
@@ -726,6 +728,72 @@ actor WorkspaceFileContextStore {
         let task: Task<Void, Never>
     }
 
+    private final class CodemapCleanupFlightWaitState: @unchecked Sendable {
+        private let lock = NSLock()
+        private var claimed = false
+        private var timerTask: Task<Void, Never>?
+        #if DEBUG
+            private let timerCounter: CodemapCleanupFlightWaitTimerCounter
+        #endif
+
+        #if DEBUG
+            init(timerCounter: CodemapCleanupFlightWaitTimerCounter) {
+                self.timerCounter = timerCounter
+            }
+        #else
+            init() {}
+        #endif
+
+        func claim() -> Bool {
+            lock.withLock {
+                guard !claimed else { return false }
+                claimed = true
+                return true
+            }
+        }
+
+        func setTimerTask(_ task: Task<Void, Never>) {
+            lock.withLock {
+                timerTask = task
+            }
+        }
+
+        func cancelTimerTask() {
+            lock.withLock {
+                timerTask?.cancel()
+            }
+        }
+
+        #if DEBUG
+            func timerDidStart() {
+                timerCounter.increment()
+            }
+
+            func timerDidFinish() {
+                timerCounter.decrement()
+            }
+        #endif
+    }
+
+    #if DEBUG
+        private final class CodemapCleanupFlightWaitTimerCounter: @unchecked Sendable {
+            private let lock = NSLock()
+            private var count = 0
+
+            func increment() {
+                lock.withLock { count += 1 }
+            }
+
+            func decrement() {
+                lock.withLock { count -= 1 }
+            }
+
+            func currentValue() -> Int {
+                lock.withLock { count }
+            }
+        }
+    #endif
+
     private struct DetachedWatcherStop {
         let index: Int
         let rootID: UUID
@@ -1237,6 +1305,8 @@ actor WorkspaceFileContextStore {
         private var sessionWorktreeDrainLoadFlightWaiterCount = 0
         private var rootLoadDidJoinInFlightHandler: (@Sendable (String) async -> Void)?
         private var rootUnloadDidDetachHandler: (@Sendable ([String]) async -> Void)?
+        private var codemapCleanupFlightUnloadBoundForTesting: Duration?
+        private let codemapCleanupFlightWaitTimerCounter = CodemapCleanupFlightWaitTimerCounter()
         private var ensureIndexedFilesEligibilityDidResolveHandler: (@Sendable (UUID, String) async -> Void)?
         private var contextBuilderSelectionCandidateEligibilityDidResolveHandler: (@Sendable (UUID) async -> Void)?
         private var contextBuilderSelectionCandidateDidRegisterHandler: (@Sendable (UUID, String) async -> Void)?
@@ -1961,6 +2031,22 @@ actor WorkspaceFileContextStore {
 
         func setRootUnloadDidDetachHandler(_ handler: (@Sendable ([String]) async -> Void)?) {
             rootUnloadDidDetachHandler = handler
+        }
+
+        func setCodemapCleanupFlightUnloadBoundForTesting(_ bound: Duration?) {
+            codemapCleanupFlightUnloadBoundForTesting = bound
+        }
+
+        func unloadingRootPathsForTesting() -> Set<String> {
+            unloadingRootPaths
+        }
+
+        func hasCodemapCleanupFlightForTesting(rootID: UUID) -> Bool {
+            codemapCleanupFlightsByRootID[rootID] != nil
+        }
+
+        func liveCodemapCleanupFlightWaitTimerCountForTesting() -> Int {
+            codemapCleanupFlightWaitTimerCounter.currentValue()
         }
 
         func setEnsureIndexedFilesEligibilityDidResolveHandler(_ handler: (@Sendable (UUID, String) async -> Void)?) {
@@ -11706,9 +11792,25 @@ actor WorkspaceFileContextStore {
                 ]
             )
         #endif
-        for cleanup in codemapCleanupFlights {
-            await cleanup.task.value
-        }
+        #if DEBUG
+            let codemapFlightWaitStartMS = WorkspaceRestorePerfLog.timestampMSIfEnabled()
+        #endif
+        let didTimeOutWaitingForCodemapFlights = await awaitCodemapCleanupFlights(
+            codemapCleanupFlights,
+            until: ContinuousClock.now.advanced(by: effectiveCodemapCleanupFlightUnloadBound)
+        )
+        #if DEBUG
+            WorkspaceRestorePerfLog.event(
+                "store.rootUnload.codemapFlightWait",
+                fields: [
+                    "flights": "\(codemapCleanupFlights.count)",
+                    "timedOut": "\(didTimeOutWaitingForCodemapFlights)",
+                    "duration": codemapFlightWaitStartMS.map {
+                        WorkspaceRestorePerfLog.formatElapsedMS(since: $0)
+                    } ?? "notMeasured"
+                ]
+            )
+        #endif
         finishRootUnload(for: unloadingPaths)
         let removedLifetimeKeys = Set(statesToUnload.map {
             SessionWorktreeRootLifetimeKey(rootID: $0.rootID, lifetimeID: $0.state.lifetimeID)
@@ -11733,6 +11835,48 @@ actor WorkspaceFileContextStore {
                 ]
             )
         #endif
+    }
+
+    private var effectiveCodemapCleanupFlightUnloadBound: Duration {
+        #if DEBUG
+            codemapCleanupFlightUnloadBoundForTesting ?? Self.codemapCleanupFlightUnloadBound
+        #else
+            Self.codemapCleanupFlightUnloadBound
+        #endif
+    }
+
+    private func awaitCodemapCleanupFlights(
+        _ flights: [CodemapCleanupFlight],
+        until deadline: ContinuousClock.Instant
+    ) async -> Bool {
+        guard !flights.isEmpty else { return false }
+        return await withCheckedContinuation { continuation in
+            #if DEBUG
+                let state = CodemapCleanupFlightWaitState(
+                    timerCounter: codemapCleanupFlightWaitTimerCounter
+                )
+            #else
+                let state = CodemapCleanupFlightWaitState()
+            #endif
+            let timer = Task {
+                #if DEBUG
+                    state.timerDidStart()
+                    defer { state.timerDidFinish() }
+                #endif
+                try? await Task.sleep(until: deadline, clock: .continuous)
+                guard !Task.isCancelled, state.claim() else { return }
+                continuation.resume(returning: true)
+            }
+            state.setTimerTask(timer)
+            Task {
+                for flight in flights {
+                    await flight.task.value
+                }
+                guard state.claim() else { return }
+                state.cancelTimerTask()
+                continuation.resume(returning: false)
+            }
+        }
     }
 
     private func startDetachedWatcherStops(
