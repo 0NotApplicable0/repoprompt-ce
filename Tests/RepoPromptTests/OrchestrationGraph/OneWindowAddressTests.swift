@@ -531,8 +531,9 @@ import XCTest
                         "_rawJSON": .bool(true)
                     ]
                 )
-                let ws2 = try XCTUnwrap(windowA.workspaceManager.workspaces.first { $0.id == workspaceTwo.id })
-                let tabID = try XCTUnwrap(ws2.activeComposeTabID)
+                let (session, provider) = try installLiveSession(on: windowA, workspace: workspaceOne)
+                let ws1 = try XCTUnwrap(windowA.workspaceManager.workspaces.first { $0.id == workspaceOne.id })
+                let tabID = try XCTUnwrap(ws1.activeComposeTabID)
                 do {
                     _ = try await bind(
                         service: service,
@@ -544,7 +545,19 @@ import XCTest
                         ]
                     )
                     XCTFail("expected context_id refusal on non-host window")
-                } catch {}
+                } catch let error as MCPError {
+                    XCTAssertTrue(
+                        error.localizedDescription.contains("does not actively show context_id"),
+                        error.localizedDescription
+                    )
+                }
+                let status = try await bind(
+                    service: service,
+                    connectionID: connectionID,
+                    arguments: ["op": .string("status"), "_rawJSON": .bool(true)]
+                )
+                XCTAssertEqual(status.binding.windowID, windowB.windowID)
+                assertSessionUnchanged(session, provider: provider)
                 XCTAssertEqual(openerCount, 0)
             }
         }
@@ -555,9 +568,9 @@ import XCTest
                 _ = registerWindow()
                 let service = configure(graphEnabled: graphEnabled)
                 let connectionID = await connection(for: service)
-                let (_, provider) = try installLiveSession(on: windowA, workspace: workspaceOne)
-                let ws2 = try XCTUnwrap(windowA.workspaceManager.workspaces.first { $0.id == workspaceTwo.id })
-                let tabID = try XCTUnwrap(ws2.activeComposeTabID)
+                let (session, provider) = try installLiveSession(on: windowA, workspace: workspaceOne)
+                let ws1 = try XCTUnwrap(windowA.workspaceManager.workspaces.first { $0.id == workspaceOne.id })
+                let tabID = try XCTUnwrap(ws1.activeComposeTabID)
                 do {
                     _ = try await bind(
                         service: service,
@@ -569,8 +582,20 @@ import XCTest
                         ]
                     )
                     XCTFail("expected context_id refusal without host selector")
-                } catch {}
-                XCTAssertEqual(provider.cancelCount, 0)
+                } catch let error as MCPError {
+                    XCTAssertTrue(
+                        error.localizedDescription.contains("Multiple windows open. Supply 'window_id' or call 'bind_context' first."),
+                        error.localizedDescription
+                    )
+                }
+                let status = try await bind(
+                    service: service,
+                    connectionID: connectionID,
+                    arguments: ["op": .string("status"), "_rawJSON": .bool(true)]
+                )
+                XCTAssertFalse(status.binding.explicit)
+                XCTAssertNil(status.binding.windowID)
+                assertSessionUnchanged(session, provider: provider)
                 XCTAssertEqual(openerCount, 0)
             }
         }

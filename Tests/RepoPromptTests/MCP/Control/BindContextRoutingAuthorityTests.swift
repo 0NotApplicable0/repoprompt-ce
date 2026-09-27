@@ -50,6 +50,7 @@ final class BindContextRoutingAuthorityTests: XCTestCase {
             let bindResult = try await connection.client.callTool(name: "bind_context", arguments: [
                 "op": .string("bind"),
                 "context_id": .string(contextID.uuidString),
+                "window_id": .int(targetWindow.windowID),
                 "_rawJSON": .bool(true)
             ])
             XCTAssertNotEqual(bindResult.isError, true, toolText(bindResult))
@@ -150,20 +151,29 @@ final class BindContextRoutingAuthorityTests: XCTestCase {
         let firstTargetWindow = try await makeWindow(activeWorkspace: firstTarget)
         let secondTargetWindow = try await makeWindow(activeWorkspace: secondTarget)
         let service = installWindows([staleWindow, firstTargetWindow, secondTargetWindow])
-        let expectedWindow = try XCTUnwrap(
-            [firstTargetWindow, secondTargetWindow].min { $0.windowID < $1.windowID }
-        )
-        let expectedWorkspace = expectedWindow.windowID == firstTargetWindow.windowID ? firstTarget : secondTarget
+
+        do {
+            _ = try await service.test_resolveContextIDBindTarget(
+                contextID: contextID,
+                connectionPreferredWindowID: nil
+            )
+            XCTFail("Expected unbound multi-window context_id bind to refuse")
+        } catch let error as MCPError {
+            XCTAssertTrue(
+                error.localizedDescription.contains("Multiple windows open. Supply 'window_id' or call 'bind_context' first."),
+                error.localizedDescription
+            )
+        }
 
         let resolved = try await service.test_resolveContextIDBindTarget(
             contextID: contextID,
-            connectionPreferredWindowID: nil
+            connectionPreferredWindowID: firstTargetWindow.windowID
         )
 
-        XCTAssertEqual(resolved.windowID, expectedWindow.windowID)
-        XCTAssertEqual(resolved.workspaceID, expectedWorkspace.id)
+        XCTAssertEqual(resolved.windowID, firstTargetWindow.windowID)
+        XCTAssertEqual(resolved.workspaceID, firstTarget.id)
         XCTAssertEqual(resolved.tabID, contextID)
-        XCTAssertEqual(resolved.repoPaths, expectedWorkspace.repoPaths)
+        XCTAssertEqual(resolved.repoPaths, firstTarget.repoPaths)
         XCTAssertEqual(staleWindow.workspaceManager.activeWorkspaceID, unrelated.id)
     }
 

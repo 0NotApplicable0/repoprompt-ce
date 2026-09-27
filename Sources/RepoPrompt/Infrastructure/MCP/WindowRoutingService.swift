@@ -1775,6 +1775,9 @@ final class WindowRoutingService: Service {
 
     private func resolveContextIDBindTarget(contextID: UUID, windowID: Int?, connectionPreferredWindowID: Int?) throws -> ResolvedBindTarget {
         let windows = windowStates.allWindows
+        if windowID == nil, connectionPreferredWindowID == nil, windows.count > 1 {
+            throw MCPError.invalidParams(Self.bindContextWindowSelectionMessage)
+        }
         if let windowID, !windows.contains(where: { $0.windowID == windowID }) {
             let validIDs = windows.map { String($0.windowID) }.joined(separator: ", ")
             throw MCPError.invalidParams("Unknown window_id \(windowID). Valid window IDs: \(validIDs)")
@@ -2503,9 +2506,23 @@ final class WindowRoutingService: Service {
                     do {
                         switch request.matchKind {
                         case .contextID:
+                            let boundWindowID = await currentBindingSnapshot(for: connectionID).windowID
+                            let effectiveWindowID = request.windowID ?? boundWindowID
+                            let multiWindowRefusal = await MainActor.run {
+                                request.windowID == nil
+                                    && boundWindowID == nil
+                                    && self.windowStates.allWindows.count > 1
+                            }
+                            if multiWindowRefusal {
+                                throw MCPError.invalidParams(Self.bindContextWindowSelectionMessage)
+                            }
                             let connectionPreferredWindow = await networkMgr.selectedWindow(for: connectionID)
                             let target = try await MainActor.run {
-                                try self.resolveContextIDBindTarget(contextID: request.contextID!, windowID: request.windowID, connectionPreferredWindowID: connectionPreferredWindow)
+                                try self.resolveContextIDBindTarget(
+                                    contextID: request.contextID!,
+                                    windowID: effectiveWindowID,
+                                    connectionPreferredWindowID: connectionPreferredWindow
+                                )
                             }
                             let authority = try await ensureBindTargetFileAuthority(target)
                             let changed = try await bindTarget(
