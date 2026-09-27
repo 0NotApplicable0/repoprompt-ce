@@ -100,6 +100,38 @@ final class ClaudeNativeApprovalAndResumeTests: XCTestCase {
         XCTAssertFalse(sameEnvironmentRequiresRestart)
     }
 
+    func testPermissionApprovalRoundTripPreservesNumericToolArguments() throws {
+        let line = Data(#"{"type":"control_request","request_id":"req-1","request":{"subtype":"can_use_tool","tool_name":"get_file_tree","input":{"max_depth":1,"nested":{"a":[0,1]},"flag":true}}}"#.utf8)
+        let message = try XCTUnwrap(ClaudeSDKProtocolCodec.decodeLine(line))
+        guard case let .controlRequest(request) = message else {
+            return XCTFail("Expected control request")
+        }
+
+        let payload = ClaudeNativeProcessSessionController.allowPermissionResponsePayload(
+            pendingRequest: request.request,
+            includeUpdatedPermissions: false
+        )
+        let encoded = try ClaudeSDKProtocolCodec.encodeControlResponseSuccess(
+            requestID: request.requestID,
+            response: payload
+        )
+        let object = try XCTUnwrap(JSONSerialization.jsonObject(with: encoded) as? [String: Any])
+        let response = try XCTUnwrap(object["response"] as? [String: Any])
+        let encodedPayload = try XCTUnwrap(response["response"] as? [String: Any])
+        let updatedInput = try XCTUnwrap(encodedPayload["updatedInput"] as? [String: Any])
+        let maxDepth = try XCTUnwrap(updatedInput["max_depth"] as? NSNumber)
+        let nested = try XCTUnwrap(updatedInput["nested"] as? [String: Any])
+        let values = try XCTUnwrap(nested["a"] as? [NSNumber])
+        let flag = try XCTUnwrap(updatedInput["flag"] as? NSNumber)
+
+        XCTAssertEqual(maxDepth.intValue, 1)
+        XCTAssertNotEqual(CFGetTypeID(maxDepth as CFTypeRef), CFBooleanGetTypeID())
+        XCTAssertEqual(values.map(\.intValue), [0, 1])
+        XCTAssertTrue(values.allSatisfy { CFGetTypeID($0 as CFTypeRef) != CFBooleanGetTypeID() })
+        XCTAssertEqual(CFGetTypeID(flag as CFTypeRef), CFBooleanGetTypeID())
+        XCTAssertTrue(flag.boolValue)
+    }
+
     func testRepoPromptPermissionAutoApprovalAndAllowPayloadPreserveToolUseID() throws {
         let repoPromptPayload: [String: Any] = [
             "tool_name": "mcp__RepoPromptCE__read_file",

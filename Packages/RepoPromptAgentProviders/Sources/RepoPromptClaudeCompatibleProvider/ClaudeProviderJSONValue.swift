@@ -55,6 +55,18 @@ public enum ClaudeProviderJSONValue: Sendable, Equatable, Codable {
         switch value {
         case _ as NSNull:
             self = .null
+        case let value as NSNumber:
+            if CFGetTypeID(value) == CFBooleanGetTypeID() {
+                self = .bool(value.boolValue)
+            } else if let exactInteger = Int(value.stringValue) {
+                self = .integer(exactInteger)
+            } else {
+                let double = value.doubleValue
+                guard double.isFinite else {
+                    throw JSONValueError.unsupportedValue(value.stringValue)
+                }
+                self = .double(double)
+            }
         case let value as Bool:
             self = .bool(value)
         case let value as Int:
@@ -67,18 +79,6 @@ public enum ClaudeProviderJSONValue: Sendable, Equatable, Codable {
                 self = .integer(exactInteger)
             } else {
                 self = .double(value)
-            }
-        case let value as NSNumber:
-            if CFGetTypeID(value) == CFBooleanGetTypeID() {
-                self = .bool(value.boolValue)
-            } else if let exactInteger = Int(value.stringValue) {
-                self = .integer(exactInteger)
-            } else {
-                let double = value.doubleValue
-                guard double.isFinite else {
-                    throw JSONValueError.unsupportedValue(value.stringValue)
-                }
-                self = .double(double)
             }
         case let value as String:
             self = .string(value)
