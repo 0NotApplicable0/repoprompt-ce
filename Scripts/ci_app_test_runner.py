@@ -316,7 +316,8 @@ def flatten_listed_tests(document: Mapping[str, object]) -> list[str]:
     specifiers: list[str] = []
 
     def is_leaf(node: object) -> bool:
-        return isinstance(node, Mapping) and not node.get("tests")
+        # Test methods carry no "tests" key; suites always do, even when empty ("tests": []).
+        return isinstance(node, Mapping) and "tests" not in node
 
     def visit(node: Mapping[str, object]) -> None:
         children = node.get("tests")

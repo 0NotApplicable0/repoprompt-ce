@@ -120,6 +120,13 @@ class DirectXCTestExecutionTests(unittest.TestCase):
             "RepoPromptTests.AlphaTests/testOne", "RepoPromptTests.AlphaTests/testTwo",
         ])
 
+    def test_flatten_ignores_bundles_containing_only_empty_suites(self) -> None:
+        document = {"name": "All Tests", "tests": [{"name": "Pkg.xctest", "tests": [
+            {"name": "M.EmptyA", "tests": []},
+            {"name": "M.EmptyB", "tests": []},
+        ]}]}
+        self.assertEqual(runner.flatten_listed_tests(document), [])
+
     def test_select_specifiers_uses_regex_search_and_collapses_whole_suites(self) -> None:
         self.assertEqual(runner.select_xctest_specifiers(self.LISTED, "AlphaTests"), ["RepoPromptTests.AlphaTests"])
         self.assertEqual(runner.select_xctest_specifiers(self.LISTED, "testOne"), [
