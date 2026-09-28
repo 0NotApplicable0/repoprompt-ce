@@ -4311,7 +4311,13 @@ extension ToolOutputFormatter {
                 }
 
             case "switch":
-                var out = ["## Workspace Bound on existing window ✅"]
+                let heading = status == "focus_failed"
+                    ? "## Workspace Binding Kept; UI Focus Failed ⚠️"
+                    : "## Workspace Bound on existing window ✅"
+                var out = [heading]
+                if status == "focus_failed" {
+                    out.append("- The connection binding was kept, but UI focus did not change.")
+                }
                 if let name = args["workspace"]?.stringValue {
                     out.append("- **Workspace**: \(name)")
                 }

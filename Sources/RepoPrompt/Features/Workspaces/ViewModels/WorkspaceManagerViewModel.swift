@@ -7667,7 +7667,14 @@ class WorkspaceManagerViewModel: ObservableObject {
         scheduleSave(workspaceID: workspaceID, fileURL: workspaceFileURL(for: workspaces[index]), source: "mcpIdleBindingTabRollback")
     }
 
+    #if DEBUG
+        var debugForceResidentFocusFailure = false
+    #endif
+
     func focusResidentWorkspace(_ workspaceID: UUID) async -> Bool {
+        #if DEBUG
+            if debugForceResidentFocusFailure { return false }
+        #endif
         guard let target = workspaces.first(where: { $0.id == workspaceID }),
               Self.isEligibleForGraphStoredBinding(target)
         else { return false }

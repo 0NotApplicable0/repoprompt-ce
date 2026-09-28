@@ -2036,7 +2036,7 @@ final class WindowRoutingService: Service {
         connectionID: UUID,
         justCreated: Bool = false,
         provisionIdleTab: Bool = false
-    ) async throws -> Int {
+    ) async throws -> (windowID: Int, createdTab: Bool) {
         let provisioned = provisionIdleTab ? window.workspaceManager.ensureIdleStoredBindingCandidate(forWorkspaceID: workspace.id) : nil
         guard let candidate = provisioned?.candidate ?? window.workspaceManager.storedBindingCandidate(forWorkspaceID: workspace.id) else {
             throw MCPError.invalidRequest(
@@ -2047,7 +2047,9 @@ final class WindowRoutingService: Service {
         defer {
             if !didAdmit,
                let createdTab = provisioned?.createdTab,
-               window.mcpServer.connectionBindingSnapshot(forConnection: connectionID).tabID != createdTab.id
+               !window.mcpServer.tabContextByConnectionID.values.contains(where: {
+                   $0.windowID == window.windowID && $0.tabID == createdTab.id
+               })
             {
                 window.workspaceManager.rollbackIdleStoredBindingTab(createdTab, inWorkspaceID: workspace.id)
             }
@@ -2170,7 +2172,7 @@ final class WindowRoutingService: Service {
 
             window.focusWindowIfPossible()
             didAdmit = true
-            return window.windowID
+            return (window.windowID, provisioned?.createdTab != nil)
         } catch {
             await networkMgr.abortGraphAdmission(ticket)
             throw error
@@ -2247,14 +2249,14 @@ final class WindowRoutingService: Service {
             createdWorkspace = true
         }
 
-        let admittedWindowID = try await admitStoredWorkspace(
+        let admission = try await admitStoredWorkspace(
             workspace: targetWorkspace,
             window: window,
             connectionID: connectionID,
             justCreated: createdWorkspace
         )
         return WorkingDirsBindResolution(
-            windowID: admittedWindowID,
+            windowID: admission.windowID,
             workspaceID: targetWorkspace.id,
             workspaceName: targetWorkspace.name,
             repoPaths: targetWorkspace.repoPaths,
@@ -2688,7 +2690,7 @@ final class WindowRoutingService: Service {
                                 )
                             }
 
-                            _ = try await admitStoredWorkspace(
+                            let admission = try await admitStoredWorkspace(
                                 workspace: workspace,
                                 window: hostWindow,
                                 connectionID: connectionID,
@@ -2701,7 +2703,7 @@ final class WindowRoutingService: Service {
                                 binding: binding,
                                 changed: binding != previousBinding,
                                 matchedBy: BindContextRequest.MatchKind.workspace.rawValue,
-                                createdTab: false,
+                                createdTab: admission.createdTab,
                                 note: note
                             )
                         case .windowID:
@@ -2910,7 +2912,7 @@ final class WindowRoutingService: Service {
                     guard let connectionID = await routingService.networkMgr.currentConnectionUUID() else {
                         throw MCPError.internalError("No active connection context")
                     }
-                    let admittedWindowID = try await routingService.admitStoredWorkspace(
+                    let admission = try await routingService.admitStoredWorkspace(
                         workspace: targetModel,
                         window: targetWindow,
                         connectionID: connectionID,
@@ -2923,7 +2925,7 @@ final class WindowRoutingService: Service {
                         action: "switch",
                         workspaces: nil,
                         status: focused ? "ok" : "focus_failed",
-                        windowID: admittedWindowID,
+                        windowID: admission.windowID,
                         deprecatedArguments: args["open_in_new_window"] == nil ? nil : ["open_in_new_window"]
                     )
 

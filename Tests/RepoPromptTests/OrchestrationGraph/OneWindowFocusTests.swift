@@ -272,6 +272,7 @@ import XCTest
                     let response = try await bind(fixture)
                     XCTAssertEqual(response.binding.windowID, fixture.window.windowID)
                     XCTAssertEqual(response.binding.workspaceID, fixture.workspaceTwo.id)
+                    XCTAssertEqual(response.createdTab, true)
                     try assertBoundToNewIdleTab(fixture, originalCount: count, remainsFocusedOnW1: true)
                 }
             }
@@ -285,6 +286,7 @@ import XCTest
                     let count = fixture.workspaceTwo.composeTabs.count
                     let response = try await bind(fixture)
                     XCTAssertEqual(response.binding.contextID, idleTabU)
+                    XCTAssertEqual(response.createdTab, false)
                     XCTAssertEqual(response.binding.windowID, fixture.window.windowID)
                     XCTAssertEqual(fixture.window.workspaceManager.workspaces.first { $0.id == fixture.workspaceTwo.id }?.composeTabs.count, count)
                     XCTAssertEqual(fixture.window.workspaceManager.activeWorkspaceID, fixture.workspaceOne.id)
@@ -306,6 +308,90 @@ import XCTest
                         if legacy { XCTAssertEqual(response.deprecatedArguments, ["open_in_new_window"]) }
                         try assertBoundToNewIdleTab(fixture, originalCount: count, remainsFocusedOnW1: true)
                     }
+                }
+            }
+        }
+
+        func testFocusFailureKeepsBindingAndReportsNonSuccess() async throws {
+            for graphEnabled in [true, false] {
+                try await withFixture(graphEnabled: graphEnabled) { fixture in
+                    fixture.window.workspaceManager.debugForceResidentFocusFailure = true
+                    defer { fixture.window.workspaceManager.debugForceResidentFocusFailure = false }
+
+                    let args: [String: Value] = [
+                        "action": .string("switch"),
+                        "workspace": .string(fixture.workspaceTwo.id.uuidString),
+                        "focus": .bool(true),
+                        "_rawJSON": .bool(true)
+                    ]
+                    let value = try await ServerNetworkManager.$currentConnectionID.withValue(fixture.connectionID) {
+                        try await fixture.service.call(tool: MCPGlobalToolName.manageWorkspaces, with: args)
+                    }
+                    let response = try JSONDecoder().decode(ManageWorkspacesResponse.self, from: JSONEncoder().encode(XCTUnwrap(value)))
+                    XCTAssertEqual(response.status, "focus_failed")
+                    let rawValue = try XCTUnwrap(value)
+                    let formatted = ToolOutputFormatter.formatManageWorkspaces(args: args, value: rawValue)
+                        .compactMap { if case let .text(text, _, _) = $0 { text } else { nil } }
+                        .joined(separator: "\n")
+                    XCTAssertFalse(formatted.contains("Workspace Bound on existing window ✅"))
+                    XCTAssertTrue(formatted.contains("focus did not change"), formatted)
+                    XCTAssertTrue(formatted.contains("binding was kept"), formatted)
+                    try assertBoundToNewIdleTab(fixture, originalCount: fixture.workspaceTwo.composeTabs.count, remainsFocusedOnW1: true)
+                    let hasLease = await ServerNetworkManager.shared.debugHasGraphAdmissionLease(connectionID: fixture.connectionID)
+                    XCTAssertTrue(hasLease)
+                    let graphRoots = await fixture.window.workspaceFileContextStore.rootRecords(forRootFolderPaths: fixture.workspaceTwo.repoPaths)
+                    XCTAssertEqual(graphRoots.count, 1)
+                    assertRunningSessions(fixture)
+                }
+            }
+        }
+
+        func testOtherConnectionBindingPreventsProvisionedTabRollback() async throws {
+            for graphEnabled in [true, false] {
+                try await withFixture(graphEnabled: graphEnabled) { fixture in
+                    let connectionB = UUID()
+                    connectionIDs.append(connectionB)
+                    var tabU: UUID?
+                    fixture.service.debugGraphAdmissionInterleaveHook = {
+                        fixture.service.debugGraphAdmissionInterleaveHook = nil
+                        do {
+                            _ = try await ServerNetworkManager.$currentConnectionID.withValue(connectionB) {
+                                try await fixture.service.call(tool: MCPGlobalToolName.bindContext, with: [
+                                    "op": .string("bind"),
+                                    "workspace": .string(fixture.workspaceTwo.id.uuidString),
+                                    "_rawJSON": .bool(true)
+                                ])
+                            }
+                        } catch {
+                            XCTFail("B bind failed: \(error)")
+                        }
+                        tabU = fixture.window.mcpServer.connectionBindingSnapshot(forConnection: connectionB).tabID
+                        if let index = fixture.window.workspaceManager.workspaces.firstIndex(where: { $0.id == fixture.workspaceTwo.id }) {
+                            fixture.window.workspaceManager.workspaces[index].consolidatedIntoWorkspaceID = UUID()
+                        }
+                    }
+                    defer { fixture.service.debugGraphAdmissionInterleaveHook = nil }
+
+                    do {
+                        _ = try await bind(fixture)
+                        XCTFail("expected A's revalidation to reject the now-ineligible workspace")
+                    } catch {
+                        XCTAssertTrue(String(describing: error).contains("no longer available"), String(describing: error))
+                    }
+                    let survivingTab = try XCTUnwrap(tabU)
+                    let bindingB = fixture.window.mcpServer.connectionBindingSnapshot(forConnection: connectionB)
+                    XCTAssertEqual(bindingB.tabID, survivingTab)
+                    XCTAssertEqual(bindingB.workspaceID, fixture.workspaceTwo.id)
+                    XCTAssertNotNil(fixture.window.workspaceManager.composeTab(with: survivingTab))
+                    XCTAssertNil(fixture.window.workspaceManager.composeTab(with: survivingTab)?.activeAgentSessionID)
+                    let bindingA = fixture.window.mcpServer.connectionBindingSnapshot(forConnection: fixture.connectionID)
+                    XCTAssertNotEqual(bindingA.tabID, survivingTab)
+                    let hasALease = await ServerNetworkManager.shared.debugHasGraphAdmissionLease(connectionID: fixture.connectionID)
+                    let hasBLease = await ServerNetworkManager.shared.debugHasGraphAdmissionLease(connectionID: connectionB)
+                    XCTAssertFalse(hasALease)
+                    XCTAssertTrue(hasBLease)
+                    XCTAssertEqual(fixture.window.workspaceManager.activeWorkspaceID, fixture.workspaceOne.id)
+                    assertRunningSessions(fixture)
                 }
             }
         }
