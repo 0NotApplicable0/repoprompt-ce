@@ -1822,6 +1822,8 @@ extension ToolOutputFormatter {
     }
 
     private struct BindContextResponseDTO: Decodable {
+        let status: String
+        let conflict: MCPBindContextConflictSummary?
         let windows: [BindContextWindowDTO]?
         let binding: BindContextBindingDTO
         let changed: Bool?
@@ -1833,6 +1835,8 @@ extension ToolOutputFormatter {
         let note: String?
 
         enum CodingKeys: String, CodingKey {
+            case status
+            case conflict
             case windows
             case binding
             case changed
@@ -1865,8 +1869,22 @@ extension ToolOutputFormatter {
         }
         let op = args["op"]?.stringValue?.lowercased() ?? "status"
         var out: [String] = []
-        out.append("## Tab Context Binding \(statusIcon(success: dto.binding.bindingKind != "unbound" || op == "list" || op == "status"))")
+        let isConflict = dto.status == "conflict"
+        if isConflict {
+            out.append("## Tab Context Binding Conflict \(statusIcon(success: false))")
+        } else {
+            out.append("## Tab Context Binding \(statusIcon(success: dto.binding.bindingKind != "unbound" || op == "list" || op == "status"))")
+        }
         out.append("- **Binding**: \(bindingSummaryLine(dto.binding))")
+        if let conflict = dto.conflict {
+            out.append("- **Status**: conflict; binding unchanged")
+            out.append("- **Path**: `\(conflict.path)`")
+            out.append("- **Holder**: \(conflict.holder)")
+            let loaded = conflict.loadedPolicy
+            let requested = conflict.requestedPolicy
+            out.append("- **Loaded policy**: respectRepoIgnore=\(loaded.respectRepoIgnore), respectCursorignore=\(loaded.respectCursorignore), skipSymlinks=\(loaded.skipSymlinks), enableHierarchicalIgnores=\(loaded.enableHierarchicalIgnores)")
+            out.append("- **Requested policy**: respectRepoIgnore=\(requested.respectRepoIgnore), respectCursorignore=\(requested.respectCursorignore), skipSymlinks=\(requested.skipSymlinks), enableHierarchicalIgnores=\(requested.enableHierarchicalIgnores)")
+        }
 
         if let changed = dto.changed {
             out.append("- **Changed**: \(changed ? "yes" : "no")")

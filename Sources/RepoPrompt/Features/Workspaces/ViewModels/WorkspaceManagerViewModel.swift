@@ -5185,8 +5185,9 @@ class WorkspaceManagerViewModel: ObservableObject {
         let configuredRootPaths = uniqueWorkspaceRootLoadRequests(
             for: Self.loadableRepoPaths(for: workspace)
         ).map(\.canonicalPath)
+        let configuredRootPathSet = Set(configuredRootPaths)
         let primaryRootRecords = await fileManager.workspaceFileContextStore.roots()
-            .filter { $0.kind == .primaryWorkspace }
+            .filter { $0.kind == .primaryWorkspace && configuredRootPathSet.contains($0.standardizedFullPath) }
         try Task.checkCancellation()
         #if DEBUG
             await workspaceRootCatalogDidCaptureRootsHandlerForTesting?()

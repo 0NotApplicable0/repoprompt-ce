@@ -200,7 +200,30 @@ public struct MCPBindContextBindingSummary: Codable, Equatable, Sendable {
     }
 }
 
+public struct MCPBindContextConflictSummary: Codable, Sendable {
+    public let path: String
+    public let holder: String
+    public let loadedPolicy: WorkspaceRootIgnorePolicy
+    public let requestedPolicy: WorkspaceRootIgnorePolicy
+
+    private enum CodingKeys: String, CodingKey {
+        case path
+        case holder
+        case loadedPolicy
+        case requestedPolicy
+    }
+
+    init(_ conflict: WorkspaceRootLoadConflict) {
+        path = conflict.path
+        holder = conflict.holder.rawValue
+        loadedPolicy = conflict.loadedPolicy
+        requestedPolicy = conflict.requestedPolicy
+    }
+}
+
 public struct BindContextResponse: Codable, Sendable {
+    public let status: String
+    public let conflict: MCPBindContextConflictSummary?
     public let windows: [MCPBindContextWindowSummary]?
     public let binding: MCPBindContextBindingSummary
     public let changed: Bool?
@@ -216,6 +239,8 @@ public struct BindContextResponse: Codable, Sendable {
     public let retryAfterMilliseconds: Int?
 
     private enum CodingKeys: String, CodingKey {
+        case status
+        case conflict
         case windows
         case binding
         case changed
@@ -232,6 +257,8 @@ public struct BindContextResponse: Codable, Sendable {
     }
 
     public init(
+        status: String = "ok",
+        conflict: MCPBindContextConflictSummary? = nil,
         windows: [MCPBindContextWindowSummary]? = nil,
         binding: MCPBindContextBindingSummary,
         changed: Bool? = nil,
@@ -246,6 +273,8 @@ public struct BindContextResponse: Codable, Sendable {
         retryable: Bool? = nil,
         retryAfterMilliseconds: Int? = nil
     ) {
+        self.status = status
+        self.conflict = conflict
         self.windows = windows
         self.binding = binding
         self.changed = changed
@@ -2035,12 +2064,20 @@ final class WindowRoutingService: Service {
             _ = try await authorityClient.registerForRead(workspace, fileURL: fileURL)
         }
 
+        let fileManager = window.workspaceManager.fileManager
+        let policy = WorkspaceRootIgnorePolicy(
+            respectRepoIgnore: fileManager.respectRepoIgnore,
+            respectCursorignore: fileManager.respectCursorignore,
+            skipSymlinks: fileManager.skipSymlinks,
+            enableHierarchicalIgnores: fileManager.enableHierarchicalIgnores
+        )
         let ticket = try await networkMgr.prepareGraphAdmission(
             connectionID: connectionID,
             window: window,
             workspaceID: candidate.workspaceID,
             tabID: candidate.tabID,
-            repoPaths: candidate.repoPaths
+            repoPaths: candidate.repoPaths,
+            policy: policy
         )
 
         #if DEBUG
@@ -2432,7 +2469,7 @@ final class WindowRoutingService: Service {
 
                 **Recommended binding flow:**
                 Bind by `working_dirs` using absolute workspace root paths:
-                	`{"op":"bind","working_dirs":["/path/to/root1","/path/to/root2"]}`
+                `{"op":"bind","working_dirs":["/path/to/root1","/path/to/root2"]}`
                 RepoPrompt first looks for an exact workspace `repo_paths` set match (order-insensitive). If no exact match exists, RepoPrompt may fall back to a workspace whose `repo_paths` is a strict superset of the requested roots. Both modes match workspace roots only — not descendant paths.
                 If the matching workspace is already open, RepoPrompt prefers that window. If it exists but is not open, RepoPrompt opens a window and switches to it. Add `create_if_missing=true` to create a new workspace after approval when neither exact nor superset workspace matches.
 
@@ -2679,6 +2716,14 @@ final class WindowRoutingService: Service {
                         case .none:
                             throw MCPError.invalidParams("bind_context op='bind' requires workspace, context_id, working_dirs, or window_id.")
                         }
+                    } catch let WorkspaceFileContextStoreError.rootAlreadyLoadedWithDifferentConfiguration(conflict) {
+                        return BindContextResponse(
+                            status: "conflict",
+                            conflict: MCPBindContextConflictSummary(conflict),
+                            binding: previousBinding,
+                            changed: false,
+                            previousBinding: previousBinding
+                        )
                     } catch let failure as MCPServerViewModel.FileToolAuthorityFailure {
                         return await bindAuthorityFailureResponse(failure, connectionID: connectionID)
                     }

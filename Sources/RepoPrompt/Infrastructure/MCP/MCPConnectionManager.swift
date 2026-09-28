@@ -1539,11 +1539,18 @@ actor ServerNetworkManager {
     /// One connection-scoped graph admission lease per connection. Presence means the connection
     /// has exact root authority over `workspaceID`'s roots on `windowID`, owned under `ownerID`
     /// in that window's `WorkspaceFileContextStore`.
+    enum GraphAdmissionOwnership {
+        case ordinary(UUID)
+        case sessionWorktree(UUID)
+        case none
+    }
+
     private struct GraphAdmissionLease {
         let windowID: Int
         let workspaceID: UUID
         let tabID: UUID
         let ownerID: UUID
+        let ownership: GraphAdmissionOwnership
         let store: WorkspaceFileContextStore
     }
 
@@ -7809,6 +7816,7 @@ actor ServerNetworkManager {
         let workspaceID: UUID
         let tabID: UUID
         let ownerID: UUID
+        let ownership: GraphAdmissionOwnership
         let lookupContext: WorkspaceLookupContext
         let store: WorkspaceFileContextStore
     }
@@ -7821,11 +7829,11 @@ actor ServerNetworkManager {
         window: WindowState,
         workspaceID: UUID,
         tabID: UUID,
-        repoPaths: [String]
+        repoPaths: [String],
+        policy: WorkspaceRootIgnorePolicy
     ) async throws -> GraphAdmissionTicket {
         let ownerID = UUID()
         let store = window.workspaceFileContextStore
-        let bindingFingerprint = "og06-graph-admission:\(connectionID.uuidString):\(workspaceID.uuidString)"
         let existingRepoPaths = repoPaths.filter { path in
             var isDirectory: ObjCBool = false
             let expanded = (path as NSString).expandingTildeInPath
@@ -7844,6 +7852,7 @@ actor ServerNetworkManager {
                 workspaceID: workspaceID,
                 tabID: tabID,
                 ownerID: ownerID,
+                ownership: .none,
                 lookupContext: WorkspaceLookupContext(
                     rootScope: .validatedSessionBoundWorkspace(canonicalRoots: [], physicalRoots: []),
                     bindingProjection: nil
@@ -7851,41 +7860,26 @@ actor ServerNetworkManager {
                 store: store
             )
         }
-        let preparation = try await store.prepareSessionWorktreeOwnership(
+        let acquisition = try await store.prepareOrdinaryWorkspaceRootAcquisition(
             ownerID: ownerID,
-            bindingFingerprint: bindingFingerprint,
-            physicalRootPaths: existingRepoPaths
+            physicalRootPaths: existingRepoPaths,
+            policy: policy
         )
-        do {
-            try await store.commitSessionWorktreeOwnership(preparation)
-        } catch {
-            await store.abortSessionWorktreeOwnership(preparation)
-            throw error
-        }
-        // From here, ownership is committed under ownerID; any further failure must release
-        // (not abort) so the already-installed record is torn down rather than ignored.
-        let physicalRefs = Set(preparation.roots.map {
-            WorkspaceRootRef(id: $0.rootID, name: ($0.standardizedPhysicalPath as NSString).lastPathComponent, fullPath: $0.standardizedPhysicalPath)
-        })
+        let canonicalRefs = Set(acquisition.roots)
         let lookupContext = WorkspaceLookupContext(
-            rootScope: .validatedSessionBoundWorkspace(canonicalRoots: [], physicalRoots: physicalRefs),
+            rootScope: .validatedSessionBoundWorkspace(canonicalRoots: canonicalRefs, physicalRoots: []),
             bindingProjection: nil
         )
-        // An empty root scope (every requested repo path was missing on disk) is trivially
-        // consistent: there is nothing to verify, and `rootScopeAvailability`/`rootRefs` treat an
-        // empty selector as unavailable rather than "available with zero roots".
-        if !physicalRefs.isEmpty {
-            let availability = await store.rootScopeAvailability(lookupContext.rootScope)
-            guard availability == .available else {
-                await store.releaseSessionWorktreeOwnership(ownerID: ownerID)
-                throw MCPError.invalidRequest("Graph admission root authority is unavailable for workspace roots.")
-            }
-            let expectedPaths = Set(existingRepoPaths.map { StandardizedPath.absolute(($0 as NSString).expandingTildeInPath) })
-            let scopedPaths = await Set(store.rootRefs(scope: lookupContext.rootScope).map(\.standardizedFullPath))
-            guard scopedPaths == expectedPaths else {
-                await store.releaseSessionWorktreeOwnership(ownerID: ownerID)
-                throw MCPError.invalidRequest("Graph admission root scope did not match the requested workspace roots exactly.")
-            }
+        let availability = await store.rootScopeAvailability(lookupContext.rootScope)
+        guard availability == .available else {
+            await store.releaseOrdinaryWorkspaceRootAcquisition(token: acquisition.token)
+            throw MCPError.invalidRequest("Graph admission root authority is unavailable for workspace roots.")
+        }
+        let expectedPaths = Set(existingRepoPaths.map { StandardizedPath.absolute(($0 as NSString).expandingTildeInPath) })
+        let scopedPaths = await Set(store.rootRefs(scope: lookupContext.rootScope).map(\.standardizedFullPath))
+        guard scopedPaths == expectedPaths else {
+            await store.releaseOrdinaryWorkspaceRootAcquisition(token: acquisition.token)
+            throw MCPError.invalidRequest("Graph admission root scope did not match the requested workspace roots exactly.")
         }
         return GraphAdmissionTicket(
             connectionID: connectionID,
@@ -7893,6 +7887,7 @@ actor ServerNetworkManager {
             workspaceID: workspaceID,
             tabID: tabID,
             ownerID: ownerID,
+            ownership: .ordinary(acquisition.token),
             lookupContext: lookupContext,
             store: store
         )
@@ -7908,6 +7903,7 @@ actor ServerNetworkManager {
             workspaceID: ticket.workspaceID,
             tabID: ticket.tabID,
             ownerID: ticket.ownerID,
+            ownership: ticket.ownership,
             store: ticket.store
         )
         if let previous, previous.ownerID != ticket.ownerID {
@@ -7923,6 +7919,7 @@ actor ServerNetworkManager {
             workspaceID: ticket.workspaceID,
             tabID: ticket.tabID,
             ownerID: ticket.ownerID,
+            ownership: ticket.ownership,
             store: ticket.store
         ))
     }
@@ -7950,7 +7947,14 @@ actor ServerNetworkManager {
     }
 
     private func releaseGraphAdmissionOwnership(_ lease: GraphAdmissionLease) async {
-        await lease.store.releaseSessionWorktreeOwnership(ownerID: lease.ownerID)
+        switch lease.ownership {
+        case let .ordinary(token):
+            await lease.store.releaseOrdinaryWorkspaceRootAcquisition(token: token)
+        case let .sessionWorktree(ownerID):
+            await lease.store.releaseSessionWorktreeOwnership(ownerID: ownerID)
+        case .none:
+            break
+        }
     }
 
     #if DEBUG

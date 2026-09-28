@@ -282,7 +282,7 @@ import XCTest
             XCTAssertEqual(identity.contextID, response.binding.contextID)
         }
 
-        func testFailedNonGraphRebindPreservesGraphAdmissionRootAuthority() async throws {
+        func testSuccessfulNonGraphRebindReplacesGraphAdmissionRootAuthority() async throws {
             let service = makeRoutingService(graphEnabled: true)
             ServerNetworkManager.shared.graphPolicy = policy(graphEnabled: true)
             let connectionID = await makeConnection(service)
@@ -298,38 +298,24 @@ import XCTest
                 connectionID: connectionID
             )
 
-            let w1TabID = try XCTUnwrap(workspaceOne.activeComposeTabID)
-            windowX.mcpServer.setAfterFileToolLookupContextRootValidationForTesting { [windowX, workspaceOne] in
-                guard let windowX, let workspaceOne else { return }
-                _ = windowX.workspaceManager.compareAndSetActiveAgentSessionID(
-                    expected: nil,
-                    replacement: UUID(),
-                    forTabID: w1TabID,
-                    inWorkspaceID: workspaceOne.id
-                )
-            }
-            defer { windowX.mcpServer.setAfterFileToolLookupContextRootValidationForTesting(nil) }
-
-            do {
-                _ = try await callBoundedTool(
-                    service: service,
-                    tool: MCPGlobalToolName.bindContext,
-                    arguments: [
-                        "op": .string("bind"),
-                        "working_dirs": .array([.string(repoRootOne.path)]),
-                        "_rawJSON": .bool(true)
-                    ],
-                    connectionID: connectionID
-                )
-                XCTFail("expected the rebind to detect a stale target and fail")
-            } catch {
-                // expected: the rebind target went stale mid-resolution
-            }
+            let value = try await callBoundedTool(
+                service: service,
+                tool: MCPGlobalToolName.bindContext,
+                arguments: [
+                    "op": .string("bind"),
+                    "working_dirs": .array([.string(repoRootOne.path)]),
+                    "_rawJSON": .bool(true)
+                ],
+                connectionID: connectionID
+            )
+            let response = try decode(BindContextResponse.self, from: value)
+            XCTAssertEqual(response.status, "ok")
+            XCTAssertEqual(response.binding.workspaceID, workspaceOne.id)
 
             try await assertRootAuthority(
                 connectionID: connectionID,
-                expectedRoot: repoRootTwo,
-                unexpectedRoot: repoRootOne,
+                expectedRoot: repoRootOne,
+                unexpectedRoot: repoRootTwo,
                 file: #filePath,
                 line: #line
             )

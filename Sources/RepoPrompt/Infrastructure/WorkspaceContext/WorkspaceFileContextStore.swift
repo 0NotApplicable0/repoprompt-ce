@@ -182,6 +182,30 @@ struct WorkspaceSessionRootLifetimeSnapshot: @unchecked Sendable {
     }
 }
 
+public struct WorkspaceRootIgnorePolicy: Codable, Equatable, Hashable, Sendable {
+    public let respectRepoIgnore: Bool
+    public let respectCursorignore: Bool
+    public let skipSymlinks: Bool
+    public let enableHierarchicalIgnores: Bool
+}
+
+struct WorkspaceRootLoadConflict: Equatable {
+    enum Holder: String {
+        case workspace
+        case sessionWorktree = "session_worktree"
+    }
+
+    let path: String
+    let holder: Holder
+    let loadedPolicy: WorkspaceRootIgnorePolicy
+    let requestedPolicy: WorkspaceRootIgnorePolicy
+}
+
+struct WorkspaceOrdinaryRootAcquisition {
+    let token: UUID
+    let roots: [WorkspaceRootRef]
+}
+
 actor WorkspaceFileContextStore {
     static let codemapCleanupFlightUnloadBound: Duration = .seconds(10)
 
@@ -809,6 +833,15 @@ actor WorkspaceFileContextStore {
         let respectCursorignore: Bool
         let skipSymlinks: Bool
         let enableHierarchicalIgnores: Bool
+
+        var ignorePolicy: WorkspaceRootIgnorePolicy {
+            WorkspaceRootIgnorePolicy(
+                respectRepoIgnore: respectRepoIgnore,
+                respectCursorignore: respectCursorignore,
+                skipSymlinks: skipSymlinks,
+                enableHierarchicalIgnores: enableHierarchicalIgnores
+            )
+        }
     }
 
     private struct RootLoadCompletionIdentity {
@@ -3035,6 +3068,9 @@ actor WorkspaceFileContextStore {
     private var unloadWaitersByRootPath: [String: [UUID: CheckedContinuation<Void, Error>]] = [:]
     private var rootLoadFlightsByPath: [String: RootLoadFlight] = [:]
     private var rootLoadConfigurationsByPath: [String: RootLoadConfiguration] = [:]
+    private var ordinaryUIClaimsByRootID: [UUID: Int] = [:]
+    private var ordinaryGraphRootIDsByToken: [UUID: [UUID]] = [:]
+    private var ordinaryGraphClaimCountByRootID: [UUID: Int] = [:]
     private var catalogGenerationsByScope: [WorkspaceLookupRootScope: UInt64] = [
         .visibleWorkspace: 0,
         .visibleWorkspacePlusGitData: 0,
@@ -10932,6 +10968,65 @@ actor WorkspaceFileContextStore {
         }
     }
 
+    private func recordOrdinaryUIClaim(for root: WorkspaceRootRecord, enabled: Bool) {
+        guard enabled, root.kind == .primaryWorkspace else { return }
+        let wasGraphOnly = ordinaryUIClaimsByRootID[root.id, default: 0] == 0
+            && ordinaryGraphClaimCountByRootID[root.id, default: 0] > 0
+        ordinaryUIClaimsByRootID[root.id, default: 0] += 1
+        if wasGraphOnly {
+            invalidatePathMatchSnapshot(affectedRootKinds: [.primaryWorkspace], affectedRootIDs: [root.id])
+        }
+    }
+
+    func prepareOrdinaryWorkspaceRootAcquisition(
+        ownerID: UUID,
+        physicalRootPaths: [String],
+        policy: WorkspaceRootIgnorePolicy
+    ) async throws -> WorkspaceOrdinaryRootAcquisition {
+        let token = UUID()
+        ordinaryGraphRootIDsByToken[token] = []
+        var refs: [WorkspaceRootRef] = []
+        do {
+            for path in Set(physicalRootPaths.map { ($0 as NSString).standardizingPath }).sorted() {
+                try Task.checkCancellation()
+                let root = try await loadRoot(
+                    path: path,
+                    kind: .primaryWorkspace,
+                    respectRepoIgnore: policy.respectRepoIgnore,
+                    respectCursorignore: policy.respectCursorignore,
+                    skipSymlinks: policy.skipSymlinks,
+                    enableHierarchicalIgnores: policy.enableHierarchicalIgnores,
+                    claimOrdinaryUIRoot: false
+                )
+                ordinaryGraphRootIDsByToken[token, default: []].append(root.id)
+                let wasVisibleWithoutClaims = ordinaryUIClaimsByRootID[root.id, default: 0] == 0
+                    && ordinaryGraphClaimCountByRootID[root.id, default: 0] == 0
+                ordinaryGraphClaimCountByRootID[root.id, default: 0] += 1
+                if wasVisibleWithoutClaims {
+                    invalidatePathMatchSnapshot(affectedRootKinds: [.primaryWorkspace], affectedRootIDs: [root.id])
+                }
+                refs.append(WorkspaceRootRef(id: root.id, name: root.name, fullPath: root.fullPath))
+            }
+            return WorkspaceOrdinaryRootAcquisition(token: token, roots: refs)
+        } catch {
+            await releaseOrdinaryWorkspaceRootAcquisition(token: token)
+            throw error
+        }
+    }
+
+    func releaseOrdinaryWorkspaceRootAcquisition(token: UUID) async {
+        guard let rootIDs = ordinaryGraphRootIDsByToken.removeValue(forKey: token) else { return }
+        for rootID in rootIDs {
+            let remaining = max(0, (ordinaryGraphClaimCountByRootID[rootID] ?? 0) - 1)
+            if remaining == 0 {
+                ordinaryGraphClaimCountByRootID.removeValue(forKey: rootID)
+            } else {
+                ordinaryGraphClaimCountByRootID[rootID] = remaining
+            }
+        }
+        await unloadRoots(ids: rootIDs, releasingOrdinaryUIClaims: false)
+    }
+
     @discardableResult
     func loadRoot(
         path: String,
@@ -10942,7 +11037,8 @@ actor WorkspaceFileContextStore {
         skipSymlinks: Bool = true,
         enableHierarchicalIgnores: Bool = true,
         cancelUnderlyingLoadOnCallerCancellation: Bool = false,
-        sessionWorktreeReservationToken: WorkspaceSessionWorktreeOwnershipToken? = nil
+        sessionWorktreeReservationToken: WorkspaceSessionWorktreeOwnershipToken? = nil,
+        claimOrdinaryUIRoot: Bool = true
     ) async throws -> WorkspaceRootRecord {
         let standardizedPath = (path as NSString).standardizingPath
         #if DEBUG
@@ -10975,8 +11071,18 @@ actor WorkspaceFileContextStore {
         if let existingID = rootIDsByStandardizedPath[standardizedPath],
            let existing = rootStatesByID[existingID]?.root
         {
-            guard let existingConfiguration = rootLoadConfigurationsByPath[standardizedPath], existingConfiguration == loadConfiguration else {
-                throw WorkspaceFileContextStoreError.rootAlreadyLoadedWithDifferentConfiguration(standardizedPath)
+            guard let existingConfiguration = rootLoadConfigurationsByPath[standardizedPath] else {
+                throw WorkspaceFileContextStoreError.catalogMaterializationFailed("Missing root load configuration for \(standardizedPath).")
+            }
+            guard existingConfiguration == loadConfiguration else {
+                throw WorkspaceFileContextStoreError.rootAlreadyLoadedWithDifferentConfiguration(
+                    WorkspaceRootLoadConflict(
+                        path: standardizedPath,
+                        holder: existingConfiguration.kind == .sessionWorktree ? .sessionWorktree : .workspace,
+                        loadedPolicy: existingConfiguration.ignorePolicy,
+                        requestedPolicy: loadConfiguration.ignorePolicy
+                    )
+                )
             }
             #if DEBUG
                 WorkspaceRestorePerfLog.event(
@@ -10989,6 +11095,7 @@ actor WorkspaceFileContextStore {
                     ]
                 )
             #endif
+            recordOrdinaryUIClaim(for: existing, enabled: claimOrdinaryUIRoot)
             return existing
         }
         if let inFlight = rootLoadFlightsByPath[standardizedPath] {
@@ -11014,12 +11121,14 @@ actor WorkspaceFileContextStore {
                     await rootLoadDidJoinInFlightHandler(standardizedPath)
                 }
             #endif
-            return try await awaitRootLoadTask(
+            let root = try await awaitRootLoadTask(
                 inFlight.task,
                 flightID: inFlight.id,
                 standardizedPath: standardizedPath,
                 cancelUnderlyingLoadOnCallerCancellation: cancelUnderlyingLoadOnCallerCancellation
             )
+            recordOrdinaryUIClaim(for: root, enabled: claimOrdinaryUIRoot)
+            return root
         }
 
         #if DEBUG
@@ -11069,12 +11178,14 @@ actor WorkspaceFileContextStore {
                 expectedFlightID: flightID
             )
         }
-        return try await awaitRootLoadTask(
+        let root = try await awaitRootLoadTask(
             task,
             flightID: flightID,
             standardizedPath: standardizedPath,
             cancelUnderlyingLoadOnCallerCancellation: cancelUnderlyingLoadOnCallerCancellation
         )
+        recordOrdinaryUIClaim(for: root, enabled: claimOrdinaryUIRoot)
+        return root
     }
 
     private func awaitRootLoadTask(
@@ -11515,8 +11626,26 @@ actor WorkspaceFileContextStore {
     }
 
     func unloadRoots(ids rootIDs: [UUID]) async {
+        await unloadRoots(ids: rootIDs, releasingOrdinaryUIClaims: true)
+    }
+
+    private func unloadRoots(ids rootIDs: [UUID], releasingOrdinaryUIClaims: Bool) async {
         var seenRootIDs = Set<UUID>()
-        let orderedRootIDs = rootIDs.filter { seenRootIDs.insert($0).inserted }
+        let orderedRootIDs = rootIDs.filter { seenRootIDs.insert($0).inserted }.filter { rootID in
+            guard rootStatesByID[rootID]?.root.kind == .primaryWorkspace else { return true }
+            if releasingOrdinaryUIClaims, let count = ordinaryUIClaimsByRootID[rootID], count > 0 {
+                if count == 1 {
+                    ordinaryUIClaimsByRootID.removeValue(forKey: rootID)
+                    if ordinaryGraphClaimCountByRootID[rootID, default: 0] > 0 {
+                        invalidatePathMatchSnapshot(affectedRootKinds: [.primaryWorkspace], affectedRootIDs: [rootID])
+                    }
+                } else {
+                    ordinaryUIClaimsByRootID[rootID] = count - 1
+                }
+            }
+            return ordinaryUIClaimsByRootID[rootID, default: 0] == 0
+                && ordinaryGraphClaimCountByRootID[rootID, default: 0] == 0
+        }
         guard !orderedRootIDs.isEmpty else { return }
 
         var statesToUnload: [(rootID: UUID, state: RootState)] = []
@@ -21570,15 +21699,20 @@ actor WorkspaceFileContextStore {
         }
     }
 
+    private func ordinaryRootIsVisible(_ rootID: UUID) -> Bool {
+        ordinaryUIClaimsByRootID[rootID, default: 0] > 0
+            || ordinaryGraphClaimCountByRootID[rootID, default: 0] == 0
+    }
+
     private func rootsForPathLookupIgnoringPublishedAuthority(
         scope: WorkspaceLookupRootScope
     ) -> [WorkspaceRootRecord] {
         let allRoots = roots()
         switch scope {
         case .visibleWorkspace:
-            return allRoots.filter { $0.kind == .primaryWorkspace }
+            return allRoots.filter { $0.kind == .primaryWorkspace && ordinaryRootIsVisible($0.id) }
         case .visibleWorkspacePlusGitData:
-            return allRoots.filter { $0.kind == .primaryWorkspace || $0.kind == .workspaceGitData }
+            return allRoots.filter { $0.kind == .workspaceGitData || ($0.kind == .primaryWorkspace && ordinaryRootIsVisible($0.id)) }
         case .allLoaded:
             return allRoots
         case .allLoadedExcludingGitData:
@@ -22348,7 +22482,7 @@ enum WorkspaceFileContextStoreError: Error, Equatable {
     case exactFileNamespaceMissingRoot(UUID)
     case exactFileNamespaceMissingAlias(UUID)
     case storeDeallocated
-    case rootAlreadyLoadedWithDifferentConfiguration(String)
+    case rootAlreadyLoadedWithDifferentConfiguration(WorkspaceRootLoadConflict)
     case rootLoadInFlightWithDifferentConfiguration(String)
     case catalogMaterializationFailed(String)
 }
@@ -22364,8 +22498,8 @@ extension WorkspaceFileContextStoreError: LocalizedError {
             "Exact file namespace does not contain a canonical alias for client root: \(id)."
         case .storeDeallocated:
             "Workspace file context store was deallocated."
-        case let .rootAlreadyLoadedWithDifferentConfiguration(path):
-            "Workspace root is already loaded with a different configuration: \(path)."
+        case let .rootAlreadyLoadedWithDifferentConfiguration(conflict):
+            "Workspace root is already loaded with a different configuration: \(conflict.path)."
         case let .rootLoadInFlightWithDifferentConfiguration(path):
             "Workspace root load is already in flight with a different configuration: \(path)."
         case let .catalogMaterializationFailed(message):
