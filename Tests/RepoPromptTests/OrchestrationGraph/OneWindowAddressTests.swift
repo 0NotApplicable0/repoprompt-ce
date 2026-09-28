@@ -23,9 +23,11 @@ import XCTest
         private var openerCount = 0
         private var runStateChangeCount = 0
         private var originalStoragePath: String?
+        private var liveFSEventBaseline = 0
 
         override func setUp() async throws {
             try await super.setUp()
+            liveFSEventBaseline = FileSystemService.liveFSEventStreamCountForTesting()
             originalWindows = WindowStatesManager.shared.allWindows
             originalMCPAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
             originalGraphPolicy = ServerNetworkManager.shared.graphPolicy
@@ -112,6 +114,9 @@ import XCTest
                 UserDefaults.standard.removeObject(forKey: "GlobalCustomStorageURL")
             }
             try await super.tearDown()
+            FileSystemService.drainQueuedFSEventTeardownsForTesting()
+            let live = FileSystemService.liveFSEventStreamCountForTesting()
+            XCTAssertEqual(live, liveFSEventBaseline, "\(name): FSEvents baseline=\(liveFSEventBaseline) live=\(live) delta=\(live - liveFSEventBaseline)")
         }
 
         private func configure(graphEnabled: Bool) -> WindowRoutingService {

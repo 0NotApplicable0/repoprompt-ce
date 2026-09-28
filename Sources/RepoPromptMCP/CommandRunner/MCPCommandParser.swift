@@ -1422,7 +1422,7 @@ enum MCPCommandParser {
                     if let ws = flags["workspace"] ?? flags.positional.first {
                         args["workspace"] = UncheckedSendableValue(ws)
                     }
-                    // Support --new-window flag to open in a new window
+                    // Preserve the deprecated --new-window flag for compatibility
                     if let newWindow = parseBoolFlag(flags["new-window"] ?? flags["new_window"]) {
                         args["open_in_new_window"] = UncheckedSendableValue(newWindow)
                     } else if flags["new-window"] != nil || flags["new_window"] != nil {
@@ -1507,7 +1507,7 @@ enum MCPCommandParser {
                     // Assume it's a workspace name to switch to (preserve original case)
                     args["action"] = UncheckedSendableValue("switch")
                     args["workspace"] = UncheckedSendableValue(parts[1])
-                    // Support --new-window flag even in shorthand form: workspace MyProject --new-window
+                    // Preserve deprecated --new-window for shorthand workspace selection
                     if let newWindow = parseBoolFlag(flags["new-window"] ?? flags["new_window"]) {
                         args["open_in_new_window"] = UncheckedSendableValue(newWindow)
                     } else if flags["new-window"] != nil || flags["new_window"] != nil {

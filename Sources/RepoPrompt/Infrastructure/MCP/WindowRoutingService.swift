@@ -2478,30 +2478,33 @@ final class WindowRoutingService: Service {
             Tool(
                 name: MCPGlobalToolName.bindContext,
                 description: """
-                List, inspect, and bind sticky RepoPrompt window/tab context for this MCP connection.
+                List, inspect, and bind sticky RepoPrompt workspace/tab context on the existing window host for this MCP connection.
 
                 Operations:
                 • list    – return **all** open windows, their compose tabs, and this connection's current binding
                 • status  – return this connection's current binding only
-                • bind    – bind by working_dirs (preferred), context_id, or window_id
+                • bind    – bind a saved workspace by name or UUID on the existing window host; legacy working_dirs, context_id, and window_id remain available
 
-                **Recommended binding flow:**
-                Bind by `working_dirs` using absolute workspace root paths:
+                **One-window binding flow:**
+                Workspaces share one existing window host. Address a saved workspace by name or UUID with `bind_context op=bind workspace=<name or id>`.
+                Legacy `working_dirs` and `context_id` bind on the selected existing window host. For `working_dirs`, use absolute workspace root paths:
                 `{"op":"bind","working_dirs":["/path/to/root1","/path/to/root2"]}`
                 RepoPrompt first looks for an exact workspace `repo_paths` set match (order-insensitive). If no exact match exists, RepoPrompt may fall back to a workspace whose `repo_paths` is a strict superset of the requested roots. Both modes match workspace roots only — not descendant paths.
-                If the matching workspace is already open, RepoPrompt prefers that window. If it exists but is not open, RepoPrompt opens a window and switches to it. Add `create_if_missing=true` to create a new workspace after approval when neither exact nor superset workspace matches.
+                Only a seat responsible for workspace setup should use `manage_workspaces create` or `add_folder`, or `create_if_missing=true` after approval; other seats report the needed setup to their starting seat. If a `bind_context op=bind` response reports `status: conflict`, report it to the starting seat and stop without retrying or changing `file_system.*` settings.
 
                 Parameters:
                 - op: "list" | "status" | "bind" (required)
-                - working_dirs: string | string[]         (for bind: preferred — absolute workspace roots; exact match first, repo_paths superset fallback)
-                - context_id: string                      (for bind: canonical compose-tab context UUID from a previous list)
+                - workspace: string                       (for bind: saved workspace UUID or name on the existing window host)
+                - working_dirs: string | string[]         (legacy bind on selected host: absolute workspace roots; exact match first, repo_paths superset fallback)
+                - context_id: string                      (legacy bind on selected host: canonical compose-tab context UUID from a previous list)
                 - window_id: integer                      (for list: filter to one window; for bind: capture and explicitly bind that window's current workspace/tab context)
-                - create_if_missing: boolean              (for bind with working_dirs; create a new workspace after approval when no exact or superset workspace matches)
+                - create_if_missing: boolean              (for workspace-setup seat only: with working_dirs, create a workspace after approval when no exact or superset match exists)
                 - tab_name: string                        (optional workspace name hint when creating via working_dirs + create_if_missing)
 
                 **Binding semantics:**
-                - working_dirs and window_id resolve the presentation target once, then explicitly bind the captured compose-tab context.
-                - context_id binds that exact compose tab directly.
+                - workspace binds a saved workspace by name or UUID on the existing window host.
+                - Legacy working_dirs and window_id resolve the selected host's presentation target once, then explicitly bind the captured compose-tab context.
+                - Legacy context_id binds that exact compose tab directly on the selected host.
                 - switching the visible tab later never redirects an existing binding.
 
                 **Discovery:**
@@ -2510,11 +2513,12 @@ final class WindowRoutingService: Service {
                 """,
                 inputSchema: .object(
                     properties: [
-                        "op": .string(description: "Operation: 'list', 'status', or 'bind'", enum: ["list", "status", "bind"]),
-                        "window_id": .integer(description: "For list: filter to one window. For bind: capture and explicitly bind that window's current workspace/tab context."),
-                        "context_id": .string(description: "For bind: canonical compose-tab context UUID"),
-                        "working_dirs": .string(description: "For bind: comma-separated absolute workspace root paths; exact match first, then repo_paths superset fallback"),
-                        "create_if_missing": .boolean(description: "For bind with working_dirs: create a new workspace after approval if no exact or superset workspace matches"),
+                        "op": .string(description: "Operation: 'list', 'status', or 'bind'; bind workspace by name or UUID on the existing window host", enum: ["list", "status", "bind"]),
+                        "workspace": .string(description: "For bind: saved workspace UUID or name on the existing window host"),
+                        "window_id": .integer(description: "For list: filter to one window. For legacy bind: capture that window's current workspace/tab context on the selected host."),
+                        "context_id": .string(description: "For legacy bind: canonical compose-tab context UUID on the selected host"),
+                        "working_dirs": .string(description: "For legacy bind on the selected host: comma-separated absolute workspace root paths; exact match first, then repo_paths superset fallback"),
+                        "create_if_missing": .boolean(description: "For workspace-setup seat only: with working_dirs, create a workspace after approval if no exact or superset match exists"),
                         "tab_name": .string(description: "Optional workspace name when creating via working_dirs + create_if_missing")
                     ],
                     required: ["op"]
@@ -2757,14 +2761,14 @@ final class WindowRoutingService: Service {
             Tool(
                 name: MCPGlobalToolName.manageWorkspaces,
                 description: """
-                Manage workspaces and compose-tab lifecycle across RepoPrompt windows.
+                Manage workspaces and compose-tab lifecycle on the existing RepoPrompt window host.
 
                 **This is the workspace inventory view.** `bind_context` remains the canonical API for per-window tab routing and context_id discovery. Legacy-compatible `list_tabs` and `select_tab` actions are restored for older clients, but new integrations should prefer `bind_context`.
 
                 Actions:
                 • list         – Return known visible workspaces by default (id, name, repoPaths, showing window IDs, is_hidden)
-                • switch       – Switch a window to a specified workspace
-                • create       – Create a new workspace (optional folder_path)
+                • switch       – Bind this connection to a workspace by name or UUID on the existing host; focus=true also shows it in the UI
+                • create       – Create a workspace on the existing host when the seat owns workspace setup (optional folder_path)
                 • hide         – Hide a workspace from default workspace lists without deleting it
                 • unhide       – Restore a hidden workspace to default workspace lists
                 • delete       – Delete a workspace permanently (optionally close window)
@@ -2787,7 +2791,7 @@ final class WindowRoutingService: Service {
                 - focus: boolean                                (optional for 'switch', 'select_tab' or 'create_tab'; default false; if true, also shows the workspace or tab in the UI)
                 - allow_active: boolean                         (optional for 'close_tab'; default false)
                 - window_id: integer                            (optional; target window, defaults to selected or only window)
-                - open_in_new_window: boolean                   (optional for 'switch' or 'create'; when true, opens workspace in a new window and binds the connection to it. When the orchestration graph window is enabled, this instead admits the saved workspace on the existing single graph window without replacing its visible workspace.)
+                - open_in_new_window: boolean                   open_in_new_window is deprecated and ignored; workspaces open on the existing window.
                 - switch_to_created: boolean                    (optional for 'create'; when true, switches to the newly created workspace)
                 - close_window: boolean                         (optional for 'delete'; when true, switches away without saving, deletes the workspace, then requests window close)
                 - include_hidden: boolean                       (optional; default false. For 'list', includes hidden workspaces. For name-based 'switch'/'delete', allows hidden matches. UUID lookup remains explicit and can resolve hidden workspaces.)
@@ -2797,7 +2801,8 @@ final class WindowRoutingService: Service {
                 **Relationship with bind_context:**
                 - `manage_workspaces.list` returns workspace inventory: names, folder paths, and which windows show each workspace
                 - `bind_context.list` returns per-window routing state: windows, active tabs, context_ids, and current binding
-                - When the same workspace is open in multiple windows, compose tabs are shared — use `bind_context` to discover per-window context_ids
+                - Address workspaces by name or UUID on the existing host, then use `bind_context op=bind workspace=<name or id>`; legacy `working_dirs` and `context_id` stay on the selected host
+                - If a `bind_context op=bind` response has `status: conflict`, report the root conflict block to the starting seat and stop; do not retry or change `file_system.*` settings
 
                 create_tab defaults to bind=true and focus=false so automation can create isolated background tabs without stealing UI focus.
 
@@ -2816,7 +2821,7 @@ final class WindowRoutingService: Service {
                         "window_id": .integer(description: "Optional window ID; defaults to selected or only window"),
                         "focus": .boolean(description: "For 'switch', 'select_tab' or 'create_tab': if true, also shows the workspace or tab in the UI (default false)"),
                         "allow_active": .boolean(description: "For 'close_tab': allow closing the currently active visible tab"),
-                        "open_in_new_window": .boolean(description: "For 'switch' or 'create': when true, opens workspace in a new window and binds connection to it. Returns window_id in response. When the orchestration graph window is enabled, this instead admits the saved workspace's stored compose tab on the existing single graph window, with exact root authority over its roots — the visible workspace is never replaced."),
+                        "open_in_new_window": .boolean(description: "open_in_new_window is deprecated and ignored; workspaces open on the existing window."),
                         "switch_to_created": .boolean(description: "For 'create': when true, switches to the newly created workspace in the target window."),
                         "close_window": .boolean(description: "For 'delete': when true, switches away without saving, deletes the workspace, then requests window close."),
                         "include_hidden": .boolean(description: "Default false. For list, includes hidden workspaces. For name-based switch/delete, allows hidden matches; UUID lookup remains explicit.")

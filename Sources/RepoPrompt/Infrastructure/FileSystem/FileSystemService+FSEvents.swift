@@ -4,6 +4,68 @@ import CoreServices
 import Dispatch
 import Foundation
 
+#if DEBUG
+    final class FileSystemServiceFSEventLiveStreamCounter: @unchecked Sendable {
+        static let shared = FileSystemServiceFSEventLiveStreamCounter()
+
+        private let lock = NSLock()
+        private let pendingTeardowns = DispatchGroup()
+        private var count = 0
+
+        var liveCount: Int {
+            lock.withLock { count }
+        }
+
+        func streamStarted() -> FileSystemServiceFSEventCountedToken {
+            lock.withLock { count += 1 }
+            return FileSystemServiceFSEventCountedToken(counter: self)
+        }
+
+        func teardownQueued() {
+            pendingTeardowns.enter()
+        }
+
+        func streamReleased() {
+            lock.withLock { count -= 1 }
+            pendingTeardowns.leave()
+        }
+
+        func drainQueuedTeardowns() {
+            pendingTeardowns.wait()
+        }
+    }
+
+    final class FileSystemServiceFSEventCountedToken: @unchecked Sendable {
+        private let counter: FileSystemServiceFSEventLiveStreamCounter
+        private let lock = NSLock()
+        private var queued = false
+        private var released = false
+
+        init(counter: FileSystemServiceFSEventLiveStreamCounter) {
+            self.counter = counter
+        }
+
+        func queueTeardown() {
+            lock.withLock {
+                guard !queued else { return }
+                queued = true
+                counter.teardownQueued()
+            }
+        }
+
+        func finishAfterRelease() {
+            let shouldRelease = lock.withLock { () -> Bool in
+                guard queued, !released else { return false }
+                released = true
+                return true
+            }
+            if shouldRelease {
+                counter.streamReleased()
+            }
+        }
+    }
+#endif
+
 struct FSEventCallbackEntry {
     let path: String
     let flags: FSEventStreamEventFlags
@@ -766,6 +828,9 @@ extension FileSystemService {
             resetWatcherIngressState()
             throw FileSystemWatcherActivationError.streamStartFailed(path: path)
         }
+        #if DEBUG
+            fseventCountedToken = FileSystemServiceFSEventLiveStreamCounter.shared.streamStarted()
+        #endif
         fileSystemDebugLog("FSEventStream started for path: \(path) from event ID \(nextFSEventStreamStartEventID)")
     }
 
@@ -802,10 +867,23 @@ extension FileSystemService {
         fseventCallbackContextPointer = nil
         resetWatcherIngressState()
 
-        let teardown = FileSystemServiceFSEventTeardownHandle(
-            stream: stream,
-            callbackContextPointer: callbackContextPointer
-        )
+        #if DEBUG
+            let countedToken = fseventCountedToken
+            fseventCountedToken = nil
+            countedToken?.queueTeardown()
+        #endif
+        #if DEBUG
+            let teardown = FileSystemServiceFSEventTeardownHandle(
+                stream: stream,
+                callbackContextPointer: callbackContextPointer,
+                countedToken: countedToken
+            )
+        #else
+            let teardown = FileSystemServiceFSEventTeardownHandle(
+                stream: stream,
+                callbackContextPointer: callbackContextPointer
+            )
+        #endif
         fseventCallbackQueue.async {
             teardown.finish()
         }

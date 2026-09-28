@@ -30,9 +30,11 @@ import XCTest
         private var pendingConfirmationLatch: PendingConfirmationLatch!
         private var switchPhaseEvents: [WorkspaceSwitchPhase] = []
         private var originalStoragePath: String?
+        private var liveFSEventBaseline = 0
 
         override func setUp() async throws {
             try await super.setUp()
+            liveFSEventBaseline = FileSystemService.liveFSEventStreamCountForTesting()
             AppWindowOpener.shared.resetForTesting()
             AppWindowOpener.shared.policy = .production
             ServerNetworkManager.shared.graphPolicy = .production
@@ -143,6 +145,9 @@ import XCTest
             }
 
             try await super.tearDown()
+            FileSystemService.drainQueuedFSEventTeardownsForTesting()
+            let live = FileSystemService.liveFSEventStreamCountForTesting()
+            XCTAssertEqual(live, liveFSEventBaseline, "\(name): FSEvents baseline=\(liveFSEventBaseline) live=\(live) delta=\(live - liveFSEventBaseline)")
         }
 
         // MARK: - working_dirs bind (graph-on)
@@ -657,14 +662,17 @@ import XCTest
         func testWorkflowPromptMatchesFlag() {
             let block = RepoPromptWorkflowPrompts.workspaceVerificationBlock(variant: .mcp)
 
+            XCTAssertTrue(block.contains("\"action\":\"list\""), "workspace list step missing: \(block)")
+            XCTAssertTrue(block.contains("name or id"), "workspace identity guidance missing: \(block)")
+            XCTAssertTrue(block.contains("`add_folder`") && block.contains("`create`"), "role-scoped add_folder/create guidance missing: \(block)")
             XCTAssertTrue(
-                block.localizedCaseInsensitiveContains("orchestration graph"),
-                "graph-on guidance marker missing: \(block)"
+                block.contains("\"op\":\"bind\",\"workspace\":\"<workspace_name_or_id>\""),
+                "explicit existing-window workspace bind missing: \(block)"
             )
-            XCTAssertTrue(
-                block.contains("do not open another main window") || block.localizedCaseInsensitiveContains("existing graph window"),
-                "graph-on 'bind the existing window' guidance missing: \(block)"
-            )
+            XCTAssertTrue(block.contains("starting seat") && block.contains("stop"), "conflict escalation missing: \(block)")
+            XCTAssertTrue(block.contains("file_system.*"), "file-system settings guard missing: \(block)")
+            XCTAssertFalse(block.localizedCaseInsensitiveContains("orchestration graph"), "flag-specific guidance remains: \(block)")
+            XCTAssertFalse(block.localizedCaseInsensitiveContains("new window"), "window-opening guidance remains: \(block)")
 
             XCTAssertEqual(RepoPromptWorkflowPrompts.workspaceVerificationBlock(variant: .agent), "")
         }

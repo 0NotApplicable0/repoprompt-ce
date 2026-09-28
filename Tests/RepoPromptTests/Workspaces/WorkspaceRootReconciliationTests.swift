@@ -1490,6 +1490,7 @@ import XCTest
                 XCTAssertFalse(fixture.files.visibleRootShellProjections.contains { $0.fullPath == fixture.rootPaths[1] })
                 let attached = try await self.attempt(fixture, paths: fixture.rootPaths)
                 XCTAssertEqual(attached.roots[1].id, canonical.id)
+                await fixture.files.workspaceFileContextStore.unloadRoot(id: canonical.id)
                 XCTAssertEqual(fixture.files.visibleRootShellProjections.map(\.fullPath), fixture.rootPaths)
             }
         }

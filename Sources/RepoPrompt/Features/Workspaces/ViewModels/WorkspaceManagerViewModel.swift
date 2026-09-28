@@ -1563,6 +1563,7 @@ class WorkspaceManagerViewModel: ObservableObject {
     private var rootIntentSequence: UInt64 = 0
     private var rootEditBlocks: [UUID: Set<UUID>] = [:]
     private var rootActivationGeneration: UInt64 = 0
+    private var residentFocusHydrationGeneration: UInt64?
     private var rootReconciliationClosing = false
     private let rootDirectoryProbe = WorkspaceRootDirectoryProbe()
     private var rootFlight: RootFlight?
@@ -1856,7 +1857,8 @@ class WorkspaceManagerViewModel: ObservableObject {
     }
 
     private func startPendingRootReconciliation() {
-        guard !rootReconciliationClosing, rootFlight == nil, !isSwitchingWorkspace else { return }
+        guard !rootReconciliationClosing, rootFlight == nil, !isSwitchingWorkspace,
+              residentFocusHydrationGeneration != workspaceHydrationGeneration else { return }
         let requestIndex = isRefreshing
             ? pendingRootRequests.firstIndex(where: { $0.allowsRefresh })
             : pendingRootRequests.indices.first
@@ -5185,9 +5187,7 @@ class WorkspaceManagerViewModel: ObservableObject {
         let configuredRootPaths = uniqueWorkspaceRootLoadRequests(
             for: Self.loadableRepoPaths(for: workspace)
         ).map(\.canonicalPath)
-        let configuredRootPathSet = Set(configuredRootPaths)
-        let primaryRootRecords = await fileManager.workspaceFileContextStore.roots()
-            .filter { $0.kind == .primaryWorkspace && configuredRootPathSet.contains($0.standardizedFullPath) }
+        let primaryRootRecords = await fileManager.workspaceFileContextStore.visibleWorkspaceRootRecords()
         try Task.checkCancellation()
         #if DEBUG
             await workspaceRootCatalogDidCaptureRootsHandlerForTesting?()
@@ -7683,6 +7683,14 @@ class WorkspaceManagerViewModel: ObservableObject {
             pollAndSaveState(source: "residentFocusCapture")
         }
         let generation = beginWorkspaceHydration(for: target)
+        var focusHydrationGeneration = generation
+        residentFocusHydrationGeneration = generation
+        defer {
+            if residentFocusHydrationGeneration == focusHydrationGeneration {
+                residentFocusHydrationGeneration = nil
+                startPendingRootReconciliation()
+            }
+        }
         activeWorkspaceID = workspaceID
         await loadWorkspaceFolders(for: target, hydrationGeneration: generation)
         if isHydrationGenerationCurrent(generation, workspaceID: workspaceID) {
@@ -7701,6 +7709,8 @@ class WorkspaceManagerViewModel: ObservableObject {
            previous.id != workspaceID
         {
             let recoveryGeneration = beginWorkspaceHydration(for: previous)
+            focusHydrationGeneration = recoveryGeneration
+            residentFocusHydrationGeneration = recoveryGeneration
             activeWorkspaceID = previous.id
             await loadWorkspaceFolders(for: previous, hydrationGeneration: recoveryGeneration)
             if isHydrationGenerationCurrent(recoveryGeneration, workspaceID: previous.id) {

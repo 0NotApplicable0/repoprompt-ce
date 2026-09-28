@@ -3032,7 +3032,11 @@ import XCTest
             try await activateWorkspace(for: context)
             let bindResponse = try await endpoint.callTool(
                 name: "bind_context",
-                arguments: ["op": "bind", "context_id": context.tabID.uuidString]
+                arguments: [
+                    "op": "bind",
+                    "context_id": context.tabID.uuidString,
+                    "window_id": context.window.windowID
+                ]
             )
             let bindText = try toolResultText(bindResponse)
             XCTAssertFalse(bindText.contains("Error:"), bindText)

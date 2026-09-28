@@ -51,16 +51,15 @@ rpce-cli -w <window_id> -e 'tree --type roots'
 
 \(variant == .mcp ? """
 **If binding succeeds** → proceed to \(nextStep)
-**If no match** → the codebase isn't loaded. Find and open the workspace:
+**If no match** → use the existing window's workspace procedure:
 ```json
 {"tool":"manage_workspaces","args":{"action":"list"}}
 ```
-**If the orchestration graph is enabled**: do not open another main window. Retry `bind_context` with `working_dirs` equal to the target roots, or call `manage_workspaces` `switch` with `open_in_new_window:true`; both bind the saved workspace on the existing graph window and keep its visible workspace. Do not use `manage_workspaces switch` without `open_in_new_window:true`.
-**If the orchestration graph is disabled**:
+Address the target workspace by name or id. If it is absent, use `manage_workspaces` `add_folder` for an existing workspace or `create` for a new workspace, only as your role permits. Then bind that workspace on the existing window:
 ```json
-{"tool":"manage_workspaces","args":{"action":"switch","workspace":"<workspace_name>","open_in_new_window":true}}
+{"tool":"bind_context","args":{"op":"bind","workspace":"<workspace_name_or_id>"}}
 ```
-`open_in_new_window:true` opens a new window; then retry the `working_dirs` bind.
+If the workspace or binding conflicts with another seat, report the conflict to the starting seat and stop. Never change `file_system.*` settings to resolve it.
 """ : """
 **Check the output:**
 - If your target root appears in a window → note the window ID and proceed to \(nextStep)

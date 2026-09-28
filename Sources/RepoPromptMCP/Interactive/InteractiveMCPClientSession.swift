@@ -1000,12 +1000,11 @@ actor InteractiveMCPClientSession {
         }
 
         // Inject hidden parameters if we have window selection
-        let suppressWindowInjection = shouldSuppressWindowInjection(toolName: name, args: args)
-        let suppressContextInjection = shouldSuppressContextInjection(toolName: name)
-        if let routedWindowID, !suppressWindowInjection {
+        let suppressRoutingInjection = name == "bind_context" || name == "app_settings"
+        if let routedWindowID, !suppressRoutingInjection {
             args["_windowID"] = .int(routedWindowID)
         }
-        if let routedContextID, args["context_id"] == nil, !suppressContextInjection {
+        if let routedContextID, args["context_id"] == nil, !suppressRoutingInjection {
             args["context_id"] = .string(routedContextID)
         }
 
@@ -1044,11 +1043,6 @@ actor InteractiveMCPClientSession {
                 toolName: name,
                 timeoutSeconds: resolvedDeadline.timeoutSeconds
             )
-        }
-
-        if result.isError != true, shouldClearWindowSelectionAfterCall(toolName: name, args: args) {
-            selectedWindowID = nil
-            logger.debug("Cleared window selection after open-in-new-window switch")
         }
 
         return result
@@ -1927,24 +1921,6 @@ actor InteractiveMCPClientSession {
         }
     #endif
 
-    private func shouldSuppressWindowInjection(toolName: String, args: [String: Value]) -> Bool {
-        guard toolName != "bind_context" else { return true }
-        guard toolName != "app_settings" else { return true }
-        guard toolName == "manage_workspaces" else { return false }
-        let action = args["action"]?.stringValue?.lowercased()
-        guard action == "switch" || action == "create" else { return false }
-        return args["open_in_new_window"]?.boolValue ?? false
-    }
-
-    private func shouldSuppressContextInjection(toolName: String) -> Bool {
-        toolName == "bind_context" || toolName == "app_settings"
-    }
-
-    private func shouldClearWindowSelectionAfterCall(toolName: String, args: [String: Value]) -> Bool {
-        guard toolName == "manage_workspaces" else { return false }
-        return shouldSuppressWindowInjection(toolName: toolName, args: args)
-    }
-
     func setSelectedContextID(_ contextID: String?) {
         selectedContextID = contextID?.trimmingCharacters(in: .whitespacesAndNewlines)
     }
@@ -1979,18 +1955,7 @@ actor InteractiveMCPClientSession {
 
     /// Returns a friendly message explaining single-window mode.
     private func singleWindowInfoMessage() -> String {
-        """
-        RepoPrompt is currently in single-window mode.
-
-        The 'windows' and 'use' commands are only available when multiple
-        RepoPrompt windows are open. With a single window, commands run
-        directly without needing window selection.
-
-        To use multi-window mode:
-        1. Open another RepoPrompt window (⌘N or File > New Window)
-        2. Run 'refresh' to update available tools
-        3. Then 'windows' will show the available windows
-        """
+        "RepoPrompt is in single-window mode; workspaces open on the existing window."
     }
 
     /// Lists available windows.

@@ -55,6 +55,7 @@ actor InteractiveREPL {
     private var lastCommandDuration: TimeInterval = 0
     private var outputSink: OutputSinkState = .stdout
     private var workspaceCacheDirty: Bool = true
+    private var didWarnLegacyNewWindow = false
 
     /// Command runner (created on demand)
     private var runner: MCPCommandRunner?
@@ -629,6 +630,15 @@ actor InteractiveREPL {
 
     private func callToolWithArgs(name: String, args: [String: UncheckedSendableValue]) async throws {
         let valueArgs = try MCPCommandParser.convertToMCPValues(args)
+        if name == "manage_workspaces",
+           let action = valueArgs["action"]?.stringValue?.lowercased(),
+           action == "switch" || action == "create",
+           valueArgs["open_in_new_window"] != nil,
+           !didWarnLegacyNewWindow
+        {
+            didWarnLegacyNewWindow = true
+            fputs("--new-window is deprecated; workspaces open on the existing window\n", stderr)
+        }
         let result = try await session.callTool(name: name, arguments: valueArgs)
         printCallResult(result)
     }
@@ -1060,8 +1070,8 @@ actor InteractiveREPL {
           \u{001B}[32mworkspace\u{001B}[0m unhide <name>         Restore to default lists
           \u{001B}[32mworkspace\u{001B}[0m <name>                Switch to workspace
           \u{001B}[32mworkspace\u{001B}[0m <name> --include-hidden  Switch hidden workspace by name
-          \u{001B}[32mworkspace\u{001B}[0m <name> --new-window   Open workspace in NEW window
-          \u{001B}[32mworkspace\u{001B}[0m create <name> --new-window   Create workspace in NEW window
+          \u{001B}[32mworkspace\u{001B}[0m <name> --new-window   Deprecated; switches in existing window
+          \u{001B}[32mworkspace\u{001B}[0m create <name> --new-window   Deprecated; creates in existing window
           \u{001B}[32mworkspace\u{001B}[0m create <name> --switch       Create workspace and switch to it
           \u{001B}[32mworkspace\u{001B}[0m create <name> --folder-path <path>  Create workspace with a root folder
           \u{001B}[32mwindows\u{001B}[0m                         List windows and context_id values

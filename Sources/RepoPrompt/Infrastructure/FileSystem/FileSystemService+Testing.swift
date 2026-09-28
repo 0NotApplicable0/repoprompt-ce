@@ -6,6 +6,14 @@ import Foundation
     extension FileSystemService {
         // MARK: - Testing Support
 
+        nonisolated static func liveFSEventStreamCountForTesting() -> Int {
+            FileSystemServiceFSEventLiveStreamCounter.shared.liveCount
+        }
+
+        nonisolated static func drainQueuedFSEventTeardownsForTesting() {
+            FileSystemServiceFSEventLiveStreamCounter.shared.drainQueuedTeardowns()
+        }
+
         nonisolated static func deepCopiedEventPathForTesting(_ source: NSString) -> String? {
             deepCopyEventPath(source as CFString)
         }

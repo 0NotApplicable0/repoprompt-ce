@@ -247,19 +247,42 @@ final class FileSystemServiceFSEventCallbackReleaseHandle: @unchecked Sendable {
 final class FileSystemServiceFSEventTeardownHandle: @unchecked Sendable {
     private let stream: FSEventStreamRef
     private let callbackContextPointer: UnsafeMutableRawPointer?
+    private let finishLock = NSLock()
+    private var finished = false
+    #if DEBUG
+        private let countedToken: FileSystemServiceFSEventCountedToken?
+    #endif
 
-    init(
-        stream: FSEventStreamRef,
-        callbackContextPointer: UnsafeMutableRawPointer?
-    ) {
-        self.stream = stream
-        self.callbackContextPointer = callbackContextPointer
-    }
+    #if DEBUG
+        init(
+            stream: FSEventStreamRef,
+            callbackContextPointer: UnsafeMutableRawPointer?,
+            countedToken: FileSystemServiceFSEventCountedToken?
+        ) {
+            self.stream = stream
+            self.callbackContextPointer = callbackContextPointer
+            self.countedToken = countedToken
+        }
+    #else
+        init(stream: FSEventStreamRef, callbackContextPointer: UnsafeMutableRawPointer?) {
+            self.stream = stream
+            self.callbackContextPointer = callbackContextPointer
+        }
+    #endif
 
     func finish() {
+        let shouldFinish = finishLock.withLock { () -> Bool in
+            guard !finished else { return false }
+            finished = true
+            return true
+        }
+        guard shouldFinish else { return }
         FSEventStreamStop(stream)
         FSEventStreamInvalidate(stream)
         FSEventStreamRelease(stream)
+        #if DEBUG
+            countedToken?.finishAfterRelease()
+        #endif
         if let callbackContextPointer {
             Unmanaged<FileSystemServiceFSEventCallbackContext>
                 .fromOpaque(callbackContextPointer)
@@ -479,6 +502,9 @@ actor FileSystemService {
 
     /// The FSEvent stream reference
     var fseventStreamRef: FSEventStreamRef?
+    #if DEBUG
+        var fseventCountedToken: FileSystemServiceFSEventCountedToken?
+    #endif
     var fseventStreamGeneration: UInt64 = 0
     /// The last durable FSEvents journal cut. Captured before the initial crawl so
     /// watcher startup can replay mutations that happen while the crawl is running.

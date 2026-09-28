@@ -3477,6 +3477,10 @@ actor WorkspaceFileContextStore {
         rootLoadOrder.compactMap { rootStatesByID[$0]?.root }
     }
 
+    func visibleWorkspaceRootRecords() -> [WorkspaceRootRecord] {
+        rootsForPathLookupIgnoringPublishedAuthority(scope: .visibleWorkspace)
+    }
+
     func rootRecords(forRootFolderPaths rootFolderPaths: [String], includeSystemRoots: Bool = true) -> [WorkspaceRootRecord] {
         let standardizedRootPaths = Set(rootFolderPaths.map { ($0 as NSString).standardizingPath })
         guard !standardizedRootPaths.isEmpty else { return [] }

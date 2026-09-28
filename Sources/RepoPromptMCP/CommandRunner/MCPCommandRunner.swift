@@ -15,6 +15,7 @@ actor MCPCommandRunner {
     private let session: InteractiveMCPClientSession
     private var parseContext: CommandParseContext
     private let settings: RunnerSettings
+    private var didWarnAboutDeprecatedNewWindow = false
 
     /// Output goes through this callback
     private let outputHandler: @Sendable (String, Bool) async -> Void // (text, isError)
@@ -159,6 +160,15 @@ actor MCPCommandRunner {
             try await callTool(name: toolName, jsonPayload: jsonPayload)
 
         case let .aliasCall(toolName, args):
+            if toolName == "manage_workspaces",
+               let action = args["action"]?.value as? String,
+               action == "switch" || action == "create",
+               args["open_in_new_window"] != nil,
+               !didWarnAboutDeprecatedNewWindow
+            {
+                didWarnAboutDeprecatedNewWindow = true
+                await outputHandler("--new-window is deprecated; workspaces open on the existing window", true)
+            }
             try await callToolWithArgs(name: toolName, args: args)
 
         case .windows:
@@ -673,7 +683,7 @@ actor MCPCommandRunner {
             workspace unhide <name>       Restore to default lists
             workspace switch <name>       Switch to workspace in current window
             workspace switch <name> --include-hidden  Switch hidden workspace by name
-            workspace switch <name> --new-window  Open workspace in NEW window
+            workspace switch <name> --new-window  Deprecated; switch in the existing window
             workspace create <name> --switch       Create workspace and switch to it
             workspace create <name> --folder-path <path>  Create workspace with a root folder
             workspace delete <name>       Delete workspace

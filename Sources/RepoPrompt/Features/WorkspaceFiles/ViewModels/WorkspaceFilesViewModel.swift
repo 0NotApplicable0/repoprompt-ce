@@ -6342,6 +6342,15 @@ class WorkspaceFilesViewModel: ObservableObject {
     }
 
     @MainActor
+    func releaseLoadedStoreRootsForWindowClose() async {
+        let roots = Array(workspaceFileContextRootsByRootKey.values)
+            + Array(preloadedWorkspaceFileContextRootsByRootKey.values)
+        workspaceFileContextRootsByRootKey.removeAll()
+        preloadedWorkspaceFileContextRootsByRootKey.removeAll()
+        await workspaceFileContextStore.unloadRoots(ids: roots.map(\.id))
+    }
+
+    @MainActor
     private func unloadAllRootFoldersFast() async {
         invalidateAllRootLoadTokens()
         currentFolderLoadingTask?.cancel()

@@ -3092,8 +3092,8 @@ func printUsage() {
           workspace unhide MyProject                   Restore to default lists
           workspace switch MyProject                   Switch workspace
           workspace switch MyProject --include-hidden  Switch hidden workspace by name
-          workspace switch MyProject --new-window      Open in NEW window (returns window_id)
-          workspace create "New Project" --new-window  Create in NEW window (returns window_id)
+          workspace switch MyProject --new-window      Deprecated/ignored; uses existing window
+          workspace create "New Project" --new-window  Deprecated/ignored; uses existing window
           workspace create "New Project" --switch      Create and switch to it
           workspace delete MyProject --include-hidden  Delete hidden workspace by name
           tabs list                                    List tabs via bind_context

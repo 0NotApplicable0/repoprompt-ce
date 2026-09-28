@@ -2512,6 +2512,7 @@ class WindowState: ObservableObject {
 
         // Cancel any ongoing AI query
         aiQueriesService.cancelQuery()
+        await workspaceFilesViewModel.releaseLoadedStoreRootsForWindowClose()
 
         // IMPORTANT:
         // During window close / app termination, avoid mutating UI-observed state

@@ -24,9 +24,11 @@ import XCTest
         private var sessionRootOwnerIDs: [UUID] = []
         private var openerCount = 0
         private var runStateChangeCount = 0
+        private var liveFSEventBaseline = 0
 
         override func setUp() async throws {
             try await super.setUp()
+            liveFSEventBaseline = FileSystemService.liveFSEventStreamCountForTesting()
             originalWindows = WindowStatesManager.shared.allWindows
             originalMCPAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
             let settings = GlobalSettingsStore.shared
@@ -102,13 +104,16 @@ import XCTest
                 symlinks: originalFileSystemFlags.symlinks,
                 hierarchical: originalFileSystemFlags.hierarchical
             )
-            await awaitRepoIgnore(originalFileSystemFlags.repo)
+            await awaitFileSystemFlags(originalFileSystemFlags)
             if let originalStoragePath {
                 UserDefaults.standard.set(originalStoragePath, forKey: "GlobalCustomStorageURL")
             } else {
                 UserDefaults.standard.removeObject(forKey: "GlobalCustomStorageURL")
             }
             try await super.tearDown()
+            FileSystemService.drainQueuedFSEventTeardownsForTesting()
+            let live = FileSystemService.liveFSEventStreamCountForTesting()
+            XCTAssertEqual(live, liveFSEventBaseline, "\(name): FSEvents baseline=\(liveFSEventBaseline) live=\(live) delta=\(live - liveFSEventBaseline)")
         }
 
         private func makeWorkspace(_ name: String, ordinal: Int) throws -> WorkspaceModel {
@@ -140,6 +145,25 @@ import XCTest
                 await Task.yield()
             }
             XCTAssertEqual(window?.workspaceManager.fileManager.respectRepoIgnore, expected)
+        }
+
+        private func awaitFileSystemFlags(_ expected: (repo: Bool, cursor: Bool, symlinks: Bool, hierarchical: Bool)) async {
+            for _ in 0 ..< 1000 {
+                let fileManager = window?.workspaceManager.fileManager
+                if fileManager?.respectRepoIgnore == expected.repo,
+                   fileManager?.respectCursorignore == expected.cursor,
+                   fileManager?.skipSymlinks == expected.symlinks,
+                   fileManager?.enableHierarchicalIgnores == expected.hierarchical
+                {
+                    break
+                }
+                await Task.yield()
+            }
+            let fileManager = window?.workspaceManager.fileManager
+            XCTAssertEqual(fileManager?.respectRepoIgnore, expected.repo)
+            XCTAssertEqual(fileManager?.respectCursorignore, expected.cursor)
+            XCTAssertEqual(fileManager?.skipSymlinks, expected.symlinks)
+            XCTAssertEqual(fileManager?.enableHierarchicalIgnores, expected.hierarchical)
         }
 
         private func focusWorkspaceOne() async {

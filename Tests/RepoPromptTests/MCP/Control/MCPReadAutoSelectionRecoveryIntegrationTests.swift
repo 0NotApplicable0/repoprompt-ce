@@ -130,7 +130,11 @@ import XCTest
             )
             let bind = try await endpoint.callTool(
                 name: "bind_context",
-                arguments: ["op": "bind", "context_id": fixture.contextA.tabID.uuidString]
+                arguments: [
+                    "op": "bind",
+                    "context_id": fixture.contextA.tabID.uuidString,
+                    "window_id": fixture.contextA.window.windowID
+                ]
             )
             XCTAssertFalse(bind.rawJSON.contains("\"isError\":true"), bind.rawJSON)
             await fixture.contextA.window.mcpServer.domainRoutingPublishTask?.value
