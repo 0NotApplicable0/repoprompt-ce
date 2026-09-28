@@ -2034,12 +2034,26 @@ final class WindowRoutingService: Service {
         workspace: WorkspaceModel,
         window: WindowState,
         connectionID: UUID,
-        justCreated: Bool = false
+        justCreated: Bool = false,
+        provisionIdleTab: Bool = false
     ) async throws -> Int {
-        guard let candidate = window.workspaceManager.storedBindingCandidate(forWorkspaceID: workspace.id) else {
+        let provisioned = provisionIdleTab ? window.workspaceManager.ensureIdleStoredBindingCandidate(forWorkspaceID: workspace.id) : nil
+        guard let candidate = provisioned?.candidate ?? window.workspaceManager.storedBindingCandidate(forWorkspaceID: workspace.id) else {
             throw MCPError.invalidRequest(
                 "Workspace '\(workspace.name)' is no longer available in window \(window.windowID). Retry after inventory refresh."
             )
+        }
+        var didAdmit = false
+        defer {
+            if !didAdmit,
+               let createdTab = provisioned?.createdTab,
+               window.mcpServer.connectionBindingSnapshot(forConnection: connectionID).tabID != createdTab.id
+            {
+                window.workspaceManager.rollbackIdleStoredBindingTab(createdTab, inWorkspaceID: workspace.id)
+            }
+        }
+        if let createdTab = provisioned?.createdTab {
+            try await window.workspaceManager.persistIdleStoredBindingTab(createdTab, inWorkspaceID: workspace.id)
         }
         let snapshot = try window.mcpServer.makeTabContextSnapshot(
             tabID: candidate.tabID,
@@ -2093,8 +2107,9 @@ final class WindowRoutingService: Service {
             // tab in between. Re-fetching the candidate and rebuilding the snapshot here closes
             // that window instead of installing the now-stale one captured before the awaits.
             guard
-                let revalidatedCandidate = window.workspaceManager.storedBindingCandidate(forWorkspaceID: workspace.id),
-                revalidatedCandidate.tabID == candidate.tabID
+                let revalidatedCandidate = window.workspaceManager.storedBindingCandidate(forContextID: candidate.tabID),
+                revalidatedCandidate.workspaceID == candidate.workspaceID,
+                window.workspaceManager.storedBindingCandidate(forWorkspaceID: workspace.id) != nil
             else {
                 throw MCPError.invalidRequest(
                     "Workspace '\(workspace.name)' is no longer available in window \(window.windowID). Retry after inventory refresh."
@@ -2154,6 +2169,7 @@ final class WindowRoutingService: Service {
             await networkMgr.publishGraphAdmission(ticket)
 
             window.focusWindowIfPossible()
+            didAdmit = true
             return window.windowID
         } catch {
             await networkMgr.abortGraphAdmission(ticket)
@@ -2676,7 +2692,8 @@ final class WindowRoutingService: Service {
                                 workspace: workspace,
                                 window: hostWindow,
                                 connectionID: connectionID,
-                                justCreated: false
+                                justCreated: false,
+                                provisionIdleTab: true
                             )
                             let binding = await currentBindingSummary(for: connectionID)
                             let note = await MainActor.run { self.bindContextWindowNote(windowID: binding.windowID) }
@@ -2765,7 +2782,7 @@ final class WindowRoutingService: Service {
                 - mode: "blank" | "fork"                      (optional for 'create_tab'; default "blank")
                 - source_tab: string                            (optional for 'create_tab' when mode="fork"; UUID or name)
                 - bind: boolean                                 (optional for 'create_tab'; default true)
-                - focus: boolean                                (optional for 'select_tab' or 'create_tab'; if true, also switches the UI to show the tab)
+                - focus: boolean                                (optional for 'switch', 'select_tab' or 'create_tab'; default false; if true, also shows the workspace or tab in the UI)
                 - allow_active: boolean                         (optional for 'close_tab'; default false)
                 - window_id: integer                            (optional; target window, defaults to selected or only window)
                 - open_in_new_window: boolean                   (optional for 'switch' or 'create'; when true, opens workspace in a new window and binds the connection to it. When the orchestration graph window is enabled, this instead admits the saved workspace on the existing single graph window without replacing its visible workspace.)
@@ -2795,7 +2812,7 @@ final class WindowRoutingService: Service {
                         "source_tab": .string(description: "For 'create_tab' with mode='fork': source compose tab UUID or name"),
                         "bind": .boolean(description: "For 'create_tab': if true, bind this MCP connection to the new tab (default true)"),
                         "window_id": .integer(description: "Optional window ID; defaults to selected or only window"),
-                        "focus": .boolean(description: "For 'select_tab' or 'create_tab': if true, also switches the UI to show the tab"),
+                        "focus": .boolean(description: "For 'switch', 'select_tab' or 'create_tab': if true, also shows the workspace or tab in the UI (default false)"),
                         "allow_active": .boolean(description: "For 'close_tab': allow closing the currently active visible tab"),
                         "open_in_new_window": .boolean(description: "For 'switch' or 'create': when true, opens workspace in a new window and binds connection to it. Returns window_id in response. When the orchestration graph window is enabled, this instead admits the saved workspace's stored compose tab on the existing single graph window, with exact root authority over its roots — the visible workspace is never replaced."),
                         "switch_to_created": .boolean(description: "For 'create': when true, switches to the newly created workspace in the target window."),
@@ -2896,12 +2913,16 @@ final class WindowRoutingService: Service {
                     let admittedWindowID = try await routingService.admitStoredWorkspace(
                         workspace: targetModel,
                         window: targetWindow,
-                        connectionID: connectionID
+                        connectionID: connectionID,
+                        provisionIdleTab: true
                     )
+                    let focused = args["focus"]?.boolValue == true
+                        ? await targetWindow.workspaceManager.focusResidentWorkspace(targetModel.id)
+                        : true
                     return ManageWorkspacesResponse(
                         action: "switch",
                         workspaces: nil,
-                        status: "ok",
+                        status: focused ? "ok" : "focus_failed",
                         windowID: admittedWindowID,
                         deprecatedArguments: args["open_in_new_window"] == nil ? nil : ["open_in_new_window"]
                     )

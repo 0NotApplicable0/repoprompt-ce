@@ -7612,6 +7612,97 @@ class WorkspaceManagerViewModel: ObservableObject {
         )
     }
 
+    func ensureIdleStoredBindingCandidate(forWorkspaceID workspaceID: UUID) -> (candidate: ComposeTabBindingCandidate, createdTab: ComposeTabState?)? {
+        guard let index = workspaces.firstIndex(where: { $0.id == workspaceID }),
+              Self.isEligibleForGraphStoredBinding(workspaces[index])
+        else { return nil }
+        let workspace = workspaces[index]
+        let idleTab = workspace.composeTabs.first(where: { $0.id == workspace.activeComposeTabID && $0.activeAgentSessionID == nil })
+            ?? workspace.composeTabs.first(where: { $0.activeAgentSessionID == nil })
+        if let idleTab {
+            return (
+                ComposeTabBindingCandidate(
+                    tabID: idleTab.id,
+                    workspaceID: workspace.id,
+                    workspaceName: workspace.name,
+                    isActiveInWorkspace: workspace.activeComposeTabID == idleTab.id,
+                    repoPaths: workspace.repoPaths
+                ),
+                nil
+            )
+        }
+        let tab = ComposeTabState(name: "T\(workspace.composeTabs.count + 1)")
+        workspaces[index].composeTabs.append(tab)
+        workspaces[index].dateModified = Date()
+        markWorkspaceDirty(workspaceID: workspaceID)
+        return (
+            ComposeTabBindingCandidate(
+                tabID: tab.id,
+                workspaceID: workspace.id,
+                workspaceName: workspace.name,
+                isActiveInWorkspace: false,
+                repoPaths: workspace.repoPaths
+            ),
+            tab
+        )
+    }
+
+    func persistIdleStoredBindingTab(_ createdTab: ComposeTabState, inWorkspaceID workspaceID: UUID) async throws {
+        guard let workspace = workspaces.first(where: { $0.id == workspaceID }),
+              workspace.composeTabs.contains(createdTab)
+        else { throw WorkspacePersistenceFailure(category: .persistenceFailure) }
+        _ = try await saveWorkspaceToFileAsync(workspace, source: "mcpIdleBindingTab")
+    }
+
+    func rollbackIdleStoredBindingTab(_ createdTab: ComposeTabState, inWorkspaceID workspaceID: UUID) {
+        guard let index = workspaces.firstIndex(where: { $0.id == workspaceID }),
+              workspaces[index].activeComposeTabID != createdTab.id,
+              let tabIndex = workspaces[index].composeTabs.firstIndex(where: { $0.id == createdTab.id }),
+              workspaces[index].composeTabs[tabIndex] == createdTab,
+              workspaces[index].composeTabs[tabIndex].activeAgentSessionID == nil
+        else { return }
+        workspaces[index].composeTabs.remove(at: tabIndex)
+        workspaces[index].dateModified = Date()
+        markWorkspaceDirty(workspaceID: workspaceID)
+        scheduleSave(workspaceID: workspaceID, fileURL: workspaceFileURL(for: workspaces[index]), source: "mcpIdleBindingTabRollback")
+    }
+
+    func focusResidentWorkspace(_ workspaceID: UUID) async -> Bool {
+        guard let target = workspaces.first(where: { $0.id == workspaceID }),
+              Self.isEligibleForGraphStoredBinding(target)
+        else { return false }
+        let previousWorkspaceID = activeWorkspaceID
+        if previousWorkspaceID != workspaceID {
+            pollAndSaveState(source: "residentFocusCapture")
+        }
+        let generation = beginWorkspaceHydration(for: target)
+        activeWorkspaceID = workspaceID
+        await loadWorkspaceFolders(for: target, hydrationGeneration: generation)
+        if isHydrationGenerationCurrent(generation, workspaceID: workspaceID) {
+            await restoreWorkspaceState(target)
+        }
+        let expectedPaths = Set(Self.loadableRepoPaths(for: target))
+        let visiblePaths = Set(fileManager.rootFolders.map(\.standardizedFullPath))
+        let previousPaths = Set(workspaces.first(where: { $0.id == previousWorkspaceID })?.repoPaths ?? [])
+        let succeeded = isHydrationGenerationCurrent(generation, workspaceID: workspaceID)
+            && expectedPaths.isSubset(of: visiblePaths)
+            && previousPaths.subtracting(expectedPaths).isDisjoint(with: visiblePaths)
+        if succeeded { return true }
+
+        if activeWorkspaceID == workspaceID,
+           let previous = workspaces.first(where: { $0.id == previousWorkspaceID }),
+           previous.id != workspaceID
+        {
+            let recoveryGeneration = beginWorkspaceHydration(for: previous)
+            activeWorkspaceID = previous.id
+            await loadWorkspaceFolders(for: previous, hydrationGeneration: recoveryGeneration)
+            if isHydrationGenerationCurrent(recoveryGeneration, workspaceID: previous.id) {
+                await restoreWorkspaceState(previous)
+            }
+        }
+        return false
+    }
+
     /// OG-06 §3.1: eligible loaded workspaces (not only the active one) whose roots match
     /// `dirs` — exact root-set matches first, strict superset only when no exact match exists,
     /// mirroring `bind_context`'s existing precedence. Excludes system, ephemeral,
