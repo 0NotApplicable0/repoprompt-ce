@@ -2,7 +2,6 @@
 # Live CE CLI probe. Run only when the debug app is already running.
 set -uo pipefail
 
-cli="$HOME/Library/Application Support/RepoPrompt CE/repoprompt_ce_cli_debug"
 warning='--new-window is deprecated; workspaces open on the existing window'
 created_id=''
 created_maybe=0
@@ -12,7 +11,24 @@ fail() {
     exit 1
 }
 
-[[ -x "$cli" ]] || fail "debug CLI unavailable: $cli"
+if [[ ${RPCE_DEBUG_CLI+x} ]]; then
+    cli=$RPCE_DEBUG_CLI
+    [[ -f "$cli" && -x "$cli" ]] || fail "RPCE_DEBUG_CLI is not an executable file: $cli"
+else
+    cli=''
+    for candidate in \
+        "$HOME/RepoPrompt/repoprompt_ce_cli_debug" \
+        "$HOME/Library/Application Support/RepoPrompt CE/repoprompt_ce_cli_debug"; do
+        if [[ -f "$candidate" && -x "$candidate" ]]; then
+            cli=$candidate
+            break
+        fi
+    done
+    if [[ -z "$cli" ]]; then
+        cli=$(command -v rpce-cli-debug 2>/dev/null || true)
+    fi
+    [[ -f "$cli" && -x "$cli" ]] || fail 'debug CLI unavailable: set RPCE_DEBUG_CLI or install rpce-cli-debug'
+fi
 command -v python3 >/dev/null 2>&1 || fail 'python3 is required to inspect CLI responses'
 
 tmp_dir=$(mktemp -d "${TMPDIR:-/tmp}/rpce-one-window-probe.XXXXXXXX") || fail 'cannot create temporary directory'
