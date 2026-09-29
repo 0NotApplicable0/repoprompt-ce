@@ -97,9 +97,192 @@ import XCTest
             }
         }
 
-        private func makeScenario(rootCount: Int) async throws -> Scenario {
+        func testShutdownDrainsResidualQueuedWaiter() async throws {
+            let deadline = Date().addingTimeInterval(30)
+            let policies = PolicySites()
+            defer { policies.restore() }
+            for enabled in [true, false] {
+                policies.set(enabled: enabled)
+                let scenario = try await makeScenario(rootCount: 2)
+                addTeardownBlock { await scenario.cleanup() }
+                for (index, root) in scenario.roots.enumerated() {
+                    let enqueued = scenario.recorder.expect("root \(index) waiter enqueued") {
+                        $0.enqueuedWaiters.count == index + 1
+                    }
+                    let launch = await scenario.engine.scheduleGraphIndex(rootEpoch: root)
+                    XCTAssertEqual(launch, .handedOff)
+                    await wait(for: enqueued, until: deadline)
+                }
+                let waiters = scenario.recorder.events.enqueuedWaiters
+                XCTAssertEqual(waiters.count, 2)
+                let staleJobID = UUID()
+                XCTAssertNotEqual(staleJobID, waiters[0].jobID)
+                XCTAssertNotEqual(staleJobID, waiters[1].jobID)
+                let retagged = await scenario.engine.debugRetagGraphIndexAdmissionWaiterForTesting(
+                    waiters[0].waiterID,
+                    jobID: staleJobID
+                )
+                XCTAssertTrue(retagged, "policy=\(enabled): a real queued waiter must be retagged")
+                let resumed = scenario.recorder.expect("rooted and residual shutdown resumes") { events in
+                    waiters.allSatisfy { events.resumeCount(for: $0.waiterID) == 1 }
+                }
+                let shutdown = Task { await scenario.engine.shutdown() }
+                await wait(for: resumed, until: deadline)
+                let events = scenario.recorder.events
+                for waiter in waiters {
+                    XCTAssertEqual(events.resumeCount(for: waiter.waiterID), 1, "policy=\(enabled)")
+                    XCTAssertEqual(
+                        events.resumeDisposition(for: waiter.waiterID),
+                        .threwCancellation,
+                        "policy=\(enabled): shutdown must throw for rooted and residual waiters"
+                    )
+                }
+                XCTAssertTrue(events.contains(.engine(.resumed(
+                    waiterID: waiters[0].waiterID,
+                    jobID: staleJobID,
+                    disposition: .threwCancellation
+                ))), "policy=\(enabled): residual waiter was not drained")
+                await shutdown.value
+                await scenario.cleanup()
+            }
+            XCTAssertLessThanOrEqual(Date(), deadline, "residual shutdown exceeded the 30 s method bound")
+        }
+
+        func testRandomizedInterleavings() async throws {
+            let seed: UInt64 = 20_260_928
+            var randomState = seed
+            let deadline = Date().addingTimeInterval(30)
+            let policies = PolicySites()
+            defer { policies.restore() }
+            for (policyIndex, enabled) in [true, false].enumerated() {
+                policies.set(enabled: enabled)
+                let scenario = try await makeScenario(
+                    rootCount: 2,
+                    maximumGraphIndexWorkerRecoveryCount: 1024
+                )
+                addTeardownBlock { await scenario.cleanup() }
+                var trace: [String] = []
+                var current: [(waiterID: UUID, jobID: UUID)] = []
+                var currentGates: [WorkspaceCodemapGraphIndexCancellationGate] = []
+                for (rootIndex, root) in scenario.roots.enumerated() {
+                    let gate = await scenario.engine.debugInstallGraphIndexCancellationGate(rootEpoch: root) {
+                        scenario.recorder.record(.gateHeld)
+                    }
+                    scenario.gates.append(gate)
+                    currentGates.append(gate)
+                    let enqueued = scenario.recorder.expect("seed=\(seed) policy=\(enabled) initial root=\(rootIndex)") {
+                        $0.enqueuedWaiters.count == rootIndex + 1
+                    }
+                    let launch = await scenario.engine.scheduleGraphIndex(rootEpoch: root)
+                    XCTAssertEqual(launch, .handedOff)
+                    await wait(for: enqueued, until: deadline)
+                    try current.append(XCTUnwrap(scenario.recorder.events.enqueuedWaiters.last))
+                }
+                XCTAssertNotEqual(current[0].jobID, current[1].jobID)
+
+                for offset in 0 ..< 500 {
+                    let iteration = policyIndex * 500 + offset
+                    randomState = randomState &* 6_364_136_223_846_793_005 &+ 1_442_695_040_888_963_407
+                    let rootIndex = Int((randomState >> 32) & 1)
+                    let root = scenario.roots[rootIndex]
+                    let w0 = current[rootIndex]
+                    trace.append("\(iteration):restart root=\(rootIndex) W0=\(w0.waiterID)")
+                    let label = "seed=\(seed) policy=\(enabled) iteration=\(iteration) trace=\(trace.suffix(12).joined(separator: " -> "))"
+                    let before = scenario.recorder.events
+                    let priorEnqueues = before.enqueuedWaiters.count { $0.jobID == w0.jobID }
+                    let priorStarts = before.workerStartCount(for: w0.jobID)
+                    let priorFinishes = before.workerFinishCount(for: w0.jobID)
+                    let priorGateHolds = before.count { $0 == .gateHeld }
+                    let oldGate = currentGates[rootIndex]
+                    let nextGate = await scenario.engine.debugInstallGraphIndexCancellationGate(rootEpoch: root) {
+                        scenario.recorder.record(.gateHeld)
+                    }
+                    scenario.gates.append(nextGate)
+                    let held = scenario.recorder.expect("\(label): old callback held") {
+                        $0.count { $0 == .gateHeld } > priorGateHolds
+                    }
+                    let restarted = scenario.recorder.expect("\(label): real finish/start/enqueue") { events in
+                        events.workerFinishCount(for: w0.jobID) > priorFinishes &&
+                            events.workerStartCount(for: w0.jobID) > priorStarts &&
+                            events.enqueuedWaiters.count { $0.jobID == w0.jobID } > priorEnqueues
+                    }
+                    let requested = await scenario.engine.debugRequestQueuedGraphIndexWorkerRestart(rootEpoch: root)
+                    XCTAssertTrue(requested, "\(label): restart request rejected")
+                    await wait(for: held, until: deadline)
+                    await wait(for: restarted, until: deadline)
+                    let w1 = try XCTUnwrap(scenario.recorder.events.enqueuedWaiters.last { $0.jobID == w0.jobID })
+                    XCTAssertNotEqual(w0.waiterID, w1.waiterID, "\(label): waiter identity was reused")
+                    XCTAssertEqual(scenario.recorder.events.resumeCount(for: w0.waiterID), 1, "\(label): W0 terminal count")
+                    XCTAssertEqual(
+                        scenario.recorder.events.resumeDisposition(for: w0.waiterID),
+                        .threwCancellation,
+                        "\(label): W0 cancellation outcome"
+                    )
+                    XCTAssertEqual(scenario.recorder.events.resumeCount(for: w1.waiterID), 0, "\(label): W1 resumed early")
+                    let applied = scenario.recorder.expect("\(label): old callback applied") {
+                        $0.contains(.engine(.cancellationCallbackApplied(waiterID: w0.waiterID, jobID: w0.jobID)))
+                    }
+                    await oldGate.release()
+                    await wait(for: applied, until: deadline)
+                    XCTAssertEqual(
+                        scenario.recorder.events.resumeCount(for: w1.waiterID),
+                        0,
+                        "\(label): late W0 cancellation resumed W1; full trace=\(trace.joined(separator: " -> "))"
+                    )
+                    let w1Queued = await scenario.engine.debugGraphIndexAdmissionWaiterIsQueued(w1.waiterID)
+                    XCTAssertTrue(
+                        w1Queued,
+                        "\(label): W1 detached by W0 callback; full trace=\(trace.joined(separator: " -> "))"
+                    )
+                    current[rootIndex] = w1
+                    currentGates[rootIndex] = nextGate
+                }
+
+                for gate in currentGates {
+                    await gate.release()
+                }
+                let lastIteration = policyIndex * 500 + 499
+                trace.append("\(lastIteration):shutdown")
+                let context = "seed=\(seed) policy=\(enabled) iteration=\(lastIteration) trace=\(trace.joined(separator: " -> "))"
+                let waiters = scenario.recorder.events.enqueuedWaiters
+                let expectedWaiterIDs = Set(waiters.map(\.waiterID))
+                XCTAssertEqual(expectedWaiterIDs.count, waiters.count, "\(context): waiter identities must be unique")
+                let resumed = scenario.recorder.expect("\(context): shutdown drained every waiter") { events in
+                    var resumeCounts: [UUID: Int] = [:]
+                    for event in events {
+                        guard case let .engine(.resumed(waiterID, _, _)) = event,
+                              expectedWaiterIDs.contains(waiterID)
+                        else { continue }
+                        resumeCounts[waiterID, default: 0] += 1
+                    }
+                    return expectedWaiterIDs.allSatisfy { resumeCounts[$0] == 1 }
+                }
+                let shutdown = Task { await scenario.engine.shutdown() }
+                await wait(for: resumed, until: deadline)
+                let events = scenario.recorder.events
+                for waiter in waiters {
+                    XCTAssertEqual(events.resumeCount(for: waiter.waiterID), 1, "\(context): terminal count")
+                    XCTAssertEqual(
+                        events.resumeDisposition(for: waiter.waiterID),
+                        .threwCancellation,
+                        "\(context): cancellation-error outcome"
+                    )
+                }
+                await shutdown.value
+                await scenario.cleanup()
+            }
+            XCTAssertLessThanOrEqual(Date(), deadline, "seed=\(seed): 1,000 schedules exceeded the 30 s method bound")
+        }
+
+        private func makeScenario(
+            rootCount: Int,
+            maximumGraphIndexWorkerRecoveryCount: UInt64? = nil
+        ) async throws -> Scenario {
             let repository = try ReviewGitRepositoryFixture(name: #function)
-            let fixture = try CodemapStoreFixture(name: #function)
+            let fixture = try CodemapStoreFixture(
+                name: #function,
+                maximumGraphIndexWorkerRecoveryCount: maximumGraphIndexWorkerRecoveryCount
+            )
             let engine = try fixture.runtime().bindingEngine()
             let scenario = Scenario(repository: repository, fixture: fixture, engine: engine)
             await engine.debugSetGraphIndexAdmissionObserver { [recorder = scenario.recorder] event in
@@ -178,6 +361,7 @@ import XCTest
         var roots: [WorkspaceCodemapRootEpoch] = []
         var holds: [(UUID, WorkspaceCodemapRootEpoch)] = []
         var gate: WorkspaceCodemapGraphIndexCancellationGate?
+        var gates: [WorkspaceCodemapGraphIndexCancellationGate] = []
 
         init(repository: ReviewGitRepositoryFixture, fixture: CodemapStoreFixture, engine: WorkspaceCodemapBindingEngine) {
             self.repository = repository
@@ -195,6 +379,10 @@ import XCTest
 
         func cleanup() async {
             await gate?.release()
+            for gate in gates {
+                await gate.release()
+            }
+            gates.removeAll()
             await releaseHolds()
             for root in roots {
                 await engine.debugClearGraphIndexCancellationGate(rootEpoch: root)
