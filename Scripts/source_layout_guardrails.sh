@@ -194,9 +194,15 @@ else:
 app_by_name_dependencies = [dependency["byName"][0] for dependency in repo_prompt_app_dependencies if dependency.get("byName")]
 if app_by_name_dependencies.count("RepoPromptWorkspaceCore") != 1:
     errors.append("RepoPromptApp must depend exactly once on RepoPromptWorkspaceCore")
-for forbidden_consumer in ("RepoPrompt", "RepoPromptMCP", "RepoPromptShared", "RepoPromptTests"):
+for forbidden_consumer in ("RepoPrompt", "RepoPromptMCP", "RepoPromptMCPCore", "RepoPromptShared", "RepoPromptTests"):
     dependencies = [dependency["byName"][0] for dependency in targets.get(forbidden_consumer, {}).get("dependencies", []) if dependency.get("byName")]
     if "RepoPromptWorkspaceCore" in dependencies: errors.append(f"{forbidden_consumer} must not directly depend on RepoPromptWorkspaceCore")
+for target_name, target in targets.items():
+    if target.get("type") == "test" or target_name == "RepoPromptTestSupport":
+        continue
+    target_dependencies = [dependency["byName"][0] for dependency in target.get("dependencies", []) if dependency.get("byName")]
+    if "RepoPromptTestSupport" in target_dependencies:
+        errors.append(f"production target {target_name} must not depend on RepoPromptTestSupport")
 for product in package.get("products", []):
     if "RepoPromptWorkspaceCore" in product.get("targets", []): errors.append("RepoPromptWorkspaceCore must not be exposed as a package product")
 
@@ -343,9 +349,15 @@ required_core_imports = {
 for module in sorted(required_core_imports):
     if f"import {module}\n" not in core_syntax_source:
         errors.append(f"CodeMapSyntaxEngine missing direct grammar/wrapper module import: {module}")
-bridging_header = Path("Sources/RepoPrompt/Support/RepoPrompt-Bridging-Header.h").read_text()
-if "tree_sitter_" in bridging_header or "TSLanguage" in bridging_header:
-    errors.append("bridging header must not redeclare Tree-sitter grammar APIs")
+if "-import-objc-header" in Path("Package.swift").read_text():
+    errors.append("first-party targets must not use an Objective-C bridging header; import a C target module instead")
+repo_prompt_c_include = Path("Sources/RepoPromptC/include")
+repo_prompt_c_umbrella = (repo_prompt_c_include / "RepoPromptC.h").read_text()
+for header in sorted(repo_prompt_c_include.glob("*.h")):
+    if header.name != "RepoPromptC.h" and f'#include "{header.name}"' not in repo_prompt_c_umbrella:
+        errors.append(f"RepoPromptC umbrella header must include {header.name} (umbrella directories leave warm module caches stale)")
+if Path("Sources/RepoPrompt/Support").exists():
+    errors.append("Sources/RepoPrompt/Support was retired with the bridging header; C declarations belong in Sources/RepoPromptC")
 
 if errors:
     raise SystemExit("\n".join(errors))

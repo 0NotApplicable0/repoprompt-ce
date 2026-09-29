@@ -294,6 +294,53 @@ Gate: at least 30% lower median edit→owning-test time excluding queue, and no 
   - the unattributed post-build gap on (a) (P0.1);
   - cross-worktree cache sharing (§5.5).
 
+## W1 slice S14 — retire the app bridging header (2026-09-28)
+
+**Manifest:**
+- Deleted `Sources/RepoPrompt/Support/RepoPrompt-Bridging-Header.h` and removed the app target's `unsafeFlags` (`-import-objc-header …`, `-disable-bridging-pch`) and the now-unused `packageRoot`/`#filePath` manifest value.
+- Added `Sources/RepoPromptC/include/repo_gitignore.h`. It declares the existing gitignore wrapper API; `repo_gitignore_pattern` moved out of `repo_wildmatch_wrapper.c` with an identical layout.
+- Added `Sources/RepoPromptC/include/repo_process_security.h` and `src/process_security/repo_process_security.c` with `repo_deny_debugger_attachment()`, because `ptrace` is not exported to Swift by `Darwin`.
+- Added explicit `import RepoPromptC` to the 7 Swift consumers: `ApplicationSecurity`, `SearchMatch`, `SearchPathFiltering`, `WorkspaceReadableFileService`, `PathSearchIndex`, `RepoSearchBatchScorer`, `GitignoreCompiler`.
+  - `sysctl`/`kinfo_proc`/`P_TRACED` already come from `Darwin`.
+  - No app Swift file used PCRE2 C symbols through the bridge.
+- Guardrails now reject `-import-objc-header` and a recreated `Sources/RepoPrompt/Support`. The Xcode generator rejects a bridging header on any target, replacing its old "app must own the header" assertion. `AGENTS.md`, `source-layout.md`, and the concurrency profile reference are updated.
+
+**Why:** a bridging header ties C interop to one Swift target, blocks moving any consumer into another module, and needed `unsafeFlags`. Every consumer now names its dependency explicitly, which the import check can enforce.
+
+**Evidence:**
+- The release-only `ptrace` call path (`#if !DEBUG`) and the gitignore API type-check against the generated `RepoPromptC` module map (`swiftc -typecheck`).
+- `generate_xcode_workspace.py generate && validate` pass.
+- `make guardrails` passes.
+- Full suite through conductor (ticket `7b24e1f3`): exit 0, **3,599 tests executed**, 2 skipped, 0 failures, 0 compile errors. The build took 1,314 s because dropping the bridging header changes every app compile flag.
+
+**Found during validation — umbrella directories leave warm caches stale.** The first full run failed: `GitignoreCompiler` could not see the new `repo_gitignore.h` symbols. The cached `RepoPromptC` precompiled module (06:31) predated the header (07:24). With a generated `umbrella` *directory*, adding a header is not a tracked module input, so warm clang module caches, including CI's restored `.build`, are not invalidated.
+- Fix: an explicit umbrella header, `Sources/RepoPromptC/include/RepoPromptC.h`, listing every public header. Adding or removing a header now edits a tracked input.
+- A guardrail fails if any `RepoPromptC` header is missing from the umbrella.
+- Rule for all future C targets: provide an explicit umbrella header.
+- Style: `conductor lint` passed (SwiftFormat 0/1594 files need formatting; SwiftLint `--strict` clean).
+
+Follow-up (style lane): SwiftFormat `--lint` took 930 s in this fresh worktree. Investigate cache reuse across worktrees under P0.1/§5.5; it lengthens every agent's pre-handoff check.
+
+## W1 slice S15 — `RepoPromptMCPCore` library plus a thin MCP executable (2026-09-28)
+
+**Manifest:**
+- All `Sources/RepoPromptMCP` files except `main.swift` moved to `Sources/RepoPromptMCPCore` (`git mv`).
+- The declarations and globals from the old 3,759-line `main.swift` moved to `RepoPromptMCPCore/MCPCLIProcess.swift`. `main.swift` keeps only the entry script (about 180 lines).
+- **Eager-initialization parity:** `main.swift` globals initialize in source order at launch; library globals are lazy. The new `bootstrapMCPCLIProcess()` is the entry's first statement and forces `log`, then `debugLogURL`, whose initializer truncates the socket debug log at startup, as before. No other moved global has an initialization side effect.
+- **Access:** only what the entry script uses became `package`. That is the CLI mode and option types, exit-code and error enums, the four service types' initializers and `run()` requirements, `DirectHeadlessChildBridge.isRequested/run`, `MCPBackendSelection.resolve`, `RuntimePolicyAdministration.run`, the stdin probes, `cliDisplayCommand`, `handleRuntimeError`, and `log`. Nothing is `public`.
+- **Tests:** the 9 CLI test files that did not import the app moved to the new `RepoPromptMCPCoreTests` target (dependencies: MCPCore, DomainRuntime, Shared, MCP). The 2 that also need the app (`OracleGroupBoundaryTests`, `MCPExportWatchdogContractTests`) stay in `RepoPromptTests` and `@testable import RepoPromptMCPCore`. `RepoPromptTests` no longer depends on an executable target.
+- **Tooling:** `sync_mcp_cli_version.sh` now points at `MCPCLIProcess.swift`; the `let CLI_VERSION` form is unchanged and `--check` passes. Also updated: the headless guardrails (array of CLI source roots; core-owned files checked in the core), the workspace-core guardrail consumer list, style and lint paths, the preflight MCP path pattern, the conductor diagnostics target map, the Xcode generator's test-dependency topology and README text, `AGENTS.md`, `xcode-workspace.md`, and `source-layout.md`.
+
+**Why:** CLI owner tests no longer compile or link the 648k-line app, and the root test target stops depending on an executable, which was the stated blocker for native Xcode test bundles.
+
+**Evidence:**
+- `conductor swift-build --product repoprompt-mcp` passes.
+- `make guardrails` passes; the gated `tests_sleep_calls` ratchet improved from 49 to 48 as one test left the app target (47 to 46 before the rebase onto main).
+- Xcode generator `generate` and `validate` pass; `make conductor-selftest` passes.
+- Full suite through conductor (`s15-full-2`): exit 0, **3,599 tests executed**, 2 skipped, 0 failures. The first attempt failed because one moved test used the `RepoRoot` helper from `RepoPromptTests/Helpers`. That helper now lives in a new shared `RepoPromptTestSupport` library target under `Tests/`, the first TestSupport target per plan §3.6; a guardrail rejects any production target that depends on it.
+- CLI smoke on the built binary: `--version`, `--help`, and the no-argument usage path are unchanged. With `MCP_SOCKET_DEBUG=1`, a pre-seeded socket debug log is truncated to 0 bytes at launch even for `--version`, which confirms eager-initialization parity.
+- Ratchet baseline lowered: `tests_sleep_calls` 49 → 48 (47 → 46 before the rebase onto main).
+
 ## P0.1 — structured conductor timing (2026-09-28)
 
 **What conductor records** (`Scripts/conductor.py`; additive, with no change to lanes, admission, or job behavior):
