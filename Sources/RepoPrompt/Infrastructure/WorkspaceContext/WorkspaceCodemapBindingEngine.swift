@@ -1,6 +1,58 @@
 import Foundation
 import RepoPromptCodeMapCore
 
+#if DEBUG
+    enum WorkspaceCodemapGraphIndexAdmissionDebugDisposition: Equatable {
+        case returned(Bool)
+        case threwCancellation
+    }
+
+    enum WorkspaceCodemapGraphIndexAdmissionDebugEvent: Equatable {
+        case enqueued(waiterID: UUID, jobID: UUID)
+        case resumed(
+            waiterID: UUID,
+            jobID: UUID,
+            disposition: WorkspaceCodemapGraphIndexAdmissionDebugDisposition
+        )
+        case cancellationCallbackApplied(waiterID: UUID, jobID: UUID)
+        case workerStarted(jobID: UUID, workerID: UUID)
+        case workerFinished(jobID: UUID, workerID: UUID)
+    }
+
+    actor WorkspaceCodemapGraphIndexCancellationGate {
+        private let onEnter: @Sendable () -> Void
+        private var released = false
+        private var entered = false
+        private var continuation: CheckedContinuation<Void, Never>?
+
+        init(onEnter: @escaping @Sendable () -> Void) {
+            self.onEnter = onEnter
+        }
+
+        func wait() async {
+            if !entered {
+                entered = true
+                onEnter()
+            }
+            guard !released else { return }
+            await withCheckedContinuation { continuation in
+                if released {
+                    continuation.resume()
+                } else {
+                    self.continuation = continuation
+                }
+            }
+        }
+
+        func release() {
+            guard !released else { return }
+            released = true
+            continuation?.resume()
+            continuation = nil
+        }
+    }
+#endif
+
 /// Inert orchestration for Git-only, artifact-backed workspace codemap bindings.
 ///
 /// One injected instance can own bounded sessions for many roots. It deliberately owns no source
@@ -399,6 +451,9 @@ actor WorkspaceCodemapBindingEngine {
         var rootOvertakeRecorded: Bool
         var explicitOvertakeRecorded: Bool
         let continuation: CheckedContinuation<Bool, Never>
+        #if DEBUG
+            var debugWaiterID: UUID?
+        #endif
     }
 
     /// Root-local warm index state and progress accounting. Graph publication is
@@ -646,6 +701,12 @@ actor WorkspaceCodemapBindingEngine {
         }
 
         private var debugGraphIndexAdmissionHolds: [UUID: DebugGraphIndexAdmissionHold] = [:]
+        private var debugGraphIndexCancellationGates: [
+            WorkspaceCodemapRootEpoch: WorkspaceCodemapGraphIndexCancellationGate
+        ] = [:]
+        private var debugGraphIndexAdmissionObserver: (
+            @Sendable (WorkspaceCodemapGraphIndexAdmissionDebugEvent) -> Void
+        )?
         private var debugGraphIndexNonCooperativeWorkerGates: [
             UUID: DebugGraphIndexNonCooperativeWorkerGate
         ] = [:]
@@ -1162,6 +1223,9 @@ actor WorkspaceCodemapBindingEngine {
         installed.task = task
         graphIndexJobs[rootEpoch] = installed
         armGraphIndexWatchdog(jobID: jobID, workerID: workerID, rootEpoch: rootEpoch)
+        #if DEBUG
+            debugGraphIndexAdmissionObserver?(.workerStarted(jobID: jobID, workerID: workerID))
+        #endif
         return true
     }
 
@@ -1906,6 +1970,47 @@ actor WorkspaceCodemapBindingEngine {
             return (released, snapshot.metrics, snapshot.queueWaitMilliseconds)
         }
 
+        func debugSetGraphIndexAdmissionObserver(
+            _ observer: (@Sendable (WorkspaceCodemapGraphIndexAdmissionDebugEvent) -> Void)?
+        ) {
+            debugGraphIndexAdmissionObserver = observer
+        }
+
+        func debugInstallGraphIndexCancellationGate(
+            rootEpoch: WorkspaceCodemapRootEpoch,
+            onEnter: @escaping @Sendable () -> Void
+        ) -> WorkspaceCodemapGraphIndexCancellationGate {
+            let gate = WorkspaceCodemapGraphIndexCancellationGate(onEnter: onEnter)
+            debugGraphIndexCancellationGates[rootEpoch] = gate
+            return gate
+        }
+
+        func debugClearGraphIndexCancellationGate(rootEpoch: WorkspaceCodemapRootEpoch) {
+            debugGraphIndexCancellationGates.removeValue(forKey: rootEpoch)
+        }
+
+        func debugGraphIndexAdmissionWaiterIsQueued(_ waiterID: UUID) -> Bool {
+            graphIndexAdmissionQueue.contains { $0.debugWaiterID == waiterID }
+        }
+
+        func debugRequestQueuedGraphIndexWorkerRestart(
+            rootEpoch: WorkspaceCodemapRootEpoch
+        ) -> Bool {
+            guard let job = graphIndexJobs[rootEpoch],
+                  job.isQueuedForAdmission,
+                  !graphIndexJobPhaseIsTerminal(job.phase),
+                  !job.workerRecoveryExhausted,
+                  job.workerRecoveryCount < policy.maximumGraphIndexWorkerRecoveryCount
+            else { return false }
+            requestGraphIndexWorkerRestart(
+                jobID: job.id,
+                rootEpoch: rootEpoch,
+                reason: .prioritizeRestart,
+                countsTowardRecoveryLimit: false
+            )
+            return true
+        }
+
         func debugGraphIndexEvents(
             rootID: UUID? = nil,
             sinceOrdinal: UInt64?,
@@ -2365,6 +2470,10 @@ actor WorkspaceCodemapBindingEngine {
         if job.isActiveBatch {
             return true
         }
+        #if DEBUG
+            let debugWaiterID = UUID()
+            let debugCancellationGate = debugGraphIndexCancellationGates[rootEpoch]
+        #endif
         return await withTaskCancellationHandler {
             await withCheckedContinuation { continuation in
                 guard !Task.isCancelled,
@@ -2390,25 +2499,59 @@ actor WorkspaceCodemapBindingEngine {
                 current.admissionWaitStartUptimeNanoseconds = queuedUptimeNanoseconds
                 current.phaseEnteredUptimeNanoseconds = queuedUptimeNanoseconds
                 graphIndexJobs[rootEpoch] = current
-                graphIndexAdmissionQueue.append(GraphIndexAdmissionWaiter(
+                var waiter = GraphIndexAdmissionWaiter(
                     jobID: jobID,
                     rootEpoch: rootEpoch,
                     enqueueOrdinal: ordinal,
                     rootOvertakeRecorded: false,
                     explicitOvertakeRecorded: false,
                     continuation: continuation
-                ))
+                )
+                #if DEBUG
+                    waiter.debugWaiterID = debugWaiterID
+                #endif
+                graphIndexAdmissionQueue.append(waiter)
                 #if DEBUG
                     debugGraphIndexAdmissionEnqueuedAtNanoseconds[jobID] = DispatchTime.now().uptimeNanoseconds
+                    debugGraphIndexAdmissionObserver?(.enqueued(waiterID: debugWaiterID, jobID: jobID))
                 #endif
                 incrementCounter(\.graphIndexBatchesQueued)
                 emit(.graphIndexBatchQueued, rootEpoch: rootEpoch, graphIndexPhase: .waitingForAdmission)
                 scheduleGraphIndexAdmissions()
             }
         } onCancel: {
-            Task { await self.cancelGraphIndexAdmission(jobID: jobID) }
+            Task {
+                #if DEBUG
+                    await debugCancellationGate?.wait()
+                #endif
+                await self.cancelGraphIndexAdmission(jobID: jobID)
+                #if DEBUG
+                    await self.debugObserveGraphIndexCancellationCallbackApplied(
+                        waiterID: debugWaiterID,
+                        jobID: jobID
+                    )
+                #endif
+            }
         }
     }
+
+    #if DEBUG
+        private func debugObserveGraphIndexCancellationCallbackApplied(waiterID: UUID, jobID: UUID) {
+            debugGraphIndexAdmissionObserver?(.cancellationCallbackApplied(waiterID: waiterID, jobID: jobID))
+        }
+
+        private func debugObserveGraphIndexAdmissionResume(
+            _ waiter: GraphIndexAdmissionWaiter,
+            returning result: Bool
+        ) {
+            guard let waiterID = waiter.debugWaiterID else { return }
+            debugGraphIndexAdmissionObserver?(.resumed(
+                waiterID: waiterID,
+                jobID: waiter.jobID,
+                disposition: .returned(result)
+            ))
+        }
+    #endif
 
     private func scheduleGraphIndexAdmissions() {
         guard !isShuttingDown, !graphIndexAdmissionQueue.isEmpty else { return }
@@ -2481,6 +2624,9 @@ actor WorkspaceCodemapBindingEngine {
                 #if DEBUG
                     debugGraphIndexAdmissionEnqueuedAtNanoseconds.removeValue(forKey: waiter.jobID)
                 #endif
+                #if DEBUG
+                    debugObserveGraphIndexAdmissionResume(waiter, returning: false)
+                #endif
                 waiter.continuation.resume(returning: false)
                 continue
             }
@@ -2523,6 +2669,9 @@ actor WorkspaceCodemapBindingEngine {
             consecutiveDemandAdmissions = 0
             incrementCounter(\.graphIndexBatchesStarted)
             emit(.graphIndexBatchStarted, rootEpoch: waiter.rootEpoch, graphIndexPhase: .readingCatalogPage)
+            #if DEBUG
+                debugObserveGraphIndexAdmissionResume(waiter, returning: true)
+            #endif
             waiter.continuation.resume(returning: true)
         }
     }
@@ -2554,6 +2703,9 @@ actor WorkspaceCodemapBindingEngine {
             debugGraphIndexAdmissionEnqueuedAtNanoseconds.removeValue(forKey: jobID)
         #endif
         for waiter in detached {
+            #if DEBUG
+                debugObserveGraphIndexAdmissionResume(waiter, returning: false)
+            #endif
             waiter.continuation.resume(returning: false)
         }
     }
@@ -5203,6 +5355,9 @@ actor WorkspaceCodemapBindingEngine {
         #if DEBUG
             debugGraphIndexNonCooperativeWorkerGates.removeValue(forKey: jobID)
         #endif
+        #if DEBUG
+            debugGraphIndexAdmissionObserver?(.workerFinished(jobID: jobID, workerID: workerID))
+        #endif
         let restartReason = job.workerRestartRequestedReason
         let terminalCompletionReconciledRecovery =
             job.workerRecoveryExhausted && graphIndexJobPhaseIsTerminal(job.phase)
@@ -5331,6 +5486,9 @@ actor WorkspaceCodemapBindingEngine {
         let detached = graphIndexAdmissionQueue.filter { $0.jobID == job.id }
         graphIndexAdmissionQueue.removeAll { $0.jobID == job.id }
         for waiter in detached {
+            #if DEBUG
+                debugObserveGraphIndexAdmissionResume(waiter, returning: false)
+            #endif
             waiter.continuation.resume(returning: false)
         }
         if wasActive {
