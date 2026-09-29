@@ -807,6 +807,7 @@ allowed_tracked_docs=(
   "docs/migrations/swift-6-2-concurrency-migration-2026-07-18.md"
   "docs/migrations/swift-6-2-concurrency/migration-ledger.md"
   "docs/migrations/build-modularization-2026-09-28.md"
+  "docs/migrations/build-modularization/completion-plan.md"
   "docs/migrations/build-modularization/ledger.md"
   "docs/migrations/build-modularization/ratchets.json"
   "docs/open-source-readiness.md"
