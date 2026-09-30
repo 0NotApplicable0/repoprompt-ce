@@ -2983,7 +2983,8 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
     private func fallbackSubmissionContext(
         _ context: AgentTabSession.CodexFallbackSubmissionContext?,
         text: String,
-        images: [AgentImageAttachment]
+        images: [AgentImageAttachment],
+        stopFence: AgentRunStartStopFence
     ) -> AgentTabSession.CodexFallbackSubmissionContext {
         context ?? .init(
             queueID: UUID(),
@@ -2993,7 +2994,8 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             draftText: text,
             optimisticUserItemID: nil,
             origin: .manual,
-            dispatchTicket: nil
+            dispatchTicket: nil,
+            stopFence: stopFence
         )
     }
 
@@ -3020,15 +3022,17 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         autoEffortApplied: Bool,
         attachmentReservationID: UUID?,
         reason: CodexTurnFallbackDecision,
-        controller: any CodexSessionControlling
+        controller: any CodexSessionControlling,
+        stopFence: AgentRunStartStopFence
     ) -> NativeSendOutcome {
+        guard stopFence.permitsStart(of: session) else { return .stale(reason: "Codex queued fallback was invalidated by Stop.") }
         guard let threadID = session.codexConversationID,
               let runID = session.runID,
               let runAttemptID = session.activeRunAttemptID
         else {
             return .stale(reason: "Codex could not queue fallback delivery because its run lineage changed.")
         }
-        let submission = fallbackSubmissionContext(context, text: text, images: images)
+        let submission = fallbackSubmissionContext(context, text: text, images: images, stopFence: stopFence)
         if session.codexFallbackQueue.contains(where: { $0.id == submission.queueID })
             || session.codexFallbackDispatchInFlight?.id == submission.queueID
         {
@@ -3063,7 +3067,8 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             originRunAttemptID: runAttemptID,
             blockingTurn: recoverableCodexFallbackBlockingTurn(session: session),
             state: .queued,
-            monitoringDispatchContext: AgentSessionLinkDispatchContext(session: session, dispatchID: .codexFallback(queueID: submission.queueID))
+            monitoringDispatchContext: AgentSessionLinkDispatchContext(session: session, dispatchID: .codexFallback(queueID: submission.queueID)),
+            stopFence: submission.stopFence ?? stopFence
         )
         detachCodexFallbackAttachmentReservation(attachmentReservationID, session: session)
         session.codexFallbackQueue.append(entry)
@@ -3197,7 +3202,8 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
               ObjectIdentifier(controller) == head.originControllerInstanceID,
               session.codexControllerGeneration == head.originControllerGeneration,
               session.codexConversationID == head.originThreadID,
-              session.runID == head.originRunID
+              session.runID == head.originRunID,
+              head.stopFence?.permitsStart(of: session) ?? true
         else { return nil }
         if beginsSuccessorAttempt {
             guard !session.runState.isActive else { return nil }
@@ -6789,68 +6795,20 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         return .steer(identity)
     }
 
-    /// Whether a RepoPrompt oversight notice can be steered into this session's exact active user
-    /// turn right now. Pure: the same plan `sendCodexNativeMessage` would compute for a steer.
-    func canSteerOversightNotice(session: AgentTabSession) -> Bool {
-        guard session.selectedAgent == .codexExec,
-              session.runState == .running,
-              session.codexController != nil,
-              case .steer = codexTurnDispatchPlan(wasRunAlreadyActive: true, session: session)
-        else { return false }
-        return true
-    }
-
-    /// Steers one RepoPrompt-authored oversight notice into the exact active Codex user turn.
-    ///
-    /// Deliberately not `sendCodexNativeMessage`: that path owns run lifecycle (running status, auth
-    /// retry, fallback queueing, first-turn start) that a notice must never touch. This is one
-    /// `turn/steer` against the turn identity classified in the same main-actor pass, with no retry
-    /// onto a different turn and no fallback — a turn that ended or changed simply does not take it,
-    /// and the caller keeps the notice owed. No transcript row, oversight claim, or composer state is
-    /// read or written here.
-    ///
-    /// - Returns: `true` only when Codex accepted the notice into a live turn of this thread.
-    func steerOversightNotice(session: AgentTabSession, text: String) async -> Bool {
-        guard session.selectedAgent == .codexExec,
-              session.runState == .running,
-              let controller = session.codexController,
-              case let .steer(identity) = codexTurnDispatchPlan(wasRunAlreadyActive: true, session: session)
-        else { return false }
-        do {
-            let receipt = try await controller.steerUserTurn(
-                text: text,
-                images: [],
-                expectedTurnID: identity.turnID
-            )
-            if receipt.acceptedTurnID != identity.turnID {
-                // Accepted by the thread's current turn rather than the one classified: the model
-                // still received it, and lifecycle bookkeeping is reconciled exactly as for a user
-                // steer that landed on a successor turn.
-                await reconcileAcceptedCodexSteerMismatch(
-                    from: identity,
-                    acceptedTurnID: receipt.acceptedTurnID,
-                    controller: controller,
-                    session: session
-                )
-            }
-            return true
-        } catch {
-            logCodex("[AgentModeVM] steerOversightNotice: not accepted: \(error)")
-            return false
-        }
-    }
-
     @discardableResult
     func sendCodexNativeMessage(
         session: AgentTabSession,
         text: String,
         attachments: [AgentImageAttachment],
         fallbackContext: AgentTabSession.CodexFallbackSubmissionContext? = nil,
+        stopFence: AgentRunStartStopFence? = nil,
         attachmentReservationID: UUID? = nil,
         policyAlreadyInstalled: Bool = false,
         terminalizeRejectedSend: Bool = true,
         autoEffortSelection: AutoEffortTurnSelection? = nil
     ) async -> NativeSendOutcome {
+        let effectiveStopFence = stopFence ?? fallbackContext?.stopFence ?? AgentRunStartStopFence(session: session)
+        guard effectiveStopFence.permitsStart(of: session) else { return .cancelled }
         logCodex("[AgentModeVM] sendCodexNativeMessage called for tab \(session.tabID)")
         let auditTurnID = fallbackContext?.optimisticUserItemID
             ?? session.pendingTurnRuntimeAnchors.first?.userItemID
@@ -7055,7 +7013,8 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                 autoEffortApplied: initialSelection.isAuto,
                 attachmentReservationID: attachmentReservationID,
                 reason: decision,
-                controller: controller
+                controller: controller,
+                stopFence: effectiveStopFence
             )
         }
 
@@ -7515,7 +7474,8 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                 autoEffortApplied: initialSelection.isAuto,
                 attachmentReservationID: attachmentReservationID,
                 reason: decision,
-                controller: controller
+                controller: controller,
+                stopFence: effectiveStopFence
             )
         } catch {
             if acquiredAgentSessionLinkPhysicalDispatch {
@@ -8456,7 +8416,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             providerBuffersAreDrained: { [weak self] in
                 self?.codexTerminalBuffersAreDrained(session) == true
             },
-            postCommit: { [weak self] in
+            postCommit: { [weak self] _, _ in
                 guard let self else { return }
                 viewModel?.requestUIRefresh(tabID: session.tabID, urgent: true)
                 // Computer-use settlement runs first on purpose: when it replaces the controller the
