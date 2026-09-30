@@ -76,6 +76,7 @@ final class ClaudeIntegratedAgentModeRunner {
         attachments: [AgentImageAttachment],
         makeLease: (_ runID: UUID) -> MCPBootstrapLease,
         autoEffortSelection: AutoEffortTurnSelection? = nil,
+        providerControlCommand: AgentProviderControlCommand? = nil,
         stopFence: AgentRunStartStopFence? = nil
     ) async {
         guard stopFence?.permitsStart(of: session) ?? true else { return }
@@ -159,7 +160,8 @@ final class ClaudeIntegratedAgentModeRunner {
                         // No event stream is owned until this send succeeds and the runner subscribes
                         // below, so replacing a route-stale controller is safe at this boundary.
                         allowsCatalogRouteControllerRecovery: true,
-                        autoEffortSelection: autoEffortSelection
+                        autoEffortSelection: autoEffortSelection,
+                        providerControlCommand: providerControlCommand
                     )
                     let providerInitializationOutcome = switch sendOutcome {
                     case .sent:

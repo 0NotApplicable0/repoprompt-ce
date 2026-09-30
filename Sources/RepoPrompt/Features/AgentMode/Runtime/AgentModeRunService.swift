@@ -132,6 +132,24 @@ final class AgentModeRunService {
         )
     }
 
+    /// Whether this session's run pipeline sends `command` as its exact native text.
+    ///
+    /// Claude Code always does. An ACP session does only while its live controller advertises the
+    /// command in the admitted provider session (see `AgentProviderControlCommand.acpSession`). The
+    /// Claude-compatible variants share the CLI but their backends are not verified to honor the
+    /// native command, and headless runtimes have no undecorated path.
+    static func dispatchesProviderControlCommand(
+        _ command: AgentProviderControlCommand,
+        for session: AgentTabSession
+    ) -> Bool {
+        if session.selectedAgent == .claudeCode { return true }
+        return AgentProviderControlCommand.acpSession(
+            session,
+            advertises: command.kind,
+            inProviderConversation: command.expectedProviderConversation
+        )
+    }
+
     @discardableResult
     func startRun(
         tabID: UUID,
@@ -141,6 +159,7 @@ final class AgentModeRunService {
         attachments: [AgentImageAttachment],
         codexFallbackContext: AgentTabSession.CodexFallbackSubmissionContext? = nil,
         autoEffortSelection: AutoEffortTurnSelection? = nil,
+        providerControlCommand: AgentProviderControlCommand? = nil,
         startOutcome: AgentRunStartOutcomeRecorder? = nil,
         stopFence: AgentRunStartStopFence? = nil
     ) async -> CodexAgentModeCoordinator.NativeSendOutcome? {
@@ -150,6 +169,15 @@ final class AgentModeRunService {
         }
         assert(session.tabID == tabID, "AgentModeRunService.startRun requires the originating tab ID to match the AgentTabSession tab ID")
         let selectedAgent = session.selectedAgent
+        // A control command is only ever routed to a runtime that dispatches it natively and
+        // undecorated. Any other runtime would send it as ordinary prose, so it never starts at all.
+        if let providerControlCommand,
+           !Self.dispatchesProviderControlCommand(providerControlCommand, for: session)
+        {
+            let message = "\(selectedAgent.displayName) does not support this provider command."
+            startOutcome?.recordStartFailure(message: message)
+            return nil
+        }
         let runtimePermission = dependencies.providerRuntimePermissionResolver(selectedAgent, session.permissionProfile)
         let workspacePath: String?
         do {
@@ -162,6 +190,12 @@ final class AgentModeRunService {
             startOutcome?.recordStartFailure(message: message)
             return selectedAgent == .codexExec ? .failed(message: message) : nil
         }
+
+        // Every path that reaches a provider from here is a new turn, and a new turn is exactly what
+        // cancels a background ACP compaction. Held deliveries never get here, so this is the
+        // session's own user (or its own queued work) choosing to proceed: the hold protects nothing
+        // any more.
+        session.endACPBackgroundCompactionSettle()
 
         if selectedAgent == .codexExec {
             let outcome = await codexRunner.startRun(
@@ -217,6 +251,7 @@ final class AgentModeRunService {
                 attachments: attachments,
                 makeLease: makeLease,
                 autoEffortSelection: autoEffortSelection,
+                providerControlCommand: providerControlCommand,
                 stopFence: stopFence
             )
             recordNonCodexStartOutcome(startOutcome, session: session)
@@ -230,6 +265,7 @@ final class AgentModeRunService {
                 initialMessageForRun: initialMessageForRun,
                 attachments: attachments,
                 runRequest: acpRunRequest,
+                providerControlCommand: providerControlCommand,
                 makeLease: makeLease,
                 stopFence: stopFence
             )

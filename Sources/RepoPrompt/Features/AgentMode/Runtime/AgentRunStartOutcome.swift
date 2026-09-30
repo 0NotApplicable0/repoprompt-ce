@@ -1,5 +1,72 @@
 import Foundation
 
+// MARK: - Provider control commands
+
+/// A provider-native maintenance command that RepoPrompt itself constructs, bound to the exact
+/// provider conversation it was admitted for.
+///
+/// The provider-bound text is fixed here and never derived from caller input, so an overseer can ask
+/// for a compaction without any sender-controlled string ever reaching a provider as a command. The
+/// conversation binding travels with the command because run preparation can suspend after the
+/// admitting transaction's last fence; the runtime re-proves it at its own send boundary.
+struct AgentProviderControlCommand: Equatable {
+    enum Kind: String, Equatable {
+        case compact
+    }
+
+    let kind: Kind
+    /// The exact app-session binding the command was admitted for. Every rebind — including one to
+    /// the same session UUID — installs a new identity, so any rebind refuses the command.
+    let expectedBinding: AgentPersistentSessionBindingIdentity
+    /// The provider conversation the command was admitted for. It runs only against exactly this
+    /// conversation; a fresh-start fallback or any other conversation refuses it.
+    let expectedProviderConversation: String
+
+    static func compact(
+        expectedBinding: AgentPersistentSessionBindingIdentity,
+        expectedProviderConversation: String
+    ) -> AgentProviderControlCommand {
+        AgentProviderControlCommand(
+            kind: .compact,
+            expectedBinding: expectedBinding,
+            expectedProviderConversation: expectedProviderConversation
+        )
+    }
+
+    /// The exact provider-bound text: the native slash command and nothing else.
+    var providerText: String {
+        "/\(kind.rawValue)"
+    }
+
+    /// ACP runtimes whose advertised slash commands are the agent's own commands.
+    ///
+    /// OpenCode advertises the user's own commands and skills, so an advertised `compact` there may
+    /// be a user command rather than native compaction; Cursor has no verified native command. Both
+    /// stay unsupported whatever they advertise.
+    static func acpRuntimeAdvertisesNativeCommands(_ agent: AgentProviderKind) -> Bool {
+        switch agent {
+        case .devin, .grokBuild, .antigravity:
+            true
+        case .openCode, .cursor, .codexExec, .claudeCode, .claudeCodeGLM, .kimiCode, .customClaudeCompatible:
+            false
+        }
+    }
+
+    /// Whether `session`'s live ACP controller currently advertises `kind` in the provider session
+    /// `providerConversation`. Live-unverified: no provider-recorded advertisement has been observed.
+    @MainActor
+    static func acpSession(
+        _ session: AgentTabSession,
+        advertises kind: Kind,
+        inProviderConversation providerConversation: String
+    ) -> Bool {
+        guard acpRuntimeAdvertisesNativeCommands(session.selectedAgent),
+              let controller = session.acpController
+        else { return false }
+        return controller.advertisesCommand(kind.rawValue, inProviderSession: providerConversation)
+    }
+}
+
 // MARK: - Direct-start options
 
 /// Narrow opt-outs for a run started by something other than the local composer.
@@ -27,10 +94,16 @@ struct AgentDirectRunStartOptions: Equatable {
     var laneUpdateWakeID: UUID?
     var periodicWakeID: UUID?
 
+    /// Marks this run as a RepoPrompt-constructed provider maintenance command (an overseer
+    /// compaction). Its provider input is exactly `command.providerText`: no user augmentation, no
+    /// initial-thread context, no staged handoff, no oversight supplement, and no instruction or
+    /// effort packaging, because any of those would turn a native command into inert prose.
+    var providerControlCommand: AgentProviderControlCommand?
+
     /// Captured at producer scheduling time so a prior Stop cannot bless deferred work.
     var stopFence: AgentRunStartStopFence?
     var skipsUserAugmentation: Bool {
-        isLaneUpdate || periodicWakeID != nil
+        isLaneUpdate || periodicWakeID != nil || providerControlCommand != nil
     }
 
     var isLaneUpdate: Bool {
@@ -52,6 +125,11 @@ struct AgentDirectRunStartOptions: Equatable {
 
     /// Options for `agent_session_link.send`.
     static let crossSessionDelivery = AgentDirectRunStartOptions(ignoresPendingHandoff: true)
+
+    /// Options for one overseer-requested provider control command.
+    static func providerControl(_ command: AgentProviderControlCommand) -> AgentDirectRunStartOptions {
+        AgentDirectRunStartOptions(ignoresPendingHandoff: true, providerControlCommand: command)
+    }
 
     /// Options for one automatic lane-update follow-up.
     static func laneUpdate(

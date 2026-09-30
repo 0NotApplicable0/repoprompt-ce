@@ -907,6 +907,7 @@ final class AgentTabSession: ObservableObject {
     /// persisted, so restored figures are never reported as current load.
     private(set) var vouchedContextCount: ContextUsageVouch? {
         didSet {
+            contextCountVouchRevision &+= 1
             if vouchedContextCount == nil { vouchedContextCountConfidence = nil }
             noteContextVouchTransition(from: oldValue, to: vouchedContextCount)
         }
@@ -974,6 +975,106 @@ final class AgentTabSession: ObservableObject {
     }
 
     var acpOccupancyReportThisTurn: ContextOccupancyEpoch?
+
+    /// Bumped by every write to `vouchedContextCount`, including a withdrawal that leaves it `nil`, so
+    /// a restore can prove no report touched the count since it was withdrawn.
+    private var contextCountVouchRevision: UInt64 = 0
+
+    /// A count vouch withdrawn at a compaction dispatch, with the revision the withdrawal produced.
+    struct WithdrawnContextCountVouch {
+        let vouch: ContextUsageVouch?
+        fileprivate let confidence: ContextUsageSnapshotConfidence?
+        fileprivate let revision: UInt64
+    }
+
+    /// True while an overseer-requested compaction turn runs on a runtime without a verified
+    /// compaction signal (ACP). Its billed prompt count describes the pre-compaction context, so
+    /// only an occupancy report may vouch for a count until the turn ends.
+    private(set) var contextCountVouchAwaitsOccupancyReport = false
+
+    /// Dispatching a compaction invalidates the count (the window is unchanged) and holds off
+    /// billed-count vouching for the rest of that turn. Returns the withdrawn vouch so a dispatch
+    /// that is refused before anything is sent can put it back.
+    @discardableResult
+    func beginCompactionContextCountSuspension() -> WithdrawnContextCountVouch {
+        let withdrawn = vouchedContextCount
+        let withdrawnConfidence = vouchedContextCountConfidence
+        vouchedContextCount = nil
+        contextCountVouchAwaitsOccupancyReport = true
+        return WithdrawnContextCountVouch(
+            vouch: withdrawn,
+            confidence: withdrawnConfidence,
+            revision: contextCountVouchRevision
+        )
+    }
+
+    func endCompactionContextCountSuspension() {
+        contextCountVouchAwaitsOccupancyReport = false
+    }
+
+    /// When an ACP compaction that ended its turn instantly (fire-and-forget) stops being protected.
+    ///
+    /// Until then the provider may still be compacting in the background, where the session's next
+    /// prompt cancels the work. Delivery readiness, the published `idle_for_send`, and every
+    /// automatic wake treat the session as not idle for the whole span, so a parked `when_sendable`
+    /// send, another overseer, or an Auto-wake cannot start that cancelling turn. The session's own
+    /// user is never held. Every transition — including expiry — publishes an observation change,
+    /// which is what lets parked work resume the moment the hold lifts.
+    private(set) var acpBackgroundCompactionSettlesAt: Date? {
+        didSet {
+            if oldValue != acpBackgroundCompactionSettlesAt {
+                noteMonitorObservationInputsChanged()
+            }
+        }
+    }
+
+    private var acpBackgroundCompactionSettleTask: Task<Void, Never>?
+
+    /// True while a fire-and-forget ACP compaction may still be running in the provider's background.
+    var isSettlingACPBackgroundCompaction: Bool {
+        guard let deadline = acpBackgroundCompactionSettlesAt else { return false }
+        return deadline > Date()
+    }
+
+    /// Holds automatic and overseer deliveries off this session for `duration`, then lifts the hold
+    /// and publishes the change. A newer hold replaces an older one.
+    func beginACPBackgroundCompactionSettle(duration: TimeInterval) {
+        acpBackgroundCompactionSettleTask?.cancel()
+        let deadline = Date().addingTimeInterval(max(0, duration))
+        acpBackgroundCompactionSettlesAt = deadline
+        acpBackgroundCompactionSettleTask = Task { @MainActor [weak self] in
+            let nanoseconds = UInt64(max(0, deadline.timeIntervalSinceNow) * 1_000_000_000)
+            try? await Task.sleep(nanoseconds: nanoseconds)
+            guard !Task.isCancelled,
+                  let self,
+                  acpBackgroundCompactionSettlesAt == deadline
+            else { return }
+            acpBackgroundCompactionSettleTask = nil
+            acpBackgroundCompactionSettlesAt = nil
+        }
+    }
+
+    /// Lifts the hold early: a new turn already started (and would have cancelled any background
+    /// compaction), so holding further protects nothing.
+    func endACPBackgroundCompactionSettle() {
+        acpBackgroundCompactionSettleTask?.cancel()
+        acpBackgroundCompactionSettleTask = nil
+        acpBackgroundCompactionSettlesAt = nil
+    }
+
+    /// Restores a vouch withdrawn by a compaction that never reached the provider, but only if no
+    /// usage report has vouched for or withdrawn the count since, and it still describes the stored
+    /// count for the same provider.
+    func restoreContextCountVouchAfterUnsentCompaction(_ withdrawn: WithdrawnContextCountVouch) {
+        guard let vouch = withdrawn.vouch,
+              contextCountVouchRevision == withdrawn.revision,
+              vouchedContextCount == nil,
+              vouch.agent == selectedAgent,
+              contextUsageSnapshot?.used == vouch.tokens
+        else { return }
+        vouchedContextCount = vouch
+        vouchedContextCountConfidence = withdrawn.confidence
+    }
 
     /// Records which figures a live usage report from the selected provider vouches for. The report's
     /// context count (or, only when it carried none, its prompt count) vouches for the stored count
