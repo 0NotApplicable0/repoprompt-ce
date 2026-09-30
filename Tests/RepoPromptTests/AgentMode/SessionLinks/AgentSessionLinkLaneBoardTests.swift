@@ -305,6 +305,7 @@ final class AgentSessionLinkLaneBoardTests: XCTestCase {
             lastRunState: AgentSessionRunState.completed.rawValue,
             acpModelParameterSelections: [],
             parentSessionID: parentID,
+            createdByOverseerSessionID: nil,
             isMCPOriginated: true,
             worktreeBindingSummaries: [],
             activeWorktreeMergeSummaries: []
@@ -372,6 +373,7 @@ final class AgentSessionLinkLaneBoardTests: XCTestCase {
             lastRunState: AgentSessionRunState.completed.rawValue,
             acpModelParameterSelections: [],
             parentSessionID: parentID,
+            createdByOverseerSessionID: nil,
             isMCPOriginated: true,
             worktreeBindingSummaries: [],
             activeWorktreeMergeSummaries: []
@@ -510,6 +512,7 @@ final class AgentSessionLinkLaneBoardTests: XCTestCase {
             lastRunState: AgentSessionRunState.completed.rawValue,
             acpModelParameterSelections: [],
             parentSessionID: parentID,
+            createdByOverseerSessionID: nil,
             isMCPOriginated: true,
             worktreeBindingSummaries: [],
             activeWorktreeMergeSummaries: []
