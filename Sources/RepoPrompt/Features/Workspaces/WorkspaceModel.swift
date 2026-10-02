@@ -220,8 +220,9 @@ struct ComposeTabState: Codable, Identifiable, Equatable {
     /// Active Context Builder tab config. Encodes/decodes under the legacy JSON key `discover`.
     var contextBuilder: ContextBuilderTabConfig
 
-    /// Matches the existing T-number placeholder convention for automatic naming.
+    /// Matches empty, chat-placeholder and T-number titles eligible for automatic naming.
     var hasDefaultName: Bool {
+        if ChatSession.isPlaceholderName(name) { return true }
         let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
         guard trimmed.count >= 2 else { return false }
         let prefix = trimmed.prefix(1)
