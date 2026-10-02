@@ -5,6 +5,50 @@ import XCTest
 
 @MainActor
 final class ContextBuilderSelectionTransactionTests: XCTestCase {
+    func testNamedTabKeepsItsNameAfterTasknamePromptMutation() async throws {
+        let fixture = try await makeFixture(name: "named-taskname")
+        defer { fixture.cleanup() }
+        fixture.window.promptManager.renameComposeTab(fixture.tabID, to: "T17")
+        _ = try fixture.installContext(selection: .init())
+
+        // An explicit rename after discovery captured its context must win over that snapshot.
+        fixture.window.agentModeViewModel.renameSession(tabID: fixture.tabID, to: "Care")
+        let prompt = "<taskname=\"Support ticket activity MCP plan\"/>\n<task>Plan support activity</task>"
+        try await ServerNetworkManager.$currentConnectionID.withValue(fixture.connectionID) {
+            try await fixture.window.mcpServer.updateCurrentTabContext(toolName: "prompt") {
+                $0.promptText = prompt
+            }
+        }
+
+        let storedTab = try XCTUnwrap(fixture.window.workspaceManager.composeTab(for: fixture.identity))
+        XCTAssertEqual(storedTab.name, "Care")
+        XCTAssertEqual(storedTab.promptText, prompt)
+        XCTAssertEqual(fixture.boundContext?.promptText, prompt)
+        XCTAssertEqual(fixture.window.promptManager.currentComposeTabs.first { $0.id == fixture.tabID }?.name, "Care")
+        XCTAssertEqual(fixture.window.agentModeViewModel.resolvedSessionDisplayName(for: fixture.tabID), "Care")
+    }
+
+    func testDefaultTabGetsNamedAfterTasknamePromptMutation() async throws {
+        let fixture = try await makeFixture(name: "default-taskname")
+        defer { fixture.cleanup() }
+        fixture.window.promptManager.renameComposeTab(fixture.tabID, to: "T17")
+        _ = try fixture.installContext(selection: .init())
+        let prompt = "<taskname=\"Support   ticket activity MCP plan\"/>\n<task>Plan support activity</task>"
+        try await ServerNetworkManager.$currentConnectionID.withValue(fixture.connectionID) {
+            try await fixture.window.mcpServer.updateCurrentTabContext(toolName: "prompt") {
+                $0.promptText = prompt
+            }
+        }
+
+        let expectedName = "Support ticket activity MCP plan"
+        let storedTab = try XCTUnwrap(fixture.window.workspaceManager.composeTab(for: fixture.identity))
+        XCTAssertEqual(storedTab.name, expectedName)
+        XCTAssertEqual(storedTab.promptText, prompt)
+        XCTAssertEqual(fixture.boundContext?.promptText, prompt)
+        XCTAssertEqual(fixture.window.promptManager.currentComposeTabs.first { $0.id == fixture.tabID }?.name, expectedName)
+        XCTAssertEqual(fixture.window.agentModeViewModel.resolvedSessionDisplayName(for: fixture.tabID), expectedName)
+    }
+
     /// A headless client (for example Devin) may restart its stdio MCP child mid-run. The successor
     /// re-matches the settlement-retained discovery policy after the pending context was already
     /// consumed, so it must inherit the displaced connection's live run context.
