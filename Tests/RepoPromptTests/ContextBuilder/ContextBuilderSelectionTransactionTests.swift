@@ -15,7 +15,11 @@ final class ContextBuilderSelectionTransactionTests: XCTestCase {
             // An explicit rename after discovery captured its context must win over that snapshot.
             fixture.window.agentModeViewModel.renameSession(tabID: fixture.tabID, to: name)
             let prompt = "<taskname=\"Support ticket activity MCP plan\"/>\n<task>Plan support activity</task>"
-            try await ServerNetworkManager.$currentConnectionID.withValue(fixture.connectionID) {
+            let invocation = ToolInvocationContext.trustedLocal(
+                toolName: "prompt",
+                metadata: fixture.metadata
+            )
+            try await MCPInvocationContextBridge.withInvocation(invocation) {
                 try await fixture.window.mcpServer.updateCurrentTabContext(toolName: "prompt") {
                     $0.promptText = prompt
                 }
@@ -45,7 +49,11 @@ final class ContextBuilderSelectionTransactionTests: XCTestCase {
             XCTAssertEqual(fixture.window.workspaceManager.composeTab(for: fixture.identity)?.name, name)
             _ = try fixture.installContext(selection: .init())
             let prompt = "<taskname=\"Support   ticket activity MCP plan\"/>\n<task>Plan support activity</task>"
-            try await ServerNetworkManager.$currentConnectionID.withValue(fixture.connectionID) {
+            let invocation = ToolInvocationContext.trustedLocal(
+                toolName: "prompt",
+                metadata: fixture.metadata
+            )
+            try await MCPInvocationContextBridge.withInvocation(invocation) {
                 try await fixture.window.mcpServer.updateCurrentTabContext(toolName: "prompt") {
                     $0.promptText = prompt
                 }
