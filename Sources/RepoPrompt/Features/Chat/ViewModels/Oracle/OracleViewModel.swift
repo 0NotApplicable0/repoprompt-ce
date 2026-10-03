@@ -455,6 +455,7 @@ class OracleViewModel: ObservableObject {
     @Published var messages: [AIChatMessage] = []
     @Published private(set) var streamingSessions: Set<UUID> = []
     @Published private(set) var messageStoreRevision: Int = 0
+    @Published var oracleGroupPresentations: [OracleGroupPresentation.Key: OracleGroupPresentation] = [:]
     @Published private(set) var currentQueryId: UUID?
 
     /// Per-session stream state
@@ -514,6 +515,7 @@ class OracleViewModel: ObservableObject {
     /// Session management
     @Published var sessions: [ChatSession] = [] {
         didSet {
+            pruneOracleGroupPresentations()
             refreshSessionLists()
         }
     }
