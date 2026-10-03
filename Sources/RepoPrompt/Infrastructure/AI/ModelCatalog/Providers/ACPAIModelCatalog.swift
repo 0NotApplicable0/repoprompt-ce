@@ -424,9 +424,7 @@ enum ACPAIModelCatalog {
             .replacingOccurrences(of: " ", with: "-")
     }
 
-    /// Cursor discovery remains runtime authority for applying a selected model and
-    /// its parameters, but is deliberately not picker authority. The release-gated
-    /// catalog makes the non-Agent picker immediately available without an ACP session.
+    /// All Cursor surfaces use the same discovered membership, with Auto before discovery.
     private static func cursorModelOptionsForPicker() -> [AgentModelOption] {
         CursorAIModelCatalog.options
     }

@@ -80,7 +80,7 @@ final class CursorACPModelDiscoveryTests: XCTestCase {
         await service.shutdown()
     }
 
-    func testLegacyModelOnlyCacheRetainsOfflineParameterFallback() async throws {
+    func testLegacyModelOnlyCacheDoesNotInventParameterMetadata() async throws {
         AgentACPModelRegistry.shared.test_reset(providerID: .cursor)
         defer { AgentACPModelRegistry.shared.test_reset(providerID: .cursor) }
         let legacy = #"{"providerID":"cursor","currentModelRaw":"grok-4.6","options":[{"rawValue":"grok-4.6","displayName":"Grok 4.6","isPlaceholderDefault":false,"isProviderDefault":false,"supportedReasoningEfforts":[]}]}"#
@@ -90,9 +90,7 @@ final class CursorACPModelDiscoveryTests: XCTestCase {
         _ = AgentACPModelRegistry.shared.updateDiscoveredModels(snapshot, for: .cursor)
         AgentACPModelRegistry.shared.test_clearMemoryPreservingStore(providerID: .cursor)
         await AgentACPModelRegistry.shared.test_warmStandardStore()
-        let effort = ACPModelParameterResolver.parameterSet(providerID: .cursor, selectedModelRaw: "grok-4.6")?.definition(kind: .thinking)
-        XCTAssertEqual(effort?.choices.map(\.rawValue), ["low", "medium", "high", "xhigh"])
-        XCTAssertEqual(effort?.currentValueRaw, "high")
+        XCTAssertNil(ACPModelParameterResolver.parameterSet(providerID: .cursor, selectedModelRaw: "grok-4.6"))
     }
 
     func testCompleteEmptyCatalogDoesNotInventParameters() throws {
