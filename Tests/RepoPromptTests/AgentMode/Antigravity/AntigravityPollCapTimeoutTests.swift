@@ -264,6 +264,58 @@ final class AntigravityPollCapTimeoutTests: XCTestCase {
         }
     }
 
+    func testQuotaExhaustionReportsResetDelayWithoutRawDiagnostics() {
+        let stderr = """
+        error: Individual quota reached. Please upgrade your subscription to increase your limits. Resets in 100h47m55s.
+        AGY_ERROR: {"short_error":"RESOURCE_EXHAUSTED (code 429): Individual quota reached.","status":"RESOURCE_EXHAUSTED","error_code":429,"error_id":"secret-error-id","url":"https://private.invalid/quota"}
+        """
+        let logTail = """
+        E1007 errorreport.go:224] error getting token source: You are not logged into Antigravity.
+        E1007 errorreport.go:224] agent executor error: generating and executing: RESOURCE_EXHAUSTED (code 429): Individual quota reached. Please upgrade your subscription to increase your limits. Resets in 100h47m55s.
+        """
+
+        let error = AntigravityAgentProvider.processFailure(
+            exitStatus: 3,
+            timedOut: false,
+            stderr: stderr,
+            logTail: logTail
+        )
+
+        XCTAssertEqual(
+            error?.localizedDescription,
+            "Antigravity CLI quota is exhausted for the selected model. Quota resets in 100h47m55s. Upgrade the subscription or wait for the reset, then retry."
+        )
+        let description = error?.localizedDescription ?? ""
+        XCTAssertFalse(description.contains("secret-error-id"))
+        XCTAssertFalse(description.contains("private.invalid"))
+        XCTAssertFalse(description.contains("not authenticated"))
+        XCTAssertFalse(description.contains("exit 3"))
+    }
+
+    func testQuotaExhaustionWithoutResetHintOmitsDelay() {
+        let error = AntigravityAgentProvider.processFailure(
+            exitStatus: 3,
+            timedOut: false,
+            stderr: "RESOURCE_EXHAUSTED (code 429): Individual quota reached.",
+            logTail: "https://private.invalid Trace: secret-trace"
+        )
+
+        XCTAssertEqual(error?.localizedDescription, AntigravityAgentProvider.quotaExhaustedMessage)
+        XCTAssertFalse(error?.localizedDescription.contains("private.invalid") == true)
+        XCTAssertFalse(error?.localizedDescription.contains("secret-trace") == true)
+        XCTAssertFalse(error?.localizedDescription.contains("Resets in") == true)
+    }
+
+    func testQuotaResetDelayAcceptsOnlyDurationTokens() {
+        XCTAssertEqual(
+            AntigravityAgentProvider.quotaResetDelay(in: "Resets in 100h47m55s."),
+            "100h47m55s"
+        )
+        XCTAssertEqual(AntigravityAgentProvider.quotaResetDelay(in: "resets in 12m"), "12m")
+        XCTAssertNil(AntigravityAgentProvider.quotaResetDelay(in: "Individual quota reached. Resets in soon."))
+        XCTAssertNil(AntigravityAgentProvider.quotaResetDelay(in: "Resets in 100"))
+    }
+
     func testInformationalTokenSourceDoesNotImplyAuthenticationFailure() {
         let error = AntigravityAgentProvider.processFailure(
             exitStatus: 17,

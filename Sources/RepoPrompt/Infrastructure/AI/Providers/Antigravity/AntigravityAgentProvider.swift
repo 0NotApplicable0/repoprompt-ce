@@ -889,6 +889,48 @@ final class AntigravityAgentProvider: HeadlessAgentProvider {
             || rejectedConfirmation
     }
 
+    /// Shown when `agy` exits because the signed-in account has no remaining quota for the
+    /// selected model. Opus and Sonnet share a pool that can be exhausted while Gemini still runs.
+    static let quotaExhaustedMessage = "Antigravity CLI quota is exhausted for the selected model. Upgrade the subscription or wait for the quota to reset, then retry."
+
+    /// True when diagnostics report Antigravity's model quota failure (`RESOURCE_EXHAUSTED` /
+    /// `Individual quota reached`). Startup logs mention token-source failures on the same run, so
+    /// this must be classified before those authentication signatures.
+    static func isQuotaExhausted(_ diagnostics: String) -> Bool {
+        let normalized = diagnostics.lowercased()
+        guard !normalized.isEmpty else { return false }
+        if normalized.contains("individual quota reached") { return true }
+        return normalized.contains("resource_exhausted") && normalized.contains("quota")
+    }
+
+    /// Parses agy's `Resets in 100h47m55s` hint. The result is only digits plus `h`/`m`/`s` units,
+    /// so the UI can show the reset delay without echoing the rest of the diagnostic.
+    static func quotaResetDelay(in diagnostics: String) -> String? {
+        let lowered = diagnostics.lowercased()
+        guard let marker = lowered.range(of: "resets in ") else { return nil }
+        var token = ""
+        var sawUnit = false
+        for character in lowered[marker.upperBound...] {
+            if character.isNumber {
+                token.append(character)
+                continue
+            }
+            if character == "h" || character == "m" || character == "s", token.last?.isNumber == true {
+                token.append(character)
+                sawUnit = true
+                continue
+            }
+            break
+        }
+        guard sawUnit, !token.isEmpty, token.count <= 16 else { return nil }
+        return token
+    }
+
+    static func quotaExhaustedDetail(in diagnostics: String) -> String {
+        guard let resetIn = quotaResetDelay(in: diagnostics) else { return quotaExhaustedMessage }
+        return "Antigravity CLI quota is exhausted for the selected model. Quota resets in \(resetIn). Upgrade the subscription or wait for the reset, then retry."
+    }
+
     /// Maps process-level diagnostics without exposing raw stderr or log content in the UI.
     /// Returns nil only for a confirmed, successful exit; callers then classify the turn output.
     static func processFailure(
@@ -917,6 +959,11 @@ final class AntigravityAgentProvider: HeadlessAgentProvider {
         let diagnostics = [stderr, logTail]
             .compactMap(\.self)
             .joined(separator: "\n")
+        // Quota outranks authentication signatures. agy startup logs mention token-source failures
+        // even when the terminal error is an exhausted model quota.
+        if isQuotaExhausted(diagnostics) {
+            return AIProviderError.invalidConfiguration(detail: quotaExhaustedDetail(in: diagnostics))
+        }
         let normalizedDiagnostics = diagnostics.lowercased()
         let authenticationFailureSignatures = [
             "not logged into",
