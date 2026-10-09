@@ -38,6 +38,14 @@ enum MCPClientIdentity {
         guard let normalized = normalized(raw) else { return nil }
         if matchesFamily(normalized, tokens: ["claude", "code"]) { return "claude-code" }
         if matchesFamily(normalized, tokens: ["codex", "mcp", "client"]) { return "codex-mcp-client" }
+        // NOTE: The gemini-cli family is matched BEFORE antigravity intentionally. Antigravity
+        // (`agy`) is Gemini-derived and may announce a `gemini*` clientInfo.name over MCP, which
+        // would canonicalize here to gemini-cli. That is fine: RepoPrompt does not rely on agy's
+        // announced name for routing — it uses PID-based routing keyed on the explicit
+        // "antigravity-client" hint (see AgentRuntimeProviderService.antigravityMCPClientID and
+        // AntigravityAgentProvider's expected-PID registration). The explicit "antigravity-client"
+        // ID is matched by its own antigravity branch below, so RepoPrompt's own client hint is
+        // never misclassified as gemini-cli.
         if matchesFamily(normalized, tokens: ["gemini", "cli", "mcp", "client"])
             || matchesFamily(normalized, tokens: ["gemini", "cli"])
         {
@@ -57,6 +65,16 @@ enum MCPClientIdentity {
             return "grok-shell"
         }
         if matchesFamily(normalized, tokens: ["claude", "ai"]) { return "claude-ai" }
+        if matchesFamily(normalized, tokens: ["antigravity", "client"])
+            || matchesFamily(normalized, tokens: ["antigravity"])
+        {
+            return "antigravity-client"
+        }
+        if matchesFamily(normalized, tokens: ["grok", "client"])
+            || matchesFamily(normalized, tokens: ["grok"])
+        {
+            return "grok-client"
+        }
         if matchesFamily(normalized, tokens: ["repoprompt", "cli"]) { return "repoprompt-cli" }
         return nil
     }
@@ -71,7 +89,12 @@ enum MCPClientIdentity {
         else {
             return false
         }
-        return lhsFamily == rhsFamily
+        switch (lhsFamily, rhsFamily) {
+        case ("grok-shell", "grok-client"), ("grok-client", "grok-shell"):
+            return true
+        default:
+            return lhsFamily == rhsFamily
+        }
     }
 
     static func matches(_ lhs: String?, _ rhs: String?) -> Bool {
@@ -89,7 +112,8 @@ enum MCPClientIdentity {
     static func isHeadlessAgentClient(_ raw: String?) -> Bool {
         guard let family = canonicalFamilyID(raw) else { return false }
         switch family {
-        case "claude-code", "codex-mcp-client", "gemini-cli-mcp-client", "cursor":
+        case "claude-code", "codex-mcp-client", "gemini-cli-mcp-client", "cursor", "antigravity-client",
+             "grok-client", "grok-shell":
             return true
         default:
             return false

@@ -351,14 +351,24 @@ final class AutoRecommendationEngine {
         return nil
     }
 
-    /// Restores a saved Context Builder selection only when both provider and model are currently usable.
-    /// Invalid or unavailable persisted values fall back through the same recommendation ranking as the wizard.
+    /// Restored CLI identities are preserved for explicit execution validation, not silently replaced.
     static func resolveContextBuilderSelection(
         persistedAgentRaw: String?,
         persistedModelRaw: String?,
         availability: AgentModelCatalog.AvailabilityContext,
         enabledRecommendationProviders: Set<RecommendationProviderKind> = Set(RecommendationProviderKind.allCases)
     ) -> AgentModelCatalog.NormalizedAgentSelection? {
+        if let agentRaw = persistedAgentRaw?.trimmingCharacters(in: .whitespacesAndNewlines),
+           let agent = AgentProviderKind(rawValue: agentRaw),
+           agent.preservesSavedSelection
+        {
+            return AgentModelCatalog.normalizePersistedSelection(
+                agentRaw: agentRaw,
+                modelRaw: persistedModelRaw,
+                availability: availability,
+                surface: .headless
+            )
+        }
         if let agentRaw = persistedAgentRaw?.trimmingCharacters(in: .whitespacesAndNewlines),
            let modelRaw = persistedModelRaw?.trimmingCharacters(in: .whitespacesAndNewlines),
            let agent = AgentProviderKind(rawValue: agentRaw),
@@ -402,11 +412,9 @@ final class AutoRecommendationEngine {
                 enabledRecommendationProviders.contains(.codex)
             case .cursor:
                 enabledRecommendationProviders.contains(.cursor)
-            case .grokBuild:
-                enabledRecommendationProviders.contains(.grokBuild)
-            case .openCode, .claudeCodeGLM, .kimiCode, .customClaudeCompatible:
+            case .openCode, .claudeCodeGLM, .kimiCode, .customClaudeCompatible, .antigravity, .grok:
                 true
-            case .antigravity, .devin:
+            case .grokBuild, .devin:
                 false
             }
         }) else {
@@ -473,8 +481,9 @@ final class AutoRecommendationEngine {
             codexAvailable: status.codexCLI == .ready,
             openCodeAvailable: false,
             cursorAvailable: status.cursorCLI == .ready,
-            grokBuildAvailable: status.grokBuildCLI == .ready,
             antigravityAvailable: runtimeAvailability.antigravityAvailable,
+            grokAvailable: runtimeAvailability.grokAvailable,
+            grokBuildAvailable: false,
             devinAvailable: runtimeAvailability.devinAvailable,
             zaiConfigured: backendStore.isConfigured(.glmZAI) && backendStore.config(for: .glmZAI).isEnabled && backendStore.config(for: .glmZAI).isValid,
             kimiConfigured: backendStore.isConfigured(.kimi) && backendStore.config(for: .kimi).isEnabled && backendStore.config(for: .kimi).isValid,
@@ -490,6 +499,9 @@ final class AutoRecommendationEngine {
         let runtimeAvailability = apiSettingsViewModel?.agentModeAvailabilityContext ?? .none
         let availability = mcpAgentAvailabilityContext(from: actualStatus, runtimeAvailability: runtimeAvailability)
         let recommendedAvailability = mcpAgentAvailabilityContext(from: recommendedStatus, runtimeAvailability: runtimeAvailability)
+        guard AgentProviderKind.allCases.contains(where: { AgentModelCatalog.isAgentAvailable($0, availability: availability) }) else {
+            return nil
+        }
         let profileStore = AgentModelsProfileRoleDefaultsStore(
             overrides: profile(for: scope).mcpAgentRoleOverrides
         )

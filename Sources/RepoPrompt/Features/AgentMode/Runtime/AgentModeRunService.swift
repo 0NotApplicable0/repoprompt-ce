@@ -309,6 +309,9 @@ final class AgentModeRunService {
             initialUserMessage: initialUserMessage,
             initialMessageForRun: initialMessageForRun,
             attachments: attachments,
+            workspacePath: workspacePath,
+            antigravityPermissionLevel: runtimePermission.antigravityPermissionLevel,
+            grokPermissionLevel: runtimePermission.grokPermissionLevel,
             makeLease: makeLease,
             stopFence: stopFence
         )

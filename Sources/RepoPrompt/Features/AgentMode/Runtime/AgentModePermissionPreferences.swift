@@ -60,9 +60,14 @@ enum AgentModePermissionPreferences {
         defaults: UserDefaults = .standard,
         secureStore: AgentPermissionSecureStore? = nil
     ) {
-        let normalizedLevel = level.providerID == providerID
-            ? level
-            : AgentProviderPermissionLevelID.subagentDefault(for: providerID)
+        if case .grok(.storedPermissionUnavailable) = level { return }
+        let normalizedLevel: AgentProviderPermissionLevelID = if level.providerID != providerID {
+            AgentProviderPermissionLevelID.subagentDefault(for: providerID)
+        } else if case .antigravity(.safeManagedUnavailable) = level {
+            AgentProviderPermissionLevelID.subagentDefault(for: providerID)
+        } else {
+            level
+        }
         if let secureStore = resolvedSecureStore(defaults: defaults, secureStore: secureStore) {
             secureStore.updateSubagentPermissions { document in
                 var levels = document.providerPermissionLevelsRawByProviderID ?? [:]
@@ -113,6 +118,11 @@ enum AgentModePermissionPreferences {
            let level = AgentProviderPermissionLevelID(providerID: providerID, subagentRawValue: raw)
         {
             return level
+        }
+        if providerID == .grok,
+           defaults.object(forKey: providerPermissionLevelKey(for: providerID)) != nil
+        {
+            return .grok(.storedPermissionUnavailable)
         }
         return AgentProviderPermissionLevelID.subagentDefault(for: providerID)
     }

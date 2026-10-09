@@ -135,22 +135,23 @@ final class AgentProviderPreferenceSnapshotStore {
                 acpSessionModeID: level.sessionModeID,
                 acceptsPendingACPApprovalWhenActivated: level.acceptsPendingApprovalWhenActivated
             )
-        case .antigravity:
-            let level = effectiveAntigravityPermissionLevel(profile: profile)
-            let modeID = switch level {
-            case .default: "default"
-            case .autoEdit: "auto_edit"
-            case .yolo: "yolo"
-            }
-            return AgentProviderRuntimePermissionBinding(
-                acpSessionModeID: modeID,
-                acceptsPendingACPApprovalWhenActivated: level == .yolo
-            )
         case .cursor:
             let level = effectiveCursorPermissionLevel(profile: profile)
             return AgentProviderRuntimePermissionBinding(
                 autoApproveAllACPToolPermissions: level.autoApprovesACPToolPermissions,
                 acceptsPendingACPApprovalWhenActivated: level.autoApprovesACPToolPermissions
+            )
+        case .antigravity:
+            return AgentProviderRuntimePermissionBinding(
+                autoApproveAllACPToolPermissions: false,
+                acceptsPendingACPApprovalWhenActivated: false,
+                antigravityPermissionLevel: effectiveAntigravityPermissionLevel(profile: profile)
+            )
+        case .grok:
+            return AgentProviderRuntimePermissionBinding(
+                autoApproveAllACPToolPermissions: false,
+                acceptsPendingACPApprovalWhenActivated: false,
+                grokPermissionLevel: effectiveGrokPermissionLevel(profile: profile)
             )
         case .grokBuild:
             let level = effectiveGrokBuildPermissionLevel(profile: profile)
@@ -180,10 +181,12 @@ final class AgentProviderPreferenceSnapshotStore {
             ClaudeAgentToolPreferences.setPermissionLevel(level, defaults: defaults, secureStore: securePermissions)
         case let .openCode(level):
             OpenCodeAgentToolPreferences.setPermissionLevel(level, defaults: defaults, secureStore: securePermissions)
-        case let .antigravity(level):
-            AntigravityAgentToolPreferences.setPermissionLevel(level, defaults: defaults, secureStore: securePermissions)
         case let .cursor(level):
             CursorAgentToolPreferences.setPermissionLevel(level, defaults: defaults, secureStore: securePermissions)
+        case let .antigravity(level):
+            AntigravityAgentToolPreferences.setPermissionLevel(level, defaults: defaults, secureStore: securePermissions)
+        case let .grok(level):
+            GrokAgentToolPreferences.setPermissionLevel(level, defaults: defaults, secureStore: securePermissions)
         case let .grokBuild(level):
             GrokBuildAgentToolPreferences.setPermissionLevel(level, defaults: defaults, secureStore: securePermissions)
         case let .devin(level):
@@ -399,6 +402,26 @@ final class AgentProviderPreferenceSnapshotStore {
                     )
                 }
             )
+        case .cursor:
+            let effective = effectiveCursorPermissionLevel(profile: profile)
+            return AgentPermissionChromeBinding(
+                providerID: providerID,
+                displayName: effective.displayName,
+                iconName: effective.iconName,
+                isWarning: effective.isWarning,
+                externallyManagedReason: externallyManagedReason,
+                options: CursorAgentToolPreferences.PermissionLevel.allCases.map { level in
+                    AgentPermissionOptionBinding(
+                        id: .cursor(level),
+                        title: level.displayName,
+                        iconName: level.iconName,
+                        detailText: level.detailText,
+                        isWarning: level.isWarning,
+                        isSelected: level == effective,
+                        isEnabled: externallyManagedReason == nil
+                    )
+                }
+            )
         case .antigravity:
             let effective = effectiveAntigravityPermissionLevel(profile: profile)
             return AgentPermissionChromeBinding(
@@ -419,17 +442,17 @@ final class AgentProviderPreferenceSnapshotStore {
                     )
                 }
             )
-        case .cursor:
-            let effective = effectiveCursorPermissionLevel(profile: profile)
+        case .grok:
+            let effective = effectiveGrokPermissionLevel(profile: profile)
             return AgentPermissionChromeBinding(
                 providerID: providerID,
                 displayName: effective.displayName,
                 iconName: effective.iconName,
                 isWarning: effective.isWarning,
                 externallyManagedReason: externallyManagedReason,
-                options: CursorAgentToolPreferences.PermissionLevel.allCases.map { level in
+                options: GrokAgentToolPreferences.PermissionLevel.allCases.map { level in
                     AgentPermissionOptionBinding(
-                        id: .cursor(level),
+                        id: .grok(level),
                         title: level.displayName,
                         iconName: level.iconName,
                         detailText: level.detailText,
@@ -665,21 +688,6 @@ final class AgentProviderPreferenceSnapshotStore {
         }
     }
 
-    private func effectiveAntigravityPermissionLevel(
-        profile: AgentProviderPermissionProfile
-    ) -> AntigravityAgentToolPreferences.PermissionLevel {
-        switch profile {
-        case .userConfigured:
-            AntigravityAgentToolPreferences.permissionLevel(defaults: defaults, secureStore: securePermissions)
-        case .mcpSafeDefaults:
-            .autoEdit
-        case let .providerOverride(.antigravity(level)):
-            level
-        case .providerOverride:
-            .autoEdit
-        }
-    }
-
     private func effectiveCursorPermissionLevel(
         profile: AgentProviderPermissionProfile
     ) -> CursorAgentToolPreferences.PermissionLevel {
@@ -689,6 +697,36 @@ final class AgentProviderPreferenceSnapshotStore {
         case .mcpSafeDefaults:
             .managedDefault
         case let .providerOverride(.cursor(level)):
+            level
+        case .providerOverride:
+            .managedDefault
+        }
+    }
+
+    private func effectiveAntigravityPermissionLevel(
+        profile: AgentProviderPermissionProfile
+    ) -> AntigravityAgentToolPreferences.PermissionLevel {
+        switch profile {
+        case .userConfigured:
+            AntigravityAgentToolPreferences.permissionLevel(defaults: defaults, secureStore: securePermissions)
+        case .mcpSafeDefaults:
+            .safeManagedUnavailable
+        case let .providerOverride(.antigravity(level)):
+            level
+        case .providerOverride:
+            .managedDefault
+        }
+    }
+
+    private func effectiveGrokPermissionLevel(
+        profile: AgentProviderPermissionProfile
+    ) -> GrokAgentToolPreferences.PermissionLevel {
+        switch profile {
+        case .userConfigured:
+            GrokAgentToolPreferences.permissionLevel(defaults: defaults, secureStore: securePermissions)
+        case .mcpSafeDefaults:
+            .managedDefault
+        case let .providerOverride(.grok(level)):
             level
         case .providerOverride:
             .managedDefault
@@ -727,8 +765,9 @@ final class AgentProviderPreferenceSnapshotStore {
         case .claude: .claudeCode
         case .openCode: .openCode
         case .cursor: .cursor
-        case .grokBuild: .grokBuild
         case .antigravity: .antigravity
+        case .grok: .grok
+        case .grokBuild: .grokBuild
         case .devin: .devin
         }
     }

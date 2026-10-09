@@ -38,6 +38,16 @@ extension Notification.Name {
     /// Posted when Cursor CLI connection status changes
     /// userInfo mirrors `claudeCodeConnectionChanged`
     static let cursorConnectionChanged = Notification.Name("cursorConnectionChanged")
+    /// Posted after the app-wide Antigravity connection coordinator commits a new projection.
+    /// Consumers read the coordinator's latest generation-safe projection; carries no userInfo.
+    static let antigravityConnectionChanged = Notification.Name("antigravityConnectionChanged")
+    /// Posted when the cached Antigravity (`agy`) live model list changes.
+    /// Drives an Agent Mode model-picker refresh; carries no userInfo.
+    static let antigravityModelsChanged = Notification.Name("antigravityModelsChanged")
+    /// Posted when the cached Grok (`grok`) live model list changes.
+    /// Drives an Agent Mode model-picker refresh; carries no userInfo.
+    static let grokModelsChanged = Notification.Name("grokModelsChanged")
+
     /// Posted when Grok Build CLI connection status changes
     /// userInfo mirrors `claudeCodeConnectionChanged`
     static let grokBuildConnectionChanged = Notification.Name("grokBuildConnectionChanged")

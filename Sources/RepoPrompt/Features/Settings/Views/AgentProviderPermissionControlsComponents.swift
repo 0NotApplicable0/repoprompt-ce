@@ -86,8 +86,8 @@ struct AgentProviderPermissionLevelSection: View {
 
     private func permissionLevelLabel(for providerID: AgentProviderBindingID) -> String {
         switch providerID {
-        case .codex, .claude: "Permission Level"
-        case .openCode, .antigravity: "ACP Session Mode"
+        case .codex, .claude, .antigravity, .grok: "Permission Level"
+        case .openCode: "ACP Session Mode"
         case .cursor: "ACP Auto-Approve"
         case .grokBuild: "Always-Approve Launch"
         case .devin: "Permission Mode"
@@ -141,7 +141,7 @@ struct AgentProviderToolsRuntimeDisclosure: View {
         switch providerID {
         case .codex: binding.codexTools != nil
         case .claude: binding.claudeTools != nil
-        case .openCode, .cursor, .grokBuild, .antigravity, .devin: false
+        case .openCode, .cursor, .antigravity, .grok, .grokBuild, .devin: false
         }
     }
 }
@@ -169,7 +169,7 @@ struct AgentProviderToolsRuntimeControls: View {
                         onApplyMutation: onApplyClaudeToolSettingMutation
                     )
                 }
-            case .openCode, .cursor, .grokBuild, .antigravity, .devin:
+            case .openCode, .cursor, .antigravity, .grok, .grokBuild, .devin:
                 EmptyView()
             }
         }

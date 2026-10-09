@@ -430,10 +430,17 @@ enum ACPAIModelCatalog {
         CursorAIModelCatalog.options
     }
 
-    private static func grokBuildModelOptionsFromStore() -> [AgentModelOption] {
-        AgentModelCatalog.options(
-            for: .grokBuild,
-            availability: AgentModelCatalog.AvailabilityContext(grokBuildAvailable: true)
+    static func grokBuildModelOptionsFromStore() -> [AgentModelOption] {
+        let fallback = AgentModelOption(
+            rawValue: AgentModel.defaultModel.rawValue,
+            displayName: "Default",
+            description: nil,
+            isPlaceholderDefault: true,
+            isProviderDefault: true
         )
+        let storedOptions = AgentACPModelRegistry.shared.resolvedSnapshot(for: .grokBuild)?.options ?? []
+        return [fallback] + storedOptions.filter {
+            $0.rawValue.caseInsensitiveCompare(AgentModel.defaultModel.rawValue) != .orderedSame
+        }
     }
 }

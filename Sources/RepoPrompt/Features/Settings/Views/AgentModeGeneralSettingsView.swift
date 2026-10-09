@@ -683,9 +683,10 @@ struct AgentModeGeneralSettingsView: View {
         case .claude: apiSettingsVM.isClaudeCodeConnected
         case .codex: apiSettingsVM.isCodexConnected
         case .openCode: apiSettingsVM.isOpenCodeConnected
-        case .antigravity: AntigravityRuntimeManager.installedRuntimeSync() != nil
         case .cursor: apiSettingsVM.isCursorConnected
-        case .grokBuild: apiSettingsVM.isGrokBuildConnected
+        case .antigravity: apiSettingsVM.isAntigravityConnected
+        case .grok: apiSettingsVM.isGrokConnected
+        case .grokBuild: false
         // Devin owns its own auth, so the installed CLI is the connection.
         case .devin: DevinRuntimeLocator.isInstalledSync()
         }

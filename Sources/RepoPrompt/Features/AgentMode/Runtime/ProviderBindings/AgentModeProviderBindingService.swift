@@ -211,7 +211,7 @@ final class AgentModeProviderBindingService {
                 // Claude launch settings are revalidated immediately before dispatch.
                 // Avoid an eager untracked shutdown that could race a newly started run.
                 break
-            case .openCode, .antigravity:
+            case .openCode:
                 let runtime = runtimePermission(for: session.selectedAgent, profile: session.permissionProfile)
                 guard let sessionModeID = runtime.acpSessionModeID,
                       session.runState.isActive,
@@ -244,6 +244,8 @@ final class AgentModeProviderBindingService {
                         updateActiveBindings(session)
                     }
                 }
+            case .antigravity, .grok:
+                break
             case .grokBuild, .devin:
                 // These providers take their permission level as a launch-time CLI flag
                 // (`--always-approve` / `--permission-mode`); it applies to newly launched

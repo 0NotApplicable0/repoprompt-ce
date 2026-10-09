@@ -17,8 +17,9 @@ enum AgentModelCatalog {
         let codexAvailable: Bool
         let openCodeAvailable: Bool
         let cursorAvailable: Bool
-        let grokBuildAvailable: Bool
         let antigravityAvailable: Bool
+        let grokAvailable: Bool
+        let grokBuildAvailable: Bool
         let devinAvailable: Bool
         let zaiConfigured: Bool
         let kimiConfigured: Bool
@@ -29,8 +30,9 @@ enum AgentModelCatalog {
             codexAvailable: false,
             openCodeAvailable: false,
             cursorAvailable: false,
-            grokBuildAvailable: false,
             antigravityAvailable: false,
+            grokAvailable: false,
+            grokBuildAvailable: false,
             devinAvailable: false,
             zaiConfigured: false,
             kimiConfigured: false,
@@ -43,8 +45,9 @@ enum AgentModelCatalog {
                 codexAvailable: codexAvailable && providers.contains(.codex),
                 openCodeAvailable: false,
                 cursorAvailable: cursorAvailable && providers.contains(.cursor),
+                antigravityAvailable: false,
+                grokAvailable: false,
                 grokBuildAvailable: grokBuildAvailable && providers.contains(.grokBuild),
-                antigravityAvailable: antigravityAvailable,
                 devinAvailable: false,
                 zaiConfigured: zaiConfigured && providers.contains(.claudeCode),
                 kimiConfigured: kimiConfigured && providers.contains(.claudeCode),
@@ -59,8 +62,9 @@ enum AgentModelCatalog {
                 codexAvailable: true,
                 openCodeAvailable: true,
                 cursorAvailable: false,
+                antigravityAvailable: true,
+                grokAvailable: true,
                 grokBuildAvailable: false,
-                antigravityAvailable: AntigravityRuntimeManager.installedRuntimeSync() != nil,
                 devinAvailable: DevinRuntimeLocator.isInstalledSync(),
                 zaiConfigured: backendIsAvailable(.glmZAI, store: store),
                 kimiConfigured: backendIsAvailable(.kimi, store: store),
@@ -73,8 +77,9 @@ enum AgentModelCatalog {
             codexAvailable: Bool = true,
             openCodeAvailable: Bool = true,
             cursorAvailable: Bool = false,
-            grokBuildAvailable: Bool = false,
             antigravityAvailable: Bool = false,
+            grokAvailable: Bool = false,
+            grokBuildAvailable: Bool = false,
             devinAvailable: Bool = false,
             zaiConfigured: Bool = false,
             kimiConfigured: Bool = false,
@@ -84,8 +89,9 @@ enum AgentModelCatalog {
             self.codexAvailable = codexAvailable
             self.openCodeAvailable = openCodeAvailable
             self.cursorAvailable = cursorAvailable
-            self.grokBuildAvailable = grokBuildAvailable
             self.antigravityAvailable = antigravityAvailable
+            self.grokAvailable = grokAvailable
+            self.grokBuildAvailable = grokBuildAvailable
             self.devinAvailable = devinAvailable
             self.zaiConfigured = zaiConfigured
             self.kimiConfigured = kimiConfigured
@@ -109,8 +115,9 @@ enum AgentModelCatalog {
                 codexAvailable: codexAvailable || agentKind == .codexExec,
                 openCodeAvailable: openCodeAvailable || agentKind == .openCode,
                 cursorAvailable: cursorAvailable || agentKind == .cursor,
-                grokBuildAvailable: grokBuildAvailable || agentKind == .grokBuild,
                 antigravityAvailable: antigravityAvailable || agentKind == .antigravity,
+                grokAvailable: grokAvailable || agentKind == .grok,
+                grokBuildAvailable: grokBuildAvailable || agentKind == .grokBuild,
                 devinAvailable: devinAvailable || agentKind == .devin,
                 zaiConfigured: zaiConfigured || agentKind == .claudeCodeGLM,
                 kimiConfigured: kimiConfigured || agentKind == .kimiCode,
@@ -125,10 +132,8 @@ enum AgentModelCatalog {
 
         func allows(_ agentKind: AgentProviderKind) -> Bool {
             switch self {
-            case .general:
+            case .general, .headless:
                 true
-            case .headless:
-                agentKind != .antigravity
             }
         }
     }
@@ -218,15 +223,15 @@ enum AgentModelCatalog {
         .claudeCode,
         .openCode,
         .cursor,
-        .grokBuild,
-        .antigravity
+        .antigravity,
+        .grok
     ]
 
     static func selectableAgents(
         availability: AvailabilityContext = .current,
         surface: AgentSelectionSurface = .general
     ) -> [AgentProviderKind] {
-        [.codexExec, .claudeCode, .openCode, .cursor, .grokBuild, .antigravity, .devin, .claudeCodeGLM, .kimiCode, .customClaudeCompatible]
+        [.codexExec, .claudeCode, .openCode, .cursor, .antigravity, .grok, .devin, .claudeCodeGLM, .kimiCode, .customClaudeCompatible]
             .filter { surface.allows($0) && isAgentAvailable($0, availability: availability) }
     }
 
@@ -256,10 +261,12 @@ enum AgentModelCatalog {
             availability.openCodeAvailable
         case .cursor:
             availability.cursorAvailable
-        case .grokBuild:
-            availability.grokBuildAvailable
         case .antigravity:
             availability.antigravityAvailable
+        case .grok:
+            availability.grokAvailable
+        case .grokBuild:
+            false
         case .devin:
             availability.devinAvailable
         }
@@ -278,7 +285,7 @@ enum AgentModelCatalog {
             // Grok's default follows its own configuration.
             return AgentModel.defaultModel.rawValue
         }
-        if agentKind == .antigravity || agentKind == .devin {
+        if agentKind == .devin {
             return resolvedACPDiscoveredModels(for: agentKind)?.preferredModelRaw ?? ""
         }
         if isAgentAvailable(agentKind, availability: availability),
@@ -292,9 +299,9 @@ enum AgentModelCatalog {
         case .claudeCode, .claudeCodeGLM, .kimiCode, .customClaudeCompatible:
             return ClaudeCompatibleModelCatalogAdapter.defaultModelRaw(for: agentKind, availability: availability)
                 ?? AgentModel.defaultModel.rawValue
-        case .codexExec, .openCode, .grokBuild:
+        case .codexExec, .openCode, .antigravity, .grok, .grokBuild:
             return AgentModel.defaultModel.rawValue
-        case .antigravity, .devin:
+        case .devin:
             return ""
         }
     }
@@ -308,6 +315,12 @@ enum AgentModelCatalog {
         surface: AgentSelectionSurface = .general
     ) -> NormalizedAgentSelection {
         let parsedAgent = normalizedAgentKind(agentRaw)
+        if let parsedAgent, parsedAgent.preservesSavedSelection {
+            return NormalizedAgentSelection(
+                agent: parsedAgent,
+                modelRaw: modelRaw ?? AgentModel.defaultModel.rawValue
+            )
+        }
         var agent = parsedAgent ?? .claudeCode
         var candidateModelRaw = normalizedRawModel(modelRaw)
         var effectiveAvailability = availability
@@ -398,21 +411,6 @@ enum AgentModelCatalog {
         if agentKind == .devin {
             return DevinModelCatalog(snapshot: resolvedACPDiscoveredModels(for: .devin)).entries.map(\.option)
         }
-        if agentKind == .antigravity {
-            return resolvedACPDiscoveredModels(for: agentKind)?.options ?? []
-        }
-        if agentKind == .grokBuild {
-            let fallback = staticOption(.defaultModel, for: .grokBuild)
-            guard let discoveredOptions = resolvedACPDiscoveredModels(for: agentKind)?.options,
-                  !discoveredOptions.isEmpty
-            else {
-                return [fallback]
-            }
-            let discoveredWithoutDefault = discoveredOptions.filter {
-                $0.rawValue.caseInsensitiveCompare(AgentModel.defaultModel.rawValue) != .orderedSame
-            }
-            return [fallback] + discoveredWithoutDefault
-        }
         if let discoveredOptions = resolvedACPDiscoveredModels(for: agentKind)?.options,
            !discoveredOptions.isEmpty
         {
@@ -431,13 +429,77 @@ enum AgentModelCatalog {
                 availability: availability,
                 includeClaudeEffortVariants: includeClaudeEffortVariants
             ) ?? []
+        case .antigravity:
+            return antigravityOptions(for: agentKind, availability: availability)
+        case .grok:
+            return grokOptions(for: agentKind, availability: availability)
         case .openCode, .cursor, .grokBuild:
             return AgentModel.modelsForAgent(agentKind)
                 .filter { isAvailable($0, for: agentKind, availability: availability) }
                 .map { staticOption($0, for: agentKind) }
-        case .antigravity, .devin:
+        case .devin:
             return []
         }
+    }
+
+    /// Builds the Antigravity model options: the static `Default` placeholder followed by one
+    /// option per live `agy models` record. The raw value is the model *id* (the only form
+    /// `agy --model` accepts) and the display name is the label column. Mirrors the Codex
+    /// live-model path: a background refresh is kicked off when the cache is stale, and the picker
+    /// re-reads these options when `AntigravityModelRegistry` posts `.antigravityModelsChanged`.
+    private static func antigravityOptions(
+        for agentKind: AgentProviderKind,
+        availability: AvailabilityContext
+    ) -> [AgentModelOption] {
+        // Non-blocking, coalesced background refresh; results surface via the change notification.
+        Task { await AntigravityModelRegistry.shared.refreshIfStale() }
+
+        var options = AgentModel.modelsForAgent(agentKind)
+            .filter { isAvailable($0, for: agentKind, availability: availability) }
+            .map { staticOption($0, for: agentKind) }
+
+        var seen = Set(options.map { $0.rawValue.lowercased() })
+        for model in AntigravityModelRegistry.shared.currentModels() {
+            guard seen.insert(model.id.lowercased()).inserted else { continue }
+            options.append(AgentModelOption(
+                rawValue: model.id,
+                displayName: model.displayName,
+                description: nil,
+                isPlaceholderDefault: false,
+                isProviderDefault: false
+            ))
+        }
+        return options
+    }
+
+    /// Builds the Grok model options: the static `Default` placeholder followed by one
+    /// option per live `grok models` label (raw value == display name == the verbatim label, which
+    /// `grok --model "<LABEL>"` accepts directly — no slug mapping). Mirrors the Codex live-model
+    /// path: a background refresh is kicked off when the cache is stale, and the picker re-reads
+    /// these options when `GrokModelRegistry` posts `.grokModelsChanged`.
+    private static func grokOptions(
+        for agentKind: AgentProviderKind,
+        availability: AvailabilityContext
+    ) -> [AgentModelOption] {
+        // Non-blocking, coalesced background refresh; results surface via the change notification.
+        Task { await GrokModelRegistry.shared.refreshIfStale() }
+
+        var options = AgentModel.modelsForAgent(agentKind)
+            .filter { isAvailable($0, for: agentKind, availability: availability) }
+            .map { staticOption($0, for: agentKind) }
+
+        var seen = Set(options.map { $0.rawValue.lowercased() })
+        for label in GrokModelRegistry.shared.currentModelLabels() {
+            guard seen.insert(label.lowercased()).inserted else { continue }
+            options.append(AgentModelOption(
+                rawValue: label,
+                displayName: label,
+                description: nil,
+                isPlaceholderDefault: false,
+                isProviderDefault: false
+            ))
+        }
+        return options
     }
 
     static func isValid(
@@ -453,16 +515,17 @@ enum AgentModelCatalog {
         if agentKind == .cursor {
             return CursorAIModelCatalog.contains(modelRaw: normalized)
         }
-        if agentKind == .grokBuild,
-           normalized.caseInsensitiveCompare(AgentModel.defaultModel.rawValue) == .orderedSame
-        {
-            return true
+        if agentKind == .antigravity {
+            let modelID = AntigravityAgentProvider.normalizedModelID(normalized)
+            return modelID.caseInsensitiveCompare(AgentModel.defaultModel.rawValue) == .orderedSame
+                || AntigravityModelRegistry.shared.currentModels().contains { $0.id == modelID }
+        }
+        if agentKind == .grok {
+            return normalized.caseInsensitiveCompare(AgentModel.defaultModel.rawValue) == .orderedSame
+                || GrokModelRegistry.shared.currentModelLabels().contains(normalized)
         }
         if agentKind == .devin {
             return DevinModelCatalog(snapshot: resolvedACPDiscoveredModels(for: .devin)).entry(matching: normalized) != nil
-        }
-        if agentKind == .antigravity {
-            return resolvedACPDiscoveredModels(for: agentKind)?.contains(rawModel: normalized) == true
         }
         if let discoveredModels = resolvedACPDiscoveredModels(for: agentKind) {
             return discoveredModels.contains(rawModel: normalized)
@@ -496,6 +559,17 @@ enum AgentModelCatalog {
         let effectiveRaw = normalized.isEmpty
             ? defaultModelRaw(for: agentKind, availability: availability, codexDynamicModels: codexDynamicModels)
             : normalized
+
+        if agentKind.preservesSavedSelection {
+            if effectiveRaw.caseInsensitiveCompare(AgentModel.defaultModel.rawValue) == .orderedSame {
+                return AgentModel.defaultModel.displayName
+            }
+            if agentKind == .antigravity {
+                let modelID = AntigravityAgentProvider.normalizedModelID(effectiveRaw)
+                return AntigravityModelRegistry.shared.currentModels().first { $0.id == modelID }?.displayName ?? effectiveRaw
+            }
+            return effectiveRaw
+        }
 
         func baseDisplayName(for raw: String) -> String {
             if let compatibleDisplayName = ClaudeCompatibleModelCatalogAdapter.compatibleBackendDisplayName(forRequestedModelRaw: raw, agentKind: agentKind) {
@@ -1462,7 +1536,7 @@ enum AgentModelCatalog {
             .kimi
         case .customClaudeCompatible:
             .custom
-        case .claudeCode, .codexExec, .openCode, .cursor, .grokBuild, .antigravity, .devin:
+        case .claudeCode, .codexExec, .openCode, .cursor, .antigravity, .grok, .grokBuild, .devin:
             nil
         }
     }
@@ -1665,7 +1739,7 @@ enum AgentModelCatalog {
             availability.kimiConfigured
         case .customClaudeCompatible:
             availability.customClaudeCompatibleConfigured
-        case .claudeCode, .codexExec, .openCode, .cursor, .grokBuild, .antigravity, .devin:
+        case .claudeCode, .codexExec, .openCode, .cursor, .antigravity, .grok, .grokBuild, .devin:
             true
         }
     }
@@ -1945,7 +2019,8 @@ enum AgentModelCatalog {
                 SelectionCandidate(agent: .codexExec, modelRaw: AgentModel.gpt54MiniMedium.rawValue),
                 SelectionCandidate(agent: .codexExec, modelRaw: AgentModel.codexMini.rawValue),
                 SelectionCandidate(agent: .cursor, modelRaw: AgentModel.cursorAuto.rawValue),
-                SelectionCandidate(agent: .grokBuild, modelRaw: AgentModel.defaultModel.rawValue)
+                SelectionCandidate(agent: .grok, modelRaw: AgentModel.defaultModel.rawValue),
+                SelectionCandidate(agent: .antigravity, modelRaw: AgentModel.defaultModel.rawValue)
             ]
         case .engineer:
             [
@@ -1955,7 +2030,8 @@ enum AgentModelCatalog {
                 SelectionCandidate(agent: .kimiCode, modelRaw: AgentModel.kimiCode.rawValue),
                 SelectionCandidate(agent: .customClaudeCompatible, modelRaw: defaultCompatibleBackendModelRaw(for: .customClaudeCompatible)),
                 SelectionCandidate(agent: .cursor, modelRaw: AgentModel.cursorComposer2.rawValue),
-                SelectionCandidate(agent: .grokBuild, modelRaw: AgentModel.defaultModel.rawValue)
+                SelectionCandidate(agent: .grok, modelRaw: AgentModel.defaultModel.rawValue),
+                SelectionCandidate(agent: .antigravity, modelRaw: AgentModel.defaultModel.rawValue)
             ]
         case .pair:
             [
@@ -1965,7 +2041,8 @@ enum AgentModelCatalog {
                 SelectionCandidate(agent: .kimiCode, modelRaw: AgentModel.kimiCode.rawValue),
                 SelectionCandidate(agent: .customClaudeCompatible, modelRaw: defaultCompatibleBackendModelRaw(for: .customClaudeCompatible)),
                 SelectionCandidate(agent: .cursor, modelRaw: AgentModel.cursorComposer2.rawValue),
-                SelectionCandidate(agent: .grokBuild, modelRaw: AgentModel.defaultModel.rawValue)
+                SelectionCandidate(agent: .grok, modelRaw: AgentModel.defaultModel.rawValue),
+                SelectionCandidate(agent: .antigravity, modelRaw: AgentModel.defaultModel.rawValue)
             ]
         case .design:
             [
@@ -1975,7 +2052,8 @@ enum AgentModelCatalog {
                 SelectionCandidate(agent: .customClaudeCompatible, modelRaw: defaultCompatibleBackendModelRaw(for: .customClaudeCompatible)),
                 SelectionCandidate(agent: .cursor, modelRaw: AgentModel.cursorComposer2.rawValue),
                 SelectionCandidate(agent: .codexExec, modelRaw: solMedium),
-                SelectionCandidate(agent: .grokBuild, modelRaw: AgentModel.defaultModel.rawValue)
+                SelectionCandidate(agent: .grok, modelRaw: AgentModel.defaultModel.rawValue),
+                SelectionCandidate(agent: .antigravity, modelRaw: AgentModel.defaultModel.rawValue)
             ]
         }
     }
@@ -2033,7 +2111,6 @@ enum AgentModelCatalog {
     ) -> [DiscoveryTaskLabel] {
         taskLabels.compactMap { entry in
             guard let resolved = resolveTaskLabelKind(entry.kind, availability: availability) else { return nil }
-            let selectionID = AgentModelSelectionID(agentRaw: resolved.agent.rawValue, modelRaw: resolved.modelRaw)
             let name = displayName(for: resolved.modelRaw, agentKind: resolved.agent, availability: availability)
             return DiscoveryTaskLabel(
                 label: entry.label,

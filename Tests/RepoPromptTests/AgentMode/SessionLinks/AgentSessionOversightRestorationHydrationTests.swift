@@ -104,7 +104,7 @@ final class AgentSessionOversightRestorationHydrationTests: XCTestCase {
                 requests.record("claude")
                 return MonitorFakeNativeController()
             },
-            headlessProviderFactory: { _, _ in
+            headlessProviderFactory: { _, _, _, _, _ in
                 requests.record("headless")
                 return AgentSessionLinkCapturingHeadlessProvider(failuresRemaining: 1)
             },

@@ -328,7 +328,7 @@ final class AgentSelfCompactACPSettleTests: XCTestCase {
             environment: ["ACP_HOLD_METHOD": "session/set_config_option", "ACP_RESPONSE_GATE": gate.path]
         )
         let harness = AgentSessionLinkRunnerHarness(
-            headlessProviderFactory: { _, _ in AgentSessionLinkCapturingHeadlessProvider() },
+            headlessProviderFactory: { _, _, _, _, _ in AgentSessionLinkCapturingHeadlessProvider() },
             acpProviderFactory: { _, _ in provider },
             workspacePath: directory.path
         )

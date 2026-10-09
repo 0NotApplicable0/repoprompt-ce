@@ -70,12 +70,12 @@ final class ACPAdvertisedCommandControllerTests: XCTestCase {
         var environment = environment
         environment["ACP_PROMPT_LOG"] = promptLog.path
         let provider = AgentSessionLinkCapturingACPProvider(
-            providerID: .antigravity,
+            providerID: .devin,
             commandPath: scriptURL.path,
             environment: environment
         )
         let request = ACPRunRequest(
-            agentKind: .antigravity,
+            agentKind: .devin,
             modelString: nil,
             workspacePath: directory.path,
             resumeSessionID: nil,
@@ -351,8 +351,8 @@ final class AgentSessionLinkACPCompactRunnerTests: XCTestCase {
     }
 
     private func makeFixture(
-        agent: AgentProviderKind = .antigravity,
-        providerID: ACPProviderID = .antigravity,
+        agent: AgentProviderKind = .devin,
+        providerID: ACPProviderID = .devin,
         environment: [String: String] = ["ACP_ADVERTISE_COMMANDS": "compact"]
     ) throws -> Fixture {
         let workspace = try ACPCompactFixtures.makeTemporaryDirectory(tracking: &temporaryURLs)
@@ -366,7 +366,7 @@ final class AgentSessionLinkACPCompactRunnerTests: XCTestCase {
             environment: environment
         )
         let harness = AgentSessionLinkRunnerHarness(
-            headlessProviderFactory: { _, _ in AgentSessionLinkCapturingHeadlessProvider() },
+            headlessProviderFactory: { _, _, _, _, _ in AgentSessionLinkCapturingHeadlessProvider() },
             acpProviderFactory: { _, _ in provider },
             workspacePath: workspace.path
         )
@@ -658,6 +658,12 @@ final class AgentSessionLinkACPCompactRunnerTests: XCTestCase {
 
 @MainActor
 final class AgentSessionLinkACPCompactTransactionTests: XCTestCase {
+    private final class ACPCompactAPISettingsViewModel: APISettingsViewModel {
+        override var agentModeAvailabilityContext: AgentModelCatalog.AvailabilityContext {
+            AgentModelCatalog.AvailabilityContext.none.assumingAvailable(.devin)
+        }
+    }
+
     private var retainedViewModels: [AgentModeViewModel] = []
     private var temporaryURLs: [URL] = []
     private var liveControllers: [ACPAgentSessionController] = []
@@ -690,8 +696,8 @@ final class AgentSessionLinkACPCompactTransactionTests: XCTestCase {
     }
 
     private func makeFixture(
-        agent: AgentProviderKind = .grokBuild,
-        providerID: ACPProviderID = .grokBuild,
+        agent: AgentProviderKind = .devin,
+        providerID: ACPProviderID = .devin,
         environment: [String: String] = ["ACP_ADVERTISE_COMMANDS": "compact"]
     ) throws -> Fixture {
         let directory = try ACPCompactFixtures.makeTemporaryDirectory(tracking: &temporaryURLs)
@@ -709,7 +715,7 @@ final class AgentSessionLinkACPCompactTransactionTests: XCTestCase {
         let tabID = UUID()
         let fileManager = WorkspaceFilesViewModel()
         let keyManager = KeyManager(secureService: SecureKeysService(secureStorage: TestSecureStorageBackend()))
-        let apiSettings = APISettingsViewModel(
+        let apiSettings = ACPCompactAPISettingsViewModel(
             aiQueriesService: AIQueriesService(keyManager: keyManager),
             keyManager: keyManager,
             loadStoredDataOnInit: false
@@ -747,9 +753,6 @@ final class AgentSessionLinkACPCompactTransactionTests: XCTestCase {
         )
         retainedViewModels.append(viewModel)
         viewModel.workspaceManager = manager
-        // A deterministic availability context: Grok Build is available only through this in-memory
-        // flag (setting it directly persists nothing), never through the machine's installed CLIs.
-        apiSettings.isGrokBuildConnected = true
         viewModel.promptManager = prompt
         viewModel.test_setCurrentTabIDOverride(tabID)
         viewModel.test_setAgentSessionSaver { _, _, _ in

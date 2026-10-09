@@ -446,7 +446,10 @@ extension GlobalSettingsStore {
     /// should continue using `globalContextBuilderAgentSelection()`.
     func globalContextBuilderRememberedModelRaw(for agentRaw: String) -> String? {
         let trimmedAgentRaw = agentRaw.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard AgentProviderKind(rawValue: trimmedAgentRaw) != nil else { return nil }
+        guard let agent = AgentProviderKind(rawValue: trimmedAgentRaw) else { return nil }
+        if agent.preservesSavedSelection {
+            return globalDefaults.discoverModelsByAgent?[trimmedAgentRaw]
+        }
         guard let raw = globalDefaults.discoverModelsByAgent?[trimmedAgentRaw]?.trimmingCharacters(in: .whitespacesAndNewlines),
               !raw.isEmpty
         else {
@@ -524,10 +527,10 @@ extension GlobalSettingsStore {
 
         let trimmedModelRaw = modelRaw?.trimmingCharacters(in: .whitespacesAndNewlines)
         let newModelRaw: String?
-        if let trimmedModelRaw, !trimmedModelRaw.isEmpty {
+        if let trimmedModelRaw, !trimmedModelRaw.isEmpty || agent.preservesSavedSelection {
             let normalized = AgentModelCatalog.normalizeSelection(
                 agentRaw: agent.rawValue,
-                modelRaw: trimmedModelRaw
+                modelRaw: agent.preservesSavedSelection ? modelRaw : trimmedModelRaw
             )
             if globalDefaults.discoverModelsByAgent == nil {
                 globalDefaults.discoverModelsByAgent = [:]

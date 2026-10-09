@@ -305,7 +305,16 @@ public class APISettingsViewModel: ObservableObject {
     @Published var cursorError: String? = nil
     @Published private(set) var availableCursorModelOptions: [AgentModelOption] = []
     private var cursorLogCollector: CLIProcessLogCollector?
-    // Grok Build CLI / ACP
+    /// Antigravity CLI (`agy`) — Pattern 1 auth (user pre-authenticates by running `agy` once).
+    /// The persisted bit is only a hint: never publish connected unless the current MCP document
+    /// is also valid and functionally points at RepoPrompt.
+    @Published private(set) var isAntigravityConnected: Bool = false
+    @Published private(set) var antigravityError: String? = nil
+    @Published private(set) var hasOwnedAntigravityMCPEntry = false
+    // Grok CLI (`grok`) — Pattern 1 auth (user pre-authenticates by running `grok login` once).
+    @Published var isGrokConnected: Bool = UserDefaults.standard.bool(forKey: "GrokCLIConnected")
+    @Published var grokError: String? = nil
+    // Grok Build CLI / Chat
     @Published var isGrokBuildConnected: Bool = UserDefaults.standard.bool(forKey: "GrokBuildCLIConnected")
     @Published var grokBuildError: String? = nil
     @Published private(set) var availableGrokBuildModelOptions: [AgentModelOption] = []
@@ -362,7 +371,6 @@ public class APISettingsViewModel: ObservableObject {
     private var cursorModelsRefreshTask: Task<Void, Never>?
     @Published private(set) var isDiscoveringCursorModels = false
     @Published private(set) var cursorModelDiscoveryMessage: String?
-    private var grokBuildModelsTask: Task<Void, Never>?
     private var devinModelsTask: Task<Void, Never>?
     @Published private(set) var isDiscoveringDevinModels = false
     @Published private(set) var devinModelDiscoveryMessage: String?
@@ -370,6 +378,7 @@ public class APISettingsViewModel: ObservableObject {
     private var customModelsTask: Task<Void, Never>?
     private var initialLoadTask: Task<Void, Never>?
     private var cliConnectionCancellables = Set<AnyCancellable>()
+    private var lastAppliedAntigravityConnectionRevision: UInt64 = 0
     private var hasLoadedStoredData = false
     private var isLoadingStoredData = false
     private var hasStoredZAIKey = false
@@ -397,8 +406,9 @@ public class APISettingsViewModel: ObservableObject {
             codexAvailable: isCodexConnected,
             openCodeAvailable: isOpenCodeConnected,
             cursorAvailable: isCursorConnected,
-            grokBuildAvailable: isGrokBuildConnected,
-            antigravityAvailable: AntigravityRuntimeManager.installedRuntimeSync() != nil,
+            antigravityAvailable: isAntigravityConnected,
+            grokAvailable: isGrokConnected,
+            grokBuildAvailable: false,
             devinAvailable: DevinRuntimeLocator.isInstalledSync(),
             zaiConfigured: compatibleBackendIsActive(.glmZAI),
             kimiConfigured: compatibleBackendIsActive(.kimi),
@@ -430,6 +440,8 @@ public class APISettingsViewModel: ObservableObject {
             $isCodexConnected.map { _ in () }.eraseToAnyPublisher(),
             $isOpenCodeConnected.map { _ in () }.eraseToAnyPublisher(),
             $isCursorConnected.map { _ in () }.eraseToAnyPublisher(),
+            $isAntigravityConnected.map { _ in () }.eraseToAnyPublisher(),
+            $isGrokConnected.map { _ in () }.eraseToAnyPublisher(),
             $isGrokBuildConnected.map { _ in () }.eraseToAnyPublisher(),
             $claudeCodeCLIStatus.map { _ in () }.eraseToAnyPublisher(),
             $compatibleBackendConfigs.map { _ in () }.eraseToAnyPublisher(),
@@ -451,7 +463,9 @@ public class APISettingsViewModel: ObservableObject {
             codexAvailable: isVerifiedContextBuilderProvider(.codexExec) && isCodexConnected,
             openCodeAvailable: isVerifiedContextBuilderProvider(.openCode) && isOpenCodeConnected,
             cursorAvailable: isVerifiedContextBuilderProvider(.cursor) && isCursorConnected,
-            grokBuildAvailable: isVerifiedContextBuilderProvider(.grokBuild) && isGrokBuildConnected,
+            antigravityAvailable: isVerifiedContextBuilderProvider(.antigravity) && isAntigravityConnected,
+            grokAvailable: isVerifiedContextBuilderProvider(.grok) && isGrokConnected,
+            grokBuildAvailable: false,
             devinAvailable: DevinRuntimeLocator.isInstalledSync(),
             zaiConfigured: compatibleBackendIsActive(.glmZAI),
             kimiConfigured: compatibleBackendIsActive(.kimi),
@@ -481,6 +495,7 @@ public class APISettingsViewModel: ObservableObject {
     ) -> ProviderStatusSnapshot.Availability {
         guard isConnected else { return .notConfigured }
         if isVerifiedContextBuilderProvider(provider) { return .ready }
+        if provider == .grokBuild { return .configured }
         return isContextBuilderProviderValidationComplete ? .notConfigured : .configured
     }
 
@@ -512,10 +527,12 @@ public class APISettingsViewModel: ObservableObject {
             isOpenCodeConnected
         case .cursor:
             isCursorConnected
+        case .antigravity:
+            isAntigravityConnected
+        case .grok:
+            isGrokConnected
         case .grokBuild:
             isGrokBuildConnected
-        case .antigravity:
-            AntigravityRuntimeManager.installedRuntimeSync() != nil
         case .devin:
             DevinRuntimeLocator.isInstalledSync()
         case .claudeCodeGLM, .kimiCode, .customClaudeCompatible:
@@ -562,11 +579,11 @@ public class APISettingsViewModel: ObservableObject {
 
     private func installCLIConnectionObservers() {
         Publishers.MergeMany([
-            NotificationCenter.default.publisher(for: .claudeCodeConnectionChanged).map { _ in AgentProviderKind.claudeCode },
-            NotificationCenter.default.publisher(for: .codexConnectionChanged).map { _ in AgentProviderKind.codexExec },
-            NotificationCenter.default.publisher(for: .openCodeConnectionChanged).map { _ in AgentProviderKind.openCode },
-            NotificationCenter.default.publisher(for: .cursorConnectionChanged).map { _ in AgentProviderKind.cursor },
-            NotificationCenter.default.publisher(for: .grokBuildConnectionChanged).map { _ in AgentProviderKind.grokBuild }
+            notificationCenter.publisher(for: .claudeCodeConnectionChanged).map { _ in AgentProviderKind.claudeCode },
+            notificationCenter.publisher(for: .codexConnectionChanged).map { _ in AgentProviderKind.codexExec },
+            notificationCenter.publisher(for: .openCodeConnectionChanged).map { _ in AgentProviderKind.openCode },
+            notificationCenter.publisher(for: .cursorConnectionChanged).map { _ in AgentProviderKind.cursor },
+            notificationCenter.publisher(for: .grokBuildConnectionChanged).map { _ in AgentProviderKind.grokBuild }
         ])
         .receive(on: DispatchQueue.main)
         .sink { [weak self] provider in
@@ -586,6 +603,40 @@ public class APISettingsViewModel: ObservableObject {
             }
         }
         .store(in: &cliConnectionCancellables)
+
+        notificationCenter.publisher(for: .antigravityConnectionChanged)
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in
+                guard let self else { return }
+                Task { @MainActor [weak self] in
+                    await self?.applyLatestAntigravityConnectionProjection()
+                }
+            }
+            .store(in: &cliConnectionCancellables)
+
+        // A window created after the last notification still needs the app-wide projection.
+        // Revision ordering makes this seed safe if a newer notification arrives first.
+        Task { @MainActor [weak self] in
+            await self?.applyLatestAntigravityConnectionProjection()
+        }
+    }
+
+    private func applyLatestAntigravityConnectionProjection() async {
+        guard let projection = await antigravityConnectionCoordinator.latestProjection() else { return }
+        applyAntigravityConnectionProjection(projection)
+    }
+
+    private func applyAntigravityConnectionProjection(
+        _ projection: AntigravityConnectionCoordinator.Projection
+    ) {
+        guard projection.revision > lastAppliedAntigravityConnectionRevision else { return }
+        lastAppliedAntigravityConnectionRevision = projection.revision
+        isAntigravityConnected = projection.isConnected
+        antigravityError = projection.errorMessage
+        hasOwnedAntigravityMCPEntry = projection.hasOwnedMCPEntry
+        setContextBuilderProviderVerified(.antigravity, verified: projection.isConnected)
+        refreshAgentAvailability()
+        Task { await updateAvailableModels() }
     }
 
     private func applyAuthoritativeCodexDisconnectedState() {
@@ -608,7 +659,6 @@ public class APISettingsViewModel: ObservableObject {
 
     private func reloadCLIConnectionFlagsFromDefaults() {
         let wasCursorConnected = isCursorConnected
-        let wasGrokBuildConnected = isGrokBuildConnected
         isClaudeCodeConnected = UserDefaults.standard.bool(forKey: "ClaudeCodeConnected")
         if isClaudeCodeConnected {
             claudeCodeCLIStatus = .binaryPresent
@@ -620,13 +670,7 @@ public class APISettingsViewModel: ObservableObject {
         isOpenCodeConnected = UserDefaults.standard.bool(forKey: "OpenCodeCLIConnected")
         isCursorConnected = UserDefaults.standard.bool(forKey: "CursorCLIConnected")
         isGrokBuildConnected = UserDefaults.standard.bool(forKey: "GrokBuildCLIConnected")
-        if wasGrokBuildConnected != isGrokBuildConnected {
-            if isGrokBuildConnected {
-                startGrokBuildModelsSubscriptionIfNeeded(workspacePath: nil)
-            } else {
-                stopGrokBuildModelsSubscription(clearModels: true)
-            }
-        }
+        availableGrokBuildModelOptions = isGrokBuildConnected ? ACPAIModelCatalog.grokBuildModelOptionsFromStore() : []
         if wasCursorConnected != isCursorConnected {
             if isCursorConnected {
                 startCursorModelsSubscriptionIfNeeded(workspacePath: nil)
@@ -1040,6 +1084,12 @@ public class APISettingsViewModel: ObservableObject {
     private let codexManagedAuthRecovery: any CodexManagedAuthRecovering
     private let codexSessionFence: CodexManagedSessionFence
     private let codexExecutablePreflight: @MainActor @Sendable (CLIProcessLogCollector?) async -> CodexProviderHelpers.CodexExecutableResolution
+    private let antigravityConnectionCoordinator: AntigravityConnectionCoordinator
+    private let notificationCenter: NotificationCenter
+    private let antigravityCachedConnectionProbeOverride: (@MainActor @Sendable (Bool) async -> CachedAntigravityConnectionProbeResult)?
+    private let antigravityConnectionObservationOverride: (@Sendable () async -> MCPIntegrationHelper.AntigravityConnectionObservation)?
+    private let antigravityRemovalOverride: (@Sendable () async -> (MCPIntegrationHelper.AntigravityRemovalResult, Bool))?
+    private let antigravityManualVersionProbeOverride: (@MainActor @Sendable () async throws -> Int32)?
     private let storedDataLoadBoundary: (@MainActor @Sendable () async -> Void)?
     private let contextBuilderProviderValidationWillBegin: (@MainActor @Sendable () async -> Void)?
     private var hasPreparedForWindowClose = false
@@ -1055,6 +1105,12 @@ public class APISettingsViewModel: ObservableObject {
         codexExecutablePreflight: @escaping @MainActor @Sendable (CLIProcessLogCollector?) async -> CodexProviderHelpers.CodexExecutableResolution = { collector in
             await CodexProviderHelpers.preflightCodexExecutable(logCollector: collector)
         },
+        antigravityConnectionCoordinator: AntigravityConnectionCoordinator = .shared,
+        notificationCenter: NotificationCenter = .default,
+        antigravityCachedConnectionProbeOverride: (@MainActor @Sendable (Bool) async -> CachedAntigravityConnectionProbeResult)? = nil,
+        antigravityConnectionObservationOverride: (@Sendable () async -> MCPIntegrationHelper.AntigravityConnectionObservation)? = nil,
+        antigravityRemovalOverride: (@Sendable () async -> (MCPIntegrationHelper.AntigravityRemovalResult, Bool))? = nil,
+        antigravityManualVersionProbeOverride: (@MainActor @Sendable () async throws -> Int32)? = nil,
         storedDataLoadBoundary: (@MainActor @Sendable () async -> Void)? = nil,
         contextBuilderProviderValidationWillBegin: (@MainActor @Sendable () async -> Void)? = nil
     ) {
@@ -1065,6 +1121,12 @@ public class APISettingsViewModel: ObservableObject {
         self.codexManagedAuthRecovery = codexManagedAuthRecovery
         self.codexSessionFence = codexSessionFence
         self.codexExecutablePreflight = codexExecutablePreflight
+        self.antigravityConnectionCoordinator = antigravityConnectionCoordinator
+        self.notificationCenter = notificationCenter
+        self.antigravityCachedConnectionProbeOverride = antigravityCachedConnectionProbeOverride
+        self.antigravityConnectionObservationOverride = antigravityConnectionObservationOverride
+        self.antigravityRemovalOverride = antigravityRemovalOverride
+        self.antigravityManualVersionProbeOverride = antigravityManualVersionProbeOverride
         self.storedDataLoadBoundary = storedDataLoadBoundary
         self.contextBuilderProviderValidationWillBegin = contextBuilderProviderValidationWillBegin
         installCLIConnectionObservers()
@@ -1105,7 +1167,6 @@ public class APISettingsViewModel: ObservableObject {
         openCodeModelsTask?.cancel()
         openCodeModelsTask = nil
         stopCursorModelsSubscription()
-        stopGrokBuildModelsSubscription()
         openRouterModelsTask?.cancel()
         openRouterModelsTask = nil
         customModelsTask?.cancel()
@@ -1129,7 +1190,6 @@ public class APISettingsViewModel: ObservableObject {
         openCodeModelsTask?.cancel()
         cursorModelsRefreshTask?.cancel()
         cursorModelsTask?.cancel()
-        grokBuildModelsTask?.cancel()
         openRouterModelsTask?.cancel()
         customModelsTask?.cancel()
         contextBuilderProviderValidationTask?.cancel()
@@ -1224,7 +1284,7 @@ public class APISettingsViewModel: ObservableObject {
     }
 
     /// Revalidates persisted CLI connection hints once per view-model lifetime. Startup uses
-    /// bounded, non-generation checks and the shared single-flight ACP pollers, so restoration
+    /// bounded, non-mutating checks and the shared single-flight ACP pollers, so restoration
     /// cannot reject a saved dynamic model before discovery has had a chance to run.
     @MainActor
     func validateCachedContextBuilderProvidersIfNeeded() async {
@@ -1253,6 +1313,11 @@ public class APISettingsViewModel: ObservableObject {
         let codexPublicationToken = codexSessionFence.capturePublicationToken()
         let shouldValidateOpenCode = isOpenCodeConnected
         let shouldValidateCursor = isCursorConnected
+        // Capture the app-wide generation and persisted hint atomically. Published state starts
+        // disconnected and becomes true only after this bounded validation succeeds.
+        let antigravityValidationSnapshot = await antigravityConnectionCoordinator.captureStartupValidation()
+        let shouldValidateAntigravity = antigravityValidationSnapshot.persistedConnectionHint
+        let shouldValidateGrok = isGrokConnected
         let shouldValidateGrokBuild = isGrokBuildConnected
 
         let task = Task { @MainActor [weak self] in
@@ -1265,10 +1330,19 @@ public class APISettingsViewModel: ObservableObject {
             async let codexReady = probeCachedCodexConnection(ifNeeded: shouldValidateCodex)
             async let openCodeReady = probeCachedOpenCodeConnection(ifNeeded: shouldValidateOpenCode)
             async let cursorReady = probeCachedCursorConnection(ifNeeded: shouldValidateCursor)
+            async let antigravityProbe = probeCachedAntigravityConnection(ifNeeded: shouldValidateAntigravity)
+            async let grokReady = probeCachedGrokConnection(ifNeeded: shouldValidateGrok)
             async let grokBuildReady = probeCachedGrokBuildConnection(ifNeeded: shouldValidateGrokBuild)
-            let readiness = await (claudeReady, codexReady, openCodeReady, cursorReady, grokBuildReady)
+            let readiness = await (
+                claudeReady,
+                codexReady,
+                openCodeReady,
+                cursorReady,
+                antigravityProbe,
+                grokReady,
+                grokBuildReady
+            )
             guard !Task.isCancelled, !hasPreparedForWindowClose else { return }
-
             applyContextBuilderProviderValidationResult(readiness.0, provider: .claudeCode)
             let codexPublicationAllowed = codexSessionFence.allowsAuthenticationPublication(codexPublicationToken)
             applyContextBuilderProviderValidationResult(
@@ -1277,7 +1351,55 @@ public class APISettingsViewModel: ObservableObject {
             )
             applyContextBuilderProviderValidationResult(readiness.2, provider: .openCode)
             applyContextBuilderProviderValidationResult(readiness.3, provider: .cursor)
-            applyContextBuilderProviderValidationResult(readiness.4, provider: .grokBuild)
+            if case .cancelled = readiness.4 {
+                // Cancellation is not evidence of a broken connection. Reconcile any projection
+                // another window already published and leave durable Connect intent untouched.
+                await applyLatestAntigravityConnectionProjection()
+            } else if case .notRequested = readiness.4 {
+                // No durable Connect intent means there is no CLI probe. Preserve any app-wide
+                // projection already published; on a fresh process, still inspect ownership so an
+                // interrupted/failed Forget remains recoverable after restart.
+                if await antigravityConnectionCoordinator.latestProjection() == nil {
+                    let finalObservation = await observeAntigravityConnection()
+                    guard !Task.isCancelled, !hasPreparedForWindowClose else { return }
+                    if finalObservation.hasRecordedOwnershipMarker,
+                       let projection = await antigravityConnectionCoordinator.publishStartupProjectionIfCurrent(
+                           snapshot: antigravityValidationSnapshot,
+                           isConnected: false,
+                           errorMessage: finalObservation.configValidationFailureMessage,
+                           hasOwnedMCPEntry: true
+                       )
+                    {
+                        applyAntigravityConnectionProjection(projection)
+                    }
+                }
+            } else {
+                let finalObservation = await observeAntigravityConnection()
+                guard !Task.isCancelled, !hasPreparedForWindowClose else { return }
+                let antigravityStartupState: (isConnected: Bool, errorMessage: String?) = switch readiness.4 {
+                case .notRequested, .cancelled:
+                    // Handled above; retained to keep this switch exhaustive.
+                    (false, nil)
+                case .ready:
+                    if let configFailure = finalObservation.configValidationFailureMessage {
+                        (false, configFailure)
+                    } else {
+                        (true, nil)
+                    }
+                case let .failed(message):
+                    (false, finalObservation.configValidationFailureMessage ?? message)
+                }
+                if let projection = await antigravityConnectionCoordinator.publishStartupProjectionIfCurrent(
+                    snapshot: antigravityValidationSnapshot,
+                    isConnected: antigravityStartupState.isConnected,
+                    errorMessage: antigravityStartupState.errorMessage,
+                    hasOwnedMCPEntry: finalObservation.hasRecordedOwnershipMarker
+                ) {
+                    applyAntigravityConnectionProjection(projection)
+                }
+            }
+            applyContextBuilderProviderValidationResult(readiness.5, provider: .grok)
+            applyContextBuilderProviderValidationResult(readiness.6, provider: .grokBuild)
             if codexPublicationAllowed,
                isCodexConnected,
                isVerifiedContextBuilderProvider(.codexExec)
@@ -1375,14 +1497,156 @@ public class APISettingsViewModel: ObservableObject {
         return await cursorModelPollingService.refreshNow(workspacePath: nil)
     }
 
+    enum CachedAntigravityConnectionProbeResult {
+        case notRequested
+        case ready
+        case failed(String)
+        case cancelled
+
+        var isReady: Bool {
+            if case .ready = self { return true }
+            return false
+        }
+    }
+
+    /// Bounded startup validation for Antigravity. This is deliberately non-mutating and makes
+    /// no model/network request: the current config must already be usable, then `agy --version`
+    /// must resolve and exit successfully.
+    private func probeCachedAntigravityConnection(
+        ifNeeded: Bool
+    ) async -> CachedAntigravityConnectionProbeResult {
+        if let antigravityCachedConnectionProbeOverride {
+            let result = await antigravityCachedConnectionProbeOverride(ifNeeded)
+            return Task.isCancelled ? .cancelled : result
+        }
+        guard ifNeeded else { return .notRequested }
+        let configFailure = await Task.detached(priority: .utility) {
+            MCPIntegrationHelper.antigravityConfigValidationFailureMessage()
+        }.value
+        guard !Task.isCancelled else { return .cancelled }
+        if let configFailure {
+            return .failed(configFailure)
+        }
+
+        let environmentResult = await ProcessEnvironmentBuilder.build(
+            ProcessEnvironmentRequest(purpose: .cliRunner)
+        )
+        guard !Task.isCancelled else { return .cancelled }
+        let profile = CLILaunchProfiles.antigravity
+        let resolvedCommand = CommandPathResolver.resolve(
+            profile.commandName,
+            environment: environmentResult.environment,
+            additionalPaths: profile.supplementalSearchPaths,
+            preferredBasenames: profile.preferredBasenames
+        )
+        switch CommandPathResolver.launchability(of: resolvedCommand) {
+        case .launchable, .bareCommandFallback:
+            break
+        case .missingPath, .directory, .notExecutable:
+            return .failed(
+                "Antigravity CLI (agy) could not be revalidated because its executable is unavailable. Reinstall it or fix PATH, then reconnect."
+            )
+        }
+
+        do {
+            let exitStatus = try await runAntigravityVersionProbe(
+                executable: resolvedCommand,
+                environment: environmentResult.environment
+            )
+            guard !Task.isCancelled else { return .cancelled }
+            guard exitStatus == 0 else {
+                return .failed(
+                    "Antigravity CLI (agy) failed its startup check (exit \(exitStatus)). Run `agy --version` in a terminal, then reconnect."
+                )
+            }
+            return .ready
+        } catch {
+            if error is CancellationError || Task.isCancelled {
+                return .cancelled
+            }
+            if let providerError = error as? AIProviderError,
+               case let .invalidConfiguration(detail) = providerError
+            {
+                return .failed(detail)
+            }
+            return .failed(
+                "Antigravity CLI (agy) could not be revalidated. Run `agy --version` in a terminal, then reconnect."
+            )
+        }
+    }
+
+    private func observeAntigravityConnection() async -> MCPIntegrationHelper.AntigravityConnectionObservation {
+        if let antigravityConnectionObservationOverride {
+            return await antigravityConnectionObservationOverride()
+        }
+        return await Task.detached(priority: .utility) {
+            MCPIntegrationHelper.observeAntigravityConnection()
+        }.value
+    }
+
+    private func reconcileCancelledAntigravityMutationIfNeeded(
+        generation: AntigravityConnectionCoordinator.Generation
+    ) async {
+        let projection = await antigravityConnectionCoordinator.reconcileCancelledMutationIfNeeded(
+            for: generation
+        ) { [self] in
+            let observation = await observeAntigravityConnection()
+            return .init(
+                configValidationFailureMessage: observation.configValidationFailureMessage,
+                hasOwnedMCPEntry: observation.hasRecordedOwnershipMarker
+            )
+        }
+        if let projection {
+            applyAntigravityConnectionProjection(projection)
+        } else {
+            await applyLatestAntigravityConnectionProjection()
+        }
+    }
+
+    /// Bounded startup validation for headless Grok CLI. Non-mutating: resolve `grok` and
+    /// confirm `grok --version` exits successfully.
+    private func probeCachedGrokConnection(ifNeeded: Bool) async -> Bool {
+        guard ifNeeded else { return false }
+        let environmentResult = await ProcessEnvironmentBuilder.build(
+            ProcessEnvironmentRequest(purpose: .cliRunner)
+        )
+        guard !Task.isCancelled else { return false }
+        let profile = CLILaunchProfiles.grok
+        let resolvedCommand = CommandPathResolver.resolve(
+            profile.commandName,
+            environment: environmentResult.environment,
+            additionalPaths: profile.supplementalSearchPaths,
+            preferredBasenames: profile.preferredBasenames
+        )
+        switch CommandPathResolver.launchability(of: resolvedCommand) {
+        case .launchable, .bareCommandFallback:
+            break
+        case .missingPath, .directory, .notExecutable:
+            return false
+        }
+        do {
+            let exitStatus = try await runGrokVersionProbe(
+                executable: resolvedCommand,
+                environment: environmentResult.environment
+            )
+            return !Task.isCancelled && exitStatus == 0
+        } catch {
+            return false
+        }
+    }
+
     private func probeCachedGrokBuildConnection(ifNeeded: Bool) async -> Bool {
         guard ifNeeded else { return false }
-        if let latest = await GrokBuildACPModelPollingService.shared.latestSnapshot(),
-           latest.isLiveDiscovery
-        {
-            return true
+        do {
+            let support = try await GrokBuildCLILaunchResolver().probeSupport(for: GrokBuildAgentConfig())
+            if let reason = support.reason {
+                grokBuildError = reason
+            }
+        } catch {
+            grokBuildError = friendlyGrokBuildMessage(for: error)
         }
-        return await GrokBuildACPModelPollingService.shared.refreshNow(workspacePath: nil)
+        // Help establishes CLI capability, not authenticated Chat/Oracle readiness.
+        return false
     }
 
     private func diagnosticReason(for error: Error) -> APIKeychainAccessDiagnostic.Reason {
@@ -1610,7 +1874,7 @@ public class APISettingsViewModel: ObservableObject {
         }
         if isOpenCodeConnected { startOpenCodeModelsSubscriptionIfNeeded(workspacePath: nil) } else { stopOpenCodeModelsSubscription(clearModels: true) }
         if isCursorConnected { startCursorModelsSubscriptionIfNeeded(workspacePath: nil) } else { stopCursorModelsSubscription(clearModels: true) }
-        if isGrokBuildConnected { startGrokBuildModelsSubscriptionIfNeeded(workspacePath: nil) } else { stopGrokBuildModelsSubscription(clearModels: true) }
+        availableGrokBuildModelOptions = isGrokBuildConnected ? ACPAIModelCatalog.grokBuildModelOptionsFromStore() : []
         if isOpenRouterKeyValid { openRouterModelsTask = Task { await self.fetchOpenRouterModels() } }
         if isCustomProviderValid { customModelsTask = Task { await self.fetchCustomModels() } }
 
@@ -3748,6 +4012,61 @@ public class APISettingsViewModel: ObservableObject {
         )
     }
 
+    @discardableResult
+    @MainActor
+    func disconnectAntigravity() async -> MCPIntegrationHelper.AntigravityRemovalResult {
+        let generation = await antigravityConnectionCoordinator.beginManualMutation()
+        let removalOverride = antigravityRemovalOverride
+        // Remove the MCP entry only when RepoPrompt created it and its value remains unchanged.
+        // Disconnecting this app never signs the user out of agy or removes user-owned config.
+        let execution = await antigravityConnectionCoordinator.performMutation(for: generation) {
+            if let removalOverride {
+                return await removalOverride()
+            }
+            return await Task.detached(priority: .userInitiated) {
+                let result = MCPIntegrationHelper.removeAntigravityInstallEntry()
+                return (result, MCPIntegrationHelper.hasOwnedAntigravityMCPEntry())
+            }.value
+        }
+        let removalState: (MCPIntegrationHelper.AntigravityRemovalResult, Bool)
+        switch execution {
+        case let .completed(state):
+            removalState = state
+        case .superseded:
+            await applyLatestAntigravityConnectionProjection()
+            return .failed("A newer Antigravity connection action replaced this Forget request.")
+        case .cancelled:
+            await reconcileCancelledAntigravityMutationIfNeeded(generation: generation)
+            return .failed("The Antigravity Forget request was cancelled before configuration changed.")
+        }
+        // A busy/unreadable store or failed config write retains the journal for an explicit retry.
+        // Re-query instead of hiding Forget after an ambiguous failure.
+        guard let projection = await antigravityConnectionCoordinator.publishIfCurrent(
+            generation: generation,
+            isConnected: false,
+            errorMessage: removalState.0.failureMessage,
+            hasOwnedMCPEntry: removalState.1
+        ) else {
+            await applyLatestAntigravityConnectionProjection()
+            return .failed("A newer Antigravity connection action replaced this Forget request.")
+        }
+        applyAntigravityConnectionProjection(projection)
+        AntigravityModelRegistry.shared.clearCache()
+        return removalState.0
+    }
+
+    func disconnectGrok() {
+        isGrokConnected = false
+        grokError = nil
+        UserDefaults.standard.set(false, forKey: "GrokCLIConnected")
+        setContextBuilderProviderVerified(.grok, verified: false)
+        // Surgically remove only the RepoPrompt MCP entry from grok's HOME-level config and
+        // drop the cached live-model labels so a stale picker does not survive disconnect.
+        MCPIntegrationHelper.removeGrokInstallEntry()
+        GrokModelRegistry.shared.clearCache()
+        Task { await updateAvailableModels() }
+    }
+
     private func friendlyCursorMessage(for error: Error) -> String {
         if let providerError = error as? AIProviderError {
             switch providerError {
@@ -3774,6 +4093,288 @@ public class APISettingsViewModel: ObservableObject {
             return "Installed Cursor Agent CLI does not support ACP mode. Update Cursor Agent CLI and ensure `cursor-agent acp --help` or `agent acp --help` identifies Cursor ACP."
         }
         return message
+    }
+
+    // MARK: - Antigravity CLI (`agy`)
+
+    /// Lightweight Pattern-1 connection probe for the Antigravity (`agy`) CLI: the user
+    /// pre-authenticates by running `agy` once, so the test only verifies that the `agy`
+    /// binary is resolvable and runnable. No LLM/network call is made — we resolve the
+    /// executable through the same PATH machinery other CLI providers use and run
+    /// `agy --version` with a short timeout. Exit 0 marks the provider connected.
+    func testAntigravityConnection() async throws -> Bool {
+        let antigravityNotFoundMessage = "Antigravity CLI (agy) not found. Install it and run `agy` once to sign in."
+        let generation = await antigravityConnectionCoordinator.beginManualMutation()
+        var observedOwnership: Bool?
+        var configMutationDidRun = false
+
+        do {
+            let exitStatus: Int32
+            if let antigravityManualVersionProbeOverride {
+                exitStatus = try await antigravityManualVersionProbeOverride()
+            } else {
+                await CLIEnvironmentCache.shared.invalidate()
+                let environmentResult = await ProcessEnvironmentBuilder.build(
+                    ProcessEnvironmentRequest(purpose: .cliRunner)
+                )
+                let profile = CLILaunchProfiles.antigravity
+                let resolvedCommand = CommandPathResolver.resolve(
+                    profile.commandName,
+                    environment: environmentResult.environment,
+                    additionalPaths: profile.supplementalSearchPaths,
+                    preferredBasenames: profile.preferredBasenames
+                )
+                switch CommandPathResolver.launchability(of: resolvedCommand) {
+                case .launchable, .bareCommandFallback:
+                    break
+                case .missingPath, .directory, .notExecutable:
+                    throw AIProviderError.invalidConfiguration(detail: antigravityNotFoundMessage)
+                }
+                exitStatus = try await runAntigravityVersionProbe(
+                    executable: resolvedCommand,
+                    environment: environmentResult.environment
+                )
+            }
+            guard exitStatus == 0 else {
+                // The binary resolved and ran but `agy --version` exited nonzero — distinct from
+                // a missing binary (a broken install, an unexpected agy build, etc.).
+                throw AIProviderError.invalidConfiguration(
+                    detail: "Antigravity CLI (agy) failed to run (exit \(exitStatus)). Verify your `agy` installation by running `agy --version` in a terminal."
+                )
+            }
+
+            // Install the RepoPrompt MCP server entry now that `agy` is confirmed reachable.
+            // Config mutation is part of connection success: a malformed, unreadable, or
+            // conflicting user config must not be overwritten or reported as connected.
+            let execution = await antigravityConnectionCoordinator.performMutation(for: generation) {
+                await Task.detached(priority: .userInitiated) {
+                    MCPIntegrationHelper.installInAntigravity()
+                }.value
+            }
+            let installResult: MCPIntegrationHelper.AntigravityInstallResult
+            switch execution {
+            case let .completed(result):
+                configMutationDidRun = true
+                installResult = result
+            case .superseded:
+                throw AIProviderError.invalidConfiguration(
+                    detail: "A newer Antigravity connection action replaced this Connect request."
+                )
+            case .cancelled:
+                throw CancellationError()
+            }
+            guard installResult.success else {
+                throw AIProviderError.invalidConfiguration(
+                    detail: installResult.failureMessage
+                        ?? "RepoPrompt could not configure Antigravity MCP. Check `~/.gemini/config/mcp_config.json`, then reconnect."
+                )
+            }
+            let finalObservation = await observeAntigravityConnection()
+            observedOwnership = finalObservation.hasRecordedOwnershipMarker
+            if let configFailure = finalObservation.configValidationFailureMessage {
+                throw AIProviderError.invalidConfiguration(detail: configFailure)
+            }
+
+            guard let projection = await antigravityConnectionCoordinator.publishIfCurrent(
+                generation: generation,
+                isConnected: true,
+                errorMessage: nil,
+                hasOwnedMCPEntry: finalObservation.hasRecordedOwnershipMarker
+            ) else {
+                throw AIProviderError.invalidConfiguration(
+                    detail: "A newer Antigravity connection action replaced this Connect request."
+                )
+            }
+            applyAntigravityConnectionProjection(projection)
+            await updateAvailableModels()
+            // Populate the Agent Mode model picker from the live `agy models` list now that the
+            // CLI is reachable. Fire-and-forget: failures leave the picker's static `Default`.
+            Task { await AntigravityModelRegistry.shared.refresh() }
+            return true
+        } catch {
+            if !configMutationDidRun, error is CancellationError || Task.isCancelled {
+                // Cancellation before the serialized mutation starts is not a connection failure.
+                // Preserve the current projection when no predecessor changed disk. If this intent
+                // superseded an in-flight mutation, wait behind it and reconcile its durable result.
+                await reconcileCancelledAntigravityMutationIfNeeded(generation: generation)
+                throw CancellationError()
+            }
+            // Surface the real failure reason (missing binary vs. run failure vs. timeout)
+            // rather than collapsing every error into the generic "not found" message.
+            let message: String = if let providerError = error as? AIProviderError,
+                                     case let .invalidConfiguration(detail) = providerError
+            {
+                detail
+            } else {
+                antigravityNotFoundMessage
+            }
+            guard await antigravityConnectionCoordinator.isCurrent(generation) else {
+                await applyLatestAntigravityConnectionProjection()
+                throw AIProviderError.invalidConfiguration(detail: message)
+            }
+            let currentOwnership = if let observedOwnership {
+                observedOwnership
+            } else {
+                await observeAntigravityConnection().hasRecordedOwnershipMarker
+            }
+            if let projection = await antigravityConnectionCoordinator.publishIfCurrent(
+                generation: generation,
+                isConnected: false,
+                errorMessage: message,
+                hasOwnedMCPEntry: currentOwnership
+            ) {
+                applyAntigravityConnectionProjection(projection)
+            } else {
+                await applyLatestAntigravityConnectionProjection()
+            }
+            await updateAvailableModels()
+            throw AIProviderError.invalidConfiguration(detail: message)
+        }
+    }
+
+    /// Runs `agy --version` with the shared process runner's bounded timeout and process-group
+    /// cleanup so a hung or cancellation-ignoring binary cannot stall connection validation.
+    private func runAntigravityVersionProbe(
+        executable: String,
+        environment: [String: String]
+    ) async throws -> Int32 {
+        let processConfig = CLIProcessConfiguration(
+            command: executable,
+            environment: environment,
+            additionalPaths: [],
+            resolveCandidates: [URL(fileURLWithPath: executable).lastPathComponent],
+            shellLookupMode: .fallbackOnly,
+            captureStdoutTailBytes: 0,
+            captureStderrTailBytes: 0
+        )
+        let runner = CLIProcessRunner(config: processConfig)
+        do {
+            let result = try await runner.run(
+                args: ["--version"],
+                stdin: nil,
+                outputMode: .none,
+                timeout: 5,
+                cancelChildOnTaskCancellation: true
+            )
+            await runner.cancelAll()
+            guard !result.timedOut else {
+                throw AIProviderError.invalidConfiguration(
+                    detail: "Antigravity CLI (agy) did not respond in time."
+                )
+            }
+            return result.status
+        } catch {
+            await runner.cancelAll()
+            throw error
+        }
+    }
+
+    // MARK: - Grok CLI (`grok`)
+
+    /// Lightweight Pattern-1 connection probe for the Grok (`grok`) CLI: the user
+    /// pre-authenticates by running `grok login` once, so the test only verifies that the `grok`
+    /// binary is resolvable and runnable. No LLM/network call is made — we resolve the
+    /// executable through the same PATH machinery other CLI providers use and run
+    /// `grok --version` with a short timeout. Exit 0 marks the provider connected.
+    func testGrokConnection() async throws -> Bool {
+        let grokNotFoundMessage = "Grok CLI (grok) not found. Install it and run `grok login` once to sign in."
+
+        await CLIEnvironmentCache.shared.invalidate()
+        let environmentResult = await ProcessEnvironmentBuilder.build(
+            ProcessEnvironmentRequest(purpose: .cliRunner)
+        )
+        let profile = CLILaunchProfiles.grok
+        let resolvedCommand = CommandPathResolver.resolve(
+            profile.commandName,
+            environment: environmentResult.environment,
+            additionalPaths: profile.supplementalSearchPaths,
+            preferredBasenames: profile.preferredBasenames
+        )
+
+        do {
+            switch CommandPathResolver.launchability(of: resolvedCommand) {
+            case .launchable, .bareCommandFallback:
+                break
+            case .missingPath, .directory, .notExecutable:
+                throw AIProviderError.invalidConfiguration(detail: grokNotFoundMessage)
+            }
+
+            let exitStatus = try await runGrokVersionProbe(
+                executable: resolvedCommand,
+                environment: environmentResult.environment
+            )
+            guard exitStatus == 0 else {
+                // The binary resolved and ran but `grok --version` exited nonzero — distinct from
+                // a missing binary (a broken install, an unexpected grok build, etc.).
+                throw AIProviderError.invalidConfiguration(
+                    detail: "Grok CLI (grok) failed to run (exit \(exitStatus)). Verify your `grok` installation by running `grok --version` in a terminal."
+                )
+            }
+
+            // Install the RepoPrompt MCP server entry now that `grok` is confirmed reachable, so
+            // the MCP-installed flag is set and grok can see RepoPrompt tools on its next run.
+            guard MCPIntegrationHelper.installInGrok().success else {
+                throw AIProviderError.invalidConfiguration(
+                    detail: "Grok CLI is reachable, but installing the RepoPrompt MCP config for Grok failed. Check write access to ~/.grok/config.toml and try again."
+                )
+            }
+
+            isGrokConnected = true
+            grokError = nil
+            UserDefaults.standard.set(true, forKey: "GrokCLIConnected")
+            setContextBuilderProviderVerified(.grok, verified: true)
+            await updateAvailableModels()
+            // Populate the Agent Mode model picker from the live `grok models` list now that the
+            // CLI is reachable. Fire-and-forget: failures leave the picker's static `Default`.
+            Task { await GrokModelRegistry.shared.refresh() }
+            return true
+        } catch {
+            isGrokConnected = false
+            setContextBuilderProviderVerified(.grok, verified: false)
+            // Surface the real failure reason (missing binary vs. run failure vs. timeout)
+            // rather than collapsing every error into the generic "not found" message.
+            let message: String = if let providerError = error as? AIProviderError,
+                                     case let .invalidConfiguration(detail) = providerError
+            {
+                detail
+            } else {
+                grokNotFoundMessage
+            }
+            grokError = message
+            UserDefaults.standard.set(false, forKey: "GrokCLIConnected")
+            await updateAvailableModels()
+            throw AIProviderError.invalidConfiguration(detail: message)
+        }
+    }
+
+    /// Runs `grok --version` and returns the process exit status. Spawned off the main
+    /// actor with a short timeout so a hung binary cannot stall the connection test.
+    private func runGrokVersionProbe(
+        executable: String,
+        environment: [String: String]
+    ) async throws -> Int32 {
+        try await Task.detached(priority: .userInitiated) {
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: executable)
+            process.arguments = ["--version"]
+            process.environment = environment
+            process.standardInput = FileHandle.nullDevice
+            process.standardOutput = FileHandle.nullDevice
+            process.standardError = FileHandle.nullDevice
+
+            try process.run()
+
+            let deadline = Date().addingTimeInterval(5)
+            while process.isRunning, Date() < deadline {
+                try await Task.sleep(nanoseconds: 50_000_000)
+            }
+            if process.isRunning {
+                process.terminate()
+                process.waitUntilExit()
+                throw AIProviderError.invalidConfiguration(detail: "Grok CLI (grok) did not respond in time.")
+            }
+            return process.terminationStatus
+        }.value
     }
 
     func hasCursorTrace() -> Bool {
@@ -3829,7 +4430,7 @@ public class APISettingsViewModel: ObservableObject {
         }
     }
 
-    // MARK: - Grok Build CLI / ACP
+    // MARK: - Grok Build CLI / Chat
 
     func testGrokBuildConnection() async throws -> Bool {
         let collector = CLIProcessLogCollector()
@@ -3838,26 +4439,35 @@ public class APISettingsViewModel: ObservableObject {
 
         collector.append("Refreshing login-shell environment cache")
         await CLIEnvironmentCache.shared.invalidate()
-        collector.append("Starting Grok Build ACP model discovery preflight")
+        collector.append("Checking Grok Build prompt-only support")
 
         do {
-            let snapshot = try await GrokBuildACPModelPollingService.shared.discoverOnce(workspacePath: nil)
-            let grokOptions = AgentModelCatalog.options(
-                for: .grokBuild,
-                availability: AgentModelCatalog.AvailabilityContext(grokBuildAvailable: true)
-            )
-            if let snapshot {
-                collector.append("Discovered \(snapshot.models.options.count) Grok Build model option(s)")
-                availableGrokBuildModelOptions = grokOptions
-            } else {
-                collector.append("Grok Build ACP preflight completed without dynamic model metadata; using Default")
-                availableGrokBuildModelOptions = grokOptions
+            let support = try await GrokBuildCLILaunchResolver().probeSupport(for: GrokBuildAgentConfig())
+            if let reason = support.reason {
+                throw AIProviderError.invalidConfiguration(detail: reason)
             }
+            collector.append("Verifying Chat/Oracle authentication with a text-only request")
+            let provider = GrokBuildCLIProvider()
+            do {
+                let result = try await provider.completeMessage(
+                    AIMessage(systemPrompt: "", userMessage: "Reply with OK only."),
+                    model: .grokBuildCustom(name: AgentModel.defaultModel.rawValue)
+                )
+                guard !result.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                      result.completionOutcome == .completed
+                else {
+                    throw AIProviderError.invalidResponse(detail: "Grok Build did not complete the Chat/Oracle connection check.")
+                }
+                await provider.dispose()
+            } catch {
+                await provider.dispose()
+                throw error
+            }
+            availableGrokBuildModelOptions = ACPAIModelCatalog.grokBuildModelOptionsFromStore()
             isGrokBuildConnected = true
             setContextBuilderProviderVerified(.grokBuild, verified: true)
             grokBuildError = nil
             UserDefaults.standard.set(true, forKey: "GrokBuildCLIConnected")
-            startGrokBuildModelsSubscriptionIfNeeded(workspacePath: nil)
             await updateAvailableModels()
             collector.append("Grok Build CLI marked as connected")
             grokBuildLogCollector = nil
@@ -3873,7 +4483,7 @@ public class APISettingsViewModel: ObservableObject {
             setContextBuilderProviderVerified(.grokBuild, verified: false)
             grokBuildError = friendlyGrokBuildMessage(for: error)
             UserDefaults.standard.set(false, forKey: "GrokBuildCLIConnected")
-            stopGrokBuildModelsSubscription(clearModels: true)
+            availableGrokBuildModelOptions = []
             await updateAvailableModels()
             let finalMessage = grokBuildError ?? error.localizedDescription
             collector.append("User guidance: \(finalMessage)")
@@ -3891,7 +4501,7 @@ public class APISettingsViewModel: ObservableObject {
         setContextBuilderProviderVerified(.grokBuild, verified: false)
         grokBuildError = nil
         UserDefaults.standard.set(false, forKey: "GrokBuildCLIConnected")
-        stopGrokBuildModelsSubscription(clearModels: true)
+        availableGrokBuildModelOptions = []
         Task {
             await updateAvailableModels()
         }
@@ -3916,7 +4526,7 @@ public class APISettingsViewModel: ObservableObject {
         let message = error.localizedDescription
         let lowered = message.lowercased()
         if lowered.contains("not installed") || lowered.contains("no such file") || lowered.contains("command not found") || lowered.contains("not found") {
-            return "Grok Build CLI was not found. Install it (`npm i -g @xai-official/grok` or https://x.ai/cli/install.sh) and ensure `grok agent stdio` is available."
+            return "Grok Build CLI was not found. Install it (`npm i -g @xai-official/grok` or https://x.ai/cli/install.sh) and ensure `grok --help` lists `--prompt-file`."
         }
         if lowered.contains("permission denied") {
             return "Permission denied. Ensure the `grok` executable is accessible."
@@ -3924,8 +4534,8 @@ public class APISettingsViewModel: ObservableObject {
         if lowered.contains("unauthorized") || lowered.contains("not authenticated") || lowered.contains("login") {
             return "Grok Build is not authenticated. Run `grok login` or set `XAI_API_KEY`."
         }
-        if lowered.contains("stdio") {
-            return "Installed Grok Build CLI does not advertise the ACP stdio subcommand. Update Grok Build and ensure `grok agent --help` lists `stdio`."
+        if lowered.contains("prompt-file") {
+            return "Installed Grok Build CLI does not support prompt-only Chat/Oracle requests. Update it and ensure `grok --help` lists `--prompt-file`."
         }
         return message
     }
@@ -3947,36 +4557,6 @@ public class APISettingsViewModel: ObservableObject {
         )
         collector.append("Trace exported to \(url.lastPathComponent)")
         return url
-    }
-
-    private func startGrokBuildModelsSubscriptionIfNeeded(workspacePath: String?) {
-        guard !hasPreparedForWindowClose else { return }
-        guard grokBuildModelsTask == nil else { return }
-        grokBuildModelsTask = Task { [weak self, workspacePath] in
-            let stream = await GrokBuildACPModelPollingService.shared.subscribe(workspacePath: workspacePath)
-            for await snapshot in stream {
-                guard !Task.isCancelled else { return }
-                await MainActor.run { [weak self] in
-                    guard let self else { return }
-                    availableGrokBuildModelOptions = AgentModelCatalog.options(
-                        for: .grokBuild,
-                        availability: AgentModelCatalog.AvailabilityContext(grokBuildAvailable: true)
-                    )
-                    if snapshot.isLiveDiscovery {
-                        setContextBuilderProviderVerified(.grokBuild, verified: true)
-                    }
-                }
-                await self?.updateAvailableModels()
-            }
-        }
-    }
-
-    private func stopGrokBuildModelsSubscription(clearModels: Bool = false) {
-        grokBuildModelsTask?.cancel()
-        grokBuildModelsTask = nil
-        if clearModels {
-            availableGrokBuildModelOptions = []
-        }
     }
 
     func isCustomModelEnabled(_ modelName: String) -> Bool {

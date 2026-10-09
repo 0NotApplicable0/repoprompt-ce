@@ -22,17 +22,13 @@ final class AgentSessionLinkHeadlessRunnerPromptAdapterTests: XCTestCase {
     ) -> AgentSessionLinkRunnerHarness {
         let harness = AgentSessionLinkRunnerHarness(
             stubSystemPrompt: stubSystemPrompt,
-            headlessProviderFactory: { _, _ in provider }
+            headlessProviderFactory: { _, _, _, _, _ in provider }
         )
         harnesses.append(harness)
         return harness
     }
 
     /// Drives the real `HeadlessAgentModeRunner` directly.
-    ///
-    /// No shipping agent kind routes to this runner through `AgentModeRunService.startRun` (Codex,
-    /// Claude-compatible, and ACP kinds each go elsewhere), so constructing the runner is the only way
-    /// to exercise its adapter and acceptance boundary.
     private func startRun(
         _ harness: AgentSessionLinkRunnerHarness,
         session: AgentModeViewModel.TabSession,
@@ -45,6 +41,9 @@ final class AgentSessionLinkHeadlessRunnerPromptAdapterTests: XCTestCase {
             initialUserMessage: message,
             initialMessageForRun: message,
             attachments: [],
+            workspacePath: nil,
+            antigravityPermissionLevel: nil,
+            grokPermissionLevel: nil,
             makeLease: { runID in harness.makeLease(runID: runID, tabID: session.tabID) }
         )
         await session.agentTask?.value
@@ -296,7 +295,7 @@ final class AgentSessionLinkACPRunnerPromptAdapterTests: XCTestCase {
             environment: environment
         )
         let harness = AgentSessionLinkRunnerHarness(
-            headlessProviderFactory: { _, _ in AgentSessionLinkCapturingHeadlessProvider() },
+            headlessProviderFactory: { _, _, _, _, _ in AgentSessionLinkCapturingHeadlessProvider() },
             acpProviderFactory: { _, _ in provider },
             workspacePath: workspace.path
         )

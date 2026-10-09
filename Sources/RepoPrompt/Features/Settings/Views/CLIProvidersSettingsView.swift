@@ -49,17 +49,13 @@ struct CLIProvidersSettingsView: View {
     @State private var showCodexSignOutConfirmation = false
     @State private var isLoadingOpenCode = false
     @State private var isLoadingCursor = false
-    @State private var isLoadingGrokBuild = false
     @State private var isLoadingAntigravity = false
-    @State private var isTestingAntigravity = false
-    @State private var isAntigravityInstalled = false
-    @State private var isAntigravityExpanded = false
+    @State private var isLoadingGrok = false
     @State private var isLoadingZAI = false
     @State private var showClaudeCodeTraceDump = false
     @State private var showCodexTraceDump = false
     @State private var showOpenCodeTraceDump = false
     @State private var showCursorTraceDump = false
-    @State private var showGrokBuildTraceDump = false
     @State private var isClaudePromptSettingsExpanded = false
     @State private var claudeNativePromptMode = ClaudeAgentToolPreferences.agentModePromptDelivery()
 
@@ -76,7 +72,8 @@ struct CLIProvidersSettingsView: View {
     @State private var isLoadingCodexRuntimePreflight = false
     @State private var isOpenCodeExpanded: Bool = false
     @State private var isCursorExpanded: Bool = false
-    @State private var isGrokBuildExpanded: Bool = false
+    @State private var isAntigravityExpanded = false
+    @State private var isGrokExpanded = false
     @State private var isDevinExpanded: Bool = false
 
     // Per-backend secret text entry buffers (GLM uses viewModel.zaiApiKey directly).
@@ -96,7 +93,8 @@ struct CLIProvidersSettingsView: View {
             || viewModel.isCodexConnected
             || viewModel.isOpenCodeConnected
             || viewModel.isCursorConnected
-            || viewModel.isGrokBuildConnected
+            || viewModel.isAntigravityConnected
+            || viewModel.isGrokConnected
             || DevinRuntimeLocator.isInstalledSync()
     }
 
@@ -157,8 +155,8 @@ struct CLIProvidersSettingsView: View {
                 claudeCompatibleBackendsSection
                 openCodeCard
                 cursorCard
-                grokBuildCard
                 antigravityCard
+                grokCard
                 devinCard
             }
             .padding(16)
@@ -168,7 +166,6 @@ struct CLIProvidersSettingsView: View {
             viewModel.refreshDevinModels()
             Task {
                 await viewModel.loadCompatibleBackendState()
-                isAntigravityInstalled = AntigravityRuntimeManager.installedRuntimeSync() != nil
                 await viewModel.refreshClaudeCodeBinaryStatus()
             }
         }
@@ -2099,84 +2096,7 @@ struct CLIProvidersSettingsView: View {
         return count == 1 ? "1 model discovered." : "\(count) models discovered."
     }
 
-    // MARK: - Antigravity Card
-
-    private var antigravityCard: some View {
-        providerCard(
-            title: "Google Antigravity",
-            subtitle: "Managed official Antigravity ACP runtime with Google OAuth authentication.",
-            infoURL: "https://antigravity.google/",
-            isConnected: isAntigravityInstalled,
-            isExpanded: $isAntigravityExpanded
-        ) {
-            VStack(alignment: .leading, spacing: 12) {
-                HStack(spacing: 10) {
-                    Button {
-                        isLoadingAntigravity = true
-                        Task {
-                            do {
-                                _ = try await AntigravityRuntimeManager.shared.install()
-                                await MainActor.run {
-                                    isAntigravityInstalled = true
-                                    isLoadingAntigravity = false
-                                    alertMessage = "Antigravity runtime installed. It will be authenticated when you start the first session."
-                                    showAlert = true
-                                }
-                            } catch {
-                                await MainActor.run {
-                                    isLoadingAntigravity = false
-                                    alertMessage = error.localizedDescription
-                                    showAlert = true
-                                }
-                            }
-                        }
-                    } label: {
-                        if isLoadingAntigravity {
-                            ProgressView().scaleEffect(0.6).frame(height: 16)
-                        } else {
-                            Label(isAntigravityInstalled ? "Update Runtime" : "Install Runtime", systemImage: "arrow.down.circle")
-                        }
-                    }
-                    .disabled(isLoadingAntigravity)
-                    .buttonStyle(CustomButtonStyle())
-
-                    Button {
-                        isTestingAntigravity = true
-                        Task {
-                            do {
-                                let request = ACPRunRequest(agentKind: .antigravity, modelString: nil, workspacePath: nil, resumeSessionID: nil, attachments: [], taskLabelKind: nil)
-                                _ = try await AntigravityACPAgentProvider().support(for: request)
-                                let discovered = await AntigravityACPModelPollingService.shared.refreshNow(workspacePath: nil)
-                                let count = AgentACPModelRegistry.shared.resolvedSnapshot(for: .antigravity)?.options.count ?? 0
-                                await MainActor.run {
-                                    isTestingAntigravity = false
-                                    alertMessage = discovered && count > 0
-                                        ? "Antigravity ACP connected. \(count) models discovered."
-                                        : "Antigravity ACP is available, but it returned no selectable models."
-                                    showAlert = true
-                                }
-                            } catch {
-                                await MainActor.run {
-                                    isTestingAntigravity = false
-                                    alertMessage = error.localizedDescription
-                                    showAlert = true
-                                }
-                            }
-                        }
-                    } label: {
-                        if isTestingAntigravity { ProgressView().scaleEffect(0.6).frame(height: 16) }
-                        else { Label("Test Connection", systemImage: "antenna.radiowaves.left.and.right") }
-                    }
-                    .disabled(isTestingAntigravity || !isAntigravityInstalled)
-                    .buttonStyle(CustomButtonStyle())
-
-                    Text(isAntigravityInstalled ? "Runtime ready. Google login will be requested by ACP." : "Runtime not installed.")
-                        .font(.caption)
-                        .foregroundColor(.secondary)
-                }
-            }
-        }
-    }
+    // MARK: - Devin Card
 
     private var devinCard: some View {
         let isInstalled = DevinRuntimeLocator.isInstalledSync()
@@ -2222,85 +2142,6 @@ struct CLIProvidersSettingsView: View {
                 }
             }
         }
-    }
-
-    // MARK: - Cursor Card
-
-    private var grokBuildCard: some View {
-        providerCard(
-            title: "Grok Build",
-            subtitle: "Uses xAI's Grok Build ACP runtime (`grok agent stdio`) for Agent Mode and headless tasks. RepoPrompt MCP tools are added through the ACP session.",
-            infoURL: "https://docs.x.ai/build/overview",
-            isConnected: viewModel.isGrokBuildConnected,
-            isExpanded: $isGrokBuildExpanded
-        ) {
-            VStack(alignment: .leading, spacing: 12) {
-                if viewModel.isGrokBuildConnected {
-                    HStack(spacing: 8) {
-                        Button(action: { testGrokBuildConnection() }) {
-                            if isLoadingGrokBuild {
-                                ProgressView()
-                                    .scaleEffect(0.6)
-                                    .frame(height: 16)
-                            } else {
-                                Label("Test Connection", systemImage: "antenna.radiowaves.left.and.right")
-                            }
-                        }
-                        .disabled(isLoadingGrokBuild)
-                        .buttonStyle(CustomButtonStyle())
-
-                        Spacer()
-
-                        Button(action: { signOutFromGrokBuild() }) {
-                            Text("Sign Out")
-                                .foregroundColor(.secondary)
-                        }
-                        .buttonStyle(CustomButtonStyle())
-                    }
-
-                    Text(grokBuildModelSummary)
-                        .font(.caption)
-                        .foregroundColor(.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
-
-                    directProviderInlineControls(for: .grokBuild)
-                } else {
-                    HStack(spacing: 10) {
-                        Button(action: { testGrokBuildConnection() }) {
-                            if isLoadingGrokBuild {
-                                ProgressView()
-                                    .scaleEffect(0.6)
-                                    .frame(height: 16)
-                            } else {
-                                Label("Connect", systemImage: "link")
-                            }
-                        }
-                        .disabled(isLoadingGrokBuild)
-                        .buttonStyle(CustomButtonStyle())
-
-                        if let error = viewModel.grokBuildError, !error.isEmpty {
-                            Text(error)
-                                .font(.caption)
-                                .foregroundColor(.red)
-                                .fixedSize(horizontal: false, vertical: true)
-                        } else {
-                            Text("Install with `npm i -g @xai-official/grok` or the xAI installer. Authenticate with `grok login` or a Grok API key (stored under API Keys).")
-                                .font(.caption)
-                                .foregroundColor(.secondary)
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    private var grokBuildModelSummary: String {
-        let options = viewModel.availableGrokBuildModelOptions
-        let count = options.count
-        if count <= 1 {
-            return "Using Grok's configured default model; dynamic model discovery will refresh in the background."
-        }
-        return count == 1 ? "1 model available." : "\(count) models available (including Default)."
     }
 
     // MARK: - Cursor CLI / ACP card
@@ -2410,6 +2251,164 @@ struct CLIProvidersSettingsView: View {
         }
         let base = count == 1 ? "1 model available." : "\(count) models available."
         return hasComposer2 ? "\(base) Composer 2 is available when selected." : "\(base) Auto is the built-in fallback."
+    }
+
+    // MARK: - Antigravity Card
+
+    private var antigravityCard: some View {
+        providerCard(
+            title: "Antigravity CLI",
+            subtitle: "Google's Antigravity (`agy`) CLI. Headless one-shot Agent Mode runs; sign in by running `agy` once in your terminal. Connecting enables the RepoPrompt MCP integration without changing your agy sign-in.",
+            infoURL: "https://antigravity.google/",
+            isConnected: viewModel.isAntigravityConnected,
+            isExpanded: $isAntigravityExpanded
+        ) {
+            VStack(alignment: .leading, spacing: 12) {
+                if viewModel.isAntigravityConnected {
+                    HStack(spacing: 8) {
+                        Button(action: { testAntigravityConnection() }) {
+                            if isLoadingAntigravity {
+                                ProgressView()
+                                    .scaleEffect(0.6)
+                                    .frame(height: 16)
+                            } else {
+                                Label("Test Connection", systemImage: "antenna.radiowaves.left.and.right")
+                            }
+                        }
+                        .disabled(isLoadingAntigravity)
+                        .buttonStyle(CustomButtonStyle())
+
+                        Spacer()
+
+                        Button(action: { forgetAntigravityConnection() }) {
+                            Text("Forget Connection")
+                                .foregroundColor(.secondary)
+                        }
+                        .disabled(isLoadingAntigravity)
+                        .buttonStyle(CustomButtonStyle())
+                    }
+
+                    Text("RepoPrompt verified `agy` and its MCP configuration. Forgetting this connection does not sign out of `agy`; RepoPrompt removes only an unchanged MCP entry it can prove it owns.")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+
+                    directProviderInlineControls(for: .antigravity)
+                } else {
+                    HStack(spacing: 10) {
+                        Button(action: { testAntigravityConnection() }) {
+                            if isLoadingAntigravity {
+                                ProgressView()
+                                    .scaleEffect(0.6)
+                                    .frame(height: 16)
+                            } else {
+                                Label("Connect", systemImage: "link")
+                            }
+                        }
+                        .disabled(isLoadingAntigravity)
+                        .buttonStyle(CustomButtonStyle())
+
+                        if viewModel.hasOwnedAntigravityMCPEntry {
+                            Spacer()
+                            Button(action: { forgetAntigravityConnection() }) {
+                                Text("Forget Connection")
+                                    .foregroundColor(.secondary)
+                            }
+                            .disabled(isLoadingAntigravity)
+                            .buttonStyle(CustomButtonStyle())
+                        }
+                    }
+
+                    if let error = viewModel.antigravityError, !error.isEmpty {
+                        Text(error)
+                            .font(.caption)
+                            .foregroundColor(.red)
+                            .fixedSize(horizontal: false, vertical: true)
+                    } else {
+                        Text("Run `agy` in your terminal once to sign in, then Connect.")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                    }
+
+                    if viewModel.hasOwnedAntigravityMCPEntry {
+                        Text("RepoPrompt still has a recorded MCP ownership marker. You can forget the connection even while agy is unavailable; changed configuration will be preserved.")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+            }
+        }
+    }
+
+    // MARK: - Grok Card
+
+    private var grokCard: some View {
+        providerCard(
+            title: "Grok CLI",
+            subtitle: "xAI's Grok (`grok`) CLI. Headless one-shot Agent Mode runs; sign in by running `grok login` once in your terminal. RepoPrompt MCP tools are injected for agent runs.",
+            infoURL: "https://grok.com/",
+            isConnected: viewModel.isGrokConnected,
+            isExpanded: $isGrokExpanded
+        ) {
+            VStack(alignment: .leading, spacing: 12) {
+                if viewModel.isGrokConnected {
+                    HStack(spacing: 8) {
+                        Button(action: { testGrokConnection() }) {
+                            if isLoadingGrok {
+                                ProgressView()
+                                    .scaleEffect(0.6)
+                                    .frame(height: 16)
+                            } else {
+                                Label("Test Connection", systemImage: "antenna.radiowaves.left.and.right")
+                            }
+                        }
+                        .disabled(isLoadingGrok)
+                        .buttonStyle(CustomButtonStyle())
+
+                        Spacer()
+
+                        Button(action: { signOutFromGrok() }) {
+                            Text("Sign Out")
+                                .foregroundColor(.secondary)
+                        }
+                        .buttonStyle(CustomButtonStyle())
+                    }
+
+                    Text("Connected = `grok` found. If runs fail with an auth error, run `grok login` once to sign in.")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+
+                    directProviderInlineControls(for: .grok)
+                } else {
+                    HStack(spacing: 10) {
+                        Button(action: { testGrokConnection() }) {
+                            if isLoadingGrok {
+                                ProgressView()
+                                    .scaleEffect(0.6)
+                                    .frame(height: 16)
+                            } else {
+                                Label("Connect", systemImage: "link")
+                            }
+                        }
+                        .disabled(isLoadingGrok)
+                        .buttonStyle(CustomButtonStyle())
+
+                        if let error = viewModel.grokError, !error.isEmpty {
+                            Text(error)
+                                .font(.caption)
+                                .foregroundColor(.red)
+                                .fixedSize(horizontal: false, vertical: true)
+                        } else {
+                            Text("Run `grok login` in your terminal once to sign in, then Connect.")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                        }
+                    }
+                }
+            }
+        }
     }
 
     // MARK: - Actions
@@ -2886,36 +2885,83 @@ struct CLIProvidersSettingsView: View {
         onAPIKeyUpdated?()
     }
 
-    private func testGrokBuildConnection() {
-        isLoadingGrokBuild = true
+    private func forgetAntigravityConnection() {
+        guard !isLoadingAntigravity else { return }
+        isLoadingAntigravity = true
+        Task {
+            let removalResult = await viewModel.disconnectAntigravity()
+            await MainActor.run {
+                isLoadingAntigravity = false
+                alertMessage = switch removalResult {
+                case .removed:
+                    "RepoPrompt forgot the Antigravity connection and removed its owned MCP entry. Your agy sign-in was not changed."
+                case .restoredPreviousEntry:
+                    "RepoPrompt forgot this Antigravity connection and restored the unchanged RepoPrompt MCP entry that existed before Connect. Your agy sign-in was not changed."
+                case .entryAlreadyAbsent:
+                    "RepoPrompt forgot the Antigravity connection. Its owned MCP entry was already absent, and your agy sign-in was not changed."
+                case .noOwnedEntry:
+                    "RepoPrompt forgot the Antigravity connection, but left agy's MCP configuration unchanged because RepoPrompt did not own that entry. agy may continue using the RepoPrompt MCP server; your agy sign-in was not changed."
+                case .preservedChangedEntry:
+                    "RepoPrompt forgot the Antigravity connection, but left the MCP entry in place because it changed after installation. agy may continue using the RepoPrompt MCP server; your agy sign-in was not changed."
+                case let .failed(message):
+                    "RepoPrompt forgot the Antigravity connection, but could not safely update agy's MCP config: \(message) The MCP entry may remain active in agy; your agy sign-in was not changed."
+                }
+                showAlert = true
+                onAPIKeyUpdated?()
+            }
+        }
+    }
+
+    private func signOutFromGrok() {
+        viewModel.disconnectGrok()
+        alertMessage = "Signed out from Grok CLI"
+        showAlert = true
+        onAPIKeyUpdated?()
+    }
+
+    private func testAntigravityConnection() {
+        isLoadingAntigravity = true
         Task {
             do {
-                let ok = try await viewModel.testGrokBuildConnection()
+                let ok = try await viewModel.testAntigravityConnection()
                 await MainActor.run {
-                    isLoadingGrokBuild = false
+                    isLoadingAntigravity = false
                     if ok {
-                        alertMessage = "Grok Build connected. \(grokBuildModelSummary.lowercased())"
-                        showGrokBuildTraceDump = false
+                        alertMessage = "Antigravity CLI connected. For unattended direct runs, choose Sandboxed Auto-Approve under Agent Permissions. MCP-started agents use Sub-agent Permissions, so choose Inherit Provider Settings or a Custom Antigravity level that supports headless runs. Plain Sandboxed mode may stop when agy requires confirmation."
                     }
                     showAlert = true
                     onAPIKeyUpdated?()
                 }
             } catch {
                 await MainActor.run {
-                    isLoadingGrokBuild = false
-                    alertMessage = viewModel.grokBuildError ?? error.asFriendlyString()
-                    showGrokBuildTraceDump = viewModel.hasGrokBuildTrace()
+                    isLoadingAntigravity = false
+                    alertMessage = viewModel.antigravityError ?? error.asFriendlyString()
                     showAlert = true
                 }
             }
         }
     }
 
-    private func signOutFromGrokBuild() {
-        viewModel.disconnectGrokBuild()
-        alertMessage = "Signed out from Grok Build"
-        showGrokBuildTraceDump = false
-        showAlert = true
-        onAPIKeyUpdated?()
+    private func testGrokConnection() {
+        isLoadingGrok = true
+        Task {
+            do {
+                let ok = try await viewModel.testGrokConnection()
+                await MainActor.run {
+                    isLoadingGrok = false
+                    if ok {
+                        alertMessage = "Grok CLI connected."
+                    }
+                    showAlert = true
+                    onAPIKeyUpdated?()
+                }
+            } catch {
+                await MainActor.run {
+                    isLoadingGrok = false
+                    alertMessage = viewModel.grokError ?? error.asFriendlyString()
+                    showAlert = true
+                }
+            }
+        }
     }
 }

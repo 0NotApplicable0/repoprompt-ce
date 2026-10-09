@@ -1522,7 +1522,7 @@ final class AgentOracleAttachmentForwardingTests: XCTestCase {
             codexControllerFactory: { _, _, _, _, _, _ in
                 preconditionFailure("Oracle attachment forwarding tests must not start Codex")
             },
-            headlessProviderFactory: { _, _ in
+            headlessProviderFactory: { _, _, _, _, _ in
                 UnsupportedHeadlessAgentProvider(reason: "oracle attachment forwarding test")
             }
         )

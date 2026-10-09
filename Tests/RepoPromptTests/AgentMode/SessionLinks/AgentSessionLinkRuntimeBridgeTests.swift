@@ -6912,9 +6912,9 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         let originalProfile = store.globalAgentModelsProfile()
         defer { store.setGlobalAgentModelsProfile(originalProfile, contextBuilderWriteIntent: .preserveExistingOwnership) }
         let scenarios: [(name: String, agent: AgentProviderKind, model: String, connected: Bool)] = [
-            ("connected Grok", .grokBuild, AgentModel.defaultModel.rawValue, true),
+            ("connected Grok", .grok, AgentModel.defaultModel.rawValue, true),
             ("connected Cursor", .cursor, cursorModel.rawValue, true),
-            ("disconnected Grok", .grokBuild, AgentModel.defaultModel.rawValue, false),
+            ("disconnected Grok", .grok, AgentModel.defaultModel.rawValue, false),
             ("disconnected Codex", .codexExec, AgentModel.gpt61SolHigh.rawValue, false)
         ]
         for scenario in scenarios {
@@ -6927,7 +6927,7 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
                 codexAvailable: scenario.agent == .codexExec,
                 openCodeAvailable: false,
                 cursorAvailable: scenario.agent == .cursor,
-                grokBuildAvailable: scenario.agent == .grokBuild
+                grokAvailable: scenario.agent == .grok
             )
             // Opposite states distinguish the destination window from the observer window.
             fixture.host.modelAvailabilityByWindow[fixture.observer.windowID] = scenario.connected ? .none : available

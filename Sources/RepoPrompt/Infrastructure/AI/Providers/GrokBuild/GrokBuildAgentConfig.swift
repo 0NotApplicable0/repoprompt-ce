@@ -1,6 +1,6 @@
 import Foundation
 
-/// Immutable runtime configuration for the Grok Build ACP provider (`grok agent stdio`).
+/// Configuration for prompt-only Grok Build Chat and Oracle requests.
 struct GrokBuildAgentConfig {
     /// Process-local MCP import isolation shared by Grok's ACP and one-shot launch adapters.
     static let importIsolationEnvironment: [String: String] = [
@@ -20,16 +20,10 @@ struct GrokBuildAgentConfig {
     let additionalPathHints: [String]
     let enableDebugLogging: Bool
     let modelString: String?
+    // Retained for existing callers; prompt-only requests expose no RepoPrompt tools.
     let includeRepoPromptMCPServer: Bool
-    /// Provider-native full-access intent; when true the provider launches
-    /// `grok agent --always-approve --no-leader stdio`. Interactive runs may also carry the
-    /// intent via `ACPRunRequest.autoApproveAllToolPermissions`; the provider ORs both.
     let alwaysApproveTools: Bool
-    /// Grok (xAI) API key resolved asynchronously at provider-construction time from
-    /// the existing `.grokAPI` KeyManager account. `makeLaunchConfiguration` is
-    /// synchronous while the keychain is not, so resolution happens upstream
-    /// (`ACPAgentProviderFactory`). nil means "no stored key" — Grok's own credential
-    /// precedence (`~/.grok/auth.json`, config.toml) still applies.
+    /// Optional API key supplied by the caller; nil leaves authentication to the CLI.
     let apiKey: String?
     /// Process-local background-feature policy. Empty leaves the ACP caller's background
     /// policy unchanged (Context Builder); managed callers opt in explicitly.

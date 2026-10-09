@@ -705,7 +705,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         didSet {
             guard selectedAgent != oldValue else { return }
             guard !isRestoringState else { return }
-            if !isModelRawValidForSelectedAgent(selectedModelRaw) {
+            if !selectedAgent.preservesSavedSelection, !isModelRawValidForSelectedAgent(selectedModelRaw) {
                 isRestoringState = true
                 selectedModelRaw = defaultModelRaw(for: selectedAgent)
                 selectedModel = AgentModel.resolvedModel(forRaw: selectedModelRaw, agentKind: selectedAgent) ?? .defaultModel
@@ -723,7 +723,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         didSet {
             guard selectedModelRaw != oldValue else { return }
             guard !isRestoringState else { return }
-            if !isModelRawValidForSelectedAgent(selectedModelRaw) {
+            if !selectedAgent.preservesSavedSelection, !isModelRawValidForSelectedAgent(selectedModelRaw) {
                 isRestoringState = true
                 selectedModelRaw = defaultModelRaw(for: selectedAgent)
                 selectedModel = AgentModel.resolvedModel(forRaw: selectedModelRaw, agentKind: selectedAgent) ?? .defaultModel
@@ -747,7 +747,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         didSet {
             guard selectedModel != oldValue else { return }
             guard !isRestoringState else { return }
-            if !isModelRawValidForSelectedAgent(selectedModel.rawValue), selectedAgent != .codexExec {
+            if !selectedAgent.preservesSavedSelection, !isModelRawValidForSelectedAgent(selectedModel.rawValue), selectedAgent != .codexExec {
                 isRestoringState = true
                 selectedModelRaw = defaultModelRaw(for: selectedAgent)
                 selectedModel = AgentModel.resolvedModel(forRaw: selectedModelRaw, agentKind: selectedAgent) ?? .defaultModel
@@ -1069,7 +1069,6 @@ final class ContextBuilderAgentViewModel: ObservableObject {
     private var codexModelsSubscriptionTask: Task<Void, Never>?
     private var openCodeModelsSubscriptionTask: Task<Void, Never>?
     private var cursorModelsSubscriptionTask: Task<Void, Never>?
-    private var grokBuildModelsSubscriptionTask: Task<Void, Never>?
     private let codexModelPollingService: CodexModelPollingService
     private let perfRecorder: any AgentModePerfRecording
     private var hasPreparedForWindowClose = false
@@ -1303,7 +1302,6 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         updateCodexModelPolling()
         updateOpenCodeModelPolling()
         updateCursorModelPolling(startPolling: startCursorPolling)
-        updateGrokBuildModelPolling(startPolling: startCursorPolling)
     }
 
     private func updateCodexModelPolling() {
@@ -1418,42 +1416,6 @@ final class ContextBuilderAgentViewModel: ObservableObject {
     private func stopCursorModelsSubscription() {
         cursorModelsSubscriptionTask?.cancel()
         cursorModelsSubscriptionTask = nil
-    }
-
-    private func updateGrokBuildModelPolling(startPolling: Bool = true) {
-        guard selectedAgent == .grokBuild else {
-            stopGrokBuildModelsSubscription()
-            return
-        }
-        guard startPolling,
-              AgentModelCatalog.isAgentAvailable(.grokBuild, availability: agentAvailabilityContext)
-        else {
-            return
-        }
-        startGrokBuildModelsSubscriptionIfNeeded()
-    }
-
-    private func startGrokBuildModelsSubscriptionIfNeeded() {
-        guard !hasPreparedForWindowClose else { return }
-        guard grokBuildModelsSubscriptionTask == nil else { return }
-        let workspacePath = currentWorkspacePath
-        grokBuildModelsSubscriptionTask = Task { [weak self, workspacePath] in
-            let stream = await GrokBuildACPModelPollingService.shared.subscribe(workspacePath: workspacePath)
-            for await _ in stream {
-                guard !Task.isCancelled else { return }
-                await MainActor.run { [weak self] in
-                    guard let self else { return }
-                    acpDynamicModelRevision &+= 1
-                    handleAgentProviderAvailabilityChanged()
-                    syncSelectedACPModelFromRegistryIfNeeded(for: .grokBuild)
-                }
-            }
-        }
-    }
-
-    private func stopGrokBuildModelsSubscription() {
-        grokBuildModelsSubscriptionTask?.cancel()
-        grokBuildModelsSubscriptionTask = nil
     }
 
     private func syncSelectedACPModelFromRegistryIfNeeded(for agent: AgentProviderKind) {

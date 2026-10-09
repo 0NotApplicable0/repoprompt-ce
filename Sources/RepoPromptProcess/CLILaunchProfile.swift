@@ -15,6 +15,19 @@ package enum CLILaunchProfiles {
         "~/.opencode/bin"
     ]
     package static let cursorProviderSpecificPaths: [String] = []
+    /// Antigravity CLI (`agy`) installs into ~/.local/bin on Unix; supplement the
+    /// native defaults with it so the resolver finds the binary regardless of the
+    /// inherited child PATH.
+    package static let antigravityProviderSpecificPaths: [String] = [
+        "~/.local/bin"
+    ]
+
+    /// Grok CLI (`grok`) is typically installed into ~/.local/bin or a Homebrew
+    /// prefix on Unix; supplement the native defaults with these so the resolver
+    /// finds the binary regardless of the inherited child PATH.
+    package static let grokProviderSpecificPaths: [String] = [
+        "~/.local/bin"
+    ]
     /// Official Devin installer location.
     package static let devinProviderSpecificPaths: [String] = [
         "~/.local/bin"
@@ -68,6 +81,18 @@ package enum CLILaunchProfiles {
         commandName: "cursor-agent",
         preferredBasenames: ["cursor-agent"],
         supplementalSearchPaths: nativeDefaultsSupplemented(with: cursorProviderSpecificPaths)
+    )
+
+    package static let antigravity = CLILaunchProfile(
+        commandName: "agy",
+        preferredBasenames: ["agy"],
+        supplementalSearchPaths: nativeDefaultsSupplemented(with: antigravityProviderSpecificPaths)
+    )
+
+    package static let grok = CLILaunchProfile(
+        commandName: "grok",
+        preferredBasenames: ["grok"],
+        supplementalSearchPaths: nativeDefaultsSupplemented(with: grokProviderSpecificPaths)
     )
 
     package static let devin = CLILaunchProfile(

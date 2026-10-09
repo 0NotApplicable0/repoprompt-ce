@@ -23,6 +23,9 @@ final class HeadlessAgentModeRunner {
         initialUserMessage: String,
         initialMessageForRun: String,
         attachments: [AgentImageAttachment],
+        workspacePath: String? = nil,
+        antigravityPermissionLevel: AntigravityAgentToolPreferences.PermissionLevel? = nil,
+        grokPermissionLevel: GrokAgentToolPreferences.PermissionLevel? = nil,
         makeLease: (_ runID: UUID) -> MCPBootstrapLease,
         stopFence: AgentRunStartStopFence? = nil
     ) async {
@@ -82,7 +85,10 @@ final class HeadlessAgentModeRunner {
             session.selectedAgent,
             session.selectedModelRaw == AgentModel.defaultModel.rawValue
                 ? nil
-                : session.selectedModelRaw
+                : session.selectedModelRaw,
+            workspacePath,
+            antigravityPermissionLevel,
+            grokPermissionLevel
         )
         session.provider = provider
         session.installRunAttemptTerminalResources(ownership: ownership) { terminalState in

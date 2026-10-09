@@ -289,8 +289,8 @@ final class AutoRecommendationEngineScopedSettingsTests: XCTestCase {
         )] = [
             ("available Grok pin", true, true, [.codex, .grokBuild], .grokBuild, grokModel.rawValue, true, false),
             ("Grok excluded from recommendations", true, true, [.codex], .grokBuild, grokModel.rawValue, true, false),
-            ("disconnected Grok pin", false, true, [.codex, .grokBuild], .grokBuild, grokModel.rawValue, false, true),
-            ("Grok-only ready CLI", true, false, [.grokBuild], .grokBuild, AgentModel.defaultModel.rawValue, true, true),
+            ("disconnected Grok pin", false, true, [.codex, .grokBuild], .grokBuild, grokModel.rawValue, true, false),
+            ("retired Grok-only ready CLI", true, false, [.grokBuild], .grokBuild, AgentModel.defaultModel.rawValue, true, false),
             ("OpenCode stays excluded", false, true, [.codex], .openCode, openCodeModel.rawValue, false, true)
         ]
         for scenario in scenarios {
@@ -316,6 +316,11 @@ final class AutoRecommendationEngineScopedSettingsTests: XCTestCase {
                 for: AgentModelsOperationIdentity(sourceWorkspaceID: workspaceID, scope: .workspace(workspaceID)),
                 enabledProviders: scenario.enabled
             )
+            if !scenario.codexReady {
+                XCTAssertNil(result.mcpAgentDefaults, "Retired Grok Build cannot supply active Agent Mode defaults")
+                XCTAssertEqual(fixture.store.workspaceAgentModelsProfile(for: workspaceID)?.mcpAgentRoleOverrides?["pair"], pin)
+                continue
+            }
             guard let recommendation = result.mcpAgentDefaults else {
                 XCTFail("\(scenario.name): ready providers must keep all role rows")
                 continue
@@ -358,7 +363,7 @@ final class AutoRecommendationEngineScopedSettingsTests: XCTestCase {
         )
         for provider in providers {
             let model = AgentModelOption(
-                rawValue: "test-\(provider.agent.rawValue)-pinned", displayName: "Pinned model", description: nil, isDefault: false
+                rawValue: provider.agent == .antigravity ? AgentModel.defaultModel.rawValue : "test-\(provider.agent.rawValue)-pinned", displayName: "Pinned model", description: nil, isDefault: false
             )
             XCTAssertTrue(registry.updateDiscoveredModels(
                 .init(options: [model], currentModelRaw: model.rawValue), for: provider.id
@@ -380,7 +385,7 @@ final class AutoRecommendationEngineScopedSettingsTests: XCTestCase {
                 ), name)
                 XCTAssertEqual(
                     resolution.selectionID.rawValue,
-                    available ? pin : AgentModelSelectionID(
+                    available || provider.agent == .antigravity ? pin : AgentModelSelectionID(
                         agentRaw: resolution.recommended.agent.rawValue, modelRaw: resolution.recommended.modelRaw
                     ).rawValue,
                     "\(name): recommendation inputs must preserve an executable current pin"

@@ -42,18 +42,39 @@ enum AgentProviderKind: String, CaseIterable, Hashable {
     case codexExec
     case openCode
     case cursor
-    case grokBuild
     case antigravity
+    case grok
+    case grokBuild
     case devin
     case claudeCodeGLM
     case kimiCode
     case customClaudeCompatible
 
+    /// Retired raw identities remain decodable but never participate in active enumeration.
+    static let allCases: [AgentProviderKind] = [
+        .claudeCode, .codexExec, .openCode, .cursor, .antigravity, .grok, .devin,
+        .claudeCodeGLM, .kimiCode, .customClaudeCompatible
+    ]
+
+    var preservesSavedSelection: Bool {
+        SettingsModelIdentityPolicy.preservesSavedSelection(agentRaw: rawValue)
+    }
+
+    var usesBilledContextUsage: Bool {
+        switch self {
+        case .openCode, .cursor, .antigravity, .grok, .grokBuild, .devin:
+            true
+        case .claudeCode, .codexExec, .claudeCodeGLM, .kimiCode, .customClaudeCompatible:
+            false
+        }
+    }
+
     static let claudeMCPClientID = "claude-code"
     static let codexMCPClientID = "codex-mcp-client"
     static let openCodeMCPClientID = "opencode"
-    /// Cursor's ACP MCP child reports this exact initialize name; pending discovery contexts use exact keys.
     static let cursorMCPClientID = "Cursor"
+    static let antigravityMCPClientID = "antigravity-client"
+    static let grokMCPClientID = "grok-client"
     /// Devin's built-in Rust MCP client reports this exact initialize name.
     static let devinMCPClientID = "rmcp"
     /// Grok Build presents `grok-shell-<injected server name>` (here `grok-shell-RepoPromptCEGrokRuntime`)
@@ -73,10 +94,10 @@ enum AgentProviderKind: String, CaseIterable, Hashable {
             "opencode"
         case .cursor:
             "cursor-agent"
-        case .grokBuild:
-            "grok"
         case .antigravity:
-            "agy_acp_server.par"
+            "agy"
+        case .grok, .grokBuild:
+            "grok"
         case .devin:
             "devin"
         }
@@ -92,10 +113,12 @@ enum AgentProviderKind: String, CaseIterable, Hashable {
             "OpenCode"
         case .cursor:
             "Cursor CLI"
+        case .antigravity:
+            "Antigravity CLI"
+        case .grok:
+            "Grok CLI"
         case .grokBuild:
             "Grok Build"
-        case .antigravity:
-            "Google Antigravity"
         case .devin:
             "Devin CLI"
         case .claudeCodeGLM:
@@ -117,10 +140,12 @@ enum AgentProviderKind: String, CaseIterable, Hashable {
             Self.openCodeMCPClientID
         case .cursor:
             Self.cursorMCPClientID
+        case .grok:
+            Self.grokMCPClientID
         case .grokBuild:
             Self.grokBuildMCPClientID
         case .antigravity:
-            "antigravity"
+            Self.antigravityMCPClientID
         case .devin:
             Self.devinMCPClientID
         }
@@ -132,13 +157,9 @@ enum AgentProviderKind: String, CaseIterable, Hashable {
             .openCode
         case .cursor:
             .cursor
-        case .grokBuild:
-            .grokBuild
-        case .antigravity:
-            .antigravity
         case .devin:
             .devin
-        case .claudeCode, .codexExec, .claudeCodeGLM, .kimiCode, .customClaudeCompatible:
+        case .claudeCode, .codexExec, .claudeCodeGLM, .kimiCode, .customClaudeCompatible, .antigravity, .grok, .grokBuild:
             nil
         }
     }
@@ -147,7 +168,7 @@ enum AgentProviderKind: String, CaseIterable, Hashable {
         switch self {
         case .claudeCode, .claudeCodeGLM, .kimiCode, .customClaudeCompatible:
             true
-        case .codexExec, .openCode, .cursor, .grokBuild, .antigravity, .devin:
+        case .codexExec, .openCode, .cursor, .antigravity, .grok, .grokBuild, .devin:
             false
         }
     }
@@ -158,16 +179,16 @@ enum AgentProviderKind: String, CaseIterable, Hashable {
 
     var requiresExpectedPIDOwnedAgentModeMCPRouting: Bool {
         switch self {
-        case .claudeCode, .codexExec, .openCode, .cursor, .grokBuild, .antigravity, .devin, .claudeCodeGLM, .kimiCode, .customClaudeCompatible:
+        case .claudeCode, .codexExec, .openCode, .cursor, .claudeCodeGLM, .kimiCode, .customClaudeCompatible, .antigravity, .grok, .grokBuild, .devin:
             true
         }
     }
 
     var requiresPrePromptAgentModeMCPRouting: Bool {
         switch self {
-        case .cursor, .grokBuild, .antigravity:
+        case .cursor, .grokBuild:
             false
-        case .claudeCode, .codexExec, .openCode, .devin, .claudeCodeGLM, .kimiCode, .customClaudeCompatible:
+        case .claudeCode, .codexExec, .openCode, .claudeCodeGLM, .kimiCode, .customClaudeCompatible, .antigravity, .grok, .devin:
             true
         }
     }
@@ -179,14 +200,16 @@ enum AgentProviderKind: String, CaseIterable, Hashable {
             return "Anthropic's Claude Code agent. Strong at general-purpose development, code understanding, architecture, and open-ended reasoning tasks."
         case .codexExec:
             return "OpenAI's Codex CLI agent. Optimized for tool-driven engineering workflows. Supports configurable reasoning effort levels per model."
-        case .antigravity:
-            return "Google Antigravity ACP agent. Available for interactive Agent Mode; headless Context Builder and delegated runs are not supported."
         case .openCode:
             return "OpenCode ACP agent. Interactive Agent Mode uses RepoPrompt MCP tools; headless discovery/delegate runs use RepoPrompt's managed no-native-tools mode."
         case .cursor:
             return "Cursor CLI ACP agent. Uses Cursor's ACP runtime and injects RepoPrompt MCP tools through ACP session configuration."
+        case .antigravity:
+            return "Google's Antigravity CLI (agy), a Gemini-powered terminal coding agent. Runs headless one-shot prompts and uses RepoPrompt MCP tools."
+        case .grok:
+            return "xAI's Grok CLI (grok), a Grok-powered terminal coding agent. Runs headless one-shot prompts and uses RepoPrompt MCP tools."
         case .grokBuild:
-            return "xAI Grok Build ACP agent. Uses Grok Build's ACP runtime (`grok agent stdio`) and injects RepoPrompt MCP tools through ACP session configuration."
+            return "Retired Agent Mode provider. Grok Build remains available for Chat and Oracle; choose Grok CLI or another active provider for agent tasks."
         case .devin:
             return "Installed Devin ACP agent for Agent Mode, Context Builder, and delegated runs. RepoPrompt injects its MCP tools through an isolated configuration overlay."
         case .claudeCodeGLM:
@@ -217,12 +240,14 @@ enum AgentProviderKind: String, CaseIterable, Hashable {
             "claude_native"
         case .codexExec:
             "codex_native"
-        case .antigravity:
-            "antigravity_acp"
         case .openCode:
             "opencode_acp"
         case .cursor:
             "cursor_acp"
+        case .antigravity:
+            "antigravity_native"
+        case .grok:
+            "grok_native"
         case .grokBuild:
             "grok_build_acp"
         case .devin:
@@ -240,7 +265,7 @@ enum AgentProviderKind: String, CaseIterable, Hashable {
             .kimi
         case .customClaudeCompatible:
             .customCompatible
-        case .codexExec, .openCode, .cursor, .grokBuild, .antigravity, .devin:
+        case .codexExec, .openCode, .cursor, .antigravity, .grok, .grokBuild, .devin:
             nil
         }
     }
@@ -256,6 +281,18 @@ final class AgentRuntimeProviderService {
 
     private init() {}
 
+    private func rejectedModelProvider(for agent: AgentProviderKind, modelString: String?) -> HeadlessAgentProvider? {
+        let model = modelString ?? AgentModel.defaultModel.rawValue
+        guard !AgentModelCatalog.isValid(
+            rawModel: model,
+            for: agent,
+            availability: .none.assumingAvailable(agent)
+        ) else { return nil }
+        return UnsupportedHeadlessAgentProvider(
+            reason: "Model '\(model)' is unavailable for \(agent.displayName). Choose Default or a model from the provider's current model catalog. The saved selection has not been changed."
+        )
+    }
+
     /// Create a headless agent provider.
     /// - Parameters:
     ///   - agent: The provider kind to create
@@ -270,6 +307,8 @@ final class AgentRuntimeProviderService {
         modelString: String? = nil,
         runType: AgentRunType = .discover,
         workspacePath: String? = nil,
+        antigravityPermissionLevel: AntigravityAgentToolPreferences.PermissionLevel? = nil,
+        grokPermissionLevel: GrokAgentToolPreferences.PermissionLevel? = nil,
         modelParameterSelections: [ACPModelParameterSelection] = []
     ) -> HeadlessAgentProvider {
         if Self.enableDebugLogging {
@@ -334,19 +373,69 @@ final class AgentRuntimeProviderService {
                 Self.logger.debug("Created CursorACPHeadlessAgentProvider")
             }
             return CursorACPHeadlessAgentProvider(config: config, workspacePath: workspacePath)
-        case .grokBuild:
-            let config = GrokBuildAgentConfig(
-                enableDebugLogging: Self.enableDebugLogging,
-                modelString: modelString,
-                alwaysApproveTools: GrokBuildAgentToolPreferences.permissionLevel() == .fullAccess
-            )
-            if Self.enableDebugLogging {
-                Self.logger.debug("Created GrokBuildACPHeadlessAgentProvider")
-            }
-            return GrokBuildACPHeadlessAgentProvider(config: config, workspacePath: workspacePath)
         case .antigravity:
+            // Real Agent Mode runs pass the session-resolved level (honoring Safe-Managed /
+            // per-provider overrides); discovery / no-session callers omit it and fall back to
+            // the user's global Antigravity permission preference.
+            let permissionLevel = antigravityPermissionLevel ?? AntigravityAgentToolPreferences.permissionLevel()
+            // Safe Managed must retain its pre-preparation rejection, even for an unknown model.
+            if permissionLevel.supportsHeadlessRun,
+               let rejection = rejectedModelProvider(for: agent, modelString: modelString)
+            {
+                return rejection
+            }
+            let config = AntigravityAgentConfig(
+                modelString: modelString,
+                useSandbox: permissionLevel.useSandbox,
+                dangerouslySkipPermissions: permissionLevel.dangerouslySkipPermissions,
+                supportsHeadlessRun: permissionLevel.supportsHeadlessRun,
+                enableDebugLogging: Self.enableDebugLogging
+            )
+            var processConfig = CLIProcessConfiguration(
+                command: config.commandName,
+                workingDirectory: workspacePath,
+                enableDebugLogging: Self.enableDebugLogging,
+                captureStdoutTailBytes: 0,
+                captureStderrTailBytes: 256 * 1024,
+                logStdinSampleBytes: 0
+            )
+            processConfig.ensureAdditionalPaths(config.additionalPathHints)
+            let runner = CLIProcessRunner(config: processConfig)
+            if Self.enableDebugLogging {
+                Self.logger.debug("Created AntigravityAgentProvider")
+            }
+            return AntigravityAgentProvider(runner: runner, config: config, workspacePath: workspacePath)
+        case .grok:
+            let permissionLevel = grokPermissionLevel ?? GrokAgentToolPreferences.permissionLevel()
+            guard permissionLevel != .storedPermissionUnavailable else {
+                return UnsupportedHeadlessAgentProvider(reason: permissionLevel.detailText)
+            }
+            if let rejection = rejectedModelProvider(for: agent, modelString: modelString) {
+                return rejection
+            }
+            let config = GrokAgentConfig(
+                modelString: modelString,
+                useSandbox: permissionLevel.useSandbox,
+                dangerouslySkipPermissions: permissionLevel.dangerouslySkipPermissions,
+                enableDebugLogging: Self.enableDebugLogging
+            )
+            var processConfig = CLIProcessConfiguration(
+                command: config.commandName,
+                workingDirectory: workspacePath,
+                enableDebugLogging: Self.enableDebugLogging,
+                captureStdoutTailBytes: 0,
+                captureStderrTailBytes: 256 * 1024,
+                logStdinSampleBytes: 0
+            )
+            processConfig.ensureAdditionalPaths(config.additionalPathHints)
+            let runner = CLIProcessRunner(config: processConfig)
+            if Self.enableDebugLogging {
+                Self.logger.debug("Created GrokAgentProvider")
+            }
+            return GrokAgentProvider(runner: runner, config: config, workspacePath: workspacePath)
+        case .grokBuild:
             return UnsupportedHeadlessAgentProvider(
-                reason: "Google Antigravity is currently supported only in interactive Agent Mode. Choose another provider for Context Builder or delegated headless runs."
+                reason: "Grok Build (grokBuild) is retired for Agent Mode and Context Builder. Choose Grok CLI or another active agent provider. Grok Build remains available for Chat and Oracle."
             )
         case .devin:
             return DevinACPHeadlessAgentProvider(

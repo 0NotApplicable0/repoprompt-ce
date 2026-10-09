@@ -1729,6 +1729,9 @@ package class GlobalSettingsStore: ObservableObject, CodexHookApprovalSettingsPr
         else {
             return (nil, nil)
         }
+        if SettingsModelIdentityPolicy.preservesSavedSelection(agentRaw: agentRaw) {
+            return (agentRaw, globalDefaults.discoverModelsByAgent?[agentRaw])
+        }
         let modelRaw = globalDefaults.discoverModelsByAgent?[agentRaw]?
             .trimmingCharacters(in: .whitespacesAndNewlines)
         return (agentRaw, modelRaw?.isEmpty == false ? modelRaw : nil)

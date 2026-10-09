@@ -627,7 +627,7 @@ extension AgentComposerSubmissionAttemptTests {
             codexControllerFactory: { _, _, _, _, _, _ in
                 preconditionFailure("Routing transaction test must not start Codex")
             },
-            headlessProviderFactory: { _, _ in UnsupportedHeadlessAgentProvider(reason: "test terminal") }
+            headlessProviderFactory: { _, _, _, _, _ in UnsupportedHeadlessAgentProvider(reason: "test terminal") }
         )
         viewModel.modelRouterSettingsStore = store
         viewModel.modelRouterRuntime = runtime

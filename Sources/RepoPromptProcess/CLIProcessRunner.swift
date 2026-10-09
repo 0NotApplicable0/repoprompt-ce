@@ -833,10 +833,14 @@ package final class CLIProcessRunner {
                 log("Cannot escalate process \(process.pid) cancellation without a process group")
                 continue
             }
-            await ProcessTermination.terminateProcessGroup(
-                processGroupID: processGroupID,
-                logger: { [weak self] message in self?.log(message) }
-            )
+            // The cooperative wait above returns once the root PID is reaped, but a
+            // reparented same-process-group descendant that ignores SIGTERM can outlive
+            // it. Make cancellation authoritative by ensuring the whole spawned group is
+            // gone before returning.
+            await ProcessTermination.ensureProcessGroupTerminated(
+                pid: process.pid,
+                processGroupID: processGroupID
+            ) { [weak self] message in self?.log(message) }
         }
     }
 

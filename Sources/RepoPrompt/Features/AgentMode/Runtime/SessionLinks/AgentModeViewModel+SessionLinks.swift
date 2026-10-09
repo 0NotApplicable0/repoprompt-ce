@@ -785,7 +785,7 @@ extension AgentModeViewModel {
         guard let usage = session.contextUsageSnapshot else { return nil }
         // `ACPContextUsageEstimator` stores a billed count only under `.turnFinalization` (a later
         // window-only update keeps that source), and occupancy only under `.acpUsageEvent`.
-        let isACPBilledCount = session.selectedAgent.acpProviderID != nil && usage.source == .turnFinalization
+        let isACPBilledCount = session.selectedAgent.usesBilledContextUsage && usage.source == .turnFinalization
         // A compaction signal carries the pre-compaction count forward; it no longer describes the
         // context, so only the window can still be current until the next usage report.
         let countIsCurrent = usage.source != .compactionSignal

@@ -172,7 +172,7 @@ extension AgentProviderPermissionProfile {
             openCodeSessionModeID
         case .cursor, .grokBuild, .antigravity, .devin:
             nil
-        case .claudeCode, .claudeCodeGLM, .kimiCode, .customClaudeCompatible, .codexExec:
+        case .claudeCode, .claudeCodeGLM, .kimiCode, .customClaudeCompatible, .codexExec, .grok:
             nil
         }
     }

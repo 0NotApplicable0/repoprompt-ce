@@ -1410,7 +1410,6 @@ class WindowStatesManager: ObservableObject {
         await providerQuotaRuntime.claudeTelemetry.shutdown()
         await OpenCodeACPModelPollingService.shared.shutdown()
         await CursorACPModelPollingService.shared.shutdown()
-        await GrokBuildACPModelPollingService.shared.shutdown()
     }
 
     private func deduplicatedWindows(_ windows: [WindowState]) -> [WindowState] {

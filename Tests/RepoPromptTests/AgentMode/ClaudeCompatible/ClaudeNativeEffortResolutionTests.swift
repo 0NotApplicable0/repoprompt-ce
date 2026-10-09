@@ -51,7 +51,7 @@ final class ClaudeNativeEffortResolutionTests: XCTestCase {
             claudeControllerFactory: { _, _, _, _ in
                 preconditionFailure("Effort selection tests must not start Claude")
             },
-            headlessProviderFactory: { _, _ in UnsupportedHeadlessAgentProvider(reason: "effort selection test") },
+            headlessProviderFactory: { _, _, _, _, _ in UnsupportedHeadlessAgentProvider(reason: "effort selection test") },
             mcpServerEnabler: { false }
         )
     }

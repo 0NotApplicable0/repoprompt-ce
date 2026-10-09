@@ -41,6 +41,8 @@ extension SentryTelemetryModel.ProviderKind {
             self = .openCode
         case .cursor:
             self = .cursor
+        case .grok:
+            self = .grok
         case .grokBuild:
             self = .grokBuild
         case .antigravity:

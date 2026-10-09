@@ -485,8 +485,8 @@ final class GrokBuildModelRoutingTests: XCTestCase {
         let executable = root.appendingPathComponent("grok")
         let script = #"""
         #!/bin/sh
-        if [ "$1" = agent ] && [ "$2" = --help ]; then
-            printf 'stdio\n'
+        if [ "$1" = --help ]; then
+            printf 'Usage: grok --prompt-file <path>\n'
             exit 0
         fi
         printf '%s\n' \
@@ -550,7 +550,7 @@ final class GrokBuildModelRoutingTests: XCTestCase {
         ]
         return GrokBuildOneShotHeadlessAgentProvider(
             config: GrokBuildAgentConfig(commandName: executable.path, includeRepoPromptMCPServer: false),
-            launchResolver: GrokBuildACPLaunchResolver(environmentProvider: { _ in environment }),
+            launchResolver: GrokBuildCLILaunchResolver(environmentProvider: { _ in environment }),
             requestTimeout: requestTimeout,
             apiKeyProvider: { nil }
         )

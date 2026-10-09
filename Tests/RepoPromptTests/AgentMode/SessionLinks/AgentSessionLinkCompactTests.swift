@@ -216,7 +216,7 @@ final class AgentSessionLinkCompactTransactionTests: XCTestCase {
             let expected: AgentSessionLinkCompactSupport = switch agent {
             case .claudeCode: .claudeCode
             case .codexExec: .codex
-            case .devin, .grokBuild, .antigravity:
+            case .devin:
                 // A remembered ACP conversation with no live session yet is retryable, not
                 // incapable: one ordinary turn brings the provider session and its command
                 // advertisement up.

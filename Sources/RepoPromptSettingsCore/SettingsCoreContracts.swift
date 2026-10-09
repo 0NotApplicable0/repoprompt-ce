@@ -16,19 +16,24 @@ package enum SettingsAgentKind: String, CaseIterable, Hashable {
     case cursor
     case grokBuild
     case antigravity
+    case grok
     case devin
     case claudeCodeGLM
     case kimiCode
     case customClaudeCompatible
+
+    package static let allCases: [SettingsAgentKind] = [
+        .claudeCode, .codexExec, .openCode, .cursor, .antigravity, .grok, .devin,
+        .claudeCodeGLM, .kimiCode, .customClaudeCompatible
+    ]
 
     package var acpProviderID: ACPProviderID? {
         switch self {
         case .openCode: .openCode
         case .cursor: .cursor
         case .grokBuild: .grokBuild
-        case .antigravity: .antigravity
         case .devin: .devin
-        case .claudeCode, .codexExec, .claudeCodeGLM, .kimiCode, .customClaudeCompatible: nil
+        case .claudeCode, .codexExec, .claudeCodeGLM, .kimiCode, .customClaudeCompatible, .antigravity, .grok: nil
         }
     }
 }

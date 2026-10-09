@@ -100,7 +100,7 @@ enum MCPAgentRoleDefaultsService {
             case .none:
                 nil
             case .unavailable:
-                "Saved pin unavailable; using recommended default."
+                "Saved pin unavailable; choose another model or clear the pin before running."
             case let .custom(recommendedDisplayName):
                 "Recommended: \(recommendedDisplayName)"
             case .pinnedToRecommended:
@@ -370,11 +370,15 @@ enum MCPAgentRoleDefaultsService {
         codexDynamicModels: [CodexAppServerClient.RemoteModel]?
     ) -> RoleDefaultResolution? {
         guard let taskLabel = AgentModelCatalog.taskLabel(for: kind) else { return nil }
+        let rawStoredSelection: AgentModelCatalog.NormalizedAgentSelection? = overrides?[kind.rawValue].flatMap(AgentModelSelectionID.parse).flatMap { parsed in
+            guard let agent = AgentProviderKind(rawValue: parsed.agentRaw), agent.preservesSavedSelection else { return nil }
+            return AgentModelCatalog.NormalizedAgentSelection(agent: agent, modelRaw: parsed.modelRaw)
+        }
         guard let recommended = resolvedRecommendedSelection(
             for: kind,
             recommendedAvailability: recommendedAvailability,
             fallbackAvailability: availability
-        ) else {
+        ) ?? rawStoredSelection else {
             return nil
         }
 
@@ -395,6 +399,14 @@ enum MCPAgentRoleDefaultsService {
         if let storedSelection {
             effective = storedSelection.selection
             hasCustomOverride = (effective != recommended)
+        } else if let overrideRaw = overrides?[kind.rawValue],
+                  let parsed = AgentModelSelectionID.parse(overrideRaw),
+                  let agent = AgentProviderKind(rawValue: parsed.agentRaw),
+                  agent.preservesSavedSelection
+        {
+            effective = AgentModelCatalog.NormalizedAgentSelection(agent: agent, modelRaw: parsed.modelRaw)
+            hasCustomOverride = true
+            overrideUnavailable = true
         } else {
             effective = recommended
             if hasStoredOverride {

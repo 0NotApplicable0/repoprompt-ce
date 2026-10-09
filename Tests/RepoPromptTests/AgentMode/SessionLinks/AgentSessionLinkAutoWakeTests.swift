@@ -186,7 +186,7 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
             session.selectedAgent = .claudeCode
             session.claudeController = fixture.nativeController
             let harness = AgentSessionLinkRunnerHarness(
-                headlessProviderFactory: { _, _ in AgentSessionLinkCapturingHeadlessProvider() }, sessionLinkHost: fixture.viewModel
+                headlessProviderFactory: { _, _, _, _, _ in AgentSessionLinkCapturingHeadlessProvider() }, sessionLinkHost: fixture.viewModel
             )
             let runner = ClaudeIntegratedAgentModeRunner(
                 claudeCoordinator: fixture.viewModel.test_claudeCoordinator, hooks: harness.hooks,
@@ -298,7 +298,7 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
             let session = fixture.session
             session.selectedAgent = .claudeCode
             session.claudeController = fixture.nativeController
-            let harness = AgentSessionLinkRunnerHarness(headlessProviderFactory: { _, _ in AgentSessionLinkCapturingHeadlessProvider() })
+            let harness = AgentSessionLinkRunnerHarness(headlessProviderFactory: { _, _, _, _, _ in AgentSessionLinkCapturingHeadlessProvider() })
             let runner = ClaudeIntegratedAgentModeRunner(
                 claudeCoordinator: fixture.viewModel.test_claudeCoordinator, hooks: harness.hooks,
                 terminalCommitBarrier: AgentRunTerminalCommitBarrier()
@@ -347,7 +347,7 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
             session.selectedAgent = .codexExec
             let noteID = try installVerifiedParkedNote(fixture)
             session.selfCompactState.active?.phase = .dispatchingNote
-            let harness = AgentSessionLinkRunnerHarness(headlessProviderFactory: { _, _ in AgentSessionLinkCapturingHeadlessProvider() })
+            let harness = AgentSessionLinkRunnerHarness(headlessProviderFactory: { _, _, _, _, _ in AgentSessionLinkCapturingHeadlessProvider() })
             let fence = AgentRunStartStopFence(session: session)
             if exit == "entryStop" { session.stopState.invalidateScheduledStarts() }
             var mcpCalls = 0
@@ -4935,7 +4935,7 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
             "ACP_HOLD_METHOD": holdMethod, "ACP_RESPONSE_GATE": gate.path, "ACP_FAIL_LOAD": failLoad ? "1" : ""
         ])
         let harness = AgentSessionLinkRunnerHarness(
-            headlessProviderFactory: { _, _ in AgentSessionLinkCapturingHeadlessProvider() },
+            headlessProviderFactory: { _, _, _, _, _ in AgentSessionLinkCapturingHeadlessProvider() },
             acpProviderFactory: { _, _ in
                 _ = await factoryGate?.requirement()
                 return provider
@@ -5014,7 +5014,7 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
                 if fenceProviderLaunch { XCTFail("This fixture must not initialize a Claude provider") }
                 return nativeController
             },
-            headlessProviderFactory: { _, _ in AgentSessionLinkCapturingHeadlessProvider() },
+            headlessProviderFactory: { _, _, _, _, _ in AgentSessionLinkCapturingHeadlessProvider() },
             acpProviderFactory: { _, _ in
                 AgentSessionLinkCapturingACPProvider(providerID: .openCode, commandPath: "/usr/bin/false")
             },

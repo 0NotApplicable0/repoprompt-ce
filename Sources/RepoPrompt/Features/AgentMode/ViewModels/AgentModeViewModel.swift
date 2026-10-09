@@ -59,7 +59,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         _ taskLabelKind: AgentModelCatalog.TaskLabelKind?
     ) -> any CodexSessionControlling
     typealias CodexControllerFactoryWithComputerUse = CodexAgentModeCoordinator.CodexControllerFactory
-    typealias HeadlessProviderFactory = (_ agent: AgentProviderKind, _ modelString: String?) -> HeadlessAgentProvider
+    typealias HeadlessProviderFactory = (_ agent: AgentProviderKind, _ modelString: String?, _ workspacePath: String?, _ antigravityPermissionLevel: AntigravityAgentToolPreferences.PermissionLevel?, _ grokPermissionLevel: GrokAgentToolPreferences.PermissionLevel?) -> HeadlessAgentProvider
     typealias ACPProviderFactory = (_ agent: AgentProviderKind, _ modelString: String?) async throws -> (any ACPAgentProvider)?
     typealias ACPControllerFactory = (_ provider: any ACPAgentProvider, _ runRequest: ACPRunRequest) throws -> ACPAgentSessionController
     typealias ConnectionPolicyInstaller = (
@@ -332,7 +332,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                     )
                 }
                 session.selectedAgent = selectedAgent
-                if !isModelRawValid(selectedModelRaw, for: selectedAgent) {
+                if !selectedAgent.preservesSavedSelection, !isModelRawValid(selectedModelRaw, for: selectedAgent) {
                     selectedModelRaw = defaultModelRaw(for: selectedAgent)
                 }
                 codexCoordinator.normalizeCodexSelectionForSession(session, preservingExplicitEffort: false)
@@ -361,7 +361,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 syncRunInteractionUIState()
                 return
             }
-            if !isModelRawValid(selectedModelRaw, for: selectedAgent) {
+            if !selectedAgent.preservesSavedSelection, !isModelRawValid(selectedModelRaw, for: selectedAgent) {
                 isRestoringState = true
                 selectedModelRaw = defaultModelRaw(for: selectedAgent)
                 isRestoringState = false
@@ -816,8 +816,6 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     private var openCodeModelParameterObservationTarget: (tabID: UUID, key: OpenCodeACPModelParameterKey)?
     private var openCodeModelParameterObservationGeneration: UInt64 = 0
     private var cursorModelsSubscriptionTask: Task<Void, Never>?
-    private var grokBuildModelsSubscriptionTask: Task<Void, Never>?
-    private var antigravityModelsSubscriptionTask: Task<Void, Never>?
     private var skillCatalogDeltaObservationTask: Task<Void, Never>?
     private var skillCatalogRefreshDebounceTask: Task<Void, Never>?
     lazy var sessionIndexStore = AgentWorkspaceSessionIndexStore(perfRecorder: perfRecorder)
@@ -1267,6 +1265,20 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
 
         func test_installLiveSession(_ session: TabSession) {
             sessions[session.tabID] = session
+        }
+
+        func test_buildHeadlessAgentMessage(
+            session: TabSession,
+            initialMessageForRun: String,
+            runID: UUID = UUID(),
+            attachments: [AgentImageAttachment] = []
+        ) -> AgentMessage {
+            buildHeadlessAgentMessage(
+                session: session,
+                initialMessageForRun: initialMessageForRun,
+                runID: runID,
+                attachments: attachments
+            )
         }
 
         func test_installPersistentSessionBinding(
@@ -1997,8 +2009,6 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         codexCoordinator.updateCodexModelPolling()
         updateOpenCodeModelPolling()
         updateCursorModelPolling(startPolling: startCursorPolling)
-        updateGrokBuildModelPolling(startPolling: startCursorPolling)
-        updateAntigravityModelPolling(startPolling: startCursorPolling)
     }
 
     private func updateOpenCodeModelPolling() {
@@ -2190,63 +2200,6 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         cursorModelsSubscriptionTask = nil
     }
 
-    private func updateGrokBuildModelPolling(startPolling: Bool = true) {
-        guard selectedAgent == .grokBuild else {
-            stopGrokBuildModelsSubscription()
-            return
-        }
-        guard startPolling,
-              AgentModelCatalog.isAgentAvailable(.grokBuild, availability: agentAvailabilityContext)
-        else {
-            return
-        }
-        startGrokBuildModelsSubscriptionIfNeeded()
-    }
-
-    private func startGrokBuildModelsSubscriptionIfNeeded() {
-        guard grokBuildModelsSubscriptionTask == nil else { return }
-        let workspacePath = workspacePathProvider()
-        grokBuildModelsSubscriptionTask = Task { [weak self, workspacePath] in
-            let stream = await GrokBuildACPModelPollingService.shared.subscribe(workspacePath: workspacePath)
-            for await _ in stream {
-                guard !Task.isCancelled else { return }
-                await MainActor.run { [weak self] in
-                    guard let self else { return }
-                    acpDynamicModelRevision &+= 1
-                    syncSelectedACPModelFromRegistryIfNeeded(for: .grokBuild)
-                    syncComposerUIState()
-                }
-            }
-        }
-    }
-
-    private func stopGrokBuildModelsSubscription() {
-        grokBuildModelsSubscriptionTask?.cancel()
-        grokBuildModelsSubscriptionTask = nil
-    }
-
-    private func updateAntigravityModelPolling(startPolling: Bool = true) {
-        guard selectedAgent == .antigravity else { antigravityModelsSubscriptionTask?.cancel()
-            antigravityModelsSubscriptionTask = nil
-            return
-        }
-        guard startPolling, AgentModelCatalog.isAgentAvailable(.antigravity, availability: agentAvailabilityContext) else { return }
-        guard antigravityModelsSubscriptionTask == nil else { return }
-        let workspacePath = workspacePathProvider()
-        antigravityModelsSubscriptionTask = Task { [weak self, workspacePath] in
-            let stream = await AntigravityACPModelPollingService.shared.subscribe(workspacePath: workspacePath)
-            for await _ in stream {
-                guard !Task.isCancelled else { return }
-                await MainActor.run { [weak self] in
-                    guard let self else { return }
-                    acpDynamicModelRevision &+= 1
-                    syncSelectedACPModelFromRegistryIfNeeded(for: .antigravity)
-                    syncComposerUIState()
-                }
-            }
-        }
-    }
-
     private func syncSelectedACPModelFromRegistryIfNeeded(for agent: AgentProviderKind) {
         guard Self.shouldAdoptDiscoveredPreferredModel(for: agent) else { return }
         guard selectedAgent == agent,
@@ -2295,13 +2248,22 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
 
     private nonisolated static func defaultHeadlessProviderFactory(
         agent: AgentProviderKind,
-        modelString: String?
+        modelString: String?,
+        workspacePath: String?,
+        antigravityPermissionLevel: AntigravityAgentToolPreferences.PermissionLevel?,
+        grokPermissionLevel: GrokAgentToolPreferences.PermissionLevel?
     ) -> HeadlessAgentProvider {
         assert(agent != .codexExec, "Codex native runs must not use headless provider factory.")
-        return AgentRuntimeProviderService.shared.makeProvider(for: agent, modelString: modelString)
+        return AgentRuntimeProviderService.shared.makeProvider(
+            for: agent,
+            modelString: modelString,
+            workspacePath: workspacePath,
+            antigravityPermissionLevel: antigravityPermissionLevel,
+            grokPermissionLevel: grokPermissionLevel
+        )
     }
 
-    private nonisolated static func defaultConnectionPolicyInstaller(
+    nonisolated static func defaultConnectionPolicyInstaller(
         clientName: String,
         windowID: Int,
         restrictedTools: Set<String>,
@@ -2329,7 +2291,11 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             purpose: purpose,
             taskLabelKind: taskLabelKind,
             allowsAgentExternalControlTools: allowsAgentExternalControlTools,
-            requiresExpectedAgentPID: requiresExpectedAgentPID
+            requiresExpectedAgentPID: requiresExpectedAgentPID,
+            prunesOnlyAfterSettlement: MCPPolicySettlement.prunesOnlyAfterSettlement(
+                clientName: clientName,
+                purpose: purpose
+            )
         )
     }
 
@@ -2644,8 +2610,14 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             codexControllerFactory: @escaping CodexControllerFactory,
             codexControllerFactoryWithComputerUse: CodexControllerFactoryWithComputerUse? = nil,
             claudeControllerFactory: ClaudeAgentModeCoordinator.ClaudeControllerFactory? = nil,
-            headlessProviderFactory: @escaping HeadlessProviderFactory = { agent, modelString in
-                AgentModeViewModel.defaultHeadlessProviderFactory(agent: agent, modelString: modelString)
+            headlessProviderFactory: @escaping HeadlessProviderFactory = { agent, modelString, workspacePath, antigravityPermissionLevel, grokPermissionLevel in
+                AgentModeViewModel.defaultHeadlessProviderFactory(
+                    agent: agent,
+                    modelString: modelString,
+                    workspacePath: workspacePath,
+                    antigravityPermissionLevel: antigravityPermissionLevel,
+                    grokPermissionLevel: grokPermissionLevel
+                )
             },
             acpProviderFactory: @escaping ACPProviderFactory = { agent, modelString in
                 try await ACPAgentProviderFactory.makeProvider(for: agent, modelString: modelString)
@@ -3695,6 +3667,32 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                     return
                 }
                 onTabChanged(notification.userInfo?["tabID"] as? UUID)
+            }
+            .store(in: &cancellables)
+
+        // Refresh the model picker when the Antigravity (`agy`) live model list changes.
+        // Mirrors the Codex/ACP live-model refresh: bump the dynamic-model revision so the
+        // picker re-reads `AgentModelCatalog.options(for: .antigravity)` (which sources labels
+        // from `AntigravityModelRegistry`), then resync the composer UI.
+        NotificationCenter.default.publisher(for: .antigravityModelsChanged)
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in
+                guard let self else { return }
+                acpDynamicModelRevision &+= 1
+                syncComposerUIState()
+            }
+            .store(in: &cancellables)
+
+        // Refresh the model picker when the Grok (`grok`) live model list changes.
+        // Mirrors the Codex/ACP live-model refresh: bump the dynamic-model revision so the
+        // picker re-reads `AgentModelCatalog.options(for: .grok)` (which sources labels
+        // from `GrokModelRegistry`), then resync the composer UI.
+        NotificationCenter.default.publisher(for: .grokModelsChanged)
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in
+                guard let self else { return }
+                acpDynamicModelRevision &+= 1
+                syncComposerUIState()
             }
             .store(in: &cancellables)
 
@@ -6076,7 +6074,10 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         } else {
             session.selectedModelRaw = payload.normalizedSelection.modelRaw
         }
-        if !AgentModelCatalog.isValid(
+        let preservesSavedModel = session.selectedAgent == .antigravity
+            || session.selectedAgent == .grok
+            || session.selectedAgent == .grokBuild
+        if !preservesSavedModel, !AgentModelCatalog.isValid(
             rawModel: session.selectedModelRaw,
             for: session.selectedAgent,
             availability: agentAvailabilityContext,
@@ -6128,7 +6129,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                     modelContextWindow: session.codexContextUsage?.modelContextWindow
                 )
             }
-        case .codexExec, .openCode, .cursor, .grokBuild, .antigravity, .devin:
+        case .codexExec, .openCode, .cursor, .antigravity, .grok, .grokBuild, .devin:
             break
         }
         session.contextUsageSnapshot = ContextUsageSnapshot.fromAgentContextUsage(
@@ -18687,12 +18688,12 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     ) -> String {
         guard !attachments.isEmpty else { return text }
         switch agent {
-        case .claudeCode, .claudeCodeGLM, .kimiCode, .customClaudeCompatible, .openCode, .cursor, .antigravity:
+        case .claudeCode, .claudeCodeGLM, .kimiCode, .customClaudeCompatible, .openCode, .cursor:
             return renderAtPathAttachmentMessage(text: text, attachments: attachments)
         case .codexExec, .grokBuild, .devin:
-            // These transports deliver pixels natively but no file path, so the agent could not
-            // otherwise name the image in ask_oracle `images`.
             return renderAttachmentPathNote(text: text, attachments: attachments)
+        case .antigravity, .grok:
+            return text
         }
     }
 
@@ -19584,7 +19585,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             // Resumable providers handle conversation continuity natively.
             // Also keep attachment references at top-level (not wrapped) for image turns.
             fullMessage = initialMessageForRun
-            resumeSessionID = session.providerSessionID
+            resumeSessionID = supportsSessionResume ? session.providerSessionID : nil
         } else {
             // Non-resumable agents: include conversation history in prompt.
             //

@@ -1653,8 +1653,10 @@ extension AgentProviderKind {
         switch self {
         case .codexExec: "terminal"
         case .claudeCode, .claudeCodeGLM, .kimiCode, .customClaudeCompatible: "cpu"
-        case .openCode, .antigravity: "curlybraces.square"
+        case .openCode: "curlybraces.square"
         case .cursor: "cursorarrow"
+        case .antigravity: "sparkles"
+        case .grok: "bolt"
         case .grokBuild: "bolt.circle.fill"
         case .devin: "terminal.fill"
         }

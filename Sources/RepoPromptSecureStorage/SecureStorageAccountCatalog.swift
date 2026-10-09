@@ -35,8 +35,9 @@ package enum SecureStorageAccount: CaseIterable, Hashable, Identifiable {
     case agentPermissionClaudeDocument
     case agentPermissionOpenCodeDocument
     case agentPermissionCursorDocument
-    case agentPermissionGrokBuildDocument
     case agentPermissionAntigravityDocument
+    case agentPermissionGrokDocument
+    case agentPermissionGrokBuildDocument
     case agentPermissionDevinDocument
 
     package var identifier: String {
@@ -104,16 +105,21 @@ package enum SecureStorageAccount: CaseIterable, Hashable, Identifiable {
                 40, 42, 116, 59, 61, 63, 52, 46, 116, 42, 63, 40, 55, 51, 41, 41,
                 51, 53, 52, 41, 116, 57, 47, 40, 41, 53, 40, 116, 44, 107
             ])
-        case .agentPermissionGrokBuildDocument:
-            Self.decode([
-                40, 42, 116, 59, 61, 63, 52, 46, 116, 42, 63, 40, 55, 51, 41, 41,
-                51, 53, 52, 41, 116, 61, 40, 53, 49, 24, 47, 51, 54, 62, 116, 44, 107
-            ])
         case .agentPermissionAntigravityDocument:
             Self.decode([
                 40, 42, 116, 59, 61, 63, 52, 46, 116, 42, 63, 40, 55, 51, 41, 41,
                 51, 53, 52, 41, 116, 59, 52, 46, 51, 61, 40, 59, 44, 51, 46, 35,
                 116, 44, 107
+            ])
+        case .agentPermissionGrokDocument:
+            Self.decode([
+                40, 42, 116, 59, 61, 63, 52, 46, 116, 42, 63, 40, 55, 51, 41, 41,
+                51, 53, 52, 41, 116, 61, 40, 53, 49, 116, 44, 107
+            ])
+        case .agentPermissionGrokBuildDocument:
+            Self.decode([
+                40, 42, 116, 59, 61, 63, 52, 46, 116, 42, 63, 40, 55, 51, 41, 41,
+                51, 53, 52, 41, 116, 61, 40, 53, 49, 24, 47, 51, 54, 62, 116, 44, 107
             ])
         case .agentPermissionDevinDocument:
             Self.decode([
@@ -153,8 +159,9 @@ package enum SecureStorageAccount: CaseIterable, Hashable, Identifiable {
         case .agentPermissionClaudeDocument: "Claude permissions"
         case .agentPermissionOpenCodeDocument: "OpenCode permissions"
         case .agentPermissionCursorDocument: "Cursor permissions"
+        case .agentPermissionAntigravityDocument: "Antigravity permissions"
+        case .agentPermissionGrokDocument: "Grok permissions"
         case .agentPermissionGrokBuildDocument: "Grok Build permissions"
-        case .agentPermissionAntigravityDocument: "Google Antigravity permissions"
         case .agentPermissionDevinDocument: "Devin permissions"
         }
     }
@@ -227,8 +234,9 @@ enum SecureStorageAccountCatalog {
         .agentPermissionClaudeDocument,
         .agentPermissionOpenCodeDocument,
         .agentPermissionCursorDocument,
-        .agentPermissionGrokBuildDocument,
         .agentPermissionAntigravityDocument,
+        .agentPermissionGrokDocument,
+        .agentPermissionGrokBuildDocument,
         .agentPermissionDevinDocument
     ]
 
