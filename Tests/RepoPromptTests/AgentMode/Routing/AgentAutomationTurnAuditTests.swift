@@ -522,6 +522,10 @@ final class AgentTaskRoutingDecisionLogTests: XCTestCase {
         defer { viewModel.freshTaskRoutingByTabID.removeAll() }
 
         let completed = LockedCounter()
+        // Holds the first physical write so the conflict path returns before it.
+        storage.beforeActiveFileSize = {
+            try? await AsyncTestWait.waitUntil("hold append until conflict completes", timeout: 10) { completed.value > 0 }
+        }
         let submission = Task { @MainActor in
             let result = await viewModel.submitUserTurnAfterFreshTaskRouting(
                 text: text, claim: claim, session: session, destinationTabID: tabID
@@ -529,14 +533,12 @@ final class AgentTaskRoutingDecisionLogTests: XCTestCase {
             completed.increment()
             return result
         }
-        try await AsyncTestWait.waitUntil("cancelled decision append or early completion", timeout: 10) {
-            storage.appendStarted || completed.value > 0
-        }
-        let completedBeforeRelease = completed.value
-        storage.release()
+        try await AsyncTestWait.waitUntil("conflict submission returns", timeout: 10) { completed.value > 0 }
         let result = await submission.value
-        XCTAssertEqual(completedBeforeRelease, 0, "Conflict completion waits for the cancelled route to settle")
         XCTAssertEqual(result, .blocked(message: "Model routing is already in progress for this task."))
+        let held = await log.snapshot()
+        XCTAssertGreaterThan(held.admittedBytes, 0, "Cancelled decision is admitted before the conflict path returns")
+        storage.release()
 
         let requestID = claim.attempt.id.uuidString
         try await AsyncTestWait.waitUntil("rejected applied row", timeout: 10) {
@@ -1428,6 +1430,20 @@ private final class ReleasableAppendStorage: AgentTaskRoutingDecisionLogStorage,
     private var started = false
     private var waiters: [CheckedContinuation<Void, Never>] = []
     private var stored = Data()
+    private var activeFileSizeHook: (@Sendable () async -> Void)?
+
+    var beforeActiveFileSize: (@Sendable () async -> Void)? {
+        get {
+            lock.lock()
+            defer { lock.unlock() }
+            return activeFileSizeHook
+        }
+        set {
+            lock.lock()
+            activeFileSizeHook = newValue
+            lock.unlock()
+        }
+    }
 
     var appendStarted: Bool {
         lock.lock()
@@ -1457,7 +1473,9 @@ private final class ReleasableAppendStorage: AgentTaskRoutingDecisionLogStorage,
     }
 
     func activeFileSize() async throws -> Int {
-        contents().count
+        let hook = beforeActiveFileSize
+        await hook?()
+        return contents().count
     }
 
     func append(_ data: Data) async throws {

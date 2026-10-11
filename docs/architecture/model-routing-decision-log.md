@@ -26,6 +26,7 @@ Writes are serialized through one actor. A 1 MiB budget counts queued plus in-fl
 backpressure, not a cap: when the budget is full, callers wait in FIFO order, and a waiter's bytes are
 reserved and queued before the waiter resumes, so a later small row cannot overtake an older large one.
 A cancelled route still waits and its row is still written once.
+A caller waits only until its decision row is admitted to the queue, which fixes its order, while the physical append and the route's applied row follow asynchronously.
 
 If a physical open, append or rotate fails, only that row is discarded, a drop counter is incremented
 and one `os_log` error is written. Routing and run start never fail, block or change because of the log.
