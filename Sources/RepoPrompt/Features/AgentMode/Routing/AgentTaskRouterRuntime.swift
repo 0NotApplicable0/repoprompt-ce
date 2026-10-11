@@ -7,18 +7,27 @@ import RepoPromptSettingsCore
 final class AgentTaskRouterRuntime: ObservableObject {
     let registry: AgentTaskRouterRegistry
     let coordinator: AgentFreshTaskRoutingCoordinator
+    /// The single production decision-log instance for this composition.
+    let decisionLog: AgentTaskRoutingDecisionLog
     let objectWillChange = ObservableObjectPublisher()
     @MainActor var usageBalancer: AgentUsageBalancer?
+    /// Builds the candidate builder used for one routing decision. The default is the production
+    /// builder; a caller may inject `modelOptions` through it.
+    @MainActor var candidateBuilderFactory: @MainActor () -> AgentTaskRoutingCandidateBuilder = {
+        AgentTaskRoutingCandidateBuilder()
+    }
 
     private let readinessLock = NSLock()
     private var readinessByBackendID: [AgentTaskRouterBackendID: AgentTaskRouterBackendReadiness] = [:]
 
     init(
         registrations: [AgentTaskRouterBackendRegistration],
-        bootstrapBackendID: AgentTaskRouterBackendID? = nil
+        bootstrapBackendID: AgentTaskRouterBackendID? = nil,
+        decisionLog: AgentTaskRoutingDecisionLog = AgentTaskRoutingDecisionLog()
     ) throws {
         let registry = try AgentTaskRouterRegistry(registrations: registrations)
         self.registry = registry
+        self.decisionLog = decisionLog
         coordinator = AgentFreshTaskRoutingCoordinator(registry: registry)
         start(bootstrapBackendID: bootstrapBackendID)
     }
@@ -26,7 +35,8 @@ final class AgentTaskRouterRuntime: ObservableObject {
     @MainActor
     convenience init(
         secureKeys: SecureKeysService = SecureKeysService(),
-        jevClient: any JevRoutingClientProtocol = JevRoutingClient()
+        jevClient: any JevRoutingClientProtocol = JevRoutingClient(),
+        decisionLog: AgentTaskRoutingDecisionLog = AgentTaskRoutingDecisionLog()
     ) {
         let credentials = JevRouterCredentialService(secureKeys: secureKeys, client: jevClient)
         let configuration = GlobalSettingsStore.shared.modelRouterConfiguration()
@@ -39,7 +49,8 @@ final class AgentTaskRouterRuntime: ObservableObject {
                     )
                 ],
                 bootstrapBackendID: GlobalSettingsStore.shared.autoEffortEnabled() ? .jev
-                    : (configuration.enabled ? configuration.selectedBackendID : nil)
+                    : (configuration.enabled ? configuration.selectedBackendID : nil),
+                decisionLog: decisionLog
             )
         } catch {
             preconditionFailure("Invalid bundled model-router registry: \(error)")
@@ -56,21 +67,36 @@ final class AgentTaskRouterRuntime: ObservableObject {
         return readinessByBackendID[id]
     }
 
+    /// Traced sibling of `coordinator.route` for the view-model owner; same outcome plus the log trace.
+    func routeTraced(
+        backendID: AgentTaskRouterBackendID,
+        request: AgentTaskRoutingRequest
+    ) async -> AgentTaskRoutingTracedOutcome {
+        await coordinator.routeTraced(backendID: backendID, request: request)
+    }
+
     func chooseAutoEffort(
         maskedTaskExcerpt: String,
         selectedModelID: String,
         builtInWorkflow: AgentWorkflow?,
-        efforts: [String]
+        efforts: [String],
+        logScope: AgentTaskRoutingLogScope = .primarySession
     ) async -> String? {
         guard isBackendReady(.jev),
               let backend = await registry.registration(for: .jev)?.backend as? JevTaskRouterBackend
         else { return nil }
-        return await backend.chooseAutoEffort(
-            maskedTaskExcerpt: maskedTaskExcerpt,
-            selectedModelID: selectedModelID,
-            builtInWorkflow: builtInWorkflow,
-            efforts: efforts
-        )
+        // The judge writes its own decision row through the route context in scope; a follow-up turn
+        // with no routed start in scope gets a decision-only context.
+        let context = AgentTaskRoutingRouteScope.live?.context
+            ?? AgentTaskRoutingRouteContext(requestID: UUID(), scope: logScope, log: decisionLog)
+        return await AgentTaskRoutingJudgeLogging.$current.withValue(context) {
+            await backend.chooseAutoEffort(
+                maskedTaskExcerpt: maskedTaskExcerpt,
+                selectedModelID: selectedModelID,
+                builtInWorkflow: builtInWorkflow,
+                efforts: efforts
+            )
+        }
     }
 
     func cancelAll() {

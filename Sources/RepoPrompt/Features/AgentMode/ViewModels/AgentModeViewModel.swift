@@ -17872,7 +17872,11 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             // the steer is withdrawn rather than becoming a new turn outside the durable idle path.
             let managedSteerRunID = session.runID
             let managedSteerAttemptID = session.activeRunAttemptID
+            // Decision-log start hook: arm synchronously, before the Task exists (steer/queue paths never arm).
+            let routeStartArm = AgentTaskRoutingStartSink.armCurrent()
+            let routeStartRecorder = routeStartArm.map { _ in AgentRunStartOutcomeRecorder() }
             Task {
+                defer { routeStartArm?.settleRejected() }
                 var handedOffToSerialDispatch = false
                 defer {
                     if !handedOffToSerialDispatch {
@@ -17919,11 +17923,20 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                         taggedFileAttachments: taggedFilesToSend,
                         codexFallbackContext: fallbackContext,
                         autoEffortSelection: autoEffortSelection,
-                        directStartOptions: AgentDirectRunStartOptions(stopFence: producerStopFence)
+                        directStartOptions: AgentDirectRunStartOptions(stopFence: producerStopFence),
+                        startOutcome: routeStartRecorder
                     )
                 } else {
                     .preDispatchRejected(
                         message: "Codex did not send because the tab session changed before provider dispatch."
+                    )
+                }
+                if let routeStartArm, let routeStartRecorder {
+                    if let sendOutcome { routeStartRecorder.record(codexOutcome: sendOutcome) }
+                    routeStartArm.complete(
+                        recorder: routeStartRecorder,
+                        actual: self.executableTarget(for: session),
+                        sessionID: session.activeAgentSessionID
                     )
                 }
                 if sendOutcome?.didSend != true {
@@ -18014,7 +18027,10 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         if session.runState == .waitingForUser {
             if session.selectedAgent.usesClaudeNativeRuntime, !attachmentsToSend.isEmpty {
                 let producerStopFence = stopFence ?? AgentRunStartStopFence(session: session)
+                let routeStartArm = AgentTaskRoutingStartSink.armCurrent()
+                let routeStartRecorder = routeStartArm.map { _ in AgentRunStartOutcomeRecorder() }
                 Task { [weak self, weak session] in
+                    defer { routeStartArm?.settleRejected() }
                     guard let self, let session else { return }
                     #if DEBUG
                         defer { test_claudeAttachmentRestartFinished?() }
@@ -18060,8 +18076,16 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                         attachments: attachmentsToSend,
                         taggedFileAttachments: taggedFilesToSend,
                         autoEffortSelection: autoEffortSelection,
-                        directStartOptions: AgentDirectRunStartOptions(stopFence: resumedFence)
+                        directStartOptions: AgentDirectRunStartOptions(stopFence: resumedFence),
+                        startOutcome: routeStartRecorder
                     )
+                    if let routeStartArm, let routeStartRecorder {
+                        routeStartArm.complete(
+                            recorder: routeStartRecorder,
+                            actual: executableTarget(for: session),
+                            sessionID: session.activeAgentSessionID
+                        )
+                    }
                 }
                 return UserTurnSubmissionResult.submitted
             }
@@ -18105,15 +18129,26 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         // If agent is not running, start it
         if !session.runState.isActive {
             let producerStopFence = stopFence ?? AgentRunStartStopFence(session: session)
+            let routeStartArm = AgentTaskRoutingStartSink.armCurrent()
+            let routeStartRecorder = routeStartArm.map { _ in AgentRunStartOutcomeRecorder() }
             Task {
+                defer { routeStartArm?.settleRejected() }
                 await startAgentRun(
                     tabID: tabID,
                     initialMessage: wrappedText,
                     attachments: attachmentsToSend,
                     taggedFileAttachments: taggedFilesToSend,
                     autoEffortSelection: autoEffortSelection,
-                    directStartOptions: AgentDirectRunStartOptions(stopFence: producerStopFence)
+                    directStartOptions: AgentDirectRunStartOptions(stopFence: producerStopFence),
+                    startOutcome: routeStartRecorder
                 )
+                if let routeStartArm, let routeStartRecorder {
+                    routeStartArm.complete(
+                        recorder: routeStartRecorder,
+                        actual: executableTarget(for: session),
+                        sessionID: session.activeAgentSessionID
+                    )
+                }
             }
         } else if let route = activeProviderSteeringRoute(for: session, attachments: attachmentsToSend) {
             submitActiveProviderSteering(

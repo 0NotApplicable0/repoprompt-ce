@@ -343,6 +343,24 @@ struct AgentExploreMCPToolService {
         message: String,
         context: ExploreStartContext
     ) async throws -> AgentExternalMCPRunStarter.StartOutcome {
+        let routeLogContext = context.agentModeVM.makeRouteLogContext(scope: .headless)
+        do {
+            return try await startExploreRunBody(
+                target: target, message: message, context: context, routeLogContext: routeLogContext
+            )
+        } catch {
+            await routeLogContext?.finish(.rejected)
+            throw error
+        }
+    }
+
+    private func startExploreRunBody(
+        target: AgentModeViewModel.MCPSessionTarget,
+        message: String,
+        context: ExploreStartContext,
+        routeLogContext: AgentTaskRoutingRouteContext?
+    ) async throws -> AgentExternalMCPRunStarter.StartOutcome {
+        await routeLogContext?.attachSessionID(target.sessionID)
         try await AgentRunMCPToolService.requireWritableWorkspaceAuthority(
             context.targetWindow.workspaceManager.domainAuthorityAdmissionIssue(
                 for: context.expectedWorkspaceID
@@ -362,7 +380,8 @@ struct AgentExploreMCPToolService {
                 baseline: context.selection.agentRaw.flatMap { agent in
                     context.selection.modelRaw.map { .init(agentRaw: agent, modelRaw: $0, reasoningEffortRaw: nil, modelParameters: context.selection.modelParameterSelections) }
                 },
-                allowUsageBalance: context.selection.usageBalancingEligible
+                allowUsageBalance: context.selection.usageBalancingEligible,
+                logContext: routeLogContext
             ) {
                 selection = AgentMCPSelectionResolver.ResolvedSelection(
                     agentRaw: routed.agentRaw,
@@ -395,20 +414,29 @@ struct AgentExploreMCPToolService {
             modelRaw: selection.modelRaw,
             selections: selection.modelParameterSelections
         )
-        let outcome = try await startRun(
-            target,
-            message,
-            context.metadata,
-            context.agentModeVM,
-            selection.agentRaw,
-            selection.modelRaw,
-            routedReasoningEffortRaw,
-            .explore,
-            nil,
-            nil,
-            nil,
-            routerSelectedTarget
-        )
+        func performStart() async throws -> AgentExternalMCPRunStarter.StartOutcome {
+            try await startRun(
+                target,
+                message,
+                context.metadata,
+                context.agentModeVM,
+                selection.agentRaw,
+                selection.modelRaw,
+                routedReasoningEffortRaw,
+                .explore,
+                nil,
+                nil,
+                nil,
+                routerSelectedTarget
+            )
+        }
+        let outcome: AgentExternalMCPRunStarter.StartOutcome = if let routeLogContext {
+            try await routeLogContext.runStartScope(unarmedOnReturn: { _ in .notStarted }) {
+                try await performStart()
+            }
+        } else {
+            try await performStart()
+        }
         context.agentModeVM.mcpAcceptSessionTarget(target)
         return outcome
     }

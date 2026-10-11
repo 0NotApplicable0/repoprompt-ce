@@ -23,13 +23,90 @@ struct JevAutoEffortJudge {
             state: "SELECTED_MODEL_ID:\n\(selectedModelID)\(workflowCategory)\n\nMASKED_CURRENT_USER_TURN_EXCERPT:\n\(maskedTaskExcerpt)",
             questions: batch.wireQuestions()
         )
+        let logContext = AgentTaskRoutingJudgeLogging.current
+        let start = ContinuousClock.now
+        func latencyMs() -> Double {
+            let elapsed = start.duration(to: ContinuousClock.now)
+            return Double(elapsed.components.seconds) * 1000 + Double(elapsed.components.attoseconds) / 1e15
+        }
         do {
             let response = try await credentials.judgeForRouting(request)
             let validated = try JevRoutingResponseInterpreter().validate(response, batch: batch)
-            return validated.answer(forQuestionID: Self.questionID)?.selectedOpaqueKey
+            guard let answer = validated.answer(forQuestionID: Self.questionID) else {
+                await logContext?.emitDecision(
+                    logDraft(outcome: .failed, efforts: efforts, selectedModelID: selectedModelID, failure: "invalidResponse", latencyMs: latencyMs())
+                )
+                return nil
+            }
+            var draft = logDraft(outcome: .selected, efforts: efforts, selectedModelID: selectedModelID, latencyMs: latencyMs())
+            draft.jevModel = JevRouterCredentialService.pinnedModel
+            draft.policyVersion = Self.policyVersion
+            draft.chosenKey = answer.selectedOpaqueKey
+            draft.chosenTarget = AgentTaskRoutingLogTarget(
+                provider: nil, model: selectedModelID, effort: answer.selectedOpaqueKey
+            )
+            draft.probabilities = answer.probabilities
+            draft.confidence = answer.confidence
+            draft.inputTokens = validated.inputTokens
+            draft.outputTokens = validated.outputTokens
+            draft.reasonCode = "unique_argmax"
+            await logContext?.emitDecision(draft)
+            return answer.selectedOpaqueKey
         } catch {
             // Auto effort is optional. A failed judgment keeps the user's manual effort.
+            let category = Self.failureCategory(error)
+            await logContext?.emitDecision(
+                logDraft(
+                    outcome: category == nil ? .cancelled : .failed,
+                    efforts: efforts,
+                    selectedModelID: selectedModelID,
+                    failure: category,
+                    latencyMs: latencyMs()
+                )
+            )
             return nil
+        }
+    }
+
+    private func logDraft(
+        outcome: AgentTaskRoutingLogOutcome,
+        efforts: [String],
+        selectedModelID: String,
+        failure: String? = nil,
+        latencyMs: Double
+    ) -> AgentTaskRoutingDecisionDraft {
+        var draft = AgentTaskRoutingDecisionDraft(stage: .autoEffort, outcome: outcome)
+        draft.backend = AgentTaskRouterBackendID.jev.rawValue
+        draft.candidates = efforts.map {
+            AgentTaskRoutingLogCandidate(
+                key: $0,
+                target: AgentTaskRoutingLogTarget(provider: nil, model: selectedModelID, effort: $0)
+            )
+        }
+        draft.failure = failure
+        draft.latencyMs = latencyMs
+        return draft
+    }
+
+    /// Nil means cancellation, not a failure.
+    private static func failureCategory(_ error: Error) -> String? {
+        switch error {
+        case is CancellationError:
+            nil
+        case is JevRoutingResponseInterpreter.ValidationError:
+            AgentTaskRoutingBackendFailureCategory.invalidResponse.rawValue
+        case let client as JevRoutingClientError:
+            switch client {
+            case .authentication: AgentTaskRoutingBackendFailureCategory.authentication.rawValue
+            case .invalidRequest: AgentTaskRoutingBackendFailureCategory.invalidRequest.rawValue
+            case .rateLimited: AgentTaskRoutingBackendFailureCategory.rateLimited.rawValue
+            case .overloaded: AgentTaskRoutingBackendFailureCategory.overloaded.rawValue
+            case .timeout: AgentTaskRoutingBackendFailureCategory.timeout.rawValue
+            case .invalidResponse, .decoding: AgentTaskRoutingBackendFailureCategory.invalidResponse.rawValue
+            case .service: AgentTaskRoutingBackendFailureCategory.transport.rawValue
+            }
+        default:
+            AgentTaskRoutingBackendFailureCategory.transport.rawValue
         }
     }
 

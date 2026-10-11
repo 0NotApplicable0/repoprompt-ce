@@ -5,7 +5,31 @@ actor AgentFreshTaskRoutingCoordinator {
         let ownershipID: UUID
         let backendID: AgentTaskRouterBackendID
         var task: Task<Void, Never>?
-        var continuation: CheckedContinuation<AgentTaskRoutingBackendOutcome, Never>?
+        var continuation: CheckedContinuation<AgentTaskRoutingTracedOutcome, Never>?
+    }
+
+    private static func traced(
+        _ outcome: AgentTaskRoutingBackendOutcome,
+        backendID: AgentTaskRouterBackendID,
+        latencyMs: Double? = nil
+    ) -> AgentTaskRoutingTracedOutcome {
+        let evidence: AgentTaskRoutingDecisionEvidence? = switch outcome {
+        case let .selected(_, answerEvidence),
+             let .abstained(_, answerEvidence),
+             let .failed(_, _, answerEvidence):
+            answerEvidence
+        case .cancelled:
+            nil
+        }
+        return AgentTaskRoutingTracedOutcome(
+            outcome: outcome,
+            trace: AgentTaskRoutingTrace(
+                backendID: backendID,
+                jevModel: backendID == .jev && evidence?.policyVersion == JevRouterCredentialService.routingPolicyVersion
+                    ? JevRouterCredentialService.pinnedModel : nil,
+                latencyMs: latencyMs
+            )
+        )
     }
 
     private let registry: AgentTaskRouterRegistry
@@ -19,8 +43,16 @@ actor AgentFreshTaskRoutingCoordinator {
         backendID: AgentTaskRouterBackendID,
         request: AgentTaskRoutingRequest
     ) async -> AgentTaskRoutingBackendOutcome {
+        await routeTraced(backendID: backendID, request: request).outcome
+    }
+
+    /// Same execution as `route`, returning the identical outcome plus the decision-log trace.
+    func routeTraced(
+        backendID: AgentTaskRouterBackendID,
+        request: AgentTaskRoutingRequest
+    ) async -> AgentTaskRoutingTracedOutcome {
         guard reservationsByRequestID[request.requestID] == nil else {
-            return .failed(category: .invalidRequest, retryable: false, evidence: nil)
+            return Self.traced(.failed(category: .invalidRequest, retryable: false, evidence: nil), backendID: backendID)
         }
         let ownershipID = UUID()
         reservationsByRequestID[request.requestID] = Reservation(
@@ -46,7 +78,7 @@ actor AgentFreshTaskRoutingCoordinator {
     func cancel(requestID: UUID) {
         guard let reservation = reservationsByRequestID.removeValue(forKey: requestID) else { return }
         reservation.task?.cancel()
-        reservation.continuation?.resume(returning: .cancelled)
+        reservation.continuation?.resume(returning: Self.traced(.cancelled, backendID: reservation.backendID))
     }
 
     func cancelAll() {
@@ -54,18 +86,18 @@ actor AgentFreshTaskRoutingCoordinator {
         reservationsByRequestID.removeAll()
         for reservation in reservations {
             reservation.task?.cancel()
-            reservation.continuation?.resume(returning: .cancelled)
+            reservation.continuation?.resume(returning: Self.traced(.cancelled, backendID: reservation.backendID))
         }
     }
 
     private func install(
-        continuation: CheckedContinuation<AgentTaskRoutingBackendOutcome, Never>,
+        continuation: CheckedContinuation<AgentTaskRoutingTracedOutcome, Never>,
         request: AgentTaskRoutingRequest,
         backendID: AgentTaskRouterBackendID,
         ownershipID: UUID
     ) {
         guard owns(requestID: request.requestID, ownershipID: ownershipID) else {
-            continuation.resume(returning: .cancelled)
+            continuation.resume(returning: Self.traced(.cancelled, backendID: backendID))
             return
         }
         reservationsByRequestID[request.requestID]?.continuation = continuation
@@ -92,6 +124,7 @@ actor AgentFreshTaskRoutingCoordinator {
             finish(.failed(category: .policyUnavailable, retryable: false, evidence: nil), requestID: request.requestID, ownershipID: ownershipID)
             return
         }
+        let routeStart = ContinuousClock.now
         let outcome = await registration.backend.route(request)
         guard owns(requestID: request.requestID, ownershipID: ownershipID), !Task.isCancelled else { return }
         let currentReadiness = await registration.backend.readinessSnapshot()
@@ -102,7 +135,15 @@ actor AgentFreshTaskRoutingCoordinator {
             finish(.failed(category: .policyUnavailable, retryable: false, evidence: nil), requestID: request.requestID, ownershipID: ownershipID)
             return
         }
-        finish(validate(outcome, request: request, policyVersion: policyVersion), requestID: request.requestID, ownershipID: ownershipID)
+        let elapsed = routeStart.duration(to: ContinuousClock.now)
+        let latencyMs = Double(elapsed.components.seconds) * 1000
+            + Double(elapsed.components.attoseconds) / 1e15
+        finish(
+            validate(outcome, request: request, policyVersion: policyVersion),
+            requestID: request.requestID,
+            ownershipID: ownershipID,
+            latencyMs: latencyMs
+        )
     }
 
     private func cancel(requestID: UUID, ownershipID: UUID) {
@@ -110,18 +151,21 @@ actor AgentFreshTaskRoutingCoordinator {
               let reservation = reservationsByRequestID.removeValue(forKey: requestID)
         else { return }
         reservation.task?.cancel()
-        reservation.continuation?.resume(returning: .cancelled)
+        reservation.continuation?.resume(returning: Self.traced(.cancelled, backendID: reservation.backendID))
     }
 
     private func finish(
         _ outcome: AgentTaskRoutingBackendOutcome,
         requestID: UUID,
-        ownershipID: UUID
+        ownershipID: UUID,
+        latencyMs: Double? = nil
     ) {
         guard owns(requestID: requestID, ownershipID: ownershipID),
               let reservation = reservationsByRequestID.removeValue(forKey: requestID)
         else { return }
-        reservation.continuation?.resume(returning: outcome)
+        reservation.continuation?.resume(
+            returning: Self.traced(outcome, backendID: reservation.backendID, latencyMs: latencyMs)
+        )
     }
 
     private func owns(requestID: UUID, ownershipID: UUID) -> Bool {

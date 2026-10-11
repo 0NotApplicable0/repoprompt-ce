@@ -146,6 +146,22 @@ enum AgentTaskRoutingBackendOutcome: Equatable {
     case cancelled
 }
 
+/// Route evidence that is not part of the wire outcome: which backend answered and how long it took.
+/// Used only by the decision log; it never changes routing selection or error semantics.
+struct AgentTaskRoutingTrace: Equatable {
+    let backendID: AgentTaskRouterBackendID
+    /// The pinned Jev evaluator model when the Jev backend answered.
+    let jevModel: String?
+    /// Monotonic milliseconds from just before the backend call through the validated terminal result.
+    /// Nil when no backend call was made (invalid request, unavailable policy, cancellation before start).
+    let latencyMs: Double?
+}
+
+struct AgentTaskRoutingTracedOutcome: Equatable {
+    let outcome: AgentTaskRoutingBackendOutcome
+    let trace: AgentTaskRoutingTrace
+}
+
 struct AgentTaskRouterConfiguration: Equatable {
     enum Validity: Equatable {
         case valid

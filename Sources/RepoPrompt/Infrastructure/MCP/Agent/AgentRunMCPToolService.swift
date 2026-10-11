@@ -443,6 +443,20 @@ struct AgentRunMCPToolService {
     }
 
     private func executeStart(args: [String: Value]) async throws -> Value {
+        // One outer catch finishes the route's application as rejected for every pre-provider exit.
+        let routeLogHolder = AgentTaskRoutingRouteContextHolder()
+        do {
+            return try await executeStartBody(args: args, routeLogHolder: routeLogHolder)
+        } catch {
+            await routeLogHolder.context?.finish(.rejected)
+            throw error
+        }
+    }
+
+    private func executeStartBody(
+        args: [String: Value],
+        routeLogHolder: AgentTaskRoutingRouteContextHolder
+    ) async throws -> Value {
         let message = try resolveMessage(args["message"], name: "message")
         let workflow = try resolveWorkflow(args: args)
         let worktreeStartRequest = try startWorktreeCoordinator.parseRequest(args: args)
@@ -553,12 +567,15 @@ struct AgentRunMCPToolService {
             guard let agent = value.agentRaw, let model = value.modelRaw else { return nil }
             return .init(agentRaw: agent, modelRaw: model, reasoningEffortRaw: nil, modelParameters: value.modelParameterSelections)
         }
+        let routeLogContext = shouldRouteStart ? agentModeVM.makeRouteLogContext(scope: .subagent) : nil
+        routeLogHolder.context = routeLogContext
         do {
             if shouldRouteStart, let routed = try await agentModeVM.routeSubagentTargetIfEnabled(
                 task: message,
                 surface: .general,
                 baseline: baselineTarget,
-                allowUsageBalance: resolvedTabID == nil && usageBaseline?.usageBalancingEligible == true
+                allowUsageBalance: resolvedTabID == nil && usageBaseline?.usageBalancingEligible == true,
+                logContext: routeLogContext
             ) {
                 selection = AgentMCPSelectionResolver.ResolvedSelection(
                     agentRaw: routed.agentRaw,
@@ -638,6 +655,7 @@ struct AgentRunMCPToolService {
             await agentModeVM.mcpDiscardSessionTarget(target)
             throw MCPError.internalError("agent_run.start target did not resolve a session ID.")
         }
+        await routeLogContext?.attachSessionID(targetSessionID)
         #if DEBUG
             if worktreeStartupBenchmarkToken != nil {
                 do {
@@ -907,20 +925,32 @@ struct AgentRunMCPToolService {
                 modelRaw: selection.modelRaw,
                 selections: modelParameterSelections
             )
-            outcome = try await startRun(
-                target,
-                message,
-                metadata,
-                agentModeVM,
-                selection.agentRaw,
-                selection.modelRaw,
-                routedReasoningEffortRaw,
-                selection.taskLabelKind,
-                workflow,
-                spawnParentSessionID,
-                oracleLaunchSource.source,
-                routerSelectedTarget
-            )
+            func performStart() async throws -> AgentExternalMCPRunStarter.StartOutcome {
+                try await startRun(
+                    target,
+                    message,
+                    metadata,
+                    agentModeVM,
+                    selection.agentRaw,
+                    selection.modelRaw,
+                    routedReasoningEffortRaw,
+                    selection.taskLabelKind,
+                    workflow,
+                    spawnParentSessionID,
+                    oracleLaunchSource.source,
+                    routerSelectedTarget
+                )
+            }
+            // The starter dispatches inline, so the route's start sink reaches the initial-dispatch hook.
+            if let routeLogContext {
+                outcome = try await routeLogContext.runStartScope(unarmedOnReturn: { _ in .notStarted }) {
+                    try await performStart()
+                }
+            } else {
+                outcome = try await performStart()
+            }
+            // The start scope owns the application from here; the outer catch covers pre-start exits only.
+            routeLogHolder.context = nil
             agentModeVM.mcpAcceptSessionTarget(target)
             agentModeVM.recordAgentSessionProviderLifecycle(
                 target: target,
