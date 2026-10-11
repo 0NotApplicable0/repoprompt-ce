@@ -1916,7 +1916,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     }
 
     var modelRouterAvailabilityContext: AgentModelCatalog.AvailabilityContext {
-        promptManager?.apiSettingsViewModel?.modelRouterAvailabilityContext ?? .current
+        promptManager?.apiSettingsViewModel?.modelRouterAvailabilityContext ?? AgentModelCatalog.AvailabilityContext(claudeCodeAvailable: true, codexAvailable: true)
     }
 
     var hasAvailableAgentProviders: Bool {

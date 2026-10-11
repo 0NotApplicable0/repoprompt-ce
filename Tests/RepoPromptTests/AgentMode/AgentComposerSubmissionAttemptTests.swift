@@ -406,6 +406,29 @@ extension AgentComposerSubmissionAttemptTests {
         XCTAssertTrue(requests.allSatisfy { $0.candidates.allSatisfy { !$0.targetDescription.isEmpty } })
     }
 
+    func testRoutingWithoutSettingsOwnerExcludesUnverifiedProviders() async throws {
+        let backend = ComposerRoutingBackend(outcome: .selectLast)
+        let (viewModel, _) = try await makeRoutingViewModel(backend: backend)
+
+        _ = try await viewModel.routeSubagentTargetIfEnabled(task: "Implement the parser and tests", surface: .general)
+
+        let requests = await backend.requests
+        let modelRequest = try XCTUnwrap(requests.first { $0.decisionStage == .model })
+        let descriptions = modelRequest.candidates.map(\.targetDescription)
+        for provider in [AgentProviderKind.cursor, .antigravity, .grok] {
+            XCTAssertFalse(
+                descriptions.contains { $0.hasPrefix("Provider: \(provider.displayName);") },
+                "Unverified provider \(provider.rawValue) must not be a routing candidate"
+            )
+        }
+        for provider in [AgentProviderKind.claudeCode, .codexExec] {
+            XCTAssertTrue(
+                descriptions.contains { $0.hasPrefix("Provider: \(provider.displayName);") },
+                "Verified provider \(provider.rawValue) must remain a routing candidate"
+            )
+        }
+    }
+
     func testRoutingFixtureWaitsForDelayedInitialReadiness() async throws {
         let readinessGate = TestReleaseFence(name: "composer initial readiness")
         let backend = StagedCancellationRoutingBackend(readinessGate: readinessGate)
