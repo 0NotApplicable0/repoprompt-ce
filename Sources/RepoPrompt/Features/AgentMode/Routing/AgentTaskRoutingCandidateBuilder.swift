@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptSettingsCore
 
 /// Builds router-owned model and effort choices from live provider catalogs.
 ///
@@ -58,15 +59,20 @@ struct AgentTaskRoutingCandidateBuilder {
     }
 
     let opaqueKey: () -> String
+    private let cursorThinking: @MainActor (String) -> ACPModelParameterDefinition?
     private let modelOptions: @MainActor (AgentProviderKind, AgentModelCatalog.AvailabilityContext) -> [AgentModelOption]
 
     init(
         opaqueKey: @escaping () -> String = { UUID().uuidString.lowercased() },
+        cursorThinking: @escaping @MainActor (String) -> ACPModelParameterDefinition? = {
+            ACPModelParameterResolver.parameterSet(providerID: .cursor, selectedModelRaw: $0)?.definition(kind: .thinking)
+        },
         modelOptions: @escaping @MainActor (AgentProviderKind, AgentModelCatalog.AvailabilityContext) -> [AgentModelOption] = {
             AgentModelCatalog.options(for: $0, availability: $1)
         }
     ) {
         self.opaqueKey = opaqueKey
+        self.cursorThinking = cursorThinking
         self.modelOptions = modelOptions
     }
 
@@ -165,7 +171,26 @@ struct AgentTaskRoutingCandidateBuilder {
             guard allowPaidFast || provider != .codexExec || CodexModelSpecifier(raw: option.rawValue).serviceTier == nil else { continue }
             guard Self.baseModelRaw(option.rawValue, provider: provider)?.lowercased() == selectedBase else { continue }
             let target = Self.executableTarget(option.rawValue, provider: provider)
-            targets.append((target, option.displayName))
+            if provider == .cursor,
+               let thinking = cursorThinking(option.rawValue),
+               !thinking.choices.isEmpty
+            {
+                for choice in thinking.choices {
+                    let parameter = ACPModelParameterSelection(
+                        providerID: .cursor,
+                        baseModelRaw: option.rawValue,
+                        kind: .thinking,
+                        configID: thinking.configID,
+                        valueRaw: choice.rawValue
+                    )
+                    targets.append((
+                        Self.executableTarget(option.rawValue, provider: provider, modelParameters: [parameter]),
+                        "\(option.displayName) \(choice.displayName)"
+                    ))
+                }
+            } else {
+                targets.append((target, option.displayName))
+            }
             if provider == .codexExec,
                target.reasoningEffortRaw == nil,
                !option.supportedReasoningEfforts.isEmpty
@@ -252,7 +277,7 @@ struct AgentTaskRoutingCandidateBuilder {
         availability: AgentModelCatalog.AvailabilityContext,
         surface: AgentModelCatalog.AgentSelectionSurface = .general
     ) -> Set<AgentProviderKind> {
-        Set([AgentProviderKind.codexExec, .claudeCode].filter {
+        Set([AgentProviderKind.codexExec, .claudeCode, .cursor, .antigravity, .grok].filter {
             surface.allows($0) && AgentModelCatalog.isAgentAvailable($0, availability: availability)
         })
     }
@@ -320,6 +345,36 @@ struct AgentTaskRoutingCandidateBuilder {
             baseModelAliases: ["claude-fable-5-1", "fable"],
             modelClass: "claude-fable",
             rubric: "Judge Fable as a base model using its capability, expected completion reliability, and premium price."
+        ),
+        .init(
+            provider: .antigravity,
+            baseModelAliases: [],
+            modelClass: "gemini-flash",
+            rubric: "Judge Gemini Flash as a base model using its capability, expected completion reliability, and price."
+        ),
+        .init(
+            provider: .antigravity,
+            baseModelAliases: [],
+            modelClass: "gemini-pro",
+            rubric: "Judge Gemini Pro as a base model using its capability, expected completion reliability, and price."
+        ),
+        .init(
+            provider: .grok,
+            baseModelAliases: [],
+            modelClass: "grok",
+            rubric: "Judge Grok as a base model using its capability, expected completion reliability, and price."
+        ),
+        .init(
+            provider: .cursor,
+            baseModelAliases: ["composer-2.5"],
+            modelClass: "composer",
+            rubric: "Judge Composer as a base model using its capability, expected completion reliability, and price."
+        ),
+        .init(
+            provider: .cursor,
+            baseModelAliases: ["grok-4.7"],
+            modelClass: "cursor-grok",
+            rubric: "Judge Cursor Grok as a base model using its capability, expected completion reliability, and price."
         )
     ]
 
@@ -332,6 +387,7 @@ struct AgentTaskRoutingCandidateBuilder {
             allowedProviders.contains($0.provider)
                 && surface.allows($0.provider)
                 && AgentModelCatalog.isAgentAvailable($0.provider, availability: availability)
+                && ($0.modelClass != "cursor-grok" || !AgentModelCatalog.isAgentAvailable(.grok, availability: availability))
         }
     }
 
@@ -351,6 +407,15 @@ struct AgentTaskRoutingCandidateBuilder {
         let options = modelOptions(definition.provider, availability).filter {
             definition.provider != .codexExec || CodexModelSpecifier(raw: $0.rawValue).serviceTier == nil
         }
+        if definition.provider == .antigravity {
+            return Self.newestModelOption(
+                options, provider: .antigravity, prefix: "gemini-",
+                suffix: definition.modelClass == "gemini-flash" ? "-flash" : "-pro"
+            )
+        }
+        if definition.provider == .grok {
+            return Self.newestModelOption(options, provider: .grok, prefix: "grok-", suffix: "")
+        }
         if let family = definition.preferredCodexFamily,
            let option = AgentModelCatalog.preferredCodexFamilyOption(family, from: options)
         {
@@ -364,10 +429,55 @@ struct AgentTaskRoutingCandidateBuilder {
         }.first
     }
 
+    private static func newestModelOption(
+        _ options: [AgentModelOption],
+        provider: AgentProviderKind,
+        prefix: String,
+        suffix: String
+    ) -> AgentModelOption? {
+        var newest: AgentModelOption?
+        var newestVersion: [Int] = []
+        for option in options where !option.isPlaceholderDefault {
+            guard let base = baseModelRaw(option.rawValue, provider: provider)?.lowercased(),
+                  base.hasPrefix(prefix), base.hasSuffix(suffix),
+                  base.count > prefix.count + suffix.count else { continue }
+            let rawVersion = base.dropFirst(prefix.count).dropLast(suffix.count)
+            let components = rawVersion.split(separator: ".", omittingEmptySubsequences: false)
+            let version = components.compactMap { Int($0) }
+            guard !version.isEmpty, version.count == components.count else { continue }
+            if newest == nil || versionIsEarlier(newestVersion, version) {
+                newest = option
+                newestVersion = version
+            }
+        }
+        return newest
+    }
+
+    private static func versionIsEarlier(_ lhs: [Int], _ rhs: [Int]) -> Bool {
+        let count = max(lhs.count, rhs.count)
+        for index in 0 ..< count {
+            let left = index < lhs.count ? lhs[index] : 0
+            let right = index < rhs.count ? rhs[index] : 0
+            if left != right { return left < right }
+        }
+        return false
+    }
+
+    private static func antigravityModel(_ raw: String) -> (base: String, effort: String?) {
+        for effort in ["x-high", "none", "minimal", "low", "medium", "high", "xhigh", "max", "maximum", "ultra"] {
+            if raw.lowercased().hasSuffix("-\(effort)") {
+                return (String(raw.dropLast(effort.count + 1)), effort)
+            }
+        }
+        return (raw, nil)
+    }
+
     private static func baseModelRaw(_ raw: String, provider: AgentProviderKind) -> String? {
         switch provider {
         case .codexExec: CodexModelSpecifier(raw: raw).baseModel
         case .claudeCode: ClaudeModelSpecifier(raw: raw).baseModel
+        case .antigravity: antigravityModel(raw).base
+        case .cursor, .grok: raw
         default: nil
         }
     }
@@ -376,13 +486,16 @@ struct AgentTaskRoutingCandidateBuilder {
         switch provider {
         case .codexExec: target.reasoningEffortRaw ?? CodexModelSpecifier(raw: target.modelRaw).reasoningEffort?.rawValue
         case .claudeCode: target.reasoningEffortRaw ?? ClaudeModelSpecifier(raw: target.modelRaw).effortLevel?.rawValue
+        case .antigravity: antigravityModel(target.modelRaw).effort
+        case .cursor: target.modelParameters.first { $0.kind == .thinking }?.valueRaw
         default: nil
         }
     }
 
     private static func executableTarget(
         _ modelRaw: String,
-        provider: AgentProviderKind
+        provider: AgentProviderKind,
+        modelParameters: [ACPModelParameterSelection] = []
     ) -> AgentRoutingExecutableTarget {
         AgentRoutingExecutableTarget(
             agentRaw: provider.rawValue,
@@ -390,7 +503,7 @@ struct AgentTaskRoutingCandidateBuilder {
             reasoningEffortRaw: provider == .codexExec
                 ? CodexModelSpecifier(raw: modelRaw).reasoningEffort?.rawValue
                 : nil,
-            modelParameters: []
+            modelParameters: modelParameters
         )
     }
 
