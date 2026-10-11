@@ -625,6 +625,86 @@ extension AgentComposerSubmissionAttemptTests {
         XCTAssertEqual(viewModel.executableTarget(for: session), baseline)
     }
 
+    func testComposerRoutedSubmissionDispatchesAntigravityTarget() async throws {
+        let fixture = try await RoutedStartFixture.make(testCase: self, modelClass: "gemini-flash", effortRaw: "low")
+        let viewModel = fixture.window.agentModeViewModel
+        let tabID = try XCTUnwrap(fixture.window.workspaceManager.activeWorkspace?.activeComposeTabID)
+        viewModel.test_setCurrentTabIDOverride(tabID)
+        let session = viewModel.session(for: tabID)
+        session.selectedAgent = .claudeCode
+        session.selectedModelRaw = "claude-sonnet-5-5"
+        _ = try XCTUnwrap(viewModel.test_ensureSessionBoundToTab(session))
+        let claim = try routingClaim(viewModel: viewModel, session: session, text: "Implement a parser")
+
+        let result = await viewModel.submitUserTurnAfterFreshTaskRouting(
+            text: "Implement a parser",
+            claim: claim,
+            session: session,
+            destinationTabID: tabID
+        )
+
+        XCTAssertEqual(result, .submitted)
+        try await AsyncTestWait.waitUntil("composer antigravity headless dispatch", timeout: 10) {
+            !fixture.recorder.headlessStarts.isEmpty
+        }
+        XCTAssertEqual(
+            fixture.recorder.headlessStarts,
+            [RoutedStartDispatchRecorder.HeadlessStart(agent: .antigravity, model: "gemini-3.8-flash-low")]
+        )
+        XCTAssertEqual(fixture.recorder.claudeNativeStartCount, 0)
+        XCTAssertTrue(fixture.recorder.acpRunRequests.isEmpty)
+        XCTAssertEqual(session.selectedAgent, .antigravity)
+        XCTAssertEqual(session.selectedModelRaw, "gemini-3.8-flash-low")
+        XCTAssertEqual(session.acpModelParameterSelections, [])
+        let stages = await fixture.backend.requestStages()
+        XCTAssertEqual(stages, [.model, .effort])
+    }
+
+    func testComposerRoutedSubmissionKeepsCursorParameters() async throws {
+        let fixture = try await RoutedStartFixture.make(testCase: self, modelClass: "cursor-grok", effortRaw: "xhigh", verifyGrok: false)
+        let viewModel = fixture.window.agentModeViewModel
+        let tabID = try XCTUnwrap(fixture.window.workspaceManager.activeWorkspace?.activeComposeTabID)
+        viewModel.test_setCurrentTabIDOverride(tabID)
+        let session = viewModel.session(for: tabID)
+        session.selectedAgent = .claudeCode
+        session.selectedModelRaw = "claude-sonnet-5-5"
+        _ = try XCTUnwrap(viewModel.test_ensureSessionBoundToTab(session))
+        let claim = try routingClaim(viewModel: viewModel, session: session, text: "Implement a parser")
+
+        let result = await viewModel.submitUserTurnAfterFreshTaskRouting(
+            text: "Implement a parser",
+            claim: claim,
+            session: session,
+            destinationTabID: tabID
+        )
+
+        XCTAssertEqual(result, .submitted)
+        try await AsyncTestWait.waitUntil("composer cursor acp dispatch", timeout: 10) {
+            !fixture.recorder.acpRunRequests.isEmpty
+        }
+        let expected = [
+            ACPModelParameterSelection(
+                providerID: .cursor,
+                baseModelRaw: "grok-4.7",
+                kind: .thinking,
+                configID: "reasoning_effort",
+                valueRaw: "xhigh"
+            )
+        ]
+        let request = try XCTUnwrap(fixture.recorder.acpRunRequests.first)
+        XCTAssertEqual(request.agentKind, .cursor)
+        XCTAssertEqual(request.modelString, "grok-4.7")
+        XCTAssertFalse(request.modelParameterSelections.isEmpty)
+        XCTAssertEqual(request.modelParameterSelections, expected)
+        XCTAssertEqual(fixture.recorder.claudeNativeStartCount, 0)
+        XCTAssertTrue(fixture.recorder.headlessStarts.isEmpty)
+        XCTAssertEqual(session.selectedAgent, .cursor)
+        XCTAssertEqual(session.selectedModelRaw, "grok-4.7")
+        XCTAssertEqual(session.acpModelParameterSelections, expected)
+        let stages = await fixture.backend.requestStages()
+        XCTAssertEqual(stages, [.model, .effort])
+    }
+
     private func makeRoutingViewModel(
         backend: any AgentTaskRouterBackend
     ) async throws -> (AgentModeViewModel, GlobalSettingsStore) {
