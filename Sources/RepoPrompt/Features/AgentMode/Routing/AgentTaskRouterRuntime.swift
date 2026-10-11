@@ -89,7 +89,7 @@ final class AgentTaskRouterRuntime: ObservableObject {
         // with no routed start in scope gets a decision-only context.
         let context = AgentTaskRoutingRouteScope.live?.context
             ?? AgentTaskRoutingRouteContext(requestID: UUID(), scope: logScope, log: decisionLog)
-        return await AgentTaskRoutingJudgeLogging.$current.withValue(context) {
+        return await AgentTaskRoutingJudgeLogging.currentTaskLocal.withValue(context) {
             await backend.chooseAutoEffort(
                 maskedTaskExcerpt: maskedTaskExcerpt,
                 selectedModelID: selectedModelID,

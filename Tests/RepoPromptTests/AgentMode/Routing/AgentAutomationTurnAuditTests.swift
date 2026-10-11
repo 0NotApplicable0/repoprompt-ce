@@ -380,7 +380,7 @@ final class AgentTaskRoutingDecisionLogTests: XCTestCase {
                 throw NSError(domain: "AgentTaskRoutingDecisionLogTests", code: 3)
             }
             let context = AgentTaskRoutingRouteContext(requestID: UUID(), scope: .primarySession, log: log)
-            let chosen = await AgentTaskRoutingJudgeLogging.$current.withValue(context) {
+            let chosen = await AgentTaskRoutingJudgeLogging.currentTaskLocal.withValue(context) {
                 await JevAutoEffortJudge(credentials: credentials).chooseEffort(
                     maskedTaskExcerpt: "Review the cache layer",
                     selectedModelID: "claude-opus-5-5",
@@ -858,9 +858,9 @@ final class AgentTaskRoutingDecisionLogTests: XCTestCase {
         let log = injectedLog ?? AgentTaskRoutingDecisionLog(fileURL: logURL)
         let backend = StubRoutingBackend(mode: mode, id: backendID)
         let runtime = try AgentTaskRouterRuntime(registrations: [.init(backend: backend)], decisionLog: log)
-        if let candidateBuilder { runtime.candidateBuilderFactory = candidateBuilder }
         try await AsyncTestWait.waitUntil("stub ready", timeout: 5) { runtime.backendReadiness(backend.id) != nil }
         let (viewModel, store) = try makeViewModel(runtime: runtime, backendID: backend.id, providers: providers)
+        if let candidateBuilder { runtime.candidateBuilderFactory = candidateBuilder }
         backend.onRoute = { [store] in
             if mode == .staleModel { await MainActor.run { store.setModelRouterEnabled(false) } }
         }
@@ -884,6 +884,17 @@ final class AgentTaskRoutingDecisionLogTests: XCTestCase {
             roles: Set(AgentModelCatalog.TaskLabelKind.allCases),
             providers: providers
         )
+        let availability = AgentModelCatalog.AvailabilityContext(
+            claudeCodeAvailable: providers.contains(.claudeCode),
+            codexAvailable: providers.contains(.codexExec),
+            openCodeAvailable: false
+        )
+        runtime.candidateBuilderFactory = {
+            AgentTaskRoutingCandidateBuilder(modelOptions: { provider, _ in
+                guard providers.contains(provider) else { return [] }
+                return AgentModelCatalog.options(for: provider, availability: availability)
+            })
+        }
         let viewModel = AgentModeViewModel(
             codexControllerFactory: { _, _, _, _, _, _ in
                 preconditionFailure("Decision log test must not start Codex")

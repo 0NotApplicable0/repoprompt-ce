@@ -1,5 +1,6 @@
 import Foundation
 import os
+import RepoPromptShared
 
 // MARK: - Schema
 
@@ -558,7 +559,7 @@ actor AgentTaskRoutingRouteContext {
         }
         let scope = AgentTaskRoutingRouteScope(context: self, sink: sink)
         do {
-            let value = try await AgentTaskRoutingRouteScope.$current.withValue(scope) {
+            let value = try await AgentTaskRoutingRouteScope.currentTaskLocal.withValue(scope) {
                 try await body()
             }
             sink.settleIfUnarmed(unarmedOnReturn(value))
@@ -660,7 +661,10 @@ struct AgentTaskRoutingRouteScope {
     let context: AgentTaskRoutingRouteContext
     let sink: AgentTaskRoutingStartSink
 
-    @TaskLocal static var current: AgentTaskRoutingRouteScope?
+    static let currentTaskLocal = BoxedTaskLocal<AgentTaskRoutingRouteScope?>(nil)
+    static var current: AgentTaskRoutingRouteScope? {
+        currentTaskLocal.get()
+    }
 
     /// A scope whose start already settled is stale (inherited by a later task) and is ignored.
     static var live: AgentTaskRoutingRouteScope? {
@@ -671,5 +675,8 @@ struct AgentTaskRoutingRouteScope {
 
 /// Carries the context the Auto Effort judge writes its decision through.
 enum AgentTaskRoutingJudgeLogging {
-    @TaskLocal static var current: AgentTaskRoutingRouteContext?
+    static let currentTaskLocal = BoxedTaskLocal<AgentTaskRoutingRouteContext?>(nil)
+    static var current: AgentTaskRoutingRouteContext? {
+        currentTaskLocal.get()
+    }
 }
