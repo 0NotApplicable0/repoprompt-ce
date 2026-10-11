@@ -7,19 +7,20 @@ import Foundation
 /// about capability and API list price. Refresh the snapshot when recommended model families,
 /// aliases, published evaluations, or prices change.
 enum AgentTaskRoutingModelProfileCatalog {
-    static let evidenceVersion = "rpce.model-routing-evidence.2026-09-30.2"
-    static let rubricVersion = "rpce.automatic-utility-frontier.v2-evidence-2026-09-30.2"
+    static let evidenceVersion = "rpce.model-routing-evidence.2026-10-10.1"
+    static let rubricVersion = "rpce.automatic-utility-frontier.v2-evidence-2026-10-10.1"
+    private static let preamble = "Evidence snapshot 2026-10-10 (provider-published; API list price is a comparison proxy and CLI or subscription billing may differ): "
 
     static func description(for target: AgentRoutingExecutableTarget) -> String {
         let modelIdentity = normalizedModelIdentity(for: target)
         let evidence = profile(for: modelIdentity)
         let effort = effortDescription(for: target)
-        return "Evidence snapshot 2026-09-30 (provider-published; API list price is a comparison proxy and CLI or subscription billing may differ): \(evidence) \(effort)"
+        return "\(preamble)\(evidence) \(effort)"
     }
 
     static func modelDescription(for target: AgentRoutingExecutableTarget) -> String {
         let modelIdentity = normalizedModelIdentity(for: target)
-        return "Evidence snapshot 2026-09-30 (provider-published; API list price is a comparison proxy and CLI or subscription billing may differ): \(profile(for: modelIdentity))"
+        return "\(preamble)\(profile(for: modelIdentity))"
     }
 
     private static func profile(for modelIdentity: String) -> String {
@@ -56,6 +57,14 @@ enum AgentTaskRoutingModelProfileCatalog {
             "Claude Fable 5.1 is Anthropic's most capable generally available tier for ambitious, long-running, cross-codebase work; Anthropic reports 55.8% on Terminal-Bench 4.0 versus 52.3% for Opus 5 and 37.3% for GPT-5.6 Sol in its harness. API list price: $10 input / $50 output per 1M tokens."
         case "claude-fable-5":
             "Claude Fable 5 is a frontier tier for ambitious, long-running work; Anthropic reports 42.0% on Terminal-Bench 4.0 in its later comparison. API list price: $10 input / $50 output per 1M tokens."
+        case "gemini-3.8-flash":
+            "Gemini 3.8 Flash (published 2026-09-02) is Google's workhorse tier for long-horizon agentic workflows; Google reports 73.7% on DeepSWE v1.1, with a 1,048,576-token context window and 65,536-token maximum output. API list price: $0.75 input / $3.75 output per 1M tokens through December 31, 2026 ($1.50/$7.50 starting January 1, 2027), cached input $0.075 through December 31, 2026 ($0.15 from 2027-01-01)."
+        case "gemini-3.1-pro":
+            "Gemini 3.1 Pro (published 2026-02-19) is Google's flagship multimodal reasoning tier for complex coding tasks; Google reports 80.6% on SWE-Bench Verified (single attempt, Thinking (High)), with a 1,048,576-token context window and 65,536-token maximum output. API list price: $2.00 input / $12.00 output per 1M tokens (prompts <= 200k; $4.00 / $18.00 above), cached input $0.20 for prompts <= 200k ($0.40 above)."
+        case "grok-4.7":
+            "Grok 4.7 (released 2026-09-21) is xAI's flagship model for agentic coding and knowledge work, featuring 46.3% on CursorBench 4.0 at xHigh effort and a 500,000-token context window. API list price: $2.00 input / $0.50 cached / $6.00 output per 1M tokens for prompts < 200k; $4.00 / $1.00 / $12.00 at >= 200k."
+        case "composer-2.5":
+            "Composer 2.5 (released 2026-05-18) is Cursor's proprietary agentic coding model optimized for edit-test-edit loops; Cursor reports 69.3% on Terminal-Bench 2.0 and 79.8% on SWE-Bench Multilingual (image, changelog benchmark table), with a 200K-token context window. API list price: Standard $0.50 input / $2.50 output per 1M tokens, Fast $3.00 / $15.00; cache read $0.2 Standard / $0.5 Fast."
         default:
             "No audited benchmark or pricing profile is available for this exact model identity. Treat capability and cost as uncertain and rely on its configured role rubric rather than assuming it is cheap or strong."
         }
@@ -68,6 +77,14 @@ enum AgentTaskRoutingModelProfileCatalog {
         }
         if target.agentRaw == AgentProviderKind.claudeCode.rawValue {
             return ClaudeModelSpecifier(raw: raw).baseModel?.lowercased() ?? raw
+        }
+        if target.agentRaw == AgentProviderKind.antigravity.rawValue, raw.hasPrefix("gemini-") {
+            for suffix in ["-high", "-medium", "-low"] where raw.hasSuffix(suffix) {
+                let base = String(raw.dropLast(suffix.count))
+                if base.hasSuffix("-flash") || base.hasSuffix("-pro") {
+                    return base
+                }
+            }
         }
         return raw
     }
