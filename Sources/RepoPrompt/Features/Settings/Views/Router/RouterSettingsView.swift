@@ -212,12 +212,8 @@ struct RouterSettingsView: View {
         )) {
             Text("Automatic (all connected)").tag(AgentProviderKind?.none)
             ForEach(viewModel.visibleProviders, id: \.rawValue) { provider in
-                Text(
-                    viewModel.providerIsAvailable(provider)
-                        ? provider.displayName
-                        : "\(provider.displayName) (authentication needed)"
-                )
-                .tag(Optional(provider))
+                Text(viewModel.providerPickerLabel(for: provider))
+                    .tag(Optional(provider))
             }
         }
         .pickerStyle(.menu)
@@ -262,11 +258,11 @@ struct RouterSettingsView: View {
                     .font(fontPreset.swiftUIFont(sizeAtNormal: 11))
                     .foregroundStyle(.secondary)
             }
-            Text("Router builds an audited quality-and-cost set from the connected Claude Code and Codex catalogs. It chooses the base model first, then chooses that model's reasoning effort separately. Agent Models role settings are included as reference signals without limiting the choices or forcing a default.")
+            Text(viewModel.routerCandidatesDescription)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
             if viewModel.availableProviders.isEmpty {
-                Text("Connect Claude Code or Codex CLI to make automatic targets available.")
+                Text(viewModel.routerEmptyStateText)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
             } else {
@@ -419,7 +415,7 @@ struct RouterSettingsView: View {
         case .ready:
             viewModel.policyCanBuildCandidates
                 ? "Enable Router here or from the Agent Mode toolbar. It stays enabled across sessions until you turn it off."
-                : "Connect Claude Code or Codex CLI, or clear a provider requirement that is unavailable."
+                : viewModel.routerNoProviderDetail
         case .validating: "The routing service is validating your configuration."
         case let .needsConfiguration(_, reason),
              let .policyUnavailable(_, reason),

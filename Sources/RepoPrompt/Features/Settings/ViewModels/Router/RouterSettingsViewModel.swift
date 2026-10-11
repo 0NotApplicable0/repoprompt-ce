@@ -4,6 +4,10 @@ import RepoPromptSettingsCore
 
 @MainActor
 final class RouterSettingsViewModel: ObservableObject {
+    static let routableProviders: Set<AgentProviderKind> = AgentTaskRoutingCandidateBuilder.availableProviders(
+        availability: .init(cursorAvailable: true, antigravityAvailable: true, grokAvailable: true)
+    )
+
     enum BackendOperationFeedback: Equatable {
         case idle
         case running(String)
@@ -57,6 +61,7 @@ final class RouterSettingsViewModel: ObservableObject {
     @Published private(set) var backendOperationFeedback: BackendOperationFeedback = .idle
     @Published private(set) var isPerformingBackendOperation = false
     @Published private(set) var policyCanBuildCandidates = false
+    @Published private(set) var connectedProviders: Set<AgentProviderKind> = []
 
     private let settingsStore: GlobalSettingsStore
     private let runtime: AgentTaskRouterRuntime
@@ -108,6 +113,14 @@ final class RouterSettingsViewModel: ObservableObject {
             .receive(on: RunLoop.main)
             .sink { [weak self] _ in self?.scheduleRefresh() }
             .store(in: &cancellables)
+        NotificationCenter.default.publisher(for: .antigravityModelsChanged)
+            .receive(on: RunLoop.main)
+            .sink { [weak self] _ in self?.scheduleRefresh() }
+            .store(in: &cancellables)
+        NotificationCenter.default.publisher(for: .grokModelsChanged)
+            .receive(on: RunLoop.main)
+            .sink { [weak self] _ in self?.scheduleRefresh() }
+            .store(in: &cancellables)
         scheduleRefresh()
     }
 
@@ -134,7 +147,7 @@ final class RouterSettingsViewModel: ObservableObject {
     }
 
     var visibleProviders: [AgentProviderKind] {
-        availableProviders
+        Self.routableProviders
             .union([configuration.primaryProvider, configuration.subagentProvider].compactMap(\.self))
             .sorted { $0.displayName < $1.displayName }
     }
@@ -153,11 +166,11 @@ final class RouterSettingsViewModel: ObservableObject {
             }
         ]
         .compactMap(\.self)
-        .filter { !availableProviders.contains($0.provider) }
+        .filter { !connectedProviders.contains($0.provider) }
     }
 
     func providerIsAvailable(_ provider: AgentProviderKind) -> Bool {
-        availableProviders.contains(provider)
+        connectedProviders.contains(provider)
     }
 
     func providerLimit(for scope: AgentTaskRoutingScope) -> AgentProviderKind? {
@@ -378,10 +391,11 @@ final class RouterSettingsViewModel: ObservableObject {
     private func rebuildTargetPreviews() {
         let availability = availabilityProvider()
         let providers = AgentTaskRoutingCandidateBuilder.availableProviders(availability: availability)
-        let candidates = try? AgentTaskRoutingCandidateBuilder().build(
+        let candidates = try? runtime.candidateBuilderFactory().build(
             allowedProviders: providers,
             availability: availability
         )
+        connectedProviders = providers
         targetPreviews = (candidates ?? []).compactMap { candidate in
             guard let provider = AgentProviderKind(rawValue: candidate.target.agentRaw) else { return nil }
             return TargetPreview(
@@ -411,5 +425,24 @@ final class RouterSettingsViewModel: ObservableObject {
         available: Set<AgentProviderKind>
     ) -> Set<AgentProviderKind> {
         configuration.allowedProvidersMaterialized ? configuration.allowedProviders : available
+    }
+}
+
+extension RouterSettingsViewModel {
+    var routerCandidatesDescription: String {
+        "Router builds an audited quality-and-cost set from the connected Claude Code, Codex, Cursor, Antigravity and Grok catalogs. It chooses the base model first, then chooses that model's reasoning effort separately; a model with no advertised effort control runs at its provider default. Agent Models role settings are included as reference signals without limiting the choices or forcing a default."
+    }
+
+    var routerEmptyStateText: String {
+        "Connect Claude Code, Codex, Cursor, Antigravity or Grok CLI to make automatic targets available."
+    }
+
+    var routerNoProviderDetail: String {
+        "Connect Claude Code, Codex, Cursor, Antigravity or Grok CLI, or clear a provider requirement that is unavailable."
+    }
+
+    func providerPickerLabel(for provider: AgentProviderKind) -> String {
+        let name = provider.displayName
+        return providerIsAvailable(provider) ? name : name + " (authentication needed)"
     }
 }
