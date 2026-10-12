@@ -47,7 +47,11 @@ allowedProviderRawValues
 primaryProviderRawValue
 subagentProviderRawValue
 customInstructions
+randomness
+reviewDiversityEnabled
 ```
+
+The complete list of Model Router settings is in [`settings-persistence.md`](settings-persistence.md).
 
 Absence resolves disabled. `enabled` is durable user intent: transient credential readiness and provider availability never rewrite it. An explicit user toggle or a successful explicit stored-secret removal may disable routing; startup validation failures and temporarily empty provider catalogs leave routing enabled but advisory; eligible tasks continue with the current selection or role default. The optional primary and subagent provider fields are live preferences: while the preferred provider is available, it is used exclusively; on disconnect, every remaining supported provider participates, and the preference resumes when it reconnects. Custom guidance is trimmed, limited to 1,000 characters and 4,096 UTF-8 bytes, and sent to the routing backend with each request as an explicit preference. Known-setting edits preserve unknown nonblank backend, role, and provider raw values for forward/rollback compatibility. Secrets never enter this document.
 
@@ -65,7 +69,7 @@ The bundled adapter uses TypeSafe's documented HTTP surface directly; there is n
 - explicit 401/403, 422, 429, and 529 classification;
 - no request/response-body logging.
 
-`JevRoutingResponseInterpreter` strictly validates returned evaluator identity, every submitted question's choice answer, exact opaque-key coverage, finite ranged probabilities, distribution sum, a unique probability argmax matching `choice`, confidence, and nonnegative usage. Each submitted question must be answered exactly once: a missing answer, an answer for a question that was not submitted, and an answer referencing a sibling question's opaque key are all rejected. Opaque keys are scoped to their own question, so batching never weakens the single-question guarantees. The current selection policy accepts that unique validated argmax and records the full probability distribution, confidence, and token usage as evidence. It does not apply a separate confidence threshold.
+`JevRoutingResponseInterpreter` strictly validates returned evaluator identity, every submitted question's choice answer, exact opaque-key coverage, finite ranged probabilities, distribution sum, a unique probability argmax matching `choice`, confidence, and nonnegative usage. Each submitted question must be answered exactly once: a missing answer, an answer for a question that was not submitted, and an answer referencing a sibling question's opaque key are all rejected. Opaque keys are scoped to their own question, so batching never weakens the single-question guarantees. The current selection policy accepts that unique validated argmax and records the full probability distribution, confidence, and token usage as evidence. It does not apply a separate confidence threshold. After a validated Jev model-stage choice, the host may override it with the exploration pick described in [Model exploration](#model-exploration).
 
 The Jev key uses the dedicated `JevRouterAPIKey` secure-storage account. It is included in the complete repair inventory but excluded from provider/CLI, Claude-compatible, and frozen identity-migration inventories. The app-global credential service is shared across windows; each Settings window owns only its view model and observes live `APISettingsViewModel.agentAvailability`.
 
@@ -120,6 +124,30 @@ Snapshot sources:
 - Anthropic model pages or announcements for [Haiku 4.5](https://www.anthropic.com/news/claude-haiku-4-5), [Sonnet 5](https://www.anthropic.com/news/claude-sonnet-5), [Opus 5.5](https://www.anthropic.com/claude-opus-5-5), and [Fable 5.1](https://www.anthropic.com/claude/fable).
 
 Refresh this evidence and advance its version when current aliases, frontier targets, prices, or material published evaluations change. Quality evaluation can refine the instructions, rubrics, pinned evaluator, evidence, or acceptance rule in a later version. Such a change must advance the policy version and keep deterministic wire and response-validation fixtures.
+
+## Model exploration
+
+When `randomness` is `low`, `medium` or `high`, the host sometimes replaces Jev's validated model-stage pick with its second-highest-probability candidate. `off` never explores but still counts. Order of model-stage narrowing: provider limit, then maker exclusion, then Jev, then exploration, then usage balancing.
+
+- **Counted decision.** A decision counts only when Jev answered the model stage with `selected` among at least two surviving models, and its chosen key is one of those candidates. A local single-candidate application, abstention, failure and cancellation do not count. Two routing counters exist, primary session and subagent; headless subagent routing shares the subagent counter (the log `scope` value `headless` is not a third counter); changing the randomness level does not reset a counter.
+- **Cycle of 20.** The counter position is `((counter - 1) mod 20) + 1`. `low` explores at position 10; `medium` at 5 and 15; `high` at 3, 8, 13 and 18. There is no quality floor, no effort randomness and no temperature.
+- **Runner-up.** The candidate is the highest-probability key other than Jev's choice; ties go to the earliest key in builder order. Without complete, finite probabilities in 0...1 where Jev's choice is the unique maximum, an exploring position records `explorationUnavailable` and keeps Jev's pick.
+- **Usage balancing.** Usage balancing is never called on an exploring pick. After the model stage the normal effort stage runs against the applied model, with its usual advertised-effort handling and fallback. The decision log keeps Jev's original choice and evidence for audit, and the applied row reports the final picked target.
+
+### Counter file
+
+The counters live in a separate file, `~/Library/Application Support/RepoPrompt CE/ModelRouter/exploration-counters.json`, guarded by the stable sidecar `exploration-counters.json.lock`. They are outside `globalSettings` and do not bump the settings revision.
+
+Each issue creates the parent directory before taking the lock, takes an exclusive `flock`, reloads the file under the lock and issues `max(latest file value, this advisor's own last issued value) + 1`, preserving both scopes' values. Lock contention, including `EINTR`, is retried for at most 250 ms; the limit does not cover total I/O. The file is written atomically as `{schema: 1, counters}` and set to mode 0600. A file from a future schema is left untouched; a corrupt file is quarantined as `.corrupt` and its on-disk values read as zero, though the running advisor's own last issued value is still honored by the `max`. A successful commit under the lock is `durable: true`; any directory, lock, write, quarantine or future-schema failure falls back to an in-memory value with `durable: false` and one error report per failure streak.
+
+Limits, stated honestly:
+
+- W1: a counter can be durable before its decision row is admitted, so a crash can leave a counter value with no row.
+- W2: a row can be admitted to the log queue before its physical append, so a crash can lose that row.
+- W3: a non-durable value can be logged and later repeated by a restart or another process.
+- W4: a crash before the counter commit leaves no new durable increment (an existing counter file is unaffected).
+
+There is no rollback and no transaction across the counter file and the decision log. The design does not promise a gap-free or complete audit, nor durable uniqueness after a corrupt-file reset or across other processes' non-durable positions.
 
 ## Validation scope
 

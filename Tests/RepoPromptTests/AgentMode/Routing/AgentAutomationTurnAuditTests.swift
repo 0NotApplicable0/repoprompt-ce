@@ -1154,45 +1154,11 @@ final class AgentTaskRoutingDecisionLogTests: XCTestCase {
         return service
     }
 
-    private func routingClaim(
-        viewModel: AgentModeViewModel,
-        session: AgentModeViewModel.TabSession,
-        text: String
-    ) throws -> AgentModeViewModel.AgentComposerSubmitClaim {
-        let target = try XCTUnwrap(viewModel.makeComposerSubmitTarget(tabID: session.tabID, session: session))
-        let attempt = AgentComposerSubmitAttempt(
-            id: UUID(), target: target, inputRevision: 0, noticeRevision: 0, rawDraftSnapshot: text
-        )
-        guard case let .claimed(claim) = viewModel.claimComposerSubmitAttempt(attempt, requireActiveTabOwnership: false) else {
-            throw NSError(domain: "AgentTaskRoutingDecisionLogTests", code: 2)
-        }
-        return claim
-    }
-
-    private func waitForAppliedRows(_ fixture: Fixture, count: Int) async throws {
-        try await AsyncTestWait.waitUntil("applied rows", timeout: 10) {
-            await fixture.log.flush()
-            return ((try? fixture.rows()) ?? []).count(where: { $0["event"] as? String == "applied" }) >= count
-        }
-    }
-
     private func waitForSnapshot(
         _ log: AgentTaskRoutingDecisionLog,
         _ predicate: @escaping (AgentTaskRoutingDecisionLog.Snapshot) -> Bool
     ) async throws {
         try await AsyncTestWait.waitUntil("log snapshot", timeout: 10) { await predicate(log.snapshot()) }
-    }
-
-    private func assertDecisionsPrecedeApplied(_ rows: [[String: Any]], file: StaticString = #filePath, line: UInt = #line) {
-        var appliedSeen = Set<String>()
-        for row in rows {
-            guard let id = row["requestID"] as? String else { continue }
-            if row["event"] as? String == "applied" {
-                appliedSeen.insert(id)
-            } else {
-                XCTAssertFalse(appliedSeen.contains(id), "decision after applied for \(id)", file: file, line: line)
-            }
-        }
     }
 
     private static func decodedRows(_ data: Data) -> [[String: Any]] {
@@ -1211,6 +1177,43 @@ final class AgentTaskRoutingDecisionLogTests: XCTestCase {
         }
         let base = try line(pad: 0).count
         return try line(pad: size - base)
+    }
+}
+
+// MARK: - Shared composer and log helpers
+
+@MainActor
+private func routingClaim(
+    viewModel: AgentModeViewModel,
+    session: AgentModeViewModel.TabSession,
+    text: String
+) throws -> AgentModeViewModel.AgentComposerSubmitClaim {
+    let target = try XCTUnwrap(viewModel.makeComposerSubmitTarget(tabID: session.tabID, session: session))
+    let attempt = AgentComposerSubmitAttempt(
+        id: UUID(), target: target, inputRevision: 0, noticeRevision: 0, rawDraftSnapshot: text
+    )
+    guard case let .claimed(claim) = viewModel.claimComposerSubmitAttempt(attempt, requireActiveTabOwnership: false) else {
+        throw NSError(domain: "AgentTaskRoutingDecisionLogTests", code: 2)
+    }
+    return claim
+}
+
+private func waitForAppliedRows(_ fixture: RoutingStubFixture, count: Int) async throws {
+    try await AsyncTestWait.waitUntil("applied rows", timeout: 10) {
+        await fixture.log.flush()
+        return ((try? fixture.rows()) ?? []).count(where: { $0["event"] as? String == "applied" }) >= count
+    }
+}
+
+private func assertDecisionsPrecedeApplied(_ rows: [[String: Any]], file: StaticString = #filePath, line: UInt = #line) {
+    var appliedSeen = Set<String>()
+    for row in rows {
+        guard let id = row["requestID"] as? String else { continue }
+        if row["event"] as? String == "applied" {
+            appliedSeen.insert(id)
+        } else {
+            XCTAssertFalse(appliedSeen.contains(id), "decision after applied for \(id)", file: file, line: line)
+        }
     }
 }
 
@@ -1346,8 +1349,14 @@ private actor StubRoutingBackend: AgentTaskRouterBackend {
     nonisolated(unsafe) var onRoute: (@Sendable () async -> Void)?
     /// Picks a candidate by descriptor identity (never position); `nil` falls back to the last candidate.
     nonisolated(unsafe) var chooseKey: (@Sendable (AgentTaskRoutingRequest) -> String?)?
+    /// Evidence scores for the chosen key; `nil` keeps the evidence-free default.
+    private var scoresFor: (@Sendable (AgentTaskRoutingRequest, String) -> [String: Double]?)?
     let mode: Mode
     private(set) var requests: [AgentTaskRoutingRequest] = []
+
+    func setScoresFor(_ scoring: (@Sendable (AgentTaskRoutingRequest, String) -> [String: Double]?)?) {
+        scoresFor = scoring
+    }
 
     init(mode: Mode, id: AgentTaskRouterBackendID = AgentTaskRouterBackendID(rawValue: "log-stub")) {
         self.mode = mode
@@ -1369,7 +1378,14 @@ private actor StubRoutingBackend: AgentTaskRouterBackend {
         case (.failModel, .model): return .failed(category: .timeout, retryable: true, evidence: nil)
         case (.cancelModel, .model): return .cancelled
         case (.abstainEffort, .effort): return .abstained(reason: "ambiguous", evidence: nil)
-        default: return .selected(opaqueKey: chooseKey?(request) ?? last, evidence: nil)
+        default:
+            let key = chooseKey?(request) ?? last
+            let evidence = scoresFor?(request, key).map {
+                AgentTaskRoutingDecisionEvidence(
+                    policyVersion: nil, confidence: nil, scores: $0, inputTokens: nil, outputTokens: nil, reasonCode: nil
+                )
+            }
+            return .selected(opaqueKey: key, evidence: evidence)
         }
     }
 }
@@ -1515,12 +1531,18 @@ private func makeRoutingStubFixture(
     providers: Set<AgentProviderKind> = [.claudeCode, .codexExec],
     candidateBuilder: (@MainActor () -> AgentTaskRoutingCandidateBuilder)? = nil,
     log injectedLog: AgentTaskRoutingDecisionLog? = nil,
-    logURL injectedURL: URL? = nil
+    logURL injectedURL: URL? = nil,
+    explorationAdvisor injectedAdvisor: AgentTaskRoutingExplorationAdvisor? = nil
 ) async throws -> RoutingStubFixture {
     let logURL = injectedURL ?? tempRoot.appendingPathComponent("stub-\(UUID().uuidString)/jev-decisions.jsonl")
     let log = injectedLog ?? AgentTaskRoutingDecisionLog(fileURL: logURL)
     let backend = StubRoutingBackend(mode: mode, id: backendID)
-    let runtime = try AgentTaskRouterRuntime(registrations: [.init(backend: backend)], decisionLog: log)
+    let explorationAdvisor = injectedAdvisor ?? AgentTaskRoutingExplorationAdvisor(
+        fileURL: tempRoot.appendingPathComponent("exploration-\(UUID().uuidString)/exploration-counters.json")
+    )
+    let runtime = try AgentTaskRouterRuntime(
+        registrations: [.init(backend: backend)], decisionLog: log, explorationAdvisor: explorationAdvisor
+    )
     try await AsyncTestWait.waitUntil("stub ready", timeout: 5) { runtime.backendReadiness(backend.id) != nil }
     let (viewModel, store) = try makeRoutingViewModel(
         tempRoot: tempRoot, runtime: runtime, backendID: backend.id, providers: providers
@@ -2122,6 +2144,1030 @@ final class AgentTaskRoutingMakerDiversityTests: XCTestCase {
         if scenario.expectation != .denied {
             XCTAssertTrue(applied["picked"] is NSNull, label)
             XCTAssertEqual(applied["model"] as? String, settled?.modelRaw, label)
+        }
+    }
+}
+
+private final class ExplorationErrorLog: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storage: [String] = []
+
+    var messages: [String] {
+        lock.lock()
+        defer { lock.unlock() }
+        return storage
+    }
+
+    func append(_ message: String) {
+        lock.lock()
+        storage.append(message)
+        lock.unlock()
+    }
+}
+
+private struct ExplorationCounterFile: Decodable {
+    let schema: Int
+    let counters: [String: UInt64]
+}
+
+@MainActor
+final class AgentTaskRoutingExplorationTests: XCTestCase {
+    private var tempRoot: URL!
+    private let ordered = ["a", "b", "c"]
+    private let scores: [String: Double] = ["a": 0.6, "b": 0.25, "c": 0.15]
+
+    override func setUpWithError() throws {
+        tempRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("AgentTaskRoutingExplorationTests-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: tempRoot, withIntermediateDirectories: true)
+    }
+
+    override func tearDownWithError() throws {
+        try? FileManager.default.removeItem(at: tempRoot)
+    }
+
+    func testLevelsExploreAtFixedPositions() async throws {
+        let expected: [AgentRoutingRandomness: [Int]] = [
+            .off: [], .low: [10, 30], .medium: [5, 15, 25, 35], .high: [3, 8, 13, 18, 23, 28, 33, 38]
+        ]
+        for counter in 1 ... 40 {
+            XCTAssertEqual(AgentTaskRoutingExplorationAdvisor.position(counter: UInt64(counter)), (counter - 1) % 20 + 1)
+        }
+        for (level, positions) in expected {
+            let exploring = (1 ... 40).filter {
+                AgentTaskRoutingExplorationAdvisor.exploringPositions(for: level)
+                    .contains(AgentTaskRoutingExplorationAdvisor.position(counter: UInt64($0)))
+            }
+            XCTAssertEqual(exploring, positions, level.rawValue)
+        }
+
+        let runnerUp = AgentTaskRoutingExplorationAdvisor.runnerUp
+        XCTAssertEqual(runnerUp("a", ordered, scores), "b")
+        XCTAssertEqual(runnerUp("a", ["a", "c", "b"], ["a": 0.6, "b": 0.2, "c": 0.2]), "c")
+        XCTAssertEqual(runnerUp("a", ["a", "b", "c"], ["a": 0.6, "b": 0.2, "c": 0.2]), "b")
+        XCTAssertNil(runnerUp("a", ordered, nil))
+        XCTAssertNil(runnerUp("a", ordered, ["a": 0.6, "b": 0.4]), "missing key")
+        XCTAssertNil(runnerUp("a", ordered, ["a": 0.6, "b": 0.2, "c": 0.1, "d": 0.1]), "extra key")
+        XCTAssertNil(runnerUp("a", ordered, ["a": 0.6, "b": .nan, "c": 0.1]))
+        XCTAssertNil(runnerUp("a", ordered, ["a": 0.6, "b": .infinity, "c": 0.1]))
+        XCTAssertNil(runnerUp("a", ordered, ["a": 1.5, "b": 0.2, "c": 0.1]))
+        XCTAssertNil(runnerUp("a", ordered, ["a": 0.6, "b": -0.1, "c": 0.1]))
+        XCTAssertNil(runnerUp("a", ordered, ["a": 0.4, "b": 0.4, "c": 0.2]), "tied top")
+        XCTAssertNil(runnerUp("b", ordered, scores), "chosen is not the maximum")
+        XCTAssertNil(runnerUp("a", ["a"], ["a": 1]), "single candidate")
+        XCTAssertNil(runnerUp("a", ["a", "a", "b"], ["a": 0.6, "b": 0.4]), "duplicate keys")
+        XCTAssertNil(runnerUp("z", ordered, scores), "chosen not a candidate")
+
+        let url = tempRoot.appendingPathComponent("levels/exploration-counters.json")
+        for (level, positions) in expected {
+            let advisor = AgentTaskRoutingExplorationAdvisor(fileURL: nil)
+            for counter in 1 ... 20 {
+                let record = await advisor.decide(
+                    scope: .primarySession, randomness: level, chosenKey: "a", orderedKeys: ordered, scores: scores
+                )
+                let exploring = positions.contains(counter)
+                XCTAssertEqual(record.kind, exploring ? .exploration : .none, "\(level.rawValue)#\(counter)")
+                XCTAssertEqual(record.appliedKey, exploring ? "b" : "a", "\(level.rawValue)#\(counter)")
+                XCTAssertEqual(record.originalKey, "a")
+                XCTAssertEqual(record.randomness, level.rawValue)
+                XCTAssertEqual(record.counter, UInt64(counter))
+                XCTAssertEqual(record.position, counter)
+                XCTAssertFalse(record.durable, "nil file is in-memory only")
+            }
+        }
+        let advisor = AgentTaskRoutingExplorationAdvisor(fileURL: url)
+        var kinds: [AgentTaskRoutingExplorationRecord.Kind] = []
+        for _ in 1 ... 10 {
+            let record = await advisor.decide(
+                scope: .subagent, randomness: .low, chosenKey: "a", orderedKeys: ordered, scores: nil
+            )
+            kinds.append(record.kind)
+            XCTAssertEqual(record.appliedKey, "a", "invalid evidence never invents a runner-up")
+            XCTAssertTrue(record.durable)
+        }
+        XCTAssertEqual(kinds.last, .explorationUnavailable)
+        XCTAssertEqual(kinds.dropLast(), Array(repeating: .none, count: 9)[...])
+        let primary = await advisor.decide(
+            scope: .primarySession, randomness: .low, chosenKey: "a", orderedKeys: ordered, scores: scores
+        )
+        XCTAssertEqual(primary.counter, 1, "scopes count independently")
+
+        // Real routes: the same positions pick the runner-up for the shipped caller, per scope.
+        for (level, positions) in [(AgentRoutingRandomness.medium, [5, 15]), (.high, [3, 8, 13, 18])] {
+            let fixture = try await makeExplorationFixture(randomness: level)
+            await configure(fixture, pick: "claude-opus", runnerUp: "claude-sonnet")
+            for counter in 1 ... 20 {
+                let route = try await routeSubagent(fixture)
+                let exploring = positions.contains(counter)
+                XCTAssertEqual(route.target?.modelRaw, exploring ? Self.sonnet : Self.opus, "\(level.rawValue)#\(counter)")
+                try expectOverride(
+                    route.rows, kind: exploring ? "exploration" : "none", randomness: level.rawValue, counter: counter
+                )
+            }
+            let issued = try await explorationAdvisor(of: fixture).counter(for: .subagent)
+            XCTAssertEqual(issued, 20, level.rawValue)
+        }
+        let interleavedURL = counterURL()
+        try seed(["primarySession": 8, "subagent": 8], at: interleavedURL)
+        let interleaved = try await makeExplorationFixture(url: interleavedURL, randomness: .low, hosted: true)
+        await configure(interleaved, pick: "claude-opus", runnerUp: "claude-sonnet")
+        for counter in 9 ... 11 {
+            let exploring = counter == 10
+            let composer = try await routeComposer(interleaved)
+            XCTAssertEqual(composer.session.selectedModelRaw, exploring ? Self.sonnet : Self.opus, "primary#\(counter)")
+            try expectOverride(composer.rows, kind: exploring ? "exploration" : "none", randomness: "low", counter: counter)
+            let subagent = try await routeSubagent(interleaved)
+            XCTAssertEqual(subagent.target?.modelRaw, exploring ? Self.sonnet : Self.opus, "subagent#\(counter)")
+            try expectOverride(subagent.rows, kind: exploring ? "exploration" : "none", randomness: "low", counter: counter)
+        }
+    }
+
+    func testOffNeverExplores() async throws {
+        let fixture = try await makeExplorationFixture(randomness: .off)
+        await configure(fixture, pick: "claude-opus", runnerUp: "claude-sonnet")
+        for counter in 1 ... 20 {
+            let route = try await routeSubagent(fixture)
+            XCTAssertEqual(route.target?.modelRaw, Self.opus, "off#\(counter)")
+            try expectOverride(route.rows, kind: "none", randomness: "off", counter: counter)
+        }
+        let issued = try await explorationAdvisor(of: fixture).counter(for: .subagent)
+        XCTAssertEqual(issued, 20, "Off still counts")
+
+        let primaryURL = counterURL()
+        let primary = try await makeExplorationFixture(url: primaryURL, randomness: .off, hosted: true)
+        await configure(primary, pick: "claude-opus", runnerUp: "claude-sonnet")
+        for stored in [2, 4, 7, 9, 12, 14, 17] {
+            try seed(["primarySession": UInt64(stored)], at: primaryURL)
+            let composer = try await routeComposer(primary)
+            XCTAssertEqual(composer.session.selectedModelRaw, Self.opus, "off after \(stored)")
+            try expectOverride(composer.rows, kind: "none", randomness: "off", counter: stored + 1)
+        }
+
+        // Switching Off -> Low continues the count: the tenth counted decision explores.
+        let switching = try await makeExplorationFixture(randomness: .off)
+        await configure(switching, pick: "claude-opus", runnerUp: "claude-sonnet")
+        for _ in 1 ... 9 {
+            _ = try await routeSubagent(switching)
+        }
+        switching.store.setRandomness(.low)
+        let tenth = try await routeSubagent(switching)
+        XCTAssertEqual(tenth.target?.modelRaw, Self.sonnet)
+        try expectOverride(tenth.rows, kind: "exploration", randomness: "low", counter: 10)
+    }
+
+    func testExplorationAppliesJevRunnerUp() async throws {
+        let fixture = try await makeExplorationFixture(stored: ["subagent": 9], randomness: .low)
+        await configure(fixture, pick: "claude-opus", runnerUp: "claude-sonnet")
+        let target = try await routeSubagent(fixture).target
+        XCTAssertEqual(target?.agentRaw, AgentProviderKind.claudeCode.rawValue)
+        XCTAssertEqual(target?.modelRaw, Self.sonnet, "position 10 applies Jev's runner-up")
+
+        // Tied second place goes to the earliest surviving builder-ordered candidate.
+        let tied = try await makeExplorationFixture(stored: ["subagent": 9], randomness: .low)
+        tied.backend.chooseKey = Self.pick("claude-opus")
+        await tied.backend.setScoresFor(Self.scores(["claude-sonnet": 0.2, "claude-haiku": 0.2]))
+        let tiedTarget = try await routeSubagent(tied).target
+        let tiedRequests = await tied.backend.requests
+        let tiedOrder = try XCTUnwrap(tiedRequests.first { $0.decisionStage == .model }).candidates.compactMap(\.roleLabels.first)
+        let earliest = try XCTUnwrap(tiedOrder.first { $0 == "claude-sonnet" || $0 == "claude-haiku" })
+        XCTAssertEqual(tiedTarget?.modelRaw, earliest == "claude-sonnet" ? Self.sonnet : Self.haiku)
+
+        // A maker excluded before Jev is never the runner-up; the logged exclusions stay on the exploring row.
+        let excluded = try await makeExplorationFixture(stored: ["subagent": 9], randomness: .low)
+        await configure(excluded, pick: "claude-opus", runnerUp: "claude-haiku")
+        let excludedRoute = try await routeSubagent(excluded, diversity: AgentTaskRoutingDiversityOptions(exclusions: ["openai": [.excludeMakers]]))
+        let excludedRequests = await excluded.backend.requests
+        let excludedCandidates = try XCTUnwrap(excludedRequests.first { $0.decisionStage == .model }).candidates
+        XCTAssertFalse(excludedCandidates.contains { $0.roleLabels.contains { $0.hasPrefix("gpt") } })
+        XCTAssertEqual(excludedRoute.target?.modelRaw, Self.haiku)
+        XCTAssertEqual(try modelRow(excludedRoute.rows)["makerExclusions"] as? [String: [String]], ["openai": ["exclude_makers"]])
+        try expectOverride(excludedRoute.rows, kind: "exploration", randomness: "low", counter: 10)
+
+        // Normal effort routing then resolves the explored model's own advertised efforts.
+        let codex = try await makeExplorationFixture(stored: ["subagent": 9], randomness: .low)
+        await configure(codex, pick: "gpt-6.1-sol", runnerUp: "gpt-5.6-terra", effort: "high")
+        let codexTarget = try await routeSubagent(codex).target
+        XCTAssertEqual(codexTarget?.agentRaw, AgentProviderKind.codexExec.rawValue)
+        XCTAssertEqual(codexTarget?.modelRaw, "gpt-5.6-terra-high")
+        let codexRequests = await codex.backend.requests
+        let effortRequest = try XCTUnwrap(codexRequests.first { $0.decisionStage == .effort })
+        XCTAssertEqual(Set(effortRequest.candidates.compactMap(\.roleLabels.first)), ["effort:low", "effort:provider-default", "effort:medium", "effort:high"])
+
+        // An abstained effort stage keeps the explored model at its provider default, not Jev's pick.
+        let abstained = try await makeExplorationFixture(.abstainEffort, stored: ["subagent": 9], randomness: .low)
+        await configure(abstained, pick: "gpt-6.1-sol", runnerUp: "gpt-5.6-terra")
+        let abstainedTarget = try await routeSubagent(abstained).target
+        XCTAssertEqual(abstainedTarget?.modelRaw, "gpt-5.6-terra")
+
+        // The shipped composer applies the same runner-up to the session.
+        let composerURL = counterURL()
+        try seed(["primarySession": 9], at: composerURL)
+        let composerFixture = try await makeExplorationFixture(url: composerURL, randomness: .low, hosted: true)
+        await configure(composerFixture, pick: "claude-opus", runnerUp: "claude-sonnet")
+        let composer = try await routeComposer(composerFixture)
+        XCTAssertEqual(composer.session.selectedAgent, .claudeCode)
+        XCTAssertEqual(composer.session.selectedModelRaw, Self.sonnet)
+        let audit = try XCTUnwrap(composer.session.automationTurnAudit.last?.router)
+        XCTAssertEqual(audit.chosenModelRaw, Self.sonnet)
+        XCTAssertNil(audit.usageBalancingReason)
+    }
+
+    func testExplorationSkipsUsageBalancing() async throws {
+        let claudeOpus = AgentRoutingExecutableTarget(
+            agentRaw: AgentProviderKind.claudeCode.rawValue, modelRaw: Self.opus, reasoningEffortRaw: nil, modelParameters: []
+        )
+        // Subagent: Claude is near its limit, so a non-exploring Claude pick swaps to its Codex peer.
+        let control = try await makeExplorationFixture(randomness: .low)
+        await configure(control, pick: "claude-opus", runnerUp: "claude-sonnet")
+        enableUsage(control, codexUsed: 10, claudeUsed: 95)
+        let peer = try XCTUnwrap(control.viewModel.localUsageDecision(basedOn: claudeOpus, scope: .subagent, surface: .general))
+        XCTAssertEqual(peer.candidate.target.agentRaw, AgentProviderKind.codexExec.rawValue)
+        XCTAssertNotNil(peer.reason)
+        let swapped = try await routeSubagent(control)
+        XCTAssertEqual(swapped.target?.agentRaw, AgentProviderKind.codexExec.rawValue, "non-exploring starts keep usage balancing")
+        try expectOverride(swapped.rows, kind: "none", randomness: "low", counter: 1)
+
+        let exploring = try await makeExplorationFixture(stored: ["subagent": 9], randomness: .low)
+        await configure(exploring, pick: "claude-opus", runnerUp: "claude-sonnet")
+        enableUsage(exploring, codexUsed: 10, claudeUsed: 95)
+        let kept = try await routeSubagent(exploring)
+        XCTAssertEqual(kept.target?.agentRaw, AgentProviderKind.claudeCode.rawValue)
+        XCTAssertEqual(kept.target?.modelRaw, Self.sonnet, "exploring keeps the runner-up")
+        try expectOverride(kept.rows, kind: "exploration", randomness: "low", counter: 10)
+
+        // Composer: Codex is near its limit, so a non-exploring Codex pick swaps to Claude.
+        let composerURL = counterURL()
+        let composerControl = try await makeExplorationFixture(url: composerURL, randomness: .low, hosted: true)
+        await configure(composerControl, pick: "gpt-6.1-sol", runnerUp: "claude-sonnet")
+        enableUsage(composerControl, codexUsed: 95, claudeUsed: 10)
+        let balanced = try await routeComposer(composerControl)
+        XCTAssertEqual(balanced.session.selectedAgent, .claudeCode)
+        let balancedAudit = try XCTUnwrap(balanced.session.automationTurnAudit.last?.router)
+        XCTAssertNotNil(balancedAudit.usageBalancingReason)
+
+        let exploringURL = counterURL()
+        try seed(["primarySession": 9], at: exploringURL)
+        let composerExploring = try await makeExplorationFixture(url: exploringURL, randomness: .low, hosted: true)
+        await configure(composerExploring, pick: "gpt-6.1-sol", runnerUp: "claude-sonnet")
+        enableUsage(composerExploring, codexUsed: 95, claudeUsed: 10)
+        let explored = try await routeComposer(composerExploring)
+        XCTAssertEqual(explored.session.selectedAgent, .claudeCode)
+        XCTAssertEqual(explored.session.selectedModelRaw, Self.sonnet)
+        let exploredAudit = try XCTUnwrap(explored.session.automationTurnAudit.last?.router)
+        XCTAssertNil(exploredAudit.usageBalancingReason)
+        XCTAssertEqual(exploredAudit.decision, .selected)
+        let applied = try XCTUnwrap(explored.rows.last { $0["event"] as? String == "applied" })
+        XCTAssertEqual(applied["outcome"] as? String, "applied")
+        try expectOverride(explored.rows, kind: "exploration", randomness: "low", counter: 10)
+    }
+
+    func testSingleCandidateAndFailuresDoNotAdvanceCounter() async throws {
+        func assertUncounted(
+            _ fixture: RoutingStubFixture, _ label: String, rows: [[String: Any]], url: URL, stage: String = "model",
+            outcome: String? = nil
+        ) async throws {
+            let issued = try await explorationAdvisor(of: fixture).counter(for: .subagent)
+            XCTAssertEqual(issued, 0, label)
+            XCTAssertFalse(FileManager.default.fileExists(atPath: url.path), label)
+            let row = try XCTUnwrap(rows.first { $0["event"] as? String == "decision" && $0["stage"] as? String == stage }, label)
+            XCTAssertTrue(row.keys.contains("override"), label)
+            XCTAssertTrue(row["override"] is NSNull, label)
+            if let outcome { XCTAssertEqual(row["outcome"] as? String, outcome, label) }
+        }
+        let claudeBaseline = AgentRoutingExecutableTarget(
+            agentRaw: AgentProviderKind.claudeCode.rawValue, modelRaw: Self.opus, reasoningEffortRaw: nil, modelParameters: []
+        )
+        let single = counterURL()
+        let singleFixture = try await makeExplorationFixture(url: single, randomness: .low, claude: [Self.opus], codex: [])
+        await configure(singleFixture, pick: "claude-opus", runnerUp: "claude-sonnet")
+        let singleRoute = try await routeSubagent(singleFixture)
+        try await assertUncounted(singleFixture, "single", rows: singleRoute.rows, url: single, outcome: "localSingleCandidate")
+
+        for (label, mode, outcome) in [
+            ("abstain", StubRoutingBackend.Mode.abstainModel, "abstained"), ("fail", .failModel, "failed"), ("cancel", .cancelModel, "cancelled")
+        ] {
+            let url = counterURL()
+            let fixture = try await makeExplorationFixture(mode, url: url, randomness: .low)
+            await configure(fixture, pick: "claude-opus", runnerUp: "claude-sonnet")
+            let route = try await routeSubagent(fixture)
+            XCTAssertEqual(route.error, mode == .cancelModel ? AgentModeViewModel.GlobalModelRoutingError.cancelled : nil, label)
+            try await assertUncounted(fixture, label, rows: route.rows, url: url, outcome: outcome)
+        }
+
+        let invalidURL = counterURL()
+        let invalid = try await makeExplorationFixture(url: invalidURL, randomness: .low)
+        invalid.backend.chooseKey = { _ in "not-a-candidate-key" }
+        let invalidRoute = try await routeSubagent(invalid)
+        try await assertUncounted(invalid, "invalid key", rows: invalidRoute.rows, url: invalidURL, outcome: "failed")
+
+        let excludedURL = counterURL()
+        let excluded = try await makeExplorationFixture(url: excludedURL, randomness: .low)
+        await configure(excluded, pick: "claude-opus", runnerUp: "claude-sonnet")
+        let everyMaker = AgentTaskRoutingDiversityOptions(
+            exclusions: Dictionary(uniqueKeysWithValues: AgentTaskRoutingMaker.allCases.map {
+                ($0.rawValue, Set([AgentTaskRoutingDiversityOptions.ExclusionSource.excludeMakers]))
+            })
+        )
+        let excludedRoute = try await routeSubagent(excluded, diversity: everyMaker)
+        XCTAssertEqual(excludedRoute.error, .allCandidatesExcluded)
+        try await assertUncounted(excluded, "all excluded", rows: excludedRoute.rows, url: excludedURL, outcome: "failed")
+
+        let nonJevURL = counterURL()
+        let nonJev = try await makeExplorationFixture(
+            url: nonJevURL, randomness: .low, backendID: AgentTaskRouterBackendID(rawValue: "log-stub")
+        )
+        await configure(nonJev, pick: "claude-opus", runnerUp: "claude-sonnet")
+        let nonJevRoute = try await routeSubagent(nonJev)
+        XCTAssertEqual(nonJevRoute.target?.modelRaw, Self.opus)
+        try await assertUncounted(nonJev, "non-Jev selected", rows: nonJevRoute.rows, url: nonJevURL, outcome: "selected")
+
+        // Disabled and not-ready routes: only the diversity fence writes a (null-override) failed row.
+        let fenced = AgentTaskRoutingDiversityOptions(exclusions: ["openai": [.excludeMakers]])
+        for (label, mode) in [("disabled", StubRoutingBackend.Mode.selectLast), ("not ready", .notReady)] {
+            let withFence = counterURL()
+            let fenceFixture = try await makeExplorationFixture(mode, url: withFence, randomness: .low)
+            if mode == .selectLast { fenceFixture.store.setModelRouterEnabled(false) }
+            let fenceRoute = try await routeSubagent(fenceFixture, diversity: fenced, baseline: claudeBaseline)
+            try await assertUncounted(fenceFixture, "\(label) with exclusions", rows: fenceRoute.rows, url: withFence, outcome: "failed")
+
+            let withoutFence = counterURL()
+            let plain = try await makeExplorationFixture(mode, url: withoutFence, randomness: .low)
+            if mode == .selectLast { plain.store.setModelRouterEnabled(false) }
+            let plainRoute = try await routeSubagent(plain, baseline: claudeBaseline)
+            XCTAssertTrue(plainRoute.rows.filter { $0["event"] as? String == "decision" }.isEmpty, "\(label) without exclusions")
+            let plainIssued = try await explorationAdvisor(of: plain).counter(for: .subagent)
+            XCTAssertEqual(plainIssued, 0, label)
+            XCTAssertFalse(FileManager.default.fileExists(atPath: withoutFence.path), label)
+        }
+
+        // Counted selections: one route is one count, whatever the later stages do.
+        let countedURL = counterURL()
+        let counted = try await makeExplorationFixture(url: countedURL, randomness: .low)
+        await configure(counted, pick: "claude-opus", runnerUp: "claude-sonnet")
+        _ = try await routeSubagent(counted)
+        let countedIssued = try await explorationAdvisor(of: counted).counter(for: .subagent)
+        XCTAssertEqual(countedIssued, 1)
+        XCTAssertEqual(readCounters(countedURL)?.counters, ["subagent": 1])
+
+        let effortFixture = try await makeExplorationFixture(.abstainEffort, randomness: .low)
+        await configure(effortFixture, pick: "gpt-6.1-sol", runnerUp: "gpt-5.6-terra")
+        let effortRoute = try await routeSubagent(effortFixture)
+        let effortRequests = await effortFixture.backend.requests
+        XCTAssertEqual(effortRequests.count(where: { $0.decisionStage == .effort }), 1, "the effort stage ran and abstained")
+        XCTAssertNotNil(effortRoute.target)
+        let effortIssued = try await explorationAdvisor(of: effortFixture).counter(for: .subagent)
+        XCTAssertEqual(effortIssued, 1)
+
+        let stale = try await makeExplorationFixture(.staleModel, randomness: .low)
+        await configure(stale, pick: "claude-opus", runnerUp: "claude-sonnet")
+        let staleRoute = try await routeSubagent(stale)
+        XCTAssertEqual(staleRoute.error, .stale)
+        let staleIssued = try await explorationAdvisor(of: stale).counter(for: .subagent)
+        XCTAssertEqual(staleIssued, 1, "selected, then stale: the count stays consumed")
+
+        // A coordinator cancellation before any selection is never counted.
+        let cancelURL = counterURL()
+        let cancelled = try await makeExplorationFixture(url: cancelURL, randomness: .low)
+        await configure(cancelled, pick: "claude-opus", runnerUp: "claude-sonnet")
+        let cancelContext = try XCTUnwrap(cancelled.viewModel.makeRouteLogContext(scope: .subagent))
+        let coordinator = try XCTUnwrap(cancelled.viewModel.modelRouterRuntime).coordinator
+        let requestID = cancelContext.requestID
+        cancelled.backend.onRoute = { await coordinator.cancel(requestID: requestID) }
+        do {
+            _ = try await cancelled.viewModel.routeSubagentTargetIfEnabled(
+                task: "Implement parser", surface: .general, logContext: cancelContext
+            )
+            XCTFail("A cancelled route throws")
+        } catch {
+            XCTAssertEqual(error as? AgentModeViewModel.GlobalModelRoutingError, .cancelled)
+        }
+        let cancelIssued = try await explorationAdvisor(of: cancelled).counter(for: .subagent)
+        XCTAssertEqual(cancelIssued, 0)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: cancelURL.path))
+    }
+
+    func testCounterPersistsWithoutSettingsRevisionChange() async throws {
+        let fixture = try await makeRoutingStubFixture(.selectLast, tempRoot: tempRoot)
+        let revision = fixture.store.modelRouterSettingsRevision
+        let errors = ExplorationErrorLog()
+        let sink: @Sendable (String) -> Void = { errors.append($0) }
+        func decide(
+            _ advisor: AgentTaskRoutingExplorationAdvisor, _ scope: AgentTaskRoutingScope = .primarySession
+        ) async -> AgentTaskRoutingExplorationRecord {
+            await advisor.decide(scope: scope, randomness: .off, chosenKey: "a", orderedKeys: ordered, scores: scores)
+        }
+
+        // Fresh nested URL: nothing pre-created; first use builds parent, data and sidecar.
+        let url = tempRoot.appendingPathComponent("fresh/nested/dir/exploration-counters.json")
+        let lockURL = URL(fileURLWithPath: url.path + ".lock")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: url.deletingLastPathComponent().path))
+        let first = await decide(AgentTaskRoutingExplorationAdvisor(fileURL: url, errorSink: sink))
+        XCTAssertEqual(first.counter, 1)
+        XCTAssertTrue(first.durable)
+        XCTAssertEqual(readCounters(url)?.schema, 1)
+        XCTAssertEqual(readCounters(url)?.counters, ["primarySession": 1])
+        for file in [url, lockURL] {
+            let mode = (try? FileManager.default.attributesOfItem(atPath: file.path)[.posixPermissions]) as? Int
+            XCTAssertEqual(mode, 0o600, file.lastPathComponent)
+        }
+        let second = await decide(AgentTaskRoutingExplorationAdvisor(fileURL: url, errorSink: sink))
+        XCTAssertEqual(second.counter, 2, "a new advisor reads the latest file")
+        XCTAssertTrue(second.durable)
+        let restarted = AgentTaskRoutingExplorationAdvisor(fileURL: url, errorSink: sink)
+        let third = await decide(restarted)
+        XCTAssertEqual(third.counter, 3)
+        let sub = await decide(restarted, .subagent)
+        XCTAssertEqual(sub.counter, 1)
+        XCTAssertEqual(readCounters(url)?.counters, ["primarySession": 3, "subagent": 1])
+        let ownFloor = await restarted.counter(for: .primarySession)
+        XCTAssertEqual(ownFloor, 3)
+        XCTAssertEqual(errors.messages, [])
+
+        // In-memory only.
+        let memory = AgentTaskRoutingExplorationAdvisor(fileURL: nil)
+        let memoryFirst = await decide(memory)
+        let memorySecond = await decide(memory)
+        XCTAssertEqual([memoryFirst.counter, memorySecond.counter], [1, 2])
+        XCTAssertFalse(memoryFirst.durable)
+
+        // A newer schema is never overwritten.
+        let futureURL = tempRoot.appendingPathComponent("future/exploration-counters.json")
+        let futureBytes = Data(#"{"schema":2,"counters":{"primarySession":5},"extra":1}"#.utf8)
+        writeBytes(futureBytes, to: futureURL)
+        let futureErrors = ExplorationErrorLog()
+        let future = AgentTaskRoutingExplorationAdvisor(fileURL: futureURL, errorSink: { futureErrors.append($0) })
+        let futureFirst = await decide(future)
+        let futureSecond = await decide(future)
+        XCTAssertEqual([futureFirst.counter, futureSecond.counter], [1, 2])
+        XCTAssertFalse(futureFirst.durable)
+        XCTAssertEqual(try? Data(contentsOf: futureURL), futureBytes)
+        XCTAssertEqual(futureErrors.messages.count, 1, "one error per failure window")
+
+        // Malformed content is quarantined under the lock, then reset.
+        for (index, bad) in [
+            "not json", #"{"schema":1,"counters":{"primarySession":-1}}"#,
+            #"{"schema":1,"counters":{"primarySession":"x"}}"#, #"{"schema":0,"counters":{}}"#
+        ].enumerated() {
+            let corruptURL = tempRoot.appendingPathComponent("corrupt-\(index)/exploration-counters.json")
+            writeBytes(Data("older".utf8), to: URL(fileURLWithPath: corruptURL.path + ".corrupt"))
+            writeBytes(Data(bad.utf8), to: corruptURL)
+            let corruptErrors = ExplorationErrorLog()
+            let record = await decide(AgentTaskRoutingExplorationAdvisor(
+                fileURL: corruptURL, errorSink: { corruptErrors.append($0) }
+            ))
+            XCTAssertEqual(record.counter, 1, bad)
+            XCTAssertTrue(record.durable, bad)
+            XCTAssertEqual(try? Data(contentsOf: URL(fileURLWithPath: corruptURL.path + ".corrupt")), Data(bad.utf8), bad)
+            XCTAssertEqual(readCounters(corruptURL)?.counters, ["primarySession": 1], bad)
+            XCTAssertEqual(corruptErrors.messages.count, 1, bad)
+        }
+
+        // Unusable storage degrades to the advisor's own floor and never throws.
+        let blocker = tempRoot.appendingPathComponent("regular-file")
+        writeBytes(Data("file".utf8), to: blocker)
+        let blockedURL = blocker.appendingPathComponent("nested/exploration-counters.json")
+        let blockedErrors = ExplorationErrorLog()
+        let blocked = AgentTaskRoutingExplorationAdvisor(fileURL: blockedURL, errorSink: { blockedErrors.append($0) })
+        let blockedFirst = await decide(blocked)
+        let blockedSecond = await decide(blocked)
+        XCTAssertEqual([blockedFirst.counter, blockedSecond.counter], [1, 2])
+        XCTAssertFalse(blockedFirst.durable)
+        XCTAssertEqual(blockedErrors.messages.count, 1)
+        XCTAssertEqual(try? Data(contentsOf: blocker), Data("file".utf8))
+        let lockDirURL = tempRoot.appendingPathComponent("lock-dir/exploration-counters.json")
+        try FileManager.default.createDirectory(
+            at: URL(fileURLWithPath: lockDirURL.path + ".lock"), withIntermediateDirectories: true
+        )
+        let lockDir = await decide(AgentTaskRoutingExplorationAdvisor(fileURL: lockDirURL, errorSink: sink))
+        XCTAssertEqual(lockDir.counter, 1)
+        XCTAssertFalse(lockDir.durable)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: lockDirURL.path))
+        let maxURL = tempRoot.appendingPathComponent("max/exploration-counters.json")
+        let maxBytes = Data(#"{"schema":1,"counters":{"primarySession":18446744073709551615}}"#.utf8)
+        writeBytes(maxBytes, to: maxURL)
+        let overflow = await decide(AgentTaskRoutingExplorationAdvisor(fileURL: maxURL, errorSink: sink))
+        XCTAssertEqual(overflow.counter, UInt64.max)
+        XCTAssertFalse(overflow.durable)
+        XCTAssertEqual(try? Data(contentsOf: maxURL), maxBytes)
+        XCTAssertGreaterThanOrEqual(errors.messages.count, 2)
+
+        // Two advisors sharing one file: the stale one still sees the latest value.
+        let sharedURL = tempRoot.appendingPathComponent("shared/exploration-counters.json")
+        writeBytes(Data(#"{"schema":1,"counters":{"primarySession":9,"subagent":4,"zzUnknown":7}}"#.utf8), to: sharedURL)
+        let sharedA = AgentTaskRoutingExplorationAdvisor(fileURL: sharedURL, errorSink: sink)
+        let sharedB = AgentTaskRoutingExplorationAdvisor(fileURL: sharedURL, errorSink: sink)
+        let sharedCounters = await [decide(sharedA).counter, decide(sharedA).counter, decide(sharedB).counter]
+        XCTAssertEqual(sharedCounters, [10, 11, 12])
+        XCTAssertEqual(readCounters(sharedURL)?.counters, ["primarySession": 12, "subagent": 4, "zzUnknown": 7])
+
+        // Concurrent advisors, both scopes interleaved.
+        let busyURL = tempRoot.appendingPathComponent("busy/exploration-counters.json")
+        let busyA = AgentTaskRoutingExplorationAdvisor(fileURL: busyURL, errorSink: sink)
+        let busyB = AgentTaskRoutingExplorationAdvisor(fileURL: busyURL, errorSink: sink)
+        let results = await withTaskGroup(of: (Int, AgentTaskRoutingScope, AgentTaskRoutingExplorationRecord).self) { group in
+            for index in 0 ..< 50 {
+                for (owner, advisor) in [(0, busyA), (1, busyB)] {
+                    let scope: AgentTaskRoutingScope = (index + owner) % 2 == 0 ? .primarySession : .subagent
+                    group.addTask {
+                        await (owner, scope, advisor.decide(
+                            scope: scope, randomness: .off, chosenKey: "a", orderedKeys: ["a", "b", "c"],
+                            scores: ["a": 0.6, "b": 0.25, "c": 0.15]
+                        ))
+                    }
+                }
+            }
+            var collected: [(Int, AgentTaskRoutingScope, AgentTaskRoutingExplorationRecord)] = []
+            for await result in group {
+                collected.append(result)
+            }
+            return collected
+        }
+        XCTAssertEqual(results.count, 100)
+        XCTAssertTrue(results.allSatisfy(\.2.durable), "no contention degradation in the exact run")
+        for scope in [AgentTaskRoutingScope.primarySession, .subagent] {
+            XCTAssertEqual(results.filter { $0.1 == scope }.map(\.2.counter).sorted(), Array(1 ... 50), scope.rawValue)
+            for (owner, advisor) in [(0, busyA), (1, busyB)] {
+                let issued = results.filter { $0.0 == owner && $0.1 == scope }.map(\.2.counter)
+                let floor = await advisor.counter(for: scope)
+                XCTAssertEqual(floor, issued.max() ?? 0, "own floor tracks the highest issued value")
+            }
+        }
+        XCTAssertEqual(readCounters(busyURL)?.counters, ["primarySession": 50, "subagent": 50])
+
+        await assertHeldLockDegradesAndRecovers(sink: sink)
+
+        // Runtime seam: designated default is in-memory; an injected advisor is used as given.
+        let bare = try AgentTaskRouterRuntime(
+            registrations: [.init(backend: StubRoutingBackend(mode: .selectLast))],
+            decisionLog: AgentTaskRoutingDecisionLog(fileURL: tempRoot.appendingPathComponent("bare/jev-decisions.jsonl"))
+        )
+        let bareRecord = await decide(bare.explorationAdvisor)
+        XCTAssertEqual(bareRecord.counter, 1)
+        XCTAssertFalse(bareRecord.durable, "default runtime advisor never persists")
+        let injected = AgentTaskRoutingExplorationAdvisor(fileURL: nil)
+        let injectedFixture = try await makeRoutingStubFixture(.selectLast, tempRoot: tempRoot, explorationAdvisor: injected)
+        XCTAssertTrue(injectedFixture.viewModel.modelRouterRuntime?.explorationAdvisor === injected)
+        let isolated = try XCTUnwrap(fixture.viewModel.modelRouterRuntime?.explorationAdvisor)
+        let isolatedRecord = await decide(isolated)
+        XCTAssertTrue(isolatedRecord.durable, "fixture default is an isolated temp file")
+        XCTAssertEqual(
+            Array(AgentTaskRoutingExplorationAdvisor.defaultFileURL().pathComponents.suffix(3)),
+            ["RepoPrompt CE", "ModelRouter", "exploration-counters.json"]
+        )
+        XCTAssertEqual(fixture.store.modelRouterSettingsRevision, revision, "advancing never touches router settings")
+
+        // Routed counts leave the router settings untouched, never reach the real HOME and survive a restart.
+        let homeStamp = Self.modificationDate(AgentTaskRoutingExplorationAdvisor.defaultFileURL())
+        let routedURL = counterURL()
+        let knownSettings = settingsFiles()
+        let routed = try await makeExplorationFixture(url: routedURL, randomness: .off, hosted: true)
+        await configure(routed, pick: "claude-opus", runnerUp: "claude-sonnet")
+        var settingsURL: URL?
+        for _ in 0 ..< 100 where settingsURL == nil {
+            settingsURL = settingsFiles().subtracting(knownSettings).first
+            if settingsURL == nil { try await Task.sleep(for: .milliseconds(50)) }
+        }
+        let settingsFile = try XCTUnwrap(settingsURL, "the fixture settings file exists before routing")
+        let settingsBytes = try Data(contentsOf: settingsFile)
+        let settingsRevision = routed.store.modelRouterSettingsRevision
+        for _ in 1 ... 3 {
+            _ = try await routeSubagent(routed)
+        }
+        _ = try await routeComposer(routed)
+        _ = try await routed.viewModel.routeSubagentTargetIfEnabled(task: "Implement parser", surface: .general)
+        let routedAdvisor = try explorationAdvisor(of: routed)
+        let nilLogCount = await routedAdvisor.counter(for: .subagent)
+        XCTAssertEqual(nilLogCount, 4, "a route with no log context still counts")
+        XCTAssertEqual(readCounters(routedURL)?.counters, ["primarySession": 1, "subagent": 4])
+        XCTAssertEqual(routed.store.modelRouterSettingsRevision, settingsRevision)
+        XCTAssertEqual(try Data(contentsOf: settingsFile), settingsBytes, "counting never rewrites the settings JSON")
+        let reopened = try await makeExplorationFixture(url: routedURL, randomness: .off)
+        await configure(reopened, pick: "claude-opus", runnerUp: "claude-sonnet")
+        try await expectOverride(routeSubagent(reopened).rows, kind: "none", randomness: "off", counter: 5)
+
+        // Unusable storage still routes a valid pick and marks the count non-durable.
+        let routedBlocker = tempRoot.appendingPathComponent("routed-regular-file")
+        writeBytes(Data("file".utf8), to: routedBlocker)
+        let blockedFixture = try await makeExplorationFixture(
+            url: routedBlocker.appendingPathComponent("nested/exploration-counters.json"), randomness: .off
+        )
+        await configure(blockedFixture, pick: "claude-opus", runnerUp: "claude-sonnet")
+        let blockedRoute = try await routeSubagent(blockedFixture)
+        XCTAssertEqual(blockedRoute.target?.modelRaw, Self.opus)
+        try expectOverride(blockedRoute.rows, kind: "none", randomness: "off", counter: 1, durable: false)
+        let futureRouted = counterURL()
+        let futureData = Data(#"{"schema":2,"counters":{"subagent":5}}"#.utf8)
+        writeBytes(futureData, to: futureRouted)
+        let futureFixture = try await makeExplorationFixture(url: futureRouted, randomness: .off)
+        await configure(futureFixture, pick: "claude-opus", runnerUp: "claude-sonnet")
+        let futureRoute = try await routeSubagent(futureFixture)
+        XCTAssertEqual(futureRoute.target?.modelRaw, Self.opus)
+        try expectOverride(futureRoute.rows, kind: "none", randomness: "off", counter: 1, durable: false)
+        XCTAssertEqual(try Data(contentsOf: futureRouted), futureData)
+        XCTAssertEqual(Self.modificationDate(AgentTaskRoutingExplorationAdvisor.defaultFileURL()), homeStamp)
+    }
+
+    func testExplorationOverrideIsLogged() async throws {
+        let fixture = try await makeExplorationFixture(stored: ["subagent": 9], randomness: .low)
+        await configure(fixture, pick: "claude-opus", runnerUp: "claude-sonnet")
+        let route = try await routeSubagent(
+            fixture, diversity: AgentTaskRoutingDiversityOptions(exclusions: ["openai": [.excludeMakers]])
+        )
+        let row = try modelRow(route.rows)
+        let record = try overrideObject(route.rows)
+        XCTAssertEqual(
+            Set(record.keys), ["kind", "randomness", "counter", "position", "originalKey", "appliedKey", "durable"]
+        )
+        let requests = await fixture.backend.requests
+        let request = try XCTUnwrap(requests.first { $0.decisionStage == .model })
+        let opusKey = try candidateKey("claude-opus", in: request)
+        XCTAssertEqual(record["originalKey"] as? String, opusKey)
+        XCTAssertEqual(record["appliedKey"] as? String, try candidateKey("claude-sonnet", in: request))
+        try expectOverride(route.rows, kind: "exploration", randomness: "low", counter: 10)
+        XCTAssertEqual(row["chosenKey"] as? String, opusKey, "the Jev meaning of chosenKey is unchanged")
+        XCTAssertEqual((row["chosenTarget"] as? [String: Any])?["model"] as? String, Self.opus)
+        XCTAssertEqual(row["probabilities"] as? [String: Double], Self.scores(["claude-sonnet": 0.25])(request, opusKey))
+        XCTAssertEqual(row["makerExclusions"] as? [String: [String]], ["openai": ["exclude_makers"]])
+        XCTAssertEqual(row["backend"] as? String, "jev")
+        let decisions = route.rows.filter { $0["event"] as? String == "decision" }
+        XCTAssertEqual(Dictionary(grouping: decisions) { $0["stage"] as? String ?? "" }.mapValues(\.count), ["model": 1, "effort": 1])
+        let applied = try XCTUnwrap(route.rows.first { $0["event"] as? String == "applied" })
+        XCTAssertEqual(applied["outcome"] as? String, "applied")
+        XCTAssertEqual((applied["picked"] as? [String: Any])?["model"] as? String, Self.sonnet)
+        XCTAssertEqual(applied["requestID"] as? String, row["requestID"] as? String)
+        assertDecisionsPrecedeApplied(route.rows)
+
+        // Non-exploring positions and invalid evidence are visible as such.
+        let none = try await makeExplorationFixture(randomness: .low)
+        await configure(none, pick: "claude-opus", runnerUp: "claude-sonnet")
+        try await expectOverride(routeSubagent(none).rows, kind: "none", randomness: "low", counter: 1)
+        let invalidEvidence: [(String, (@Sendable (AgentTaskRoutingRequest, String) -> [String: Double]?)?)] = [
+            ("nil", nil),
+            ("missing key", { request, chosen in
+                Self.scores(["claude-sonnet": 0.25])(request, chosen)?.filter { $0.key != request.candidates.last?.opaqueKey }
+            }),
+            ("tied top", Self.scores(["claude-sonnet": 0.6]))
+        ]
+        for (label, scoring) in invalidEvidence {
+            let unavailable = try await makeExplorationFixture(stored: ["subagent": 9], randomness: .low)
+            unavailable.backend.chooseKey = Self.pick("claude-opus")
+            await unavailable.backend.setScoresFor(scoring)
+            let unavailableRoute = try await routeSubagent(unavailable)
+            XCTAssertEqual(unavailableRoute.target?.modelRaw, Self.opus, label)
+            try expectOverride(unavailableRoute.rows, kind: "explorationUnavailable", randomness: "low", counter: 10)
+        }
+
+        // Every other emitted model-adjacent row carries the key as null.
+        let codex = try await makeExplorationFixture(randomness: .low)
+        await configure(codex, pick: "gpt-6.1-sol", runnerUp: "gpt-5.6-terra", effort: "high")
+        let codexRoute = try await routeSubagent(codex)
+        let effortRow = try XCTUnwrap(codexRoute.rows.first { $0["stage"] as? String == "effort" })
+        XCTAssertEqual(effortRow["outcome"] as? String, "selected")
+        XCTAssertTrue(effortRow.keys.contains("override") && effortRow["override"] is NSNull)
+        let local = try await makeExplorationFixture(randomness: .low, claude: [Self.opus], codex: [])
+        let localRoute = try await routeSubagent(local)
+        XCTAssertTrue(localRoute.rows.filter { $0["event"] as? String == "decision" }.allSatisfy { $0["override"] is NSNull })
+        XCTAssertEqual(localRoute.rows.compactMap { $0["outcome"] as? String }.first, "localSingleCandidate")
+        for mode in [StubRoutingBackend.Mode.abstainModel, .failModel, .cancelModel] {
+            let other = try await makeExplorationFixture(mode, stored: ["subagent": 9], randomness: .low)
+            await configure(other, pick: "claude-opus", runnerUp: "claude-sonnet")
+            let otherRoute = try await routeSubagent(other)
+            let otherRow = try modelRow(otherRoute.rows)
+            XCTAssertTrue(otherRow.keys.contains("override") && otherRow["override"] is NSNull, "\(mode)")
+        }
+        let nonJev = try await makeExplorationFixture(
+            stored: ["subagent": 9], randomness: .low, backendID: AgentTaskRouterBackendID(rawValue: "log-stub")
+        )
+        await configure(nonJev, pick: "claude-opus", runnerUp: "claude-sonnet")
+        let nonJevRoute = try await routeSubagent(nonJev)
+        let nonJevRow = try modelRow(nonJevRoute.rows)
+        XCTAssertEqual(nonJevRow["outcome"] as? String, "selected")
+        XCTAssertTrue(nonJevRow.keys.contains("override") && nonJevRow["override"] is NSNull)
+        let autoContext = AgentTaskRoutingRouteContext(requestID: UUID(), scope: .subagent, log: fixture.log)
+        await autoContext.emitDecision(AgentTaskRoutingDecisionDraft(stage: .autoEffort, outcome: .selected))
+        await autoContext.finish(.rejected)
+        await fixture.log.flush()
+        let autoRow = try XCTUnwrap(fixture.rows().first { $0["stage"] as? String == "autoEffort" })
+        XCTAssertTrue(autoRow.keys.contains("override") && autoRow["override"] is NSNull)
+
+        // A degraded counter is still logged, marked non-durable.
+        let blocker = tempRoot.appendingPathComponent("logged-regular-file")
+        writeBytes(Data("file".utf8), to: blocker)
+        let degraded = try await makeExplorationFixture(
+            url: blocker.appendingPathComponent("nested/exploration-counters.json"), randomness: .low
+        )
+        await configure(degraded, pick: "claude-opus", runnerUp: "claude-sonnet")
+        try await expectOverride(routeSubagent(degraded).rows, kind: "none", randomness: "low", counter: 1, durable: false)
+    }
+
+    // MARK: - Routed seam helpers
+
+    private static let opus = "claude-opus-5-5"
+    private static let sonnet = "claude-sonnet-5-5"
+    private static let haiku = "claude-haiku-4-5"
+
+    private struct SubagentRoute {
+        let result: Result<AgentRoutingExecutableTarget?, Error>
+        let rows: [[String: Any]]
+
+        var target: AgentRoutingExecutableTarget? {
+            (try? result.get()) ?? nil
+        }
+
+        var error: AgentModeViewModel.GlobalModelRoutingError? {
+            guard case let .failure(error) = result else { return nil }
+            return error as? AgentModeViewModel.GlobalModelRoutingError
+        }
+    }
+
+    private struct ComposerRoute {
+        let session: AgentModeViewModel.TabSession
+        let rows: [[String: Any]]
+    }
+
+    private func explorationAdvisor(of fixture: RoutingStubFixture) throws -> AgentTaskRoutingExplorationAdvisor {
+        try XCTUnwrap(fixture.viewModel.modelRouterRuntime?.explorationAdvisor)
+    }
+
+    private func counterURL() -> URL {
+        tempRoot.appendingPathComponent("counters-\(UUID().uuidString)/exploration-counters.json")
+    }
+
+    private func seed(_ counters: [String: UInt64], at url: URL) throws {
+        try writeBytes(JSONSerialization.data(withJSONObject: ["schema": 1, "counters": counters]), to: url)
+    }
+
+    private func settingsFiles() -> Set<URL> {
+        let entries = (try? FileManager.default.contentsOfDirectory(at: tempRoot, includingPropertiesForKeys: nil)) ?? []
+        return Set(
+            entries.filter { $0.lastPathComponent.hasPrefix("settings-") }
+                .map { $0.appendingPathComponent("globalSettings.json") }
+                .filter { FileManager.default.fileExists(atPath: $0.path) }
+        )
+    }
+
+    private static func modificationDate(_ url: URL) -> Date? {
+        (try? FileManager.default.attributesOfItem(atPath: url.path))?[.modificationDate] as? Date
+    }
+
+    private func configure(_ fixture: RoutingStubFixture, pick: String, runnerUp: String?, effort: String? = nil) async {
+        fixture.backend.chooseKey = Self.pick(pick, effort: effort)
+        await fixture.backend.setScoresFor(runnerUp.map { Self.scores([$0: 0.25]) })
+    }
+
+    private func candidateKey(_ label: String, in request: AgentTaskRoutingRequest) throws -> String {
+        try XCTUnwrap(request.candidates.first { $0.roleLabels == [label] }?.opaqueKey)
+    }
+
+    private func routeSubagent(
+        _ fixture: RoutingStubFixture,
+        diversity: AgentTaskRoutingDiversityOptions = .none,
+        baseline: AgentRoutingExecutableTarget? = nil
+    ) async throws -> SubagentRoute {
+        let context = try XCTUnwrap(fixture.viewModel.makeRouteLogContext(scope: .subagent))
+        let result: Result<AgentRoutingExecutableTarget?, Error>
+        do {
+            result = try await .success(fixture.viewModel.routeSubagentTargetIfEnabled(
+                task: "Implement parser", surface: .general, baseline: baseline, logContext: context, diversity: diversity
+            ))
+        } catch {
+            result = .failure(error)
+        }
+        if case let .success(target) = result, let target {
+            await context.finish(.accepted(actual: target, sessionID: nil))
+        } else {
+            await context.finish(.rejected)
+        }
+        await fixture.log.flush()
+        let id = context.requestID.uuidString
+        return try SubagentRoute(result: result, rows: fixture.rows().filter { $0["requestID"] as? String == id })
+    }
+
+    /// The shipped composer entry on a fresh tab; the tab's session ends on the routed (Claude) target.
+    private func routeComposer(_ fixture: RoutingStubFixture) async throws -> ComposerRoute {
+        let viewModel = fixture.viewModel
+        await fixture.log.flush()
+        let appliedBefore = try fixture.rows().count(where: { $0["event"] as? String == "applied" })
+        let tabID = UUID()
+        viewModel.test_setCurrentTabIDOverride(tabID)
+        let session = viewModel.session(for: tabID)
+        _ = viewModel.test_installPersistentSessionBinding(sessionID: UUID(), on: session)
+        let claim = try routingClaim(viewModel: viewModel, session: session, text: "Implement parser")
+        let result = await viewModel.submitUserTurnAfterFreshTaskRouting(
+            text: "Implement parser", claim: claim, session: session, destinationTabID: tabID
+        )
+        XCTAssertEqual(result, .submitted)
+        try await waitForAppliedRows(fixture, count: appliedBefore + 1)
+        let id = claim.attempt.id.uuidString
+        let rows = try fixture.rows().filter { $0["requestID"] as? String == id }
+        assertDecisionsPrecedeApplied(rows)
+        return ComposerRoute(session: session, rows: rows)
+    }
+
+    private func modelRow(_ rows: [[String: Any]], file: StaticString = #filePath, line: UInt = #line) throws -> [String: Any] {
+        try XCTUnwrap(
+            rows.first { $0["event"] as? String == "decision" && $0["stage"] as? String == "model" },
+            "model decision row", file: file, line: line
+        )
+    }
+
+    private func overrideObject(_ rows: [[String: Any]], file: StaticString = #filePath, line: UInt = #line) throws -> [String: Any] {
+        try XCTUnwrap(modelRow(rows, file: file, line: line)["override"] as? [String: Any], "override object", file: file, line: line)
+    }
+
+    private func expectOverride(
+        _ rows: [[String: Any]], kind: String, randomness: String, counter: Int, durable: Bool = true,
+        file: StaticString = #filePath, line: UInt = #line
+    ) throws {
+        let record = try overrideObject(rows, file: file, line: line)
+        XCTAssertEqual(record["kind"] as? String, kind, file: file, line: line)
+        XCTAssertEqual(record["randomness"] as? String, randomness, file: file, line: line)
+        XCTAssertEqual(record["counter"] as? Int, counter, file: file, line: line)
+        XCTAssertEqual(record["position"] as? Int, (counter - 1) % 20 + 1, file: file, line: line)
+        XCTAssertEqual(record["durable"] as? Bool, durable, file: file, line: line)
+        XCTAssertEqual(
+            record["appliedKey"] as? String == record["originalKey"] as? String, kind != "exploration", file: file, line: line
+        )
+    }
+
+    /// Usage snapshots follow `AgentComposerSubmissionAttemptTests.testUsageBalancingRoutesFreshComposerAndSubagentWithoutJev`.
+    private func enableUsage(_ fixture: RoutingStubFixture, codexUsed: Double, claudeUsed: Double) {
+        fixture.store.setUsageBalancingEnabled(true)
+        let balancer = AgentUsageBalancer()
+        fixture.viewModel.modelRouterRuntime?.usageBalancer = balancer
+        let now = Date()
+        let reset = now.addingTimeInterval(18000).timeIntervalSince1970
+        for (provider, used) in [(AgentProviderKind.codexExec, codexUsed), (.claudeCode, claudeUsed)] {
+            let record = ClaudeCLIUsageRecord(version: 1, receivedAt: now, windows: ["five_hour": .init(used: used, resetsAt: reset)])
+            balancer.update(record.snapshot(profileID: "exploration-test"), provider: provider.rawValue)
+        }
+    }
+
+    /// Picks models and efforts by descriptor identity (label), never by position.
+    private static func pick(_ model: String, effort: String? = nil) -> @Sendable (AgentTaskRoutingRequest) -> String? {
+        { request in
+            let label = request.decisionStage == .model ? model : effort.map { "effort:\($0)" }
+            return request.candidates.first { $0.roleLabels == [label ?? ""] }?.opaqueKey
+        }
+    }
+
+    /// Chosen key 0.6, each labelled candidate its given score, everything else 0.
+    private nonisolated static func scores(_ labelled: [String: Double]) -> @Sendable (AgentTaskRoutingRequest, String) -> [String: Double]? {
+        { request, chosen in
+            guard request.decisionStage == .model else { return nil }
+            return Dictionary(uniqueKeysWithValues: request.candidates.map {
+                ($0.opaqueKey, $0.opaqueKey == chosen ? 0.6 : ($0.roleLabels.first.flatMap { labelled[$0] } ?? 0))
+            })
+        }
+    }
+
+    private func makeExplorationFixture(
+        _ mode: StubRoutingBackend.Mode = .selectLast,
+        url injectedURL: URL? = nil,
+        stored: [String: UInt64] = [:],
+        randomness: AgentRoutingRandomness,
+        hosted: Bool = false,
+        backendID: AgentTaskRouterBackendID = .jev,
+        claude: [String] = ["claude-haiku-4-5", "claude-sonnet-5-5", "claude-opus-5-5"],
+        codex: [String] = ["gpt-5.6-terra", "gpt-6.1-sol"]
+    ) async throws -> RoutingStubFixture {
+        let url = injectedURL ?? counterURL()
+        if !stored.isEmpty { try seed(stored, at: url) }
+        let options: @MainActor (AgentProviderKind, AgentModelCatalog.AvailabilityContext) -> [AgentModelOption] = { provider, _ in
+            switch provider {
+            case .claudeCode:
+                claude.map {
+                    AgentModelOption(rawValue: $0, displayName: $0, description: nil, isPlaceholderDefault: false, isProviderDefault: false)
+                }
+            case .codexExec:
+                codex.map {
+                    AgentModelOption(
+                        rawValue: $0, displayName: $0, description: nil, isPlaceholderDefault: false, isProviderDefault: false,
+                        supportedReasoningEfforts: [.low, .medium, .high]
+                    )
+                }
+            default:
+                []
+            }
+        }
+        let fixture = try await makeRoutingStubFixture(
+            mode, tempRoot: tempRoot, backendID: backendID,
+            candidateBuilder: { AgentTaskRoutingCandidateBuilder(modelOptions: options) },
+            explorationAdvisor: AgentTaskRoutingExplorationAdvisor(fileURL: url)
+        )
+        fixture.store.setRandomness(randomness)
+        guard hosted else { return fixture }
+        return try await hostInWindow(fixture)
+    }
+
+    /// Re-hosts a stub fixture's store, runtime and log in an isolated WindowState so the composer's real run
+    /// start reaches the stubbed native controller (same pattern as `makeServiceWindow`, no live provider).
+    private func hostInWindow(_ fixture: RoutingStubFixture) async throws -> RoutingStubFixture {
+        let settings = GlobalSettingsStore.shared
+        let previousAutoStart = settings.mcpAutoStart()
+        settings.setMCPAutoStart(false, commit: false)
+        defer { settings.setMCPAutoStart(previousAutoStart, commit: false) }
+        let workspacePath = tempRoot.path
+        let window = WindowState(
+            agentModeViewModelFactory: { windowID, prompt, manager, server in
+                let viewModel = AgentModeViewModel(
+                    testWindowID: windowID,
+                    testWorkspacePath: workspacePath,
+                    codexControllerFactory: { _, _, _, _, _, _ in
+                        preconditionFailure("Exploration test must not start Codex")
+                    },
+                    claudeControllerFactory: { _, _, _, _ in MonitorFakeNativeController() },
+                    headlessProviderFactory: { _, _, _, _, _ in
+                        AgentSessionLinkCapturingHeadlessProvider(failuresRemaining: 1)
+                    },
+                    acpProviderFactory: { _, _ in throw MCPError.internalError("ACP must not start") },
+                    acpControllerFactory: { _, _ in throw MCPError.internalError("ACP must not start") },
+                    connectionPolicyInstaller: { _, _, _, _, _, _, _, _, _, _, _, _, _ in },
+                    mcpRunRoutingCleaner: { _, _, _ in },
+                    mcpServerEnabler: { true },
+                    testMCPServer: server,
+                    testWorkspaceFileContextStore: prompt.workspaceFileContextStore
+                )
+                viewModel.promptManager = prompt
+                viewModel.workspaceManager = manager
+                return viewModel
+            },
+            contextBuilderProviderFactory: { _, _, _, _ in
+                AgentSessionLinkCapturingHeadlessProvider(failuresRemaining: 1)
+            }
+        )
+        WindowStatesManager.shared.registerWindowState(window)
+        addTeardownBlock { @MainActor in
+            window.beginClose()
+            await window.tearDown()
+            WindowStatesManager.shared.unregisterWindowState(window)
+        }
+        await window.workspaceManager.awaitInitialized()
+        window.apiSettingsViewModel.isClaudeCodeConnected = true
+        window.apiSettingsViewModel.isCodexConnected = true
+        window.apiSettingsViewModel.test_completeContextBuilderProviderValidation(
+            verifiedProviders: [.claudeCode, .codexExec]
+        )
+        let workspace = window.workspaceManager.createWorkspace(
+            name: "Exploration \(UUID().uuidString.prefix(8))", repoPaths: [workspacePath], ephemeral: true
+        )
+        await window.workspaceManager.switchWorkspace(to: workspace, saveState: false, reason: "explorationComposer")
+        guard let activeWorkspace = window.workspaceManager.activeWorkspace else {
+            throw MCPError.internalError("Expected active ephemeral workspace")
+        }
+        window.promptManager.loadComposeTabsFromWorkspace(activeWorkspace, syncPromptText: true)
+        window.agentModeViewModel.modelRouterSettingsStore = fixture.store
+        window.agentModeViewModel.modelRouterRuntime = fixture.viewModel.modelRouterRuntime
+        return RoutingStubFixture(
+            viewModel: window.agentModeViewModel, store: fixture.store, log: fixture.log, logURL: fixture.logURL,
+            backend: fixture.backend
+        )
+    }
+
+    private func assertHeldLockDegradesAndRecovers(sink: @escaping @Sendable (String) -> Void) async {
+        let url = tempRoot.appendingPathComponent("held/exploration-counters.json")
+        let advisor = AgentTaskRoutingExplorationAdvisor(fileURL: url, errorSink: sink)
+        let seed = await advisor.decide(
+            scope: .primarySession, randomness: .off, chosenKey: "a", orderedKeys: ordered, scores: scores
+        )
+        XCTAssertEqual(seed.counter, 1)
+        let descriptor = open(url.path + ".lock", O_RDWR | O_CLOEXEC)
+        guard descriptor >= 0 else { return XCTFail("sidecar lock was not created") }
+        defer { close(descriptor) }
+        XCTAssertEqual(flock(descriptor, LOCK_EX | LOCK_NB), 0)
+        let before = try? Data(contentsOf: url)
+        let started = ContinuousClock.now
+        let degraded = await advisor.decide(
+            scope: .primarySession, randomness: .off, chosenKey: "a", orderedKeys: ordered, scores: scores
+        )
+        let waited = started.duration(to: .now)
+        XCTAssertEqual(degraded.counter, 2)
+        XCTAssertFalse(degraded.durable)
+        XCTAssertGreaterThanOrEqual(waited, .milliseconds(200), "waited for the contention deadline")
+        XCTAssertEqual(try? Data(contentsOf: url), before, "a timed-out turn never writes")
+        XCTAssertEqual(flock(descriptor, LOCK_UN), 0)
+        let recovered = await advisor.decide(
+            scope: .primarySession, randomness: .off, chosenKey: "a", orderedKeys: ordered, scores: scores
+        )
+        XCTAssertEqual(recovered.counter, 3, "recovery exceeds the file and the advisor's own non-durable value")
+        XCTAssertTrue(recovered.durable)
+        XCTAssertEqual(readCounters(url)?.counters, ["primarySession": 3])
+    }
+
+    private func readCounters(_ url: URL) -> ExplorationCounterFile? {
+        guard FileManager.default.fileExists(atPath: url.path) else {
+            XCTFail("missing counter file \(url.lastPathComponent)")
+            return nil
+        }
+        return (try? Data(contentsOf: url)).flatMap { try? JSONDecoder().decode(ExplorationCounterFile.self, from: $0) }
+    }
+
+    private func writeBytes(_ data: Data, to url: URL) {
+        do {
+            try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try data.write(to: url)
+        } catch {
+            XCTFail("fixture write failed: \(error)")
         }
     }
 }

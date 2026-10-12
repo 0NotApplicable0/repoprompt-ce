@@ -124,6 +124,7 @@ struct AgentTaskRoutingDecisionDraft {
     var latencyMs: Double?
     var failure: String?
     var makerExclusions: [String: [String]]?
+    var routingOverride: AgentTaskRoutingExplorationRecord?
 
     init(stage: AgentTaskRoutingLogStage, outcome: AgentTaskRoutingLogOutcome) {
         self.stage = stage
@@ -142,6 +143,7 @@ struct AgentTaskRoutingDecisionEvent: Encodable {
         case event, schema, timestamp, requestID, sessionID, scope, stage, outcome, backend, jevModel
         case policyVersion, candidates, chosenKey, chosenTarget, probabilities, confidence, reasonCode
         case inputTokens, outputTokens, latencyMs, failure, rationale, makerExclusions
+        case routingOverride = "override"
     }
 
     func encode(to encoder: Encoder) throws {
@@ -170,6 +172,7 @@ struct AgentTaskRoutingDecisionEvent: Encodable {
         try container.encodeOrNull(draft.makerExclusions, forKey: .makerExclusions)
         // The decoded Jev response contract exposes no rationale.
         try container.encodeNil(forKey: .rationale)
+        try container.encodeOrNull(draft.routingOverride, forKey: .routingOverride)
     }
 }
 

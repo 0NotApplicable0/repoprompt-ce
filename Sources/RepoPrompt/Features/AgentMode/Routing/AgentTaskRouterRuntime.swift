@@ -9,6 +9,7 @@ final class AgentTaskRouterRuntime: ObservableObject {
     let coordinator: AgentFreshTaskRoutingCoordinator
     /// The single production decision-log instance for this composition.
     let decisionLog: AgentTaskRoutingDecisionLog
+    let explorationAdvisor: AgentTaskRoutingExplorationAdvisor
     let objectWillChange = ObservableObjectPublisher()
     @MainActor var usageBalancer: AgentUsageBalancer?
     /// Builds the candidate builder used for one routing decision. The default is the production
@@ -23,11 +24,13 @@ final class AgentTaskRouterRuntime: ObservableObject {
     init(
         registrations: [AgentTaskRouterBackendRegistration],
         bootstrapBackendID: AgentTaskRouterBackendID? = nil,
-        decisionLog: AgentTaskRoutingDecisionLog = AgentTaskRoutingDecisionLog()
+        decisionLog: AgentTaskRoutingDecisionLog = AgentTaskRoutingDecisionLog(),
+        explorationAdvisor: AgentTaskRoutingExplorationAdvisor = AgentTaskRoutingExplorationAdvisor(fileURL: nil)
     ) throws {
         let registry = try AgentTaskRouterRegistry(registrations: registrations)
         self.registry = registry
         self.decisionLog = decisionLog
+        self.explorationAdvisor = explorationAdvisor
         coordinator = AgentFreshTaskRoutingCoordinator(registry: registry)
         start(bootstrapBackendID: bootstrapBackendID)
     }
@@ -50,7 +53,8 @@ final class AgentTaskRouterRuntime: ObservableObject {
                 ],
                 bootstrapBackendID: GlobalSettingsStore.shared.autoEffortEnabled() ? .jev
                     : (configuration.enabled ? configuration.selectedBackendID : nil),
-                decisionLog: decisionLog
+                decisionLog: decisionLog,
+                explorationAdvisor: AgentTaskRoutingExplorationAdvisor(fileURL: AgentTaskRoutingExplorationAdvisor.defaultFileURL())
             )
         } catch {
             preconditionFailure("Invalid bundled model-router registry: \(error)")

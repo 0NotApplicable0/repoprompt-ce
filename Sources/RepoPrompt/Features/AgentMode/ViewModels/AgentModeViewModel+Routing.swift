@@ -597,17 +597,30 @@ extension AgentModeViewModel {
                 )
             }
             judgmentRequested = true
-            let modelOutcome = await tracedRoute(
-                runtime: runtime, backendID: backendID, request: modelRequest,
-                candidates: models, context: logContext
-            )
+            let traced = await runtime.routeTraced(backendID: backendID, request: modelRequest)
+            let modelOutcome = traced.outcome
+            var exploration: AgentTaskRoutingExplorationRecord?
+            // ponytail: counted before the model row, so a nil log context and later cancellation still count.
+            if case let .selected(modelKey, evidence) = modelOutcome, traced.trace.backendID == .jev,
+               models.only(where: { $0.opaqueKey == modelKey }) != nil
+            {
+                exploration = await runtime.explorationAdvisor.decide(
+                    scope: scope, randomness: configuration.randomness, chosenKey: modelKey,
+                    orderedKeys: models.map(\.opaqueKey), scores: evidence?.scores
+                )
+            }
+            await emitTracedDecision(traced, stage: .model, candidates: models, override: exploration, context: logContext)
             guard case let .selected(modelKey, evidence) = modelOutcome,
                   let match = models.only(where: { $0.opaqueKey == modelKey })
             else { return StagedTaskRoutingResult(candidates: models, outcome: modelOutcome, judgmentRequested: true) }
             selectedModel = match
             modelEvidence = evidence
-            if allowUsageBalance, configuration.usageBalancing.enabled, !Task.isCancelled,
-               modelRouterConfigurationIsCurrent(configuration, backendID: backendID), let advisor = runtime.usageBalancer
+            if let exploration, exploration.kind == .exploration,
+               let explored = models.only(where: { $0.opaqueKey == exploration.appliedKey })
+            {
+                selectedModel = explored
+            } else if allowUsageBalance, configuration.usageBalancing.enabled, !Task.isCancelled,
+                      modelRouterConfigurationIsCurrent(configuration, backendID: backendID), let advisor = runtime.usageBalancer
             {
                 let decision = advisor.choose(selected: match, candidates: models, evidence: evidence, configuration: configuration)
                 selectedModel = decision.candidate
@@ -716,8 +729,21 @@ extension AgentModeViewModel {
         context: AgentTaskRoutingRouteContext?
     ) async -> AgentTaskRoutingBackendOutcome {
         let traced = await runtime.routeTraced(backendID: backendID, request: request)
-        guard let context else { return traced.outcome }
-        let stage: AgentTaskRoutingLogStage = request.decisionStage == .model ? .model : .effort
+        await emitTracedDecision(
+            traced, stage: request.decisionStage == .model ? .model : .effort,
+            candidates: candidates, override: nil, context: context
+        )
+        return traced.outcome
+    }
+
+    private func emitTracedDecision(
+        _ traced: AgentTaskRoutingTracedOutcome,
+        stage: AgentTaskRoutingLogStage,
+        candidates: [AgentTaskRoutingCandidateBuilder.Candidate],
+        override: AgentTaskRoutingExplorationRecord?,
+        context: AgentTaskRoutingRouteContext?
+    ) async {
+        guard let context else { return }
         var draft: AgentTaskRoutingDecisionDraft
         var evidence: AgentTaskRoutingDecisionEvidence?
         switch traced.outcome {
@@ -742,6 +768,7 @@ extension AgentModeViewModel {
         case .cancelled:
             draft = AgentTaskRoutingDecisionDraft(stage: stage, outcome: .cancelled)
         }
+        draft.routingOverride = override
         draft.backend = traced.trace.backendID.rawValue
         draft.jevModel = traced.trace.jevModel
         draft.latencyMs = traced.trace.latencyMs
@@ -755,7 +782,6 @@ extension AgentModeViewModel {
             draft.reasonCode = draft.reasonCode ?? evidence.reasonCode
         }
         await context.emitDecision(draft)
-        return traced.outcome
     }
 
     private func modelRouterConfigurationIsCurrent(

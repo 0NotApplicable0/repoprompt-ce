@@ -64,6 +64,21 @@ made without a Jev request.
 | `failure` | Failure category when one exists. |
 | `rationale` | Always `null`. |
 | `makerExclusions` | Model stage only; `null` on `effort`, `autoEffort` and when nothing was excluded. Maps each excluded maker to the sources that excluded it, always in the order `exclude_makers`, `diverse_from_sessions`, `review_diversity`. `exclude_makers` is an explicit exclusion, `diverse_from_sessions` excludes makers by session diversity, and `review_diversity` is Review diversity. |
+| `override` | Model stage only; always present. `null` unless Jev selected among at least two surviving models and the decision was counted, then an object (see below). `chosenKey`, `chosenTarget` and `probabilities` stay Jev's own choice; an `applied` row reports the final executable target. |
+
+### `override` object
+
+| Field | Meaning |
+| --- | --- |
+| `kind` | `none` (counted, not exploring), `exploration` (Jev's runner-up replaced the pick) or `explorationUnavailable` (exploring position, no valid runner-up, Jev's pick kept). |
+| `randomness` | Raw level at the decision: `off`, `low`, `medium` or `high`. |
+| `counter` | Unsigned 64-bit count issued for the routing scope: primary session or subagent (a `headless` subagent uses the subagent counter). |
+| `position` | Cycle position, `1...20`. |
+| `originalKey` | Jev's chosen key. |
+| `appliedKey` | Key output by the exploration step; it is not the later usage-balancing or effort result. |
+| `durable` | `true` when committed under the counter-file lock; `false` for a degraded in-memory value. |
+
+The schema stays `1`; `override` is additive.
 
 ## `applied` events
 
@@ -84,6 +99,12 @@ later is an ordinary run failure and is not reinterpreted here. Decision rows ar
 the application row of the same route.
 
 ## Example
+
+Count exploring model decisions by scope:
+
+```bash
+jq -s 'map(select(.event=="decision" and .stage=="model" and .override.kind=="exploration")) | group_by(.scope) | map({scope:.[0].scope,exploring:length})' jev-decisions.jsonl
+```
 
 Count `decision` events by chosen provider:
 
