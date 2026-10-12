@@ -799,20 +799,7 @@ final class AgentTaskRoutingDecisionLogTests: XCTestCase {
 
     // MARK: - Fixtures
 
-    private struct Fixture {
-        let viewModel: AgentModeViewModel
-        let store: GlobalSettingsStore
-        let log: AgentTaskRoutingDecisionLog
-        let logURL: URL
-        let backend: StubRoutingBackend
-
-        func rows() throws -> [[String: Any]] {
-            guard FileManager.default.fileExists(atPath: logURL.path) else { return [] }
-            return try String(contentsOf: logURL, encoding: .utf8)
-                .split(separator: "\n")
-                .map { try XCTUnwrap(JSONSerialization.jsonObject(with: Data($0.utf8)) as? [String: Any]) }
-        }
-    }
+    private typealias Fixture = RoutingStubFixture
 
     private struct JevFixture {
         let viewModel: AgentModeViewModel
@@ -856,17 +843,10 @@ final class AgentTaskRoutingDecisionLogTests: XCTestCase {
         log injectedLog: AgentTaskRoutingDecisionLog? = nil,
         logURL injectedURL: URL? = nil
     ) async throws -> Fixture {
-        let logURL = injectedURL ?? tempRoot.appendingPathComponent("stub-\(UUID().uuidString)/jev-decisions.jsonl")
-        let log = injectedLog ?? AgentTaskRoutingDecisionLog(fileURL: logURL)
-        let backend = StubRoutingBackend(mode: mode, id: backendID)
-        let runtime = try AgentTaskRouterRuntime(registrations: [.init(backend: backend)], decisionLog: log)
-        try await AsyncTestWait.waitUntil("stub ready", timeout: 5) { runtime.backendReadiness(backend.id) != nil }
-        let (viewModel, store) = try makeViewModel(runtime: runtime, backendID: backend.id, providers: providers)
-        if let candidateBuilder { runtime.candidateBuilderFactory = candidateBuilder }
-        backend.onRoute = { [store] in
-            if mode == .staleModel { await MainActor.run { store.setModelRouterEnabled(false) } }
-        }
-        return Fixture(viewModel: viewModel, store: store, log: log, logURL: logURL, backend: backend)
+        try await makeRoutingStubFixture(
+            mode, tempRoot: tempRoot, backendID: backendID, providers: providers,
+            candidateBuilder: candidateBuilder, log: injectedLog, logURL: injectedURL
+        )
     }
 
     private func makeViewModel(
@@ -874,39 +854,7 @@ final class AgentTaskRoutingDecisionLogTests: XCTestCase {
         backendID: AgentTaskRouterBackendID,
         providers: Set<AgentProviderKind>
     ) throws -> (AgentModeViewModel, GlobalSettingsStore) {
-        let root = tempRoot.appendingPathComponent("settings-\(UUID().uuidString)", isDirectory: true)
-        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
-        let defaults = try XCTUnwrap(UserDefaults(suiteName: "AgentTaskRoutingDecisionLogTests.\(UUID())"))
-        let store = GlobalSettingsStore(
-            defaults: defaults,
-            fileStore: GlobalSettingsFileStore(fileURL: root.appendingPathComponent("globalSettings.json"))
-        )
-        store.enableModelRouterWithCurrentPolicy(
-            backendID: backendID,
-            roles: Set(AgentModelCatalog.TaskLabelKind.allCases),
-            providers: providers
-        )
-        let availability = AgentModelCatalog.AvailabilityContext(
-            claudeCodeAvailable: providers.contains(.claudeCode),
-            codexAvailable: providers.contains(.codexExec),
-            openCodeAvailable: false
-        )
-        runtime.candidateBuilderFactory = {
-            AgentTaskRoutingCandidateBuilder(modelOptions: { provider, _ in
-                guard providers.contains(provider) else { return [] }
-                return AgentModelCatalog.options(for: provider, availability: availability)
-            })
-        }
-        let viewModel = AgentModeViewModel(
-            codexControllerFactory: { _, _, _, _, _, _ in
-                preconditionFailure("Decision log test must not start Codex")
-            },
-            claudeControllerFactory: { _, _, _, _ in MonitorFakeNativeController() },
-            headlessProviderFactory: { _, _, _, _, _ in UnsupportedHeadlessAgentProvider(reason: "test terminal") }
-        )
-        viewModel.modelRouterSettingsStore = store
-        viewModel.modelRouterRuntime = runtime
-        return (viewModel, store)
+        try makeRoutingViewModel(tempRoot: tempRoot, runtime: runtime, backendID: backendID, providers: providers)
     }
 
     private func routeOnce(_ fixture: Fixture, expectCancel: Bool = false) async throws -> [[String: Any]] {
@@ -1396,6 +1344,8 @@ private actor StubRoutingBackend: AgentTaskRouterBackend {
     nonisolated let id: AgentTaskRouterBackendID
     nonisolated let displayName = "Log stub"
     nonisolated(unsafe) var onRoute: (@Sendable () async -> Void)?
+    /// Picks a candidate by descriptor identity (never position); `nil` falls back to the last candidate.
+    nonisolated(unsafe) var chooseKey: (@Sendable (AgentTaskRoutingRequest) -> String?)?
     let mode: Mode
     private(set) var requests: [AgentTaskRoutingRequest] = []
 
@@ -1419,7 +1369,7 @@ private actor StubRoutingBackend: AgentTaskRouterBackend {
         case (.failModel, .model): return .failed(category: .timeout, retryable: true, evidence: nil)
         case (.cancelModel, .model): return .cancelled
         case (.abstainEffort, .effort): return .abstained(reason: "ambiguous", evidence: nil)
-        default: return .selected(opaqueKey: last, evidence: nil)
+        default: return .selected(opaqueKey: chooseKey?(request) ?? last, evidence: nil)
         }
     }
 }
@@ -1539,5 +1489,639 @@ private actor FakeJevClient: JevRoutingClientProtocol {
             answers: [questionID: .init(type: "choice", choice: chosen, probabilities: probabilities, confidence: top)],
             usage: .init(inputTokens: 12, outputTokens: 4)
         )
+    }
+}
+
+private struct RoutingStubFixture {
+    let viewModel: AgentModeViewModel
+    let store: GlobalSettingsStore
+    let log: AgentTaskRoutingDecisionLog
+    let logURL: URL
+    let backend: StubRoutingBackend
+
+    func rows() throws -> [[String: Any]] {
+        guard FileManager.default.fileExists(atPath: logURL.path) else { return [] }
+        return try String(contentsOf: logURL, encoding: .utf8)
+            .split(separator: "\n")
+            .map { try XCTUnwrap(JSONSerialization.jsonObject(with: Data($0.utf8)) as? [String: Any]) }
+    }
+}
+
+@MainActor
+private func makeRoutingStubFixture(
+    _ mode: StubRoutingBackend.Mode,
+    tempRoot: URL,
+    backendID: AgentTaskRouterBackendID = AgentTaskRouterBackendID(rawValue: "log-stub"),
+    providers: Set<AgentProviderKind> = [.claudeCode, .codexExec],
+    candidateBuilder: (@MainActor () -> AgentTaskRoutingCandidateBuilder)? = nil,
+    log injectedLog: AgentTaskRoutingDecisionLog? = nil,
+    logURL injectedURL: URL? = nil
+) async throws -> RoutingStubFixture {
+    let logURL = injectedURL ?? tempRoot.appendingPathComponent("stub-\(UUID().uuidString)/jev-decisions.jsonl")
+    let log = injectedLog ?? AgentTaskRoutingDecisionLog(fileURL: logURL)
+    let backend = StubRoutingBackend(mode: mode, id: backendID)
+    let runtime = try AgentTaskRouterRuntime(registrations: [.init(backend: backend)], decisionLog: log)
+    try await AsyncTestWait.waitUntil("stub ready", timeout: 5) { runtime.backendReadiness(backend.id) != nil }
+    let (viewModel, store) = try makeRoutingViewModel(
+        tempRoot: tempRoot, runtime: runtime, backendID: backend.id, providers: providers
+    )
+    if let candidateBuilder { runtime.candidateBuilderFactory = candidateBuilder }
+    backend.onRoute = { [store] in
+        if mode == .staleModel { await MainActor.run { store.setModelRouterEnabled(false) } }
+    }
+    return RoutingStubFixture(viewModel: viewModel, store: store, log: log, logURL: logURL, backend: backend)
+}
+
+@MainActor
+private func makeRoutingViewModel(
+    tempRoot: URL,
+    runtime: AgentTaskRouterRuntime,
+    backendID: AgentTaskRouterBackendID,
+    providers: Set<AgentProviderKind>
+) throws -> (AgentModeViewModel, GlobalSettingsStore) {
+    let root = tempRoot.appendingPathComponent("settings-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    let defaults = try XCTUnwrap(UserDefaults(suiteName: "AgentTaskRoutingDecisionLogTests.\(UUID())"))
+    let store = GlobalSettingsStore(
+        defaults: defaults,
+        fileStore: GlobalSettingsFileStore(fileURL: root.appendingPathComponent("globalSettings.json"))
+    )
+    store.enableModelRouterWithCurrentPolicy(
+        backendID: backendID,
+        roles: Set(AgentModelCatalog.TaskLabelKind.allCases),
+        providers: providers
+    )
+    let availability = AgentModelCatalog.AvailabilityContext(
+        claudeCodeAvailable: providers.contains(.claudeCode),
+        codexAvailable: providers.contains(.codexExec),
+        openCodeAvailable: false
+    )
+    runtime.candidateBuilderFactory = {
+        AgentTaskRoutingCandidateBuilder(modelOptions: { provider, _ in
+            guard providers.contains(provider) else { return [] }
+            return AgentModelCatalog.options(for: provider, availability: availability)
+        })
+    }
+    let viewModel = AgentModeViewModel(
+        codexControllerFactory: { _, _, _, _, _, _ in
+            preconditionFailure("Decision log test must not start Codex")
+        },
+        claudeControllerFactory: { _, _, _, _ in MonitorFakeNativeController() },
+        headlessProviderFactory: { _, _, _, _, _ in UnsupportedHeadlessAgentProvider(reason: "test terminal") }
+    )
+    viewModel.modelRouterSettingsStore = store
+    viewModel.modelRouterRuntime = runtime
+    return (viewModel, store)
+}
+
+@MainActor
+final class AgentTaskRoutingMakerDiversityTests: XCTestCase {
+    private var tempRoot: URL!
+
+    override func setUpWithError() throws {
+        tempRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("AgentTaskRoutingMakerDiversityTests-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: tempRoot, withIntermediateDirectories: true)
+    }
+
+    override func tearDownWithError() throws {
+        try? FileManager.default.removeItem(at: tempRoot)
+    }
+
+    func testExclusionIsLoggedWithSource() async throws {
+        let options = AgentTaskRoutingDiversityOptions(exclusions: [
+            "openai": [.reviewDiversity, .excludeMakers],
+            "anthropic": [.diverseFromSessions],
+            "mystery": [.reviewDiversity, .diverseFromSessions, .excludeMakers]
+        ])
+        let expected: [String: [String]] = [
+            "openai": ["exclude_makers", "review_diversity"],
+            "anthropic": ["diverse_from_sessions"],
+            "mystery": ["exclude_makers", "diverse_from_sessions", "review_diversity"]
+        ]
+        XCTAssertEqual(options.canonicalMakerExclusions, expected)
+        XCTAssertEqual(AgentTaskRoutingDiversityOptions.none.canonicalMakerExclusions, [:])
+
+        let fixture = try await makeRoutingStubFixture(.selectLast, tempRoot: tempRoot)
+        let context = AgentTaskRoutingRouteContext(requestID: UUID(), scope: .subagent, log: fixture.log)
+        await context.attachMakerExclusions(AgentTaskRoutingDiversityOptions.none.canonicalMakerExclusions)
+        await context.attachMakerExclusions(options.canonicalMakerExclusions)
+        await context.attachMakerExclusions(["xai": ["exclude_makers"]])
+        for stage in [AgentTaskRoutingLogStage.model, .effort, .autoEffort] {
+            await context.emitDecision(AgentTaskRoutingDecisionDraft(stage: stage, outcome: .selected))
+        }
+        await context.finish(.rejected)
+        await fixture.log.flush()
+
+        let rows = try fixture.rows()
+        XCTAssertEqual(rows.compactMap { $0["event"] as? String }, ["decision", "decision", "decision", "applied"])
+        let decisions = rows.filter { $0["event"] as? String == "decision" }
+        XCTAssertEqual(decisions.compactMap { $0["stage"] as? String }, ["model", "effort", "autoEffort"])
+        XCTAssertEqual(decisions[0]["makerExclusions"] as? [String: [String]], expected)
+        for row in decisions.dropFirst() {
+            XCTAssertTrue(row.keys.contains("makerExclusions"))
+            XCTAssertTrue(row["makerExclusions"] is NSNull)
+        }
+
+        // Real routes: provenance reaches the actual model row; pre-route rows exist only with exclusions.
+        let diversity = Self.excluding([.openai], source: .reviewDiversity)
+        let routed = ["openai": ["review_diversity"]]
+
+        let selected = try await makeDiversityFixture(.selectLast)
+        selected.backend.chooseKey = Self.choose(model: "claude-sonnet")
+        let selectedContext = try XCTUnwrap(selected.viewModel.makeRouteLogContext(scope: .subagent))
+        let selectedResult = await route(selected, selectedContext, diversity: diversity)
+        XCTAssertEqual(try selectedResult.get()?.agentRaw, AgentProviderKind.claudeCode.rawValue)
+        let selectedRows = try await eventRows(selected, selectedContext).filter { $0["event"] as? String == "decision" }
+        XCTAssertEqual(selectedRows.compactMap { $0["stage"] as? String }, ["model", "effort"])
+        guard selectedRows.count == 2 else { return XCTFail("Expected model and effort rows") }
+        XCTAssertEqual(selectedRows[0]["outcome"] as? String, "selected")
+        XCTAssertEqual(selectedRows[0]["backend"] as? String, "log-stub")
+        XCTAssertEqual(selectedRows[0]["makerExclusions"] as? [String: [String]], routed)
+        XCTAssertTrue(selectedRows[1]["makerExclusions"] is NSNull)
+
+        let baseline = Self.claudeBaseline
+        for (mode, reason) in [(StubRoutingBackend.Mode.selectLast, "router_disabled"), (.notReady, "backend_not_ready")] {
+            let withExclusions = try await makeDiversityFixture(mode)
+            if mode == .selectLast { withExclusions.store.setModelRouterEnabled(false) }
+            let context = try XCTUnwrap(withExclusions.viewModel.makeRouteLogContext(scope: .subagent))
+            let result = await route(withExclusions, context, baseline: baseline, diversity: diversity)
+            XCTAssertNil(try result.get(), reason)
+            await context.finish(.accepted(actual: baseline, sessionID: nil))
+            let rows = try await eventRows(withExclusions, context)
+            XCTAssertEqual(rows.compactMap { $0["event"] as? String }, ["decision", "applied"], reason)
+            guard rows.count == 2 else { return XCTFail("\(reason): expected one decision and one applied row") }
+            XCTAssertEqual(rows[0]["stage"] as? String, "model", reason)
+            XCTAssertEqual(rows[0]["outcome"] as? String, "failed", reason)
+            XCTAssertEqual(rows[0]["failure"] as? String, "policyUnavailable", reason)
+            XCTAssertEqual(rows[0]["reasonCode"] as? String, reason)
+            XCTAssertEqual((rows[0]["candidates"] as? [Any])?.count, 0, reason)
+            XCTAssertTrue(rows[0]["backend"] is NSNull, reason)
+            XCTAssertEqual(rows[0]["makerExclusions"] as? [String: [String]], routed, reason)
+            XCTAssertEqual(rows[1]["outcome"] as? String, "fallback", reason)
+            let requested = await withExclusions.backend.requests
+            XCTAssertTrue(requested.isEmpty, reason)
+
+            let control = try await makeDiversityFixture(mode)
+            if mode == .selectLast { control.store.setModelRouterEnabled(false) }
+            let controlContext = try XCTUnwrap(control.viewModel.makeRouteLogContext(scope: .subagent))
+            let controlResult = await route(control, controlContext, baseline: baseline, diversity: .none)
+            XCTAssertNil(try controlResult.get(), reason)
+            await controlContext.finish(.accepted(actual: baseline, sessionID: nil))
+            let controlRows = try await eventRows(control, controlContext)
+            XCTAssertTrue(controlRows.isEmpty, "\(reason): no exclusions, no pre-route row")
+        }
+    }
+
+    func testEveryModelDefinitionHasAMaker() {
+        let projection = AgentTaskRoutingCandidateBuilder().registeredTargetMakers
+        let expectedMakers: [String: AgentTaskRoutingMaker] = [
+            "gpt-luna": .openai,
+            "gpt-5.6-terra": .openai,
+            "gpt-sol": .openai,
+            "gpt-6-astra": .openai,
+            "claude-haiku": .anthropic,
+            "claude-sonnet": .anthropic,
+            "claude-opus": .anthropic,
+            "claude-fable": .anthropic,
+            "gemini-flash": .google,
+            "gemini-pro": .google,
+            "grok": .xai,
+            "composer": .cursor,
+            "cursor-grok": .xai
+        ]
+        XCTAssertEqual(projection.count, 13)
+        XCTAssertEqual(Set(projection.keys), Set(expectedMakers.keys))
+        XCTAssertEqual(projection.values.compactMap(\.self).count, 13)
+        for (modelClass, maker) in expectedMakers {
+            XCTAssertEqual(projection[modelClass] ?? nil, Optional(maker), modelClass)
+        }
+
+        func resolved(_ provider: AgentProviderKind, _ modelRaw: String) -> AgentTaskRoutingMaker? {
+            let byProvider = AgentTaskRoutingMakerCatalog.maker(provider: provider, modelRaw: modelRaw)
+            let byTarget = AgentTaskRoutingMakerCatalog.maker(
+                for: AgentRoutingExecutableTarget(
+                    agentRaw: provider.rawValue,
+                    modelRaw: modelRaw,
+                    reasoningEffortRaw: nil,
+                    modelParameters: []
+                )
+            )
+            XCTAssertEqual(byTarget, byProvider, "\(provider.rawValue) \(modelRaw)")
+            return byProvider
+        }
+
+        let identities: [(AgentProviderKind, String, AgentTaskRoutingMaker?)] = [
+            (.claudeCode, "opus", .anthropic),
+            (.claudeCode, "default", .anthropic),
+            (.claudeCode, "opus[1m]", .anthropic),
+            (.claudeCode, "gpt-5", .anthropic),
+            (.codexExec, "claude-opus", .openai),
+            (.codexExec, "gpt-6-sol", .openai),
+            (.grok, "composer-2.5", .xai),
+            (.grok, "grok", .xai),
+            (.cursor, "grok-4.7", .xai),
+            (.cursor, "composer-2.5", .cursor),
+            (.cursor, "cursor-grok", nil),
+            (.cursor, "composer", nil),
+            (.antigravity, "gemini-flash", .google),
+            (.antigravity, "gemini-pro", .google),
+            (.antigravity, "claude-sonnet", .anthropic),
+            (.antigravity, "gpt-5", .openai),
+            (.antigravity, "grok-4", .xai),
+            (.antigravity, "composer-2.5", .cursor),
+            (.cursor, "claude-haiku", .anthropic),
+            (.cursor, "gpt-6", .openai),
+            (.cursor, "gemini-flash", .google),
+            (.cursor, "mystery", nil),
+            (.antigravity, "unknown-family", nil),
+            (.openCode, "claude-opus", nil),
+            (.grokBuild, "grok-4", nil),
+            (.devin, "gpt-5", nil),
+            (.claudeCodeGLM, "claude-opus", nil),
+            (.kimiCode, "claude-opus", nil),
+            (.customClaudeCompatible, "claude-opus", nil)
+        ]
+        for (provider, modelRaw, maker) in identities {
+            XCTAssertEqual(resolved(provider, modelRaw), maker, "\(provider.rawValue) \(modelRaw)")
+        }
+        XCTAssertNil(
+            AgentTaskRoutingMakerCatalog.maker(
+                for: AgentRoutingExecutableTarget(
+                    agentRaw: "not-a-provider",
+                    modelRaw: "claude-opus",
+                    reasoningEffortRaw: nil,
+                    modelParameters: []
+                )
+            )
+        )
+    }
+
+    func testExcludedMakerIsRemovedBeforeJevRequest() async throws {
+        let fixture = try await makeDiversityFixture(.selectLast)
+        fixture.backend.chooseKey = Self.choose(model: "claude-sonnet")
+        let context = try XCTUnwrap(fixture.viewModel.makeRouteLogContext(scope: .subagent))
+
+        let result = await route(fixture, context, diversity: Self.excluding([.openai]))
+
+        let requests = await fixture.backend.requests
+        let modelRequests = requests.filter { $0.decisionStage == .model }
+        XCTAssertEqual(modelRequests.count, 1, "At least two allowed Claude models must still reach Jev")
+        let request = try XCTUnwrap(modelRequests.first)
+        XCTAssertGreaterThanOrEqual(request.candidates.count, 2)
+        let rows = try await eventRows(fixture, context)
+        let modelRow = try XCTUnwrap(rows.first { $0["stage"] as? String == "model" })
+        let candidates = try XCTUnwrap(modelRow["candidates"] as? [[String: Any]])
+        XCTAssertEqual(Set(candidates.compactMap { $0["key"] as? String }), Set(request.candidates.map(\.opaqueKey)))
+        XCTAssertEqual(
+            Set(candidates.compactMap { $0["provider"] as? String }),
+            [AgentProviderKind.claudeCode.rawValue],
+            "No codexExec candidate may reach the request"
+        )
+        XCTAssertEqual(try result.get()?.agentRaw, AgentProviderKind.claudeCode.rawValue)
+        XCTAssertEqual(modelRow["makerExclusions"] as? [String: [String]], ["openai": ["exclude_makers"]])
+    }
+
+    func testSingleAllowedCandidateAppliesWithoutJevRequest() async throws {
+        // Allowed Sonnet beside an excluded Codex peer: one model remains, no model request, one local effort row.
+        let sonnet = try await makeDiversityFixture(.selectLast, claude: ["claude-sonnet-5-5"], codex: ["gpt-6.1-sol"])
+        let sonnetContext = try XCTUnwrap(sonnet.viewModel.makeRouteLogContext(scope: .subagent))
+        let sonnetResult = await route(sonnet, sonnetContext, diversity: Self.excluding([.openai]))
+        let sonnetRequests = await sonnet.backend.requests
+        XCTAssertTrue(sonnetRequests.allSatisfy { $0.decisionStage != .model }, "A lone allowed model makes no model request")
+        XCTAssertTrue(sonnetRequests.allSatisfy { $0.decisionStage != .effort }, "A lone default effort makes no effort request")
+        XCTAssertEqual(try sonnetResult.get()?.modelRaw, "claude-sonnet-5-5")
+        let sonnetRows = try await eventRows(sonnet, sonnetContext).filter { $0["event"] as? String == "decision" }
+        XCTAssertEqual(sonnetRows.compactMap { $0["stage"] as? String }, ["model", "effort"])
+        guard sonnetRows.count == 2 else { return XCTFail("Expected local model and effort rows") }
+        XCTAssertEqual(sonnetRows[0]["outcome"] as? String, "localSingleCandidate")
+        XCTAssertEqual((sonnetRows[0]["candidates"] as? [[String: Any]])?.count, 1)
+        XCTAssertEqual(sonnetRows[0]["makerExclusions"] as? [String: [String]], ["openai": ["exclude_makers"]])
+
+        // Allowed Codex with several efforts beside an excluded Claude peer: still exactly one effort request.
+        let codex = try await makeDiversityFixture(.selectLast, claude: ["claude-sonnet-5-5"], codex: ["gpt-6.1-sol"])
+        codex.backend.chooseKey = Self.choose(effort: "high")
+        let codexContext = try XCTUnwrap(codex.viewModel.makeRouteLogContext(scope: .subagent))
+        let codexResult = await route(codex, codexContext, diversity: Self.excluding([.anthropic]))
+        let codexRequests = await codex.backend.requests
+        XCTAssertTrue(codexRequests.allSatisfy { $0.decisionStage != .model }, "A lone allowed model makes no model request")
+        let effortRequests = codexRequests.filter { $0.decisionStage == .effort }
+        XCTAssertEqual(effortRequests.count, 1, "Local model selection must still route effort")
+        XCTAssertGreaterThan(try XCTUnwrap(effortRequests.first).candidates.count, 1)
+        XCTAssertEqual(try codexResult.get()?.modelRaw, "gpt-6.1-sol-high")
+        let codexRows = try await eventRows(codex, codexContext).filter { $0["event"] as? String == "decision" }
+        XCTAssertEqual(codexRows.compactMap { $0["stage"] as? String }, ["model", "effort"])
+        guard codexRows.count == 2 else { return XCTFail("Expected local model and effort rows") }
+        XCTAssertEqual(codexRows[0]["outcome"] as? String, "localSingleCandidate")
+        XCTAssertEqual(codexRows[1]["outcome"] as? String, "selected")
+        XCTAssertTrue(codexRows[1]["makerExclusions"] is NSNull)
+    }
+
+    func testAllCandidatesExcludedFailsTyped() async throws {
+        let diversity = Self.excluding(AgentTaskRoutingMaker.allCases)
+        let fixture = try await makeDiversityFixture(.selectLast)
+        let context = try XCTUnwrap(fixture.viewModel.makeRouteLogContext(scope: .subagent))
+
+        let result = await route(fixture, context, diversity: diversity)
+
+        XCTAssertEqual(Self.routingError(result), .allCandidatesExcluded)
+        await context.finish(.accepted(actual: Self.claudeBaseline, sessionID: nil))
+        let rows = try await eventRows(fixture, context)
+        XCTAssertEqual(rows.compactMap { $0["event"] as? String }, ["decision", "applied"])
+        guard rows.count == 2 else { return XCTFail("Expected one decision and one applied row") }
+        XCTAssertEqual(rows[0]["stage"] as? String, "model")
+        XCTAssertEqual(rows[0]["outcome"] as? String, "failed")
+        XCTAssertEqual(rows[0]["failure"] as? String, "allCandidatesExcluded")
+        XCTAssertEqual((rows[0]["candidates"] as? [Any])?.count, 0)
+        XCTAssertTrue(rows[0]["backend"] is NSNull)
+        XCTAssertEqual(rows[0]["makerExclusions"] as? [String: [String]], diversity.canonicalMakerExclusions)
+        XCTAssertEqual(rows[1]["outcome"] as? String, "rejected", "A caller's later settlement is harmless")
+        let requests = await fixture.backend.requests
+        XCTAssertTrue(requests.isEmpty)
+
+        // The existing build failure keeps its category, and a nil baseline still cannot be rescued.
+        let empty = try await makeDiversityFixture(.selectLast, claude: [], codex: [])
+        let emptyContext = try XCTUnwrap(empty.viewModel.makeRouteLogContext(scope: .subagent))
+        let emptyResult = await route(empty, emptyContext, diversity: Self.excluding([.cursor]))
+        XCTAssertEqual(Self.routingError(emptyResult), .fallbackDiversityExcluded)
+        let emptyRows = try await eventRows(empty, emptyContext)
+        XCTAssertEqual(emptyRows.compactMap { $0["event"] as? String }, ["decision", "applied"])
+        guard emptyRows.count == 2 else { return XCTFail("Expected one decision and one applied row") }
+        XCTAssertEqual(emptyRows[0]["failure"] as? String, "invalidRequest")
+        XCTAssertEqual(emptyRows[1]["outcome"] as? String, "rejected")
+    }
+
+    func testFallbackNeverReturnsExcludedMaker() async throws {
+        let codex = Self.codexBaseline
+        let claude = Self.claudeBaseline
+        let unknown = AgentRoutingExecutableTarget(
+            agentRaw: AgentProviderKind.openCode.rawValue, modelRaw: "claude-opus-5-5", reasoningEffortRaw: nil, modelParameters: []
+        )
+        let scenarios: [FallbackScenario] = [
+            .init(name: "allowed baseline, no usage swap", exclude: [.xai], baseline: claude, expectation: .retained),
+            .init(
+                name: "allowed baseline, allowed swap", exclude: [.cursor], baseline: codex,
+                usage: .init(codexUsed: 95, claudeUsed: 10, swap: .claudeCode), expectation: .swapped(.claudeCode)
+            ),
+            .init(
+                name: "allowed baseline, excluded swap", exclude: [.anthropic], baseline: codex,
+                usage: .init(codexUsed: 95, claudeUsed: 10, swap: .claudeCode), expectation: .retained
+            ),
+            .init(
+                name: "allowed Claude baseline, excluded Codex swap", exclude: [.openai], baseline: claude,
+                usage: .init(codexUsed: 10, claudeUsed: 95, swap: .codexExec), expectation: .retained
+            ),
+            .init(
+                name: "excluded baseline cannot be rescued by an allowed swap", exclude: [.openai], baseline: codex,
+                usage: .init(codexUsed: 95, claudeUsed: 10, swap: .claudeCode), expectation: .denied
+            ),
+            .init(name: "excluded baseline, no swap", exclude: [.openai], baseline: codex, expectation: .denied),
+            .init(
+                name: "usage balance off keeps the proven baseline", exclude: [.cursor], baseline: codex, allowUsageBalance: false,
+                usage: .init(codexUsed: 95, claudeUsed: 10, swap: .claudeCode), expectation: .retained
+            ),
+            .init(name: "nil baseline", exclude: [.cursor], baseline: nil, expectation: .denied),
+            .init(name: "unknown-provider baseline", exclude: [.cursor], baseline: unknown, expectation: .denied),
+            .init(name: "nil baseline, usage balance off", exclude: [.cursor], baseline: nil, allowUsageBalance: false, expectation: .denied),
+            .init(
+                name: "unknown-provider baseline, usage balance off", exclude: [.cursor], baseline: unknown,
+                allowUsageBalance: false, expectation: .denied
+            ),
+            .init(
+                name: "excluded baseline, usage balance off cannot bypass the fence", exclude: [.openai], baseline: codex,
+                allowUsageBalance: false, usage: .init(codexUsed: 95, claudeUsed: 10, swap: .claudeCode), expectation: .denied
+            )
+        ]
+        for mode in FallbackMode.allCases {
+            for scenario in scenarios {
+                try await assertFallback(mode, scenario)
+            }
+        }
+
+        // Selected Jev route: the usage advisor sees only the filtered, allowed candidates.
+        let usage = FallbackScenario.Usage(codexUsed: 10, claudeUsed: 95, swap: .codexExec)
+        let control = try await makeDiversityFixture(.selectLast)
+        control.backend.chooseKey = Self.choose(model: "claude-opus")
+        enableUsage(control, usage)
+        let controlContext = try XCTUnwrap(control.viewModel.makeRouteLogContext(scope: .subagent))
+        let controlResult = await route(control, controlContext, diversity: .none)
+        XCTAssertEqual(
+            try controlResult.get()?.agentRaw, AgentProviderKind.codexExec.rawValue,
+            "Without exclusions the advisor swaps Opus to its Codex peer, so the filtered run below is not vacuous"
+        )
+
+        let filtered = try await makeDiversityFixture(.selectLast)
+        filtered.backend.chooseKey = Self.choose(model: "claude-opus")
+        enableUsage(filtered, usage)
+        let filteredContext = try XCTUnwrap(filtered.viewModel.makeRouteLogContext(scope: .subagent))
+        let filteredResult = await route(filtered, filteredContext, diversity: Self.excluding([.openai]))
+        XCTAssertEqual(try filteredResult.get()?.agentRaw, AgentProviderKind.claudeCode.rawValue)
+        XCTAssertEqual(try filteredResult.get()?.modelRaw, "claude-opus-5-5")
+        let filteredRequests = await filtered.backend.requests
+        let modelRequest = try XCTUnwrap(filteredRequests.first { $0.decisionStage == .model })
+        XCTAssertFalse(
+            modelRequest.candidates.contains { $0.roleLabels.contains("gpt-6.1-sol") },
+            "The excluded Codex peer never reaches the model request"
+        )
+    }
+
+    // MARK: - Diversity fixtures
+
+    private enum FallbackMode: CaseIterable {
+        case disabled, notReady, abstain, fail
+
+        var backendMode: StubRoutingBackend.Mode {
+            switch self {
+            case .disabled: .selectLast
+            case .notReady: .notReady
+            case .abstain: .abstainModel
+            case .fail: .failModel
+            }
+        }
+    }
+
+    private struct FallbackScenario {
+        enum Expectation: Equatable {
+            case retained
+            case swapped(AgentProviderKind)
+            case denied
+        }
+
+        struct Usage {
+            let codexUsed: Double
+            let claudeUsed: Double
+            let swap: AgentProviderKind
+        }
+
+        let name: String
+        let exclude: [AgentTaskRoutingMaker]
+        let baseline: AgentRoutingExecutableTarget?
+        var allowUsageBalance = true
+        var usage: Usage?
+        let expectation: Expectation
+    }
+
+    private static let claudeBaseline = AgentRoutingExecutableTarget(
+        agentRaw: AgentProviderKind.claudeCode.rawValue, modelRaw: "claude-opus-5-5", reasoningEffortRaw: nil, modelParameters: []
+    )
+    private static let codexBaseline = AgentRoutingExecutableTarget(
+        agentRaw: AgentProviderKind.codexExec.rawValue, modelRaw: "gpt-6.1-sol-high", reasoningEffortRaw: nil, modelParameters: []
+    )
+
+    private static func excluding(
+        _ makers: [AgentTaskRoutingMaker],
+        source: AgentTaskRoutingDiversityOptions.ExclusionSource = .excludeMakers
+    ) -> AgentTaskRoutingDiversityOptions {
+        AgentTaskRoutingDiversityOptions(exclusions: Dictionary(uniqueKeysWithValues: makers.map { ($0.rawValue, [source]) }))
+    }
+
+    /// Selects by descriptor identity (tier or effort label), never by candidate position.
+    private static func choose(model: String? = nil, effort: String? = nil) -> @Sendable (AgentTaskRoutingRequest) -> String? {
+        { request in
+            let label = request.decisionStage == .model ? model : effort.map { "effort:\($0)" }
+            guard let label else { return nil }
+            return request.candidates.first { $0.roleLabels == [label] }?.opaqueKey
+        }
+    }
+
+    private static func routingError(
+        _ result: Result<AgentRoutingExecutableTarget?, Error>
+    ) -> AgentModeViewModel.GlobalModelRoutingError? {
+        guard case let .failure(error) = result else { return nil }
+        return error as? AgentModeViewModel.GlobalModelRoutingError
+    }
+
+    private func makeDiversityFixture(
+        _ mode: StubRoutingBackend.Mode,
+        claude: [String] = ["claude-haiku-4-5", "claude-sonnet-5-5", "claude-opus-5-5"],
+        codex: [String] = ["gpt-5.6-terra", "gpt-6.1-sol"]
+    ) async throws -> RoutingStubFixture {
+        let options: @MainActor (AgentProviderKind, AgentModelCatalog.AvailabilityContext) -> [AgentModelOption] = { provider, _ in
+            switch provider {
+            case .claudeCode:
+                claude.map {
+                    AgentModelOption(rawValue: $0, displayName: $0, description: nil, isPlaceholderDefault: false, isProviderDefault: false)
+                }
+            case .codexExec:
+                codex.map {
+                    AgentModelOption(
+                        rawValue: $0, displayName: $0, description: nil, isPlaceholderDefault: false, isProviderDefault: false,
+                        supportedReasoningEfforts: [.low, .medium, .high]
+                    )
+                }
+            default:
+                []
+            }
+        }
+        return try await makeRoutingStubFixture(
+            mode, tempRoot: tempRoot, candidateBuilder: { AgentTaskRoutingCandidateBuilder(modelOptions: options) }
+        )
+    }
+
+    /// Usage snapshots follow `AgentComposerSubmissionAttemptTests.testUsageBalancingRoutesFreshComposerAndSubagentWithoutJev`.
+    private func enableUsage(_ fixture: RoutingStubFixture, _ usage: FallbackScenario.Usage) {
+        fixture.store.setUsageBalancingEnabled(true)
+        let advisor = AgentUsageBalancer()
+        fixture.viewModel.modelRouterRuntime?.usageBalancer = advisor
+        let now = Date()
+        let reset = now.addingTimeInterval(18000).timeIntervalSince1970
+        for (provider, used) in [(AgentProviderKind.codexExec, usage.codexUsed), (.claudeCode, usage.claudeUsed)] {
+            let record = ClaudeCLIUsageRecord(version: 1, receivedAt: now, windows: ["five_hour": .init(used: used, resetsAt: reset)])
+            advisor.update(record.snapshot(profileID: "diversity-test"), provider: provider.rawValue)
+        }
+    }
+
+    private func route(
+        _ fixture: RoutingStubFixture,
+        _ context: AgentTaskRoutingRouteContext,
+        surface: AgentModelCatalog.AgentSelectionSurface = .general,
+        baseline: AgentRoutingExecutableTarget? = nil,
+        allowUsageBalance: Bool = true,
+        diversity: AgentTaskRoutingDiversityOptions
+    ) async -> Result<AgentRoutingExecutableTarget?, Error> {
+        do {
+            return try await .success(fixture.viewModel.routeSubagentTargetIfEnabled(
+                task: "Implement parser", surface: surface, baseline: baseline,
+                allowUsageBalance: allowUsageBalance, logContext: context, diversity: diversity
+            ))
+        } catch {
+            return .failure(error)
+        }
+    }
+
+    private func eventRows(_ fixture: RoutingStubFixture, _ context: AgentTaskRoutingRouteContext) async throws -> [[String: Any]] {
+        await fixture.log.flush()
+        return try fixture.rows().filter { $0["requestID"] as? String == context.requestID.uuidString }
+    }
+
+    private func assertFallback(_ mode: FallbackMode, _ scenario: FallbackScenario) async throws {
+        let label = "\(mode)/\(scenario.name)"
+        let diversity = Self.excluding(scenario.exclude)
+        let fixture = try await makeDiversityFixture(mode.backendMode)
+        if mode == .disabled { fixture.store.setModelRouterEnabled(false) }
+        if let usage = scenario.usage, let baseline = scenario.baseline {
+            enableUsage(fixture, usage)
+            let swap = fixture.viewModel.localUsageDecision(basedOn: baseline, scope: .subagent, surface: .headless)
+            XCTAssertEqual(swap?.candidate.target.agentRaw, usage.swap.rawValue, "\(label): the usage swap must be available")
+        }
+        let context = try XCTUnwrap(fixture.viewModel.makeRouteLogContext(scope: .subagent))
+
+        let result = await route(
+            fixture, context, surface: .headless, baseline: scenario.baseline,
+            allowUsageBalance: scenario.allowUsageBalance, diversity: diversity
+        )
+
+        var settled: AgentRoutingExecutableTarget?
+        switch scenario.expectation {
+        case .retained:
+            XCTAssertNil(try result.get(), label)
+            settled = scenario.baseline
+        case let .swapped(provider):
+            let target = try XCTUnwrap(result.get(), label)
+            XCTAssertEqual(target.agentRaw, provider.rawValue, label)
+            settled = target
+        case .denied:
+            XCTAssertEqual(Self.routingError(result), .fallbackDiversityExcluded, label)
+        }
+        let before = try await eventRows(fixture, context)
+        let decisions = before.filter { $0["event"] as? String == "decision" }
+        XCTAssertEqual(decisions.count, 1, "\(label): exactly one model row")
+        let row = try XCTUnwrap(decisions.first, label)
+        XCTAssertEqual(row["stage"] as? String, "model", label)
+        XCTAssertEqual(row["makerExclusions"] as? [String: [String]], diversity.canonicalMakerExclusions, label)
+        let requests = await fixture.backend.requests
+        switch mode {
+        case .disabled, .notReady:
+            XCTAssertTrue(requests.isEmpty, label)
+            XCTAssertEqual(row["outcome"] as? String, "failed", label)
+            XCTAssertEqual(
+                row["failure"] as? String, scenario.expectation == .denied ? "fallbackDiversityExcluded" : "policyUnavailable", label
+            )
+            if scenario.expectation != .denied {
+                XCTAssertEqual(row["reasonCode"] as? String, mode == .disabled ? "router_disabled" : "backend_not_ready", label)
+            }
+            XCTAssertEqual((row["candidates"] as? [Any])?.count, 0, label)
+            XCTAssertTrue(row["backend"] is NSNull, label)
+        case .abstain:
+            XCTAssertEqual(requests.count(where: { $0.decisionStage == .model }), 1, label)
+            XCTAssertEqual(row["outcome"] as? String, "abstained", label)
+            XCTAssertEqual(row["backend"] as? String, "log-stub", label)
+        case .fail:
+            XCTAssertEqual(requests.count(where: { $0.decisionStage == .model }), 1, label)
+            XCTAssertEqual(row["outcome"] as? String, "failed", label)
+            XCTAssertEqual(row["failure"] as? String, "timeout", label)
+            XCTAssertEqual(row["backend"] as? String, "log-stub", label)
+        }
+
+        // A later accepted settlement can never replace what the route already settled.
+        await context.finish(.accepted(actual: settled, sessionID: nil))
+        let after = try await eventRows(fixture, context)
+        XCTAssertEqual(after.compactMap { $0["event"] as? String }, ["decision", "applied"], label)
+        let applied = try XCTUnwrap(after.last, label)
+        XCTAssertEqual(applied["outcome"] as? String, scenario.expectation == .denied ? "rejected" : "fallback", label)
+        if scenario.expectation != .denied {
+            XCTAssertTrue(applied["picked"] is NSNull, label)
+            XCTAssertEqual(applied["model"] as? String, settled?.modelRaw, label)
+        }
     }
 }

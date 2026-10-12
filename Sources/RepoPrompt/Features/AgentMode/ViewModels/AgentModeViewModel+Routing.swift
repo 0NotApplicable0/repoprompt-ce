@@ -7,6 +7,8 @@ extension AgentModeViewModel {
         case failed
         case cancelled
         case stale
+        case allCandidatesExcluded
+        case fallbackDiversityExcluded
 
         var errorDescription: String? {
             switch self {
@@ -15,6 +17,8 @@ extension AgentModeViewModel {
             case .failed: "Model Router could not choose a target."
             case .cancelled: "Model routing was cancelled."
             case .stale: "The Model Router policy changed while the request was in progress."
+            case .allCandidatesExcluded: "Every Model Router candidate belongs to an excluded maker."
+            case .fallbackDiversityExcluded: "Model Router fallback would use an excluded or unknown maker."
             }
         }
     }
@@ -462,18 +466,39 @@ extension AgentModeViewModel {
         surface: AgentModelCatalog.AgentSelectionSurface,
         baseline: AgentRoutingExecutableTarget? = nil,
         allowUsageBalance: Bool = true,
-        logContext: AgentTaskRoutingRouteContext? = nil
+        logContext: AgentTaskRoutingRouteContext? = nil,
+        diversity: AgentTaskRoutingDiversityOptions = .none
     ) async throws -> AgentRoutingExecutableTarget? {
+        await logContext?.attachMakerExclusions(diversity.canonicalMakerExclusions)
         let configuration = modelRouterSettingsStore.modelRouterConfiguration()
         let fallback = { [self] in
             baseline.flatMap { allowUsageBalance ? localUsageDecision(basedOn: $0, scope: .subagent, surface: surface)?.candidate.target : nil }
         }
-        guard configuration.enabled else { return fallback() }
+        /// With exclusions, a fallback needs a proven-allowed baseline; a swap is taken only when it is allowed too.
+        /// `preRouteReason` is set when no route ran, so the single model row is written here.
+        func fencedFallback(preRouteReason: String?) async throws -> AgentRoutingExecutableTarget? {
+            guard !diversity.exclusions.isEmpty else { return fallback() }
+            guard Self.isAllowed(baseline, by: diversity) else {
+                if preRouteReason != nil {
+                    await emitFailedDecision(.model, candidates: [], failure: .fallbackDiversityExcluded, context: logContext)
+                }
+                await logContext?.finish(.rejected)
+                throw GlobalModelRoutingError.fallbackDiversityExcluded
+            }
+            if let preRouteReason {
+                await emitFailedDecision(
+                    .model, candidates: [], failure: .policyUnavailable, reasonCode: preRouteReason, context: logContext
+                )
+            }
+            guard let swap = fallback(), Self.isAllowed(swap, by: diversity) else { return nil }
+            return swap
+        }
+        guard configuration.enabled else { return try await fencedFallback(preRouteReason: "router_disabled") }
         guard let runtime = modelRouterRuntime,
               configuration.validity == .valid,
               let backendID = configuration.selectedBackendID,
               runtime.isBackendReady(backendID)
-        else { return fallback() }
+        else { return try await fencedFallback(preRouteReason: "backend_not_ready") }
         let result = await routeModelThenEffort(
             requestID: logContext?.requestID ?? UUID(),
             text: task,
@@ -484,7 +509,8 @@ extension AgentModeViewModel {
             backendID: backendID,
             runtime: runtime,
             allowUsageBalance: allowUsageBalance,
-            logContext: logContext
+            logContext: logContext,
+            diversity: diversity
         )
         guard modelRouterConfigurationIsCurrent(configuration, backendID: backendID) else {
             await logContext?.finish(.rejected)
@@ -498,9 +524,18 @@ extension AgentModeViewModel {
         case .cancelled:
             await logContext?.finish(.rejected)
             throw GlobalModelRoutingError.cancelled
+        case .failed(.allCandidatesExcluded, _, _):
+            await logContext?.finish(.rejected)
+            throw GlobalModelRoutingError.allCandidatesExcluded
         case .abstained, .failed:
-            return fallback()
+            return try await fencedFallback(preRouteReason: nil)
         }
+    }
+
+    /// A target is allowed only when its maker is known and not excluded; unknown makers never pass.
+    private static func isAllowed(_ target: AgentRoutingExecutableTarget?, by diversity: AgentTaskRoutingDiversityOptions) -> Bool {
+        guard let target, let maker = AgentTaskRoutingMakerCatalog.maker(for: target) else { return false }
+        return diversity.exclusions[maker.rawValue] == nil
     }
 
     private func routeModelThenEffort(
@@ -513,20 +548,29 @@ extension AgentModeViewModel {
         backendID: AgentTaskRouterBackendID,
         runtime: AgentTaskRouterRuntime,
         allowUsageBalance: Bool = true,
-        logContext: AgentTaskRoutingRouteContext? = nil
+        logContext: AgentTaskRoutingRouteContext? = nil,
+        diversity: AgentTaskRoutingDiversityOptions = .none
     ) async -> StagedTaskRoutingResult {
         let builder = runtime.candidateBuilderFactory()
         let routingText = AgentTaskRoutingTaskExcerpt.make(from: text)
-        guard let models = try? builder.build(
+        guard let built = try? builder.build(
             allowedProviders: providers,
             availability: modelRouterAvailabilityContext,
             surface: surface,
             roleDefaults: agentModelRoleDefaultReferences()
-        ), let firstModel = models.first else {
+        ), !built.isEmpty else {
             await emitFailedDecision(.model, candidates: [], context: logContext)
             return StagedTaskRoutingResult(
                 candidates: [],
                 outcome: .failed(category: .invalidRequest, retryable: false, evidence: nil)
+            )
+        }
+        let models = diversity.exclusions.isEmpty ? built : built.filter { Self.isAllowed($0.target, by: diversity) }
+        guard let firstModel = models.first else {
+            await emitFailedDecision(.model, candidates: [], failure: .allCandidatesExcluded, context: logContext)
+            return StagedTaskRoutingResult(
+                candidates: [],
+                outcome: .failed(category: .allCandidatesExcluded, retryable: false, evidence: nil)
             )
         }
 
@@ -638,11 +682,14 @@ extension AgentModeViewModel {
     private func emitFailedDecision(
         _ stage: AgentTaskRoutingLogStage,
         candidates: [AgentTaskRoutingCandidateBuilder.Candidate],
+        failure: AgentTaskRoutingBackendFailureCategory = .invalidRequest,
+        reasonCode: String? = nil,
         context: AgentTaskRoutingRouteContext?
     ) async {
         var draft = AgentTaskRoutingDecisionDraft(stage: stage, outcome: .failed)
         draft.candidates = candidates.map { .init(key: $0.opaqueKey, target: .init($0.target)) }
-        draft.failure = AgentTaskRoutingBackendFailureCategory.invalidRequest.rawValue
+        draft.failure = failure.rawValue
+        draft.reasonCode = reasonCode
         await context?.emitDecision(draft)
     }
 

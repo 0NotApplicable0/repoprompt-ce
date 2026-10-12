@@ -123,6 +123,7 @@ struct AgentTaskRoutingDecisionDraft {
     var outputTokens: Int?
     var latencyMs: Double?
     var failure: String?
+    var makerExclusions: [String: [String]]?
 
     init(stage: AgentTaskRoutingLogStage, outcome: AgentTaskRoutingLogOutcome) {
         self.stage = stage
@@ -140,7 +141,7 @@ struct AgentTaskRoutingDecisionEvent: Encodable {
     private enum CodingKeys: String, CodingKey {
         case event, schema, timestamp, requestID, sessionID, scope, stage, outcome, backend, jevModel
         case policyVersion, candidates, chosenKey, chosenTarget, probabilities, confidence, reasonCode
-        case inputTokens, outputTokens, latencyMs, failure, rationale
+        case inputTokens, outputTokens, latencyMs, failure, rationale, makerExclusions
     }
 
     func encode(to encoder: Encoder) throws {
@@ -166,6 +167,7 @@ struct AgentTaskRoutingDecisionEvent: Encodable {
         try container.encodeOrNull(draft.outputTokens, forKey: .outputTokens)
         try container.encodeOrNull(draft.latencyMs, forKey: .latencyMs)
         try container.encodeOrNull(draft.failure, forKey: .failure)
+        try container.encodeOrNull(draft.makerExclusions, forKey: .makerExclusions)
         // The decoded Jev response contract exposes no rationale.
         try container.encodeNil(forKey: .rationale)
     }
@@ -489,6 +491,7 @@ actor AgentTaskRoutingRouteContext {
     private var picked: AgentRoutingExecutableTarget?
     private var finished = false
     private var pendingEmits = 0
+    private var makerExclusions: [String: [String]]?
 
     init(requestID: UUID, scope: AgentTaskRoutingLogScope, log: AgentTaskRoutingDecisionLog) {
         self.requestID = requestID
@@ -500,6 +503,12 @@ actor AgentTaskRoutingRouteContext {
         sessionID = id
     }
 
+    /// First nonempty map wins; an empty map leaves the slot open.
+    func attachMakerExclusions(_ map: [String: [String]]) {
+        guard makerExclusions == nil, !map.isEmpty else { return }
+        makerExclusions = map
+    }
+
     func recordPick(_ target: AgentRoutingExecutableTarget?) {
         picked = target
     }
@@ -509,6 +518,8 @@ actor AgentTaskRoutingRouteContext {
         guard !finished, stagesWritten.insert(draft.stage).inserted else { return }
         hasDecision = true
         pendingEmits += 1
+        var draft = draft
+        if draft.stage == .model { draft.makerExclusions = makerExclusions }
         let event = await log.makeEvent(requestID: requestID, sessionID: sessionID, scope: scope, draft: draft)
         await log.record(event)
         pendingEmits -= 1

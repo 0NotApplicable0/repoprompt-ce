@@ -128,6 +128,28 @@ struct AgentTaskRoutingDecisionEvidence: Equatable {
     let reasonCode: String?
 }
 
+enum AgentTaskRoutingMaker: String, CaseIterable, Codable {
+    case anthropic, openai, google, xai, cursor
+}
+
+struct AgentTaskRoutingDiversityOptions: Equatable {
+    enum ExclusionSource: String, CaseIterable, Codable {
+        case excludeMakers = "exclude_makers"
+        case diverseFromSessions = "diverse_from_sessions"
+        case reviewDiversity = "review_diversity"
+    }
+
+    let exclusions: [String: Set<ExclusionSource>]
+
+    static let none = AgentTaskRoutingDiversityOptions(exclusions: [:])
+
+    var canonicalMakerExclusions: [String: [String]] {
+        exclusions.mapValues { sources in
+            ExclusionSource.allCases.filter(sources.contains).map(\.rawValue)
+        }
+    }
+}
+
 enum AgentTaskRoutingBackendFailureCategory: String, Equatable {
     case authentication
     case invalidRequest
@@ -137,6 +159,8 @@ enum AgentTaskRoutingBackendFailureCategory: String, Equatable {
     case timeout
     case invalidResponse
     case policyUnavailable
+    case allCandidatesExcluded
+    case fallbackDiversityExcluded
 }
 
 enum AgentTaskRoutingBackendOutcome: Equatable {

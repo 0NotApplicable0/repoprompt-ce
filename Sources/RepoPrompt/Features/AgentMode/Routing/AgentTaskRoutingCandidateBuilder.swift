@@ -378,6 +378,19 @@ struct AgentTaskRoutingCandidateBuilder {
         )
     ]
 
+    var registeredTargetMakers: [String: AgentTaskRoutingMaker?] {
+        Dictionary(uniqueKeysWithValues: Self.modelDefinitions.map { definition in
+            (definition.modelClass, Self.definitionMaker(definition))
+        })
+    }
+
+    private static func definitionMaker(_ definition: ModelDefinition) -> AgentTaskRoutingMaker? {
+        AgentTaskRoutingMakerCatalog.maker(
+            provider: definition.provider,
+            modelRaw: definition.baseModelAliases.first ?? definition.modelClass
+        )
+    }
+
     private func eligibleDefinitions(
         allowedProviders: Set<AgentProviderKind>,
         availability: AgentModelCatalog.AvailabilityContext,

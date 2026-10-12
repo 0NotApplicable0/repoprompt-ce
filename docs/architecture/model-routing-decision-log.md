@@ -63,6 +63,7 @@ made without a Jev request.
 | `latencyMs` | Monotonic milliseconds around the backend call. |
 | `failure` | Failure category when one exists. |
 | `rationale` | Always `null`. |
+| `makerExclusions` | Model stage only; `null` on `effort`, `autoEffort` and when nothing was excluded. Maps each excluded maker to the sources that excluded it, always in the order `exclude_makers`, `diverse_from_sessions`, `review_diversity`. `exclude_makers` is an explicit exclusion, `diverse_from_sessions` excludes makers by session diversity, and `review_diversity` is Review diversity. |
 
 ## `applied` events
 
