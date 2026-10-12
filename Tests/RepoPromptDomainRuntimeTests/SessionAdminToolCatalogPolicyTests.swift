@@ -70,8 +70,12 @@ final class SessionAdminToolCatalogPolicyTests: XCTestCase {
         for text in ["observe for inventory", "organize and restructure", "Nothing is added after approval"] {
             XCTAssertTrue(capabilities.contains(text), text)
         }
-        // Bound guidance growth; do not turn the per-turn catalog into an operations manual.
-        XCTAssertLessThan(definition.description.utf8.count, 2300)
+        // Bound the added guidance independently of later lanes' implemented-operation text.
+        let guidance = try XCTUnwrap(definition.description.components(separatedBy: "\n\n").first {
+            $0.hasPrefix("For cleanup/organizing,")
+        })
+        XCTAssertLessThan(guidance.utf8.count, 250)
+        XCTAssertLessThan(capabilities.utf8.count, 300)
     }
 
     /// `max_depth` is measured from a tree root, so the authority rejects it on every other kind.

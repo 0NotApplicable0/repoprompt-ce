@@ -239,6 +239,20 @@ final class BatchConfirmationCoordinator: ObservableObject {
         }
     }
 
+    /// Invalidates a grantee's undecided cards whose tab no longer shows it, even when that tab's view
+    /// is not on screen to run `invalidateStaleConfirmations`. Such a card could never be presented
+    /// again, so it must not keep holding one of the grantee's pending slots.
+    func invalidateUnpresentableConfirmations(granteeSessionID: UUID, liveBoundSession: @MainActor (UUID) -> UUID?) {
+        for (id, card) in confirmations where card.granteeSessionID == granteeSessionID
+            && (card.state == .pending || card.state == .approved)
+        {
+            guard let tabID = card.granteeTabID, liveBoundSession(tabID) != granteeSessionID else { continue }
+            var updated = card
+            updated.state = .invalidated
+            confirmations[id] = updated
+        }
+    }
+
     /// UI actions re-read the live binding rather than trusting the rendered card's tab.
     func isCurrentPresentation(confirmationID: UUID, tabID: UUID, sessionID: UUID?) -> Bool {
         guard let card = confirmations[confirmationID] else { return false }

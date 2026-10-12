@@ -559,13 +559,30 @@ package struct DomainDelegationScopeAuthority: Sendable {
         argumentsDigest: String = "",
         targetSessionIDs: [UUID]
     ) -> Bool {
+        confirmationBindingMatches(
+            confirmation,
+            scope: scope,
+            operation: operation,
+            idempotencyKey: idempotencyKey,
+            argumentsDigest: argumentsDigest
+        )
+            && !targetSessionIDs.isEmpty
+            && Set(targetSessionIDs).isSubset(of: confirmation.approvedSessionIDs)
+    }
+
+    /// The card was approved for exactly this scope generation, operation, key, and arguments.
+    package static func confirmationBindingMatches(
+        _ confirmation: DomainDelegationScopeConfirmation,
+        scope: DomainDelegationScopeRecord,
+        operation: DomainAgentSessionTargetOperation,
+        idempotencyKey: String?,
+        argumentsDigest: String = ""
+    ) -> Bool {
         confirmation.scopeID == scope.id
             && confirmation.scopeGeneration == scope.generation
             && confirmation.operation == operation
             && confirmation.idempotencyKey == idempotencyKey
             && confirmation.argumentsDigest == argumentsDigest
-            && !targetSessionIDs.isEmpty
-            && Set(targetSessionIDs).isSubset(of: confirmation.approvedSessionIDs)
     }
 
     // MARK: - Single authority check
@@ -666,14 +683,26 @@ package struct DomainDelegationScopeAuthority: Sendable {
         // Only admitted items are carded or applied; with none admitted there is nothing to confirm.
         let admitted = items.admittedSessionIDs
         if let confirmation = request.confirmation {
-            guard Self.confirmationMatches(
-                confirmation,
-                scope: live,
-                operation: operation,
-                idempotencyKey: request.idempotencyKey,
-                argumentsDigest: request.argumentsDigest,
-                targetSessionIDs: admitted
-            ) else {
+            // A supplied card is always validated. When every approved item now needs `control`, none
+            // is admitted: the card's binding is still checked, and the empty batch is authorized so
+            // the call reports `requires_control` per item and settles the card instead of stranding it.
+            let bound = admitted.isEmpty
+                ? Self.confirmationBindingMatches(
+                    confirmation,
+                    scope: live,
+                    operation: operation,
+                    idempotencyKey: request.idempotencyKey,
+                    argumentsDigest: request.argumentsDigest
+                )
+                : Self.confirmationMatches(
+                    confirmation,
+                    scope: live,
+                    operation: operation,
+                    idempotencyKey: request.idempotencyKey,
+                    argumentsDigest: request.argumentsDigest,
+                    targetSessionIDs: admitted
+                )
+            guard bound else {
                 return .denied(.confirmationMismatch, sessionID: nil)
             }
         } else if !admitted.isEmpty,

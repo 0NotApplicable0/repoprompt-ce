@@ -70,16 +70,28 @@ struct DelegationApprovalSlot: View {
                     BatchConfirmationCard(
                         confirmation: card,
                         onToggle: { itemSessionID, ticked in
-                            guard cardIsCurrent(card, tabID: tabID) else { return }
+                            guard currentPresentation(card, tabID: tabID) != nil else { return }
                             confirmations.setItem(itemSessionID, ticked: ticked, confirmationID: card.id)
                         },
+                        // Approval applies the stored request to the ticked items right away; the
+                        // agent reads the outcome through `confirmation_status`. Both actions run
+                        // only while the tab is still bound to the session that requested the card.
                         onApprove: {
-                            guard cardIsCurrent(card, tabID: tabID) else { return }
-                            _ = confirmations.approve(confirmationID: card.id)
+                            guard let presented = currentPresentation(card, tabID: tabID) else { return }
+                            let frontDoor = AgentSessionLinkRuntimeBridge.shared.sessionAdministrationFrontDoor
+                            Task {
+                                // The presenter can change between the button callback and this task.
+                                guard currentPresentation(card, tabID: tabID) == presented else { return }
+                                await frontDoor.approveAndApply(
+                                    confirmationID: card.id, presentedTabID: tabID, presentedSessionID: presented
+                                )
+                            }
                         },
                         onDeny: {
-                            guard cardIsCurrent(card, tabID: tabID) else { return }
-                            confirmations.deny(confirmationID: card.id, reason: "Denied by user")
+                            guard let presented = currentPresentation(card, tabID: tabID) else { return }
+                            AgentSessionLinkRuntimeBridge.shared.sessionAdministrationFrontDoor.denyConfirmation(
+                                confirmationID: card.id, presentedTabID: tabID, presentedSessionID: presented
+                            )
                         }
                     )
                 }
@@ -87,17 +99,20 @@ struct DelegationApprovalSlot: View {
         }
     }
 
-    private func cardIsCurrent(_ card: PendingBatchConfirmation, tabID: UUID) -> Bool {
+    /// Re-read the unique physical presenter, including the window and rendered session. The
+    /// front door repeats the binding check before applying the stored request.
+    private func currentPresentation(_ card: PendingBatchConfirmation, tabID: UUID) -> UUID? {
         guard let presentedSessionID = sessionID,
               let presentation = DelegationScopeRuntime.loadedPresentation(
                   forTab: tabID, in: WindowStatesManager.shared.allWindows
               ),
               presentation.window.windowID == windowID,
-              presentation.sessionID == presentedSessionID
-        else { return false }
-        return confirmations.isCurrentPresentation(
-            confirmationID: card.id, tabID: tabID, sessionID: presentedSessionID
-        )
+              presentation.sessionID == presentedSessionID,
+              confirmations.isCurrentPresentation(
+                  confirmationID: card.id, tabID: tabID, sessionID: presentedSessionID
+              )
+        else { return nil }
+        return presentedSessionID
     }
 }
 

@@ -75,11 +75,15 @@ package extension DomainAgentSessionTargetOperation {
     /// `restructure` for an idle or finished target, so an `.allSessions` scope can retire idle
     /// members; stopping a running (or unknown-state) target additionally needs `control`, and the
     /// authority reports such items as `requires_control` instead of granting it implicitly.
+    /// `archive` stashes the session's tab, which cancels a live run and its pending prompts, so a
+    /// non-idle target likewise needs `organize` + `control`.
     func requiredScopeCapabilities(for state: DomainDelegationScopeTargetState) -> Set<DomainDelegationScopeCapability> {
         guard let primary = requiredScopeCapability else { return [] }
         switch self {
         case .adminRetire:
             return state == .idle ? [.organize, .restructure] : [.organize, .restructure, .control]
+        case .adminArchive:
+            return state == .idle ? [.organize] : [.organize, .control]
         default:
             return [primary]
         }
@@ -130,10 +134,12 @@ package extension DomainAgentSessionTargetOperation {
         }
     }
 
-    /// Acting on oneself under `control`, or retiring oneself, would let an agent answer its own
-    /// prompt or stop/archive itself through delegated authority; the scope basis refuses it.
+    /// Acting on oneself under `control`, or retiring or archiving oneself, would let an agent answer
+    /// its own prompt or stop/archive itself through delegated authority; the scope basis refuses it.
+    /// Archive is included because archiving stashes the tab and cancels its run, and the caller is
+    /// always running while it makes the call. Filter targeting excludes the caller for these ops.
     var deniesScopeSelfTarget: Bool {
-        self == .adminRetire || requiredScopeCapability == .control
+        self == .adminRetire || self == .adminArchive || requiredScopeCapability == .control
     }
 
     var scopeGuardrailUse: DomainDelegationScopeGuardrailUse? {
