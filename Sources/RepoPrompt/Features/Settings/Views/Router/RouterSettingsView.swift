@@ -15,6 +15,7 @@ struct RouterSettingsView: View {
                 header
                 usageBalancingCard
                 automaticFastCard
+                diversityCard
                 statusCard
                 autoEffortCard
                 backendCard
@@ -71,6 +72,20 @@ struct RouterSettingsView: View {
         card {
             Toggle("Allow paid Fast tiers in automatic routing", isOn: Binding(get: { viewModel.configuration.allowPaidFastRouting }, set: viewModel.setAllowPaidFastRouting))
             Text("Off by default. Fast can consume allowance or credits more quickly. Models you explicitly pick yourself are unaffected.")
+                .font(fontPreset.swiftUIFont(sizeAtNormal: 11)).foregroundStyle(.secondary)
+        }
+    }
+
+    private var diversityCard: some View {
+        card {
+            Label("Diversity", systemImage: "shuffle").font(.headline)
+            Picker("Randomness", selection: Binding(get: { viewModel.configuration.randomness }, set: viewModel.setRandomness)) {
+                ForEach(AgentRoutingRandomness.allCases) { level in Text(level.title).tag(level) }
+            }.pickerStyle(.segmented)
+            Text(viewModel.configuration.randomness.explanation).foregroundStyle(.secondary)
+            Toggle("Review diversity", isOn: Binding(get: { viewModel.configuration.reviewDiversityEnabled }, set: viewModel.setReviewDiversityEnabled))
+                .accessibilityLabel("Review diversity")
+            Text("Save preferences for routing variety and review diversity.")
                 .font(fontPreset.swiftUIFont(sizeAtNormal: 11)).foregroundStyle(.secondary)
         }
     }

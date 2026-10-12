@@ -288,7 +288,9 @@ extension GlobalSettingsStore {
                 enabled: stored?.usageBalancingEnabled == true && AgentUsageBalancingPreset.stored(stored?.usageBalancingPreset) != nil,
                 preset: AgentUsageBalancingPreset.stored(stored?.usageBalancingPreset) ?? .evenPace
             ),
-            allowPaidFastRouting: stored?.allowPaidFastRouting == true
+            allowPaidFastRouting: stored?.allowPaidFastRouting == true,
+            randomness: AgentRoutingRandomness.stored(stored?.randomness),
+            reviewDiversityEnabled: stored?.reviewDiversityEnabled == true
         )
     }
 
@@ -302,6 +304,14 @@ extension GlobalSettingsStore {
 
     func setAllowPaidFastRouting(_ enabled: Bool) {
         updateModelRouterScalar(commit: true) { $0.allowPaidFastRouting = enabled }
+    }
+
+    func setRandomness(_ level: AgentRoutingRandomness) {
+        updateModelRouterScalar(commit: true) { $0.randomness = level.rawValue }
+    }
+
+    func setReviewDiversityEnabled(_ enabled: Bool) {
+        updateModelRouterScalar(commit: true) { $0.reviewDiversityEnabled = enabled }
     }
 
     func setModelRouterBackend(_ backendID: AgentTaskRouterBackendID, commit: Bool = true) {

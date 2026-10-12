@@ -204,11 +204,19 @@ scalarPreferences.modelRouter.allowedProviderRawValues
 scalarPreferences.modelRouter.primaryProviderRawValue
 scalarPreferences.modelRouter.subagentProviderRawValue
 scalarPreferences.modelRouter.customInstructions
+scalarPreferences.modelRouter.usageBalancingEnabled
+scalarPreferences.modelRouter.usageBalancingPreset
+scalarPreferences.modelRouter.usageLargerPlan
+scalarPreferences.modelRouter.allowPaidFastRouting
+scalarPreferences.modelRouter.randomness
+scalarPreferences.modelRouter.reviewDiversityEnabled
 ```
 
 The base group is a schema-v9 feature fence. Its absence leaves the document's minimum schema unchanged; any presence requires v9 so older typed writers reject the document instead of silently dropping router consent. A nonnil primary provider, subagent provider, or custom guidance field requires v10. Clearing all three returns the content-derived minimum to v9. The group stores no API keys or backend secrets. Unknown nonblank backend, role, and provider raws are preserved during sibling edits and ignored by current runtime validation. An unknown backend is never replaced by the first registered backend.
 
 Missing values resolve disabled and do not materialize defaults. First enable explicitly writes the selected backend plus the current known role/provider policy; subsequently discovered roles/providers are not silently authorized. Scope provider fields are optional limits over the allowed-provider set. Custom guidance is trimmed on supported writes, removed when empty, and bounded to 1,000 characters and 4,096 UTF-8 bytes. `GlobalSettingsStore.modelRouterSettingsRevision` is process-local and changes only after an actual in-memory router mutation. Future/foreign blocking, compatible import, raw unknown-field preservation, and rollback rules remain those of the owning global settings document.
+
+`usageLargerPlan` is a legacy value retained for lossless round trips but no longer used. `randomness` accepts exactly `off`, `low`, `medium`, or `high`; missing, unknown, empty, whitespace-prefixed, or wrong-case strings read as `off`. Stored raw values survive sibling edits until an explicit `setRandomness` overwrites them. `reviewDiversityEnabled` enables only on literal `true` and defaults to `false`. Neither field raises the schema: unscoped router fields remain v9, while scoped provider or guidance fields require v10. Both setters are normal router updates and bump the revision only on a real change.
 
 ## Agent Mode Handoff instructions
 

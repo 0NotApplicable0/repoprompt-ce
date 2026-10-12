@@ -245,6 +245,16 @@ final class RouterSettingsViewModel: ObservableObject {
         synchronizeConfiguration()
     }
 
+    func setRandomness(_ level: AgentRoutingRandomness) {
+        settingsStore.setRandomness(level)
+        synchronizeConfiguration()
+    }
+
+    func setReviewDiversityEnabled(_ enabled: Bool) {
+        settingsStore.setReviewDiversityEnabled(enabled)
+        synchronizeConfiguration()
+    }
+
     /// This setter is only reachable from the explicit UI disclosure, never MCP settings.
     func setClaudeBackgroundRefreshEnabled(_ enabled: Bool) {
         guard !enabled || claudeUsageConnected else { return }

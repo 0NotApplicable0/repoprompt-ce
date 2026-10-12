@@ -145,6 +145,49 @@ final class RouterSettingsViewModelTests: XCTestCase {
         XCTAssertEqual(fixture.viewModel.providerLimit(for: .subagent), .claudeCode)
     }
 
+    func testRandomnessLevelsAreSelectable() throws {
+        let fixture = try makeFixture()
+        let backend = fixture.store.scalarPreferences.modelRouter?.selectedBackendRawValue
+        XCTAssertEqual(AgentRoutingRandomness.allCases.map(\.rawValue), ["off", "low", "medium", "high"], "randomness levels in order")
+        XCTAssertEqual(fixture.viewModel.configuration.randomness, .off)
+
+        for level in [AgentRoutingRandomness.low, .medium, .high, .off] {
+            let revision = fixture.store.modelRouterSettingsRevision
+            fixture.viewModel.setRandomness(level)
+            XCTAssertEqual(fixture.viewModel.configuration.randomness, level, "view model configuration randomness \(level.rawValue)")
+            XCTAssertEqual(fixture.store.modelRouterConfiguration().randomness, level, "store configuration randomness \(level.rawValue)")
+            XCTAssertEqual(fixture.store.scalarPreferences.modelRouter?.randomness, level.rawValue, "store raw randomness \(level.rawValue)")
+            XCTAssertEqual(fixture.store.modelRouterSettingsRevision, revision &+ 1, "revision bumps once per distinct selection \(level.rawValue)")
+            let updatedRevision = fixture.store.modelRouterSettingsRevision
+            fixture.viewModel.setRandomness(level)
+            XCTAssertEqual(fixture.store.modelRouterSettingsRevision, updatedRevision, "identical selection does not bump revision")
+            XCTAssertFalse(fixture.viewModel.configuration.reviewDiversityEnabled)
+            XCTAssertFalse(fixture.store.modelRouterConfiguration().reviewDiversityEnabled)
+            XCTAssertNil(fixture.store.scalarPreferences.modelRouter?.reviewDiversityEnabled)
+            XCTAssertEqual(fixture.store.scalarPreferences.modelRouter?.selectedBackendRawValue, backend)
+        }
+    }
+
+    func testReviewDiversityToggles() throws {
+        let fixture = try makeFixture()
+        XCTAssertFalse(fixture.viewModel.configuration.reviewDiversityEnabled)
+
+        for enabled in [true, false] {
+            let revision = fixture.store.modelRouterSettingsRevision
+            fixture.viewModel.setReviewDiversityEnabled(enabled)
+            XCTAssertEqual(fixture.viewModel.configuration.reviewDiversityEnabled, enabled, "view model configuration review diversity \(enabled)")
+            XCTAssertEqual(fixture.store.modelRouterConfiguration().reviewDiversityEnabled, enabled, "store configuration review diversity \(enabled)")
+            XCTAssertEqual(fixture.store.scalarPreferences.modelRouter?.reviewDiversityEnabled, enabled, "review diversity raw \(enabled)")
+            XCTAssertEqual(fixture.store.modelRouterSettingsRevision, revision &+ 1, "revision bumps once per distinct toggle \(enabled)")
+            let updatedRevision = fixture.store.modelRouterSettingsRevision
+            fixture.viewModel.setReviewDiversityEnabled(enabled)
+            XCTAssertEqual(fixture.store.modelRouterSettingsRevision, updatedRevision, "identical toggle does not bump revision")
+            XCTAssertEqual(fixture.viewModel.configuration.randomness, .off)
+            XCTAssertEqual(fixture.store.modelRouterConfiguration().randomness, .off)
+            XCTAssertNil(fixture.store.scalarPreferences.modelRouter?.randomness)
+        }
+    }
+
     func testCompletedProviderValidationWithNoAuthenticatedTargetsPreservesEnablementIntent() async throws {
         let fixture = try makeFixture(
             availability: .none,

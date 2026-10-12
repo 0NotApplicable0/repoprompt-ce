@@ -211,6 +211,38 @@ struct AgentTaskRouterConfiguration: Equatable {
     let revision: UInt64
     var usageBalancing = AgentUsageBalancingConfiguration()
     var allowPaidFastRouting = false
+    var randomness: AgentRoutingRandomness = .off
+    var reviewDiversityEnabled = false
+}
+
+enum AgentRoutingRandomness: String, CaseIterable, Identifiable {
+    case off, low, medium, high
+
+    var id: String {
+        rawValue
+    }
+
+    var title: String {
+        switch self {
+        case .off: "Off"
+        case .low: "Low"
+        case .medium: "Medium"
+        case .high: "High"
+        }
+    }
+
+    var explanation: String {
+        switch self {
+        case .off: "No added variety."
+        case .low: "Adds a little variety among comparable models."
+        case .medium: "Adds moderate variety among comparable models."
+        case .high: "Adds the most variety among comparable models."
+        }
+    }
+
+    static func stored(_ raw: String?) -> Self {
+        raw.flatMap(Self.init(rawValue:)) ?? .off
+    }
 }
 
 private extension String {
