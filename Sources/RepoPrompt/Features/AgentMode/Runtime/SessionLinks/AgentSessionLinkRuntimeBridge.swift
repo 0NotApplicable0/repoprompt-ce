@@ -1362,6 +1362,8 @@ final class AgentSessionLinkRuntimeBridge {
     private var sidebarObserverIndex: SidebarObserverIndex?
     private var projectedEndpoints: Set<DomainAgentSessionLinkEndpointIdentity> = []
     private var candidateAvailabilityNotificationPending = false
+    /// Collapses readiness bursts into one queued settle.
+    private var candidatePresentationRefreshPending = false
     private var pendingRefreshScope: ProjectionRefreshScope?
     /// Exact target incarnations whose effective location label changed and whose observers still
     /// have to be repainted. Coalesced: a burst of worktree/branch/workspace edits costs one pass.
@@ -1379,10 +1381,29 @@ final class AgentSessionLinkRuntimeBridge {
         /// another catalog or blocking AppKit's nested run loop on an async authority turn.
         var test_menuCatalogUnavailable = false
 
-        func test_settleCandidateAvailabilityNotifications() async {
-            while candidateAvailabilityNotificationPending {
+        /// True while any candidate-presentation work is queued or a sibling task (monitor
+        /// repaint, availability notification) is still outstanding.
+        private var test_presentationRefreshUnsettled: Bool {
+            candidatePresentationRefreshPending
+                || monitorProjectionRefreshTask != nil || candidateAvailabilityNotificationPending
+        }
+
+        /// Polls until presentation work is quiescent; returns false once `maxYields` polls are
+        /// spent. Polls also elapse while the monitor lane awaits the authority actor, so a bounded
+        /// call measures scheduling opportunities, not progress — keep budgets generous.
+        private func test_drainPresentationPipelines(maxYields: Int) async -> Bool {
+            var remainingYields = maxYields
+            while test_presentationRefreshUnsettled {
+                guard remainingYields > 0 else { return false }
+                remainingYields -= 1
                 await Task.yield()
             }
+            return true
+        }
+
+        @discardableResult
+        func test_settleCandidateAvailabilityNotifications(maxYields: Int = .max) async -> Bool {
+            await test_drainPresentationPipelines(maxYields: maxYields)
         }
 
         func test_enqueueProjectionRefresh(sessionIDs: Set<UUID>) {
@@ -5137,6 +5158,22 @@ final class AgentSessionLinkRuntimeBridge {
     /// uses the presentation-only lane so the repaint cannot publish prompt inventory, consume its
     /// discarded `statusSamples`, reconcile passive work, advance target activity, or trigger Auto-wake.
     private func requestCandidatePresentationRefresh() {
+        // Retire the census at emission time, before the coalesced hop: eligibility and existence
+        // inputs can change without an authority revision, and a queued settle cannot stand in for
+        // the synchronous presentation fence the census contract requires.
+        sidebarObserverIndex = nil
+        guard !isFrozenForTermination, host != nil, !candidatePresentationRefreshPending else { return }
+        // Queued, not inline: the settle's own publish re-signals readiness, which would nest a
+        // full candidate pass on the caller's stack.
+        candidatePresentationRefreshPending = true
+        Task { @MainActor [weak self] in
+            self?.performCandidatePresentationRefresh()
+        }
+    }
+
+    /// Must stay synchronous: coalescing relies on each settle being atomic.
+    private func performCandidatePresentationRefresh() {
+        candidatePresentationRefreshPending = false
         guard !isFrozenForTermination, let host else { return }
         // Keep creator-name publication with its existing owner; it is not menu materialization.
         settleCreatorNames(host.agentSessionLinkCandidates())
@@ -5196,11 +5233,11 @@ final class AgentSessionLinkRuntimeBridge {
 
     #if DEBUG
         /// Test seam: drains queued presentation-only projection refreshes, including work a drain
-        /// enqueues, so assertions observe settled rows.
-        func test_settleMonitorProjectionRefresh() async {
-            while let task = monitorProjectionRefreshTask {
-                await task.value
-            }
+        /// enqueues, so assertions observe settled rows. Tests that must fail rather than hang on
+        /// non-convergence pass `maxYields`; the drain then reports false instead of looping.
+        @discardableResult
+        func test_settleMonitorProjectionRefresh(maxYields: Int = .max) async -> Bool {
+            await test_drainPresentationPipelines(maxYields: maxYields)
         }
     #endif
 
