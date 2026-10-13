@@ -86,7 +86,7 @@ struct AgentExploreMCPToolService {
         )
 
         let metadata = await captureRequestMetadata()
-        let context = try await resolveStartContext(metadata: metadata)
+        let context = try await resolveStartContext(args: args, metadata: metadata)
         let started = try await startExploreRuns(
             messages: messages,
             context: context,
@@ -185,6 +185,8 @@ struct AgentExploreMCPToolService {
         let callerSessionID: UUID
         let parentSessionID: UUID
         let selection: AgentMCPSelectionResolver.ResolvedSelection
+        let diversityOptions: AgentTaskRoutingDiversityOptions?
+        let diversityConfiguration: AgentTaskRouterConfiguration?
     }
 
     private struct StartedExploreRun {
@@ -220,7 +222,7 @@ struct AgentExploreMCPToolService {
         return .batch(messages)
     }
 
-    private func resolveStartContext(metadata: MCPRequestMetadata) async throws -> ExploreStartContext {
+    private func resolveStartContext(args: [String: Value], metadata: MCPRequestMetadata) async throws -> ExploreStartContext {
         let targetWindow = try requireTargetWindow()
         guard let workspace = targetWindow.workspaceManager.activeWorkspace else {
             throw MCPError.invalidParams("No active workspace available for agent_explore.start.")
@@ -243,6 +245,22 @@ struct AgentExploreMCPToolService {
             workspaceID: workspace.id,
             surface: .headless
         )
+        let diversityConfiguration = args["exclude_makers"] != nil || args["diverse_from_sessions"] != nil
+            ? agentModeVM.modelRouterSettingsStore.modelRouterConfiguration() : nil
+        let diversityOptions: AgentTaskRoutingDiversityOptions? = if let diversityConfiguration {
+            try await AgentRunMCPToolService.resolveDiversityOptions(
+                args: args,
+                workspace: workspace,
+                configuration: diversityConfiguration,
+                agentModeVM: agentModeVM,
+                workflow: nil,
+                validatedParentSessionID: nil,
+                hasExplicitModelPin: false,
+                sessionDataService: .shared
+            )
+        } else {
+            nil
+        }
         return ExploreStartContext(
             metadata: metadata,
             targetWindow: targetWindow,
@@ -251,8 +269,23 @@ struct AgentExploreMCPToolService {
             callerSourceTabID: caller.sourceTabID,
             callerSessionID: caller.sourceSessionID,
             parentSessionID: caller.sourceSessionID,
-            selection: selection
+            selection: selection,
+            diversityOptions: diversityOptions,
+            diversityConfiguration: diversityConfiguration
         )
+    }
+
+    private func requireDiversityContextCurrent(_ context: ExploreStartContext) throws {
+        guard let configuration = context.diversityConfiguration else { return }
+        try Task.checkCancellation()
+        guard context.targetWindow.workspaceManager.activeWorkspaceID == context.expectedWorkspaceID,
+              context.agentModeVM.workspaceManager?.activeWorkspaceID == context.expectedWorkspaceID
+        else {
+            throw MCPError.invalidParams("The active workspace changed while diversity arguments were resolved.")
+        }
+        guard context.agentModeVM.modelRouterSettingsStore.modelRouterConfiguration() == configuration else {
+            throw MCPError.invalidParams("Model Router settings changed while diversity arguments were resolved.")
+        }
     }
 
     private func createFreshExploreTargets(
@@ -343,6 +376,7 @@ struct AgentExploreMCPToolService {
         message: String,
         context: ExploreStartContext
     ) async throws -> AgentExternalMCPRunStarter.StartOutcome {
+        try requireDiversityContextCurrent(context)
         let routeLogContext = context.agentModeVM.makeRouteLogContext(scope: .headless)
         do {
             return try await startExploreRunBody(
@@ -370,6 +404,10 @@ struct AgentExploreMCPToolService {
             target,
             expectedWorkspaceID: context.expectedWorkspaceID
         )
+        try requireDiversityContextCurrent(context)
+        let baseline: AgentRoutingExecutableTarget? = context.selection.agentRaw.flatMap { agent in
+            context.selection.modelRaw.map { .init(agentRaw: agent, modelRaw: $0, reasoningEffortRaw: nil, modelParameters: context.selection.modelParameterSelections) }
+        }
         var selection = context.selection
         var routedReasoningEffortRaw: String?
         var routerSelectedTarget = false
@@ -377,11 +415,10 @@ struct AgentExploreMCPToolService {
             if let routed = try await context.agentModeVM.routeSubagentTargetIfEnabled(
                 task: message,
                 surface: .headless,
-                baseline: context.selection.agentRaw.flatMap { agent in
-                    context.selection.modelRaw.map { .init(agentRaw: agent, modelRaw: $0, reasoningEffortRaw: nil, modelParameters: context.selection.modelParameterSelections) }
-                },
+                baseline: baseline,
                 allowUsageBalance: context.selection.usageBalancingEligible,
-                logContext: routeLogContext
+                logContext: routeLogContext,
+                diversity: context.diversityOptions ?? .none
             ) {
                 selection = AgentMCPSelectionResolver.ResolvedSelection(
                     agentRaw: routed.agentRaw,
@@ -399,10 +436,15 @@ struct AgentExploreMCPToolService {
                         "effort": routed.reasoningEffortRaw ?? "provider-default"
                     ])
                 #endif
+            } else if let diversity = context.diversityOptions, !diversity.exclusions.isEmpty {
+                guard let baseline, let maker = AgentTaskRoutingMakerCatalog.maker(for: baseline),
+                      diversity.exclusions[maker.rawValue] == nil
+                else { throw AgentModeViewModel.GlobalModelRoutingError.fallbackDiversityExcluded }
             }
         } catch {
             throw MCPError.invalidParams(error.localizedDescription)
         }
+        try requireDiversityContextCurrent(context)
         // An `explore` role default may carry a stored model-parameter pin (e.g. an OpenCode
         // thinking level). Stage it onto the freshly created session so the run builder picks it
         // up from stored selections, exactly as `agent_run` start does. No rollback bookkeeping:
@@ -627,7 +669,7 @@ struct AgentExploreMCPToolService {
         }
     }
 
-    private static let startKeys = Set(["op", "message", "messages", "detach", "timeout"])
+    private static let startKeys = Set(["op", "message", "messages", "detach", "timeout", "exclude_makers", "diverse_from_sessions"])
         .union(AgentMCPStartWorktreeCoordinator.Request.argumentKeys)
     private static let pollKeys: Set<String> = ["op", "session_id", "session_ids"]
     private static let waitKeys: Set<String> = ["op", "session_id", "session_ids", "timeout"]

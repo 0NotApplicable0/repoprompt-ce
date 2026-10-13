@@ -1119,6 +1119,7 @@ package enum MCPDomainCanonicalToolDefinitions {
         }
         return (canonicalize ? definitions.map(canonicalizeGlobalSemantics) : definitions)
             .map(advertiseModelParameters)
+            .map(advertiseDiversityArguments)
             .map(advertiseOracleImageAttachments)
     }
 
@@ -1186,6 +1187,98 @@ package enum MCPDomainCanonicalToolDefinitions {
         )
     }
 
+    private static func advertiseDiversityArguments(
+        _ definition: MCPDomainToolDefinition
+    ) -> MCPDomainToolDefinition {
+        let explore = definition.name == MCPWindowToolName.agentExplore
+        guard definition.name == MCPWindowToolName.agentRun || explore,
+              case var .object(schema) = definition.inputSchema,
+              case var .object(properties)? = schema["properties"]
+        else { return definition }
+
+        if properties["exclude_makers"] == nil {
+            properties["exclude_makers"] = diversityMakerProperty(explore: explore)
+        }
+        if properties["diverse_from_sessions"] == nil {
+            properties["diverse_from_sessions"] = diversitySessionProperty(explore: explore)
+        }
+        schema["properties"] = .object(properties)
+
+        let schemaSentence = "start accepts optional exclude_makers and diverse_from_sessions."
+        if let existing = schema["description"]?.stringValue {
+            if !existing.contains("exclude_makers") || !existing.contains("diverse_from_sessions") {
+                schema["description"] = .string(existing + "\n\n" + schemaSentence)
+            }
+        } else {
+            schema["description"] = .string(schemaSentence)
+        }
+
+        var description = definition.description
+        if definition.name == MCPWindowToolName.agentRun, !description.contains("diversity key") {
+            description += "\n\nA diversity key, including [], rejects an explicit pin and `model_parameters` and suppresses default built-in Review. An ordinary pin bypasses routing except under default built-in Review: builtInWorkflow == .review, Router enabled, reviewDiversityEnabled, and neither diversity key. That predicate rejects a compound model_id or a present model_parameters key, including [] or null, before parent resolution, even if the parent is missing or unclassifiable. A custom display name is inert. Explore has no implicit Review."
+        }
+        if explore, !description.contains("no implicit Review") {
+            description += "\n\nExplore has no implicit Review and no model or workflow custom pin. It does not apply default built-in Review."
+        }
+        return MCPDomainToolDefinition(
+            name: definition.name,
+            description: description,
+            inputSchema: .object(schema),
+            annotations: definition.annotations,
+            isEnabledByDefault: definition.isEnabledByDefault
+        )
+    }
+
+    private static func diversityMakerProperty(explore: Bool) -> Value {
+        .object([
+            "type": .string("array"),
+            "description": .string(diversityMakerDescription(explore: explore)),
+            "items": .object([
+                "type": .string("string"),
+                "description": .string("Canonical maker id."),
+                "enum": .array([
+                    .string("anthropic"),
+                    .string("openai"),
+                    .string("google"),
+                    .string("xai"),
+                    .string("cursor")
+                ])
+            ])
+        ])
+    }
+
+    private static func diversitySessionProperty(explore: Bool) -> Value {
+        .object([
+            "type": .string("array"),
+            "description": .string(diversitySessionDescription(explore: explore)),
+            "items": .object([
+                "type": .string("string"),
+                "description": .string("One full session UUID.")
+            ])
+        ])
+    }
+
+    private static func diversityMakerDescription(explore: Bool) -> String {
+        var text = "[start] Optional start-only maker exclusion. Canonical ids are anthropic, openai, google, xai, and cursor. Omitting this field contributes no exclusions from this field and does not suppress diverse_from_sessions or default built-in Review. A present [] excludes nothing and is still a diversity key. Null is not an array and is rejected. Names union with diverse_from_sessions on the referenced session's current maker; sources stay in canonical order exclude_makers, diverse_from_sessions, review_diversity. With the router off, any present diversity key is rejected."
+        text += diversityPinScope(explore: explore)
+        text += " A missing, unknown, or excluded baseline rejects only a fallback that needs that baseline. A successful routed target stays eligible with no baseline. That fallback uses the same frozen pre-route baseline only, with no arbitrary survivor or Pair substitution."
+        return text
+    }
+
+    private static func diversitySessionDescription(explore: Bool) -> String {
+        var text = "[start] Optional start-only session diversity. Each entry is one full UUID. The resolved current maker is unioned with exclude_makers. Do not infer a maker from the UUID, scan other workspaces, or log the session id. Omitting this field contributes no exclusions from this field and does not suppress exclude_makers or default built-in Review. A present [] excludes nothing and is still a diversity key. Null is rejected. With the router off, any present diversity key is rejected."
+        text += diversityPinScope(explore: explore)
+        text += " Explicit unknown or unclassifiable sessions are rejected. An unproven automatic parent stays inert."
+        return text
+    }
+
+    private static func diversityPinScope(explore: Bool) -> String {
+        if explore {
+            return " Explore has no implicit Review and no model or workflow custom pin. Explore never accepts a compound model_id or model_parameters pin and never uses an ordinary routing bypass. Explore does not apply default built-in Review."
+        }
+        return " For agent_run, an ordinary compound model_id or present model_parameters key, including [] or null, bypasses routing except when a diversity key is present or default built-in Review applies. For agent_run, default built-in Review is builtInWorkflow == .review, Router enabled, reviewDiversityEnabled, and neither diversity key. That predicate rejects the pin before parent resolution, even if the parent is missing or unclassifiable. For agent_run, a custom display name is inert. For agent_run, a present key, including [], suppresses default built-in Review."
+    }
+
     /// The vendored `ask_oracle` definition predates Oracle image attachments, so
     /// canonicalization advertises the app-backend `images` contract here instead of
     /// re-vendoring the blob. The direct headless backend cannot resolve workspace
@@ -1248,7 +1341,7 @@ package enum MCPDomainCanonicalToolDefinitions {
         var description = definition.description
 
         if definition.name == MCPWindowToolName.agentRun {
-            let routerDescription = "When the app-global Model Router is enabled, new starts that omit `model_id` or use a role label are routed across the configured subagent targets. A compound `model_id` or explicit `model_parameters` remains an exact pin and bypasses routing."
+            let routerDescription = "When the app-global Model Router is enabled, new starts that omit `model_id` or use a role label are routed across the configured subagent targets. A compound `model_id` or a present `model_parameters` key, including [] or null, remains an exact pin and bypasses routing except under default built-in Review."
             if !description.contains(routerDescription) {
                 description += "\n\n\(routerDescription)"
             }
