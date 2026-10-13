@@ -761,7 +761,7 @@ struct AgentModeSessionsListView: View {
                                     expectedReference: reference
                                 )
                             },
-                            onAddOutboundOversight: { observerEndpoint, targetEndpoint in
+                            onAddOversightLink: { observerEndpoint, targetEndpoint in
                                 await agentModeVM.addAgentOversightLink(
                                     observerEndpoint: observerEndpoint,
                                     targetEndpoint: targetEndpoint
