@@ -534,7 +534,7 @@ final class ClaudeNativeAutoFallbackTests: XCTestCase {
     private func fixture(_ controller: ClaudeNativeProcessSessionController) throws -> (ClaudeAgentModeCoordinator, AgentTabSession, ClaudeAgentModeCoordinator.NativeSessionIntent) {
         let coordinator = ClaudeAgentModeCoordinator(
             windowID: 1, workspacePathProvider: { _ in nil },
-            claudeControllerFactory: { _, _, _, _ in controller }, autoEffortEnabledProvider: { true }
+            claudeControllerFactory: { _, _, _, _ in controller }, autoEffortConfigurationProvider: { .init(enabled: true, selectedBackendRawValue: nil, revision: 0) }
         )
         let session = AgentTabSession(tabID: UUID())
         session.selectedAgent = .claudeCode
@@ -579,7 +579,7 @@ final class ClaudeNativeAutoFallbackTests: XCTestCase {
                             provider: .claudeCode,
                             selectedModelRaw: session.selectedModelRaw,
                             manualEffortRaw: "high",
-                            effortRaw: "low"
+                            effortRaw: "low", backendID: .jev, autoEffortRevision: 0
                         )
                     )
                 }
@@ -623,7 +623,7 @@ final class ClaudeNativeAutoFallbackTests: XCTestCase {
                 provider: .claudeCode,
                 selectedModelRaw: session.selectedModelRaw,
                 manualEffortRaw: "high",
-                effortRaw: "low"
+                effortRaw: "low", backendID: .jev, autoEffortRevision: 0
             )
         )
         XCTAssertEqual(outcome, .sent)
@@ -666,7 +666,7 @@ final class ClaudeNativeAutoFallbackTests: XCTestCase {
             allowsCatalogRouteControllerRecovery: false,
             autoEffortSelection: .init(
                 provider: .claudeCode, selectedModelRaw: session.selectedModelRaw,
-                manualEffortRaw: "high", effortRaw: "low"
+                manualEffortRaw: "high", effortRaw: "low", backendID: .jev, autoEffortRevision: 0
             )
         )
         XCTAssertEqual(auto, .sent)
@@ -715,7 +715,7 @@ final class ClaudeNativeAutoFallbackTests: XCTestCase {
                 allowsCatalogRouteControllerRecovery: false,
                 autoEffortSelection: .init(
                     provider: .claudeCode, selectedModelRaw: session.selectedModelRaw,
-                    manualEffortRaw: "high", effortRaw: "low"
+                    manualEffortRaw: "high", effortRaw: "low", backendID: .jev, autoEffortRevision: 0
                 )
             )
         }
@@ -766,7 +766,7 @@ final class ClaudeNativeAutoFallbackTests: XCTestCase {
                 allowsCatalogRouteControllerRecovery: false,
                 autoEffortSelection: .init(
                     provider: .claudeCode, selectedModelRaw: session.selectedModelRaw,
-                    manualEffortRaw: "high", effortRaw: "low"
+                    manualEffortRaw: "high", effortRaw: "low", backendID: .jev, autoEffortRevision: 0
                 )
             )
         }

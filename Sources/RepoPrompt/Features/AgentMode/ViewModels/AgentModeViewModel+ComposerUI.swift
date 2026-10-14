@@ -27,6 +27,13 @@ extension AgentModeViewModel {
         let acpRunLocksModelControls = session?.runState.isActive == true
             && (selectedAgent == .cursor || !acpControls.isEmpty)
         let routerControlsFreshTask = session.map(isGlobalModelRouterControllingFreshTask) ?? false
+        let selectedRouterServiceID = routerControlsFreshTask
+            ? modelRouterSettingsStore.modelRouterConfiguration().selectedBackendID : nil
+        let automaticRouterServiceName = selectedRouterServiceID.flatMap { modelRouterRuntime?.serviceDisplayNamesByID[$0] }
+        let autoEffortConfiguration = modelRouterSettingsStore.autoEffortConfiguration()
+        let autoEffortServiceName = autoEffortConfiguration.enabled
+            ? autoEffortConfiguration.selectedBackendID.flatMap { modelRouterRuntime?.serviceDisplayNamesByID[$0] } ?? "Unavailable service"
+            : nil
         return AgentComposerProps(
             computerUse: computerUseComposerProps(session: session),
             currentTabID: tabID,
@@ -49,6 +56,8 @@ extension AgentModeViewModel {
             canSendWithCurrentProvider: canSendWithCurrentProvider,
             isRoutingFreshTask: tabID.map { freshTaskRoutingByTabID[$0] != nil } ?? false,
             isGlobalModelRouterControllingFreshTask: routerControlsFreshTask,
+            automaticRouterServiceName: automaticRouterServiceName,
+            autoEffortServiceName: autoEffortServiceName,
             unavailableSelectedAgentMessage: unavailableSelectedAgentMessage,
             selectedAgent: selectedAgent,
             selectedModelRaw: selectedModelRaw,

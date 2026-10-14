@@ -86,7 +86,7 @@ final class AgentTabSession: ObservableObject {
 
     var activeAgentRunStartedAt: Date?
 
-    /// Last Jev effort choice submitted for this tab, plus a transient in-flight indication.
+    /// Last Auto Effort service choice submitted for this tab, plus a transient in-flight indication.
     /// Neither changes the user's manual model/effort selection or persisted session state.
     var autoEffortFeedback: AutoEffortTurnFeedback?
     var autoEffortJudgmentID: UUID?

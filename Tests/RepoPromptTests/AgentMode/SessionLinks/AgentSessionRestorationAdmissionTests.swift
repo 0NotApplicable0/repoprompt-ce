@@ -499,10 +499,6 @@ final class AgentSessionRestorationAdmissionTests: XCTestCase {
         guard case .saved = await credentials.validateStoredKey(operationID: UUID()) else {
             return XCTFail("The in-memory fake Jev credential must validate before dispatch")
         }
-        let runtime = try AgentTaskRouterRuntime(registrations: [
-            .init(backend: JevTaskRouterBackend(credentialService: credentials))
-        ])
-        try await AsyncTestWait.waitUntil("initial effort backend readiness") { runtime.isBackendReady(.jev) }
         let suiteName = "RestorationInitialEffort-\(UUID())"
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
         addTeardownBlock { defaults.removePersistentDomain(forName: suiteName) }
@@ -511,6 +507,14 @@ final class AgentSessionRestorationAdmissionTests: XCTestCase {
             fileStore: GlobalSettingsFileStore(fileURL: fixture.root.appendingPathComponent("router-settings.json"))
         )
         settings.setAutoEffortEnabled(true)
+        let runtime = try AgentTaskRouterRuntime(registrations: [
+            .init(
+                service: JevDecisionService(credentialService: credentials),
+                configuration: JevDecisionService.settingsRegistration(controller: credentials)
+            )
+        ], demandSource: settings)
+        await runtime.reconcileDemand()
+        try await AsyncTestWait.waitUntil("initial effort backend readiness") { runtime.isBackendReady(.jev) }
         fixture.vm.modelRouterSettingsStore = settings
         fixture.vm.modelRouterRuntime = runtime
         let target = try await fixture.vm.mcpResolveOrCreateSessionTarget(
