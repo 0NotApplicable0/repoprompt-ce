@@ -8304,7 +8304,7 @@ enum AgentTranscriptProjectionBuilder {
 }
 
 enum AgentTranscriptAnalyticsBuilder {
-    static func build(from transcript: AgentTranscript, selectedAgent: AgentProviderKind?) -> AgentTranscriptAnalyticsSnapshot {
+    static func build(from transcript: AgentTranscript, selectedAgent: AgentProviderKind?, visitRequest: ((AgentChatItem) -> Void)? = nil) -> AgentTranscriptAnalyticsSnapshot {
         var observedReadFiles = Set<String>()
         var latestWorkspaceContextItem: AgentChatItem?
         var latestManageSelectionItem: AgentChatItem?
@@ -8313,6 +8313,7 @@ enum AgentTranscriptAnalyticsBuilder {
 
         for turn in transcript.turns {
             totalCharacters += turn.request?.text.count ?? 0
+            if let request = turn.request { visitRequest?(request.toItem()) }
         }
 
         for activity in transcript.allActivities {
