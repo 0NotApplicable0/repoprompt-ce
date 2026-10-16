@@ -2026,10 +2026,22 @@ class WorkspaceManagerViewModel: ObservableObject {
         selectionMirrorContextRevision &+= 1
     }
 
-    private func bumpStateVersion(for id: UUID?) {
+    private func bumpStateVersion(for id: UUID?, source: StaticString = #function) {
         guard let id else { return }
         stateVersionByWorkspaceID[id, default: 0] &+= 1 // wraparound-safe
+        #if DEBUG
+            lastStateVersionWriterForTesting[id] = String(describing: source)
+        #endif
     }
+
+    #if DEBUG
+        private var lastStateVersionWriterForTesting: [UUID: String] = [:]
+        private var workspaceSaveConflictHandlerForTesting: (([String: String]) -> Void)?
+
+        func setWorkspaceSaveConflictHandlerForTesting(_ handler: (([String: String]) -> Void)?) {
+            workspaceSaveConflictHandlerForTesting = handler
+        }
+    #endif
 
     // MARK: - Domain read-registration cache (M3 scoped reads)
 
@@ -4728,9 +4740,14 @@ class WorkspaceManagerViewModel: ObservableObject {
 
     // MARK: - Init / Deinit
 
+    /// A nonvisual exact-session owner borrows a workspace document for routing, never for saving
+    /// UI placement. Its session file still uses the normal session persistence owner.
+    private(set) var isSessionRuntimeProjection = false
+
     init(
         fileManager: WorkspaceFilesViewModel,
         promptViewModel: PromptViewModel,
+        sessionRuntimeWorkspace: WorkspaceModel? = nil,
         workspaceSearchService: WorkspaceSearchService = WorkspaceSearchService(),
         domainWorkspaceAuthorityClient: DomainWorkspaceAuthorityClient? = nil,
         workspaceActivityCoordinator: WorkspaceActivityCoordinator? = nil,
@@ -4760,6 +4777,15 @@ class WorkspaceManagerViewModel: ObservableObject {
 
         if let path = UserDefaults.standard.string(forKey: "GlobalCustomStorageURL") {
             globalCustomStorageURL = URL(fileURLWithPath: path)
+        }
+
+        if let sessionRuntimeWorkspace {
+            isSessionRuntimeProjection = true
+            workspaces = [sessionRuntimeWorkspace]
+            activeWorkspaceID = sessionRuntimeWorkspace.id
+            promptViewModel.loadComposeTabsFromWorkspace(sessionRuntimeWorkspace)
+            completeInitialization()
+            return
         }
 
         // Track when the file selection changes to detect if active preset is dirty
@@ -12719,7 +12745,7 @@ class WorkspaceManagerViewModel: ObservableObject {
 
     /// Capture/publication is shared; the caller chooses its existing persistence owner.
     private func captureActiveWorkspaceForSave(source: WorkspaceSaveSource) -> (workspaceID: UUID, fileURL: URL)? {
-        guard let active = activeWorkspace else { return nil }
+        guard !isSessionRuntimeProjection, let active = activeWorkspace else { return nil }
         let workspaceID = active.id
 
         // Post notification to allow SwiftUI views to flush pending state
@@ -15929,6 +15955,10 @@ class WorkspaceManagerViewModel: ObservableObject {
         remainingRetryCount: Int = 1,
         ownSaveFence: OwnSaveFence? = nil
     ) async -> Result<Int, WorkspacePersistenceFailure> {
+        // Nonvisual runtimes own session payloads, never the borrowed UI document.
+        guard !isSessionRuntimeProjection else {
+            return .failure(WorkspacePersistenceFailure(category: .workspaceChanged))
+        }
         guard !Task.isCancelled,
               isOwnSaveFenceCurrent(ownSaveFence, workspaceID: workspaceID)
         else {
@@ -16209,6 +16239,29 @@ class WorkspaceManagerViewModel: ObservableObject {
         ownSaveFence: OwnSaveFence?
     ) async throws -> DomainAuthoritySaveResult {
         try Task.checkCancellation()
+        #if DEBUG
+            // Value-only conflict evidence: no document, path, prompt or selection contents.
+            workspaceSaveConflictHandlerForTesting?([
+                "workspace": String(proposal.id.uuidString.prefix(8)),
+                "writerManager": String(instanceID.uuidString.prefix(8)),
+                "writerWindow": domainWorkspaceAuthorityClient.map { String($0.windowID) } ?? "none",
+                "source": source.description,
+                "runtimeProjection": String(isSessionRuntimeProjection),
+                "stateWriter": lastStateVersionWriterForTesting[proposal.id] ?? "none",
+                "capturedState": String(capture.stateVersion),
+                "currentState": String(stateVersionByWorkspaceID[proposal.id, default: 0]),
+                "modelEqual": String(workspace(withID: proposal.id) == capture.localWorkspace),
+                "capturedWorking": capture.revisions.map { String($0.workingRevision) } ?? "none",
+                "currentWorking": domainWorkspaceRevisionsByID[proposal.id].map { String($0.workingRevision) } ?? "none",
+                "capturedSaved": capture.revisions.map { String($0.savedRevision) } ?? "none",
+                "currentSaved": domainWorkspaceRevisionsByID[proposal.id].map { String($0.savedRevision) } ?? "none",
+                "capturedAdoption": String(capture.adoptionGeneration),
+                "currentAdoption": String(fullDocumentAdoptionGenerations[proposal.id, default: 0]),
+                "capturedRoot": String(capture.rootEditGeneration),
+                "currentRoot": String(rootEditGenerationByWorkspaceID[proposal.id, default: 0]),
+                "remainingRetries": String(remainingRetryCount)
+            ])
+        #endif
         guard let current = workspace(withID: proposal.id) else { throw WorkspaceDirectWriteError.workspaceUnavailable }
         guard !current.isEphemeral else { throw WorkspaceDirectWriteError.ephemeralWorkspace }
         guard isOwnSaveFenceCurrent(ownSaveFence, workspaceID: proposal.id) else {
@@ -16750,6 +16803,7 @@ class WorkspaceManagerViewModel: ObservableObject {
         rootEditContext: RootEditSaveContext? = nil
     ) async throws -> URL {
         let targetURL = workspaceFileURL(for: workspace)
+        guard !isSessionRuntimeProjection else { throw WorkspaceDirectWriteError.domainAuthorityRequired }
         guard !workspace.isEphemeral else { throw WorkspaceDirectWriteError.ephemeralWorkspace }
         guard !agentAdmissionRecoveryOwnsWorkspace(workspace.id) else {
             throw WorkspacePersistenceFailure(category: .durabilityUncertain)
@@ -16839,6 +16893,7 @@ class WorkspaceManagerViewModel: ObservableObject {
         metadata: WorkspaceSavePayloadMetadata? = nil
     ) async throws -> URL {
         let finalURL = workspaceFileURL(for: workspace, baseRoot: baseRoot)
+        guard !isSessionRuntimeProjection else { throw WorkspaceDirectWriteError.domainAuthorityRequired }
         guard !workspace.isEphemeral else { throw WorkspaceDirectWriteError.ephemeralWorkspace }
         guard domainWorkspaceAuthorityClient == nil else {
             workspaceSaveTracer.event(
@@ -16868,6 +16923,7 @@ class WorkspaceManagerViewModel: ObservableObject {
     /// Synchronous workspace write used by focused tests and direct save paths.
     func saveWorkspaceToFile(_ workspace: WorkspaceModel, source: WorkspaceSaveSource = .directUnknown) throws -> URL {
         let finalURL = workspaceFileURL(for: workspace)
+        guard !isSessionRuntimeProjection else { throw WorkspaceDirectWriteError.domainAuthorityRequired }
         guard !workspace.isEphemeral else { throw WorkspaceDirectWriteError.ephemeralWorkspace }
         guard domainWorkspaceAuthorityClient == nil else {
             throw NSError(
