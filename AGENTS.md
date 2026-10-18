@@ -303,3 +303,7 @@ See [`docs/testing.md`](docs/testing.md) for the contributor workflow, test-qual
 ```bash
 make clean    # removes .build
 ```
+
+## Corrections
+
+- **ALWAYS quit the installed RepoPrompt CE before a debug-app live check that deletes workspaces (learned 2026-10-17).** Both apps share `~/Library/Application Support/RepoPrompt CE/DomainRuntime/v1/default-*`. With both running, `manage_workspaces delete` with `close_window` fails with a journal-CAS conflict ("could not be deleted. Window N remains open on the system workspace."), and a plain delete of a workspace a window is showing can return ok without removing it.
