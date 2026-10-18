@@ -26,7 +26,7 @@ final class DockMenuTests: XCTestCase {
         )
 
         let menu = controller.makeMenu()
-        XCTAssertEqual(menu.items.count, 1)
+        XCTAssertEqual(menu.items.count, 2)
 
         let item = try XCTUnwrap(menu.items.first)
         XCTAssertEqual(item.title, "New Window")

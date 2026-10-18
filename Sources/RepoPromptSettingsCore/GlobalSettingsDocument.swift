@@ -1015,6 +1015,7 @@ package struct GlobalScalarPreferences: Codable, Equatable {
         package var codexGoalSupportEnabled: Bool?
         package var codexComputerUseEnabled: Bool?
         package var codexReasoningSummariesEnabled: Bool?
+        package var fleetParkAgentWindows: Bool?
         package var autoEffortEnabled: Bool?
         package var codexMemoriesEnabled: Bool?
         package var codexAppsEnabled: Bool?
@@ -1055,6 +1056,7 @@ package struct GlobalScalarPreferences: Codable, Equatable {
             codexGoalSupportEnabled: Bool? = nil,
             codexComputerUseEnabled: Bool? = nil,
             codexReasoningSummariesEnabled: Bool? = nil,
+            fleetParkAgentWindows: Bool? = nil,
             autoEffortEnabled: Bool? = nil,
             codexMemoriesEnabled: Bool? = nil,
             codexAppsEnabled: Bool? = nil,
@@ -1084,6 +1086,7 @@ package struct GlobalScalarPreferences: Codable, Equatable {
             self.codexGoalSupportEnabled = codexGoalSupportEnabled
             self.codexComputerUseEnabled = codexComputerUseEnabled
             self.codexReasoningSummariesEnabled = codexReasoningSummariesEnabled
+            self.fleetParkAgentWindows = fleetParkAgentWindows
             self.autoEffortEnabled = autoEffortEnabled
             self.codexMemoriesEnabled = codexMemoriesEnabled
             self.codexAppsEnabled = codexAppsEnabled

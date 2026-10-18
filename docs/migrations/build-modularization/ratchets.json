@@ -1,5 +1,5 @@
 {
-  "description": "Oversight window-reopen integration: measured upstream/main 872398766e4e8a3df4b8bbdba22c735ad2c88823 app baseline 602902 plus exact net source delta 231 = 603133, with zero app-line headroom. All other upstream metrics and advisory enforcement remain unchanged.",
+  "description": "Fleet Manager parking: one app-wide owner FleetParkingCoordinator.shared (Sources/RepoPrompt/App/FleetParkingCoordinator.swift); app_static_shared_declarations 89 → 90 (operator Q10). All other metrics unchanged.",
   "ratcheted": [
     "app_files_over_5000_lines",
     "app_files_over_2000_lines",
@@ -22,7 +22,7 @@
     "app_largest_cycle_components": 64,
     "app_share_permille": 868,
     "app_shared_accessor_uses": 1218,
-    "app_static_shared_declarations": 89,
+    "app_static_shared_declarations": 90,
     "app_target_swift_files": 1126,
     "app_target_swift_lines": 603133,
     "app_userdefaults_standard_uses": 234,

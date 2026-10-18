@@ -259,13 +259,10 @@ public final class WorkspaceApprovalManager: ObservableObject {
            let windowState = WindowStatesManager.shared.allWindows.first(where: { $0.windowID == windowID }),
            let nsWindow = windowState.nsWindow
         {
-            if !NSApp.isActive {
-                NSApp.activate(ignoringOtherApps: true)
-            }
             if nsWindow.isMiniaturized {
                 nsWindow.deminiaturize(nil)
             }
-            nsWindow.makeKeyAndOrderFront(nil)
+            windowState.revealWindow()
         } else if !NSApp.isActive {
             NSApp.activate(ignoringOtherApps: true)
         }

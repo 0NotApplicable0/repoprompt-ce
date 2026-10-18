@@ -4,6 +4,7 @@ import MCP
 import Ontology
 import RepoPromptDomainRuntime
 import RepoPromptFileSystem
+import RepoPromptSettingsCore
 import RepoPromptShared
 import RepoPromptWorkspaceCore
 import SwiftUI
@@ -86,6 +87,11 @@ private extension Array {
     }
 }
 
+/// The route-lifetime park scope of the current invocation; nil when parking is disabled.
+private enum RoutingParkTaskLocals {
+    @TaskLocal static var scope: WindowParkOnOpenScope?
+}
+
 @MainActor
 final class WindowRoutingService: Service {
     let domainRegistrationID = MCPDomainToolRegistrationID()
@@ -97,11 +103,7 @@ final class WindowRoutingService: Service {
     }
 
     nonisolated static func workspaceDeleteCloseAuthorization() -> WindowCloseAuthorization {
-        WindowCloseAuthorization(
-            source: .workspaceDelete,
-            bypassConfirmation: true,
-            bypassBackgroundPreservation: true
-        )
+        WorkspaceWindowDeletion.closeAuthorization()
     }
 
     nonisolated static func shouldBindConnectionAfterStandardWorkspaceSwitch(explicitWindowIDProvided: Bool) -> Bool {
@@ -159,6 +161,7 @@ final class WindowRoutingService: Service {
     private let windowStates: WindowStatesManager
     private let networkMgr: ServerNetworkManager
     private let setActiveWindowForCurrentConnection: (@Sendable (Int) async throws -> Void)?
+    private let deletionExecutor: @MainActor (WindowState, WorkspaceModel) async -> WorkspaceWindowDeletion.Result
 
     /// Thread-safe tools storage. Routing definitions are static in M1; disabled-tool
     /// filtering and window selection are applied from live state outside this cache.
@@ -172,11 +175,24 @@ final class WindowRoutingService: Service {
     init(
         windowStates: WindowStatesManager,
         networkMgr: ServerNetworkManager,
-        setActiveWindowForCurrentConnection: (@Sendable (Int) async throws -> Void)? = nil
+        setActiveWindowForCurrentConnection: (@Sendable (Int) async throws -> Void)? = nil,
+        deletionExecutor: (@MainActor (WindowState, WorkspaceModel) async -> WorkspaceWindowDeletion.Result)? = nil
     ) {
         self.windowStates = windowStates
         self.networkMgr = networkMgr
         self.setActiveWindowForCurrentConnection = setActiveWindowForCurrentConnection
+        self.deletionExecutor = deletionExecutor ?? { target, workspace in
+            await WorkspaceWindowDeletion(
+                target: target,
+                workspace: workspace,
+                registeredTarget: { windowStates.window(withID: $0) },
+                showingWindowIDs: { workspaceID in
+                    windowStates.allWindows.filter { $0.workspaceManager.activeWorkspaceID == workspaceID }.map(\.windowID)
+                },
+                requestClose: { try windowStates.requestCloseWindow(windowID: $0, authorization: $1) },
+                authorization: Self.workspaceDeleteCloseAuthorization()
+            ).execute()
+        }
     }
 
     /// Materializes the static M1 routing definitions without publishing them.
@@ -1081,11 +1097,47 @@ final class WindowRoutingService: Service {
         )
     }
 
+    /// Runs one route that may open a new agent window. With the setting enabled (snapshotted once)
+    /// the scope covers waiting, adoption, every workspace/bind await and the final parked check,
+    /// which runs only after the route's own binding work has completed.
+    private func withParkOnOpenScope<T>(_ body: @Sendable () async throws -> T) async throws -> T {
+        guard GlobalSettingsStore.shared.fleetParkAgentWindows() else {
+            return try await body()
+        }
+        let scope = WindowParkOnOpenScope(manager: windowStates)
+        return try await withTaskCancellationHandler {
+            do {
+                let value = try await RoutingParkTaskLocals.$scope.withValue(scope) { try await body() }
+                if let windowID = scope.adoptedWindowID {
+                    try await scope.requireParked(windowID: windowID)
+                }
+                return value
+            } catch let error as WindowOpenError {
+                scope.cancel()
+                throw MCPError.invalidRequest(error.localizedDescription)
+            } catch {
+                scope.cancel()
+                throw error
+            }
+        } onCancel: {
+            Task { @MainActor in scope.cancel() }
+        }
+    }
+
     private func openRoutingWindow(deferringInitialAgentSystemWorkspaceRefresh: Bool = false) async throws -> WindowState {
+        let scope = RoutingParkTaskLocals.scope
         do {
-            return try await windowStates.openNewMainWindow(
-                deferringInitialAgentSystemWorkspaceRefresh: deferringInitialAgentSystemWorkspaceRefresh
+            let result = try await windowStates.openNewMainWindow(
+                deferringInitialAgentSystemWorkspaceRefresh: deferringInitialAgentSystemWorkspaceRefresh,
+                parkOnOpen: scope != nil,
+                requestID: scope?.requestID ?? UUID()
             )
+            guard let scope else { return result.window }
+            let window = try scope.adopt()
+            #if DEBUG
+                await windowStates.afterOpenAdoptionGateForTesting?()
+            #endif
+            return window
         } catch let error as WindowOpenError {
             throw MCPError.internalError("Failed to open new window: \(error.localizedDescription)")
         } catch is CancellationError {
@@ -2040,45 +2092,47 @@ final class WindowRoutingService: Service {
                                 note: note
                             )
                         case .workingDirs:
-                            let target = try await resolveWorkingDirsBindTarget(
-                                workingDirs: request.workingDirs,
-                                windowID: request.windowID,
-                                createIfMissing: request.createIfMissing,
-                                tabName: request.tabName,
-                                connectionID: connectionID,
-                                invocationContext: invocationContext
-                            )
+                            return try await withParkOnOpenScope { () async throws -> BindContextResponse in
+                                let target = try await self.resolveWorkingDirsBindTarget(
+                                    workingDirs: request.workingDirs,
+                                    windowID: request.windowID,
+                                    createIfMissing: request.createIfMissing,
+                                    tabName: request.tabName,
+                                    connectionID: connectionID,
+                                    invocationContext: invocationContext
+                                )
 
-                            let tabTarget = try await MainActor.run {
-                                try self.resolveActiveTabBindTarget(
-                                    windowID: target.windowID,
-                                    expectedWorkspaceID: target.workspaceID,
+                                let tabTarget = try await MainActor.run {
+                                    try self.resolveActiveTabBindTarget(
+                                        windowID: target.windowID,
+                                        expectedWorkspaceID: target.workspaceID,
+                                        matchedBy: target.matchedBy,
+                                        normalizedWorkingDirs: target.normalizedWorkingDirs
+                                    )
+                                }
+                                let prospectiveLookupResolution = try await self.ensureWorkingDirsRootProjectionIsLoaded(
+                                    tabTarget,
+                                    requestedRoots: target.normalizedWorkingDirs
+                                )
+                                let changed = try await self.bindTarget(
+                                    tabTarget,
+                                    connectionID: connectionID,
+                                    clientName: clientName,
+                                    expectedFileAuthority: prospectiveLookupResolution
+                                )
+
+                                let binding = await self.currentBindingSummary(for: connectionID)
+                                let note = await MainActor.run { self.bindContextWindowNote(windowID: binding.windowID) }
+                                return BindContextResponse(
+                                    binding: binding,
+                                    changed: changed,
                                     matchedBy: target.matchedBy,
-                                    normalizedWorkingDirs: target.normalizedWorkingDirs
+                                    createdTab: false,
+                                    createdWorkspace: target.createdWorkspace,
+                                    normalizedWorkingDirs: target.normalizedWorkingDirs,
+                                    note: note
                                 )
                             }
-                            let prospectiveLookupResolution = try await ensureWorkingDirsRootProjectionIsLoaded(
-                                tabTarget,
-                                requestedRoots: target.normalizedWorkingDirs
-                            )
-                            let changed = try await bindTarget(
-                                tabTarget,
-                                connectionID: connectionID,
-                                clientName: clientName,
-                                expectedFileAuthority: prospectiveLookupResolution
-                            )
-
-                            let binding = await currentBindingSummary(for: connectionID)
-                            let note = await MainActor.run { self.bindContextWindowNote(windowID: binding.windowID) }
-                            return BindContextResponse(
-                                binding: binding,
-                                changed: changed,
-                                matchedBy: target.matchedBy,
-                                createdTab: false,
-                                createdWorkspace: target.createdWorkspace,
-                                normalizedWorkingDirs: target.normalizedWorkingDirs,
-                                note: note
-                            )
                         case .windowID:
                             let windowID = request.windowID!
                             let target = try await MainActor.run {
@@ -2274,41 +2328,45 @@ final class WindowRoutingService: Service {
                         // First, resolve the workspace model from disk (don't require an existing window)
                         let targetWorkspace = try await routingService.resolveWorkspaceForSwitch(rawWorkspaceParam: rawWorkspaceParam, includeHidden: includeHidden)
 
-                        // Open a new window
-                        let newWindow: WindowState
-                        do {
-                            newWindow = try await routingService.openRoutingWindow(deferringInitialAgentSystemWorkspaceRefresh: true)
-                        } catch let error as WindowOpenError {
-                            throw MCPError.internalError("Failed to open new window: \(error.localizedDescription)")
-                        } catch {
-                            throw MCPError.internalError("Failed to open new window: \(error)")
-                        }
-
-                        defer {
-                            Task { @MainActor [newWindow] in
-                                newWindow.agentModeViewModel.finishInitialSystemWorkspaceSessionListRefreshDeferral()
+                        return try await routingService.withParkOnOpenScope { () async throws -> ManageWorkspacesResponse in
+                            // Open a new window
+                            let newWindow: WindowState
+                            do {
+                                newWindow = try await routingService.openRoutingWindow(deferringInitialAgentSystemWorkspaceRefresh: true)
+                            } catch let error as WindowOpenError {
+                                throw MCPError.internalError("Failed to open new window: \(error.localizedDescription)")
+                            } catch is CancellationError where RoutingParkTaskLocals.scope != nil {
+                                throw CancellationError()
+                            } catch {
+                                throw MCPError.internalError("Failed to open new window: \(error)")
                             }
+
+                            defer {
+                                Task { @MainActor [newWindow] in
+                                    newWindow.agentModeViewModel.finishInitialSystemWorkspaceSessionListRefreshDeferral()
+                                }
+                            }
+
+                            // Wait for initial workspace setup before switching
+                            await newWindow.workspaceManager.awaitInitialized()
+
+                            // Switch the new window to the target workspace
+                            let switchResult = await newWindow.workspaceManager.requestWorkspaceSwitch(to: targetWorkspace, saveState: true)
+                            if !switchResult.didSwitch {
+                                throw MCPError.invalidRequest(switchResult.message ?? "Workspace switch was cancelled.")
+                            }
+
+                            // Bind this MCP connection to the new window
+                            try await routingService.networkMgr.setActiveWindowForCurrentConnection(newWindow.windowID)
+
+                            // Return success with the new window ID
+                            return ManageWorkspacesResponse(
+                                action: "switch",
+                                workspaces: nil,
+                                status: "ok",
+                                windowID: newWindow.windowID
+                            )
                         }
-
-                        // Wait for initial workspace setup before switching
-                        await newWindow.workspaceManager.awaitInitialized()
-
-                        // Switch the new window to the target workspace
-                        let switchResult = await newWindow.workspaceManager.requestWorkspaceSwitch(to: targetWorkspace, saveState: true)
-                        if !switchResult.didSwitch {
-                            throw MCPError.invalidRequest(switchResult.message ?? "Workspace switch was cancelled.")
-                        }
-
-                        // Bind this MCP connection to the new window
-                        try await routingService.networkMgr.setActiveWindowForCurrentConnection(newWindow.windowID)
-
-                        // Return success with the new window ID
-                        return ManageWorkspacesResponse(
-                            action: "switch",
-                            workspaces: nil,
-                            status: "ok",
-                            windowID: newWindow.windowID
-                        )
                     }
 
                     // ═══════════════════════════════════════════════════════════════
@@ -2428,54 +2486,58 @@ final class WindowRoutingService: Service {
                     }
 
                     if openInNewWindow {
-                        // Open a new window for the workspace
-                        let newWindow: WindowState
-                        do {
-                            newWindow = try await routingService.openRoutingWindow(deferringInitialAgentSystemWorkspaceRefresh: switchToCreated)
-                        } catch let error as WindowOpenError {
-                            throw MCPError.internalError("Failed to open new window: \(error.localizedDescription)")
-                        } catch {
-                            throw MCPError.internalError("Failed to open new window: \(error)")
-                        }
-                        defer {
-                            Task { @MainActor [newWindow] in
-                                newWindow.agentModeViewModel.finishInitialSystemWorkspaceSessionListRefreshDeferral()
+                        return try await routingService.withParkOnOpenScope { () async throws -> ManageWorkspacesResponse in
+                            // Open a new window for the workspace
+                            let newWindow: WindowState
+                            do {
+                                newWindow = try await routingService.openRoutingWindow(deferringInitialAgentSystemWorkspaceRefresh: switchToCreated)
+                            } catch let error as WindowOpenError {
+                                throw MCPError.internalError("Failed to open new window: \(error.localizedDescription)")
+                            } catch is CancellationError where RoutingParkTaskLocals.scope != nil {
+                                throw CancellationError()
+                            } catch {
+                                throw MCPError.internalError("Failed to open new window: \(error)")
                             }
+                            defer {
+                                Task { @MainActor [newWindow] in
+                                    newWindow.agentModeViewModel.finishInitialSystemWorkspaceSessionListRefreshDeferral()
+                                }
+                            }
+
+                            // Wait for initial workspace setup before creating
+                            await newWindow.workspaceManager.awaitInitialized()
+
+                            let created = try await Self.createWorkspaceForRouting(
+                                workspaceManager: newWindow.workspaceManager,
+                                name: workspaceName,
+                                repoPaths: initialRepoPaths,
+                                windowID: newWindow.windowID,
+                                switchToCreated: switchToCreated,
+                                openedNewWindow: true
+                            )
+                            let newWorkspace = created.workspace
+
+                            // Bind only after confirmed creation and any requested activation.
+                            do {
+                                try await routingService.networkMgr.setActiveWindowForCurrentConnection(newWindow.windowID)
+                            } catch {
+                                throw MCPError.invalidRequest("Workspace \(newWorkspace.id) creation operation \(created.operationID) committed in new window \(newWindow.windowID), but connection binding failed: \(error.localizedDescription) No automatic close, rollback or deletion was performed.")
+                            }
+
+                            let summary = MCPWorkspaceSummary(
+                                id: newWorkspace.id,
+                                name: newWorkspace.name,
+                                allRepoPaths: newWorkspace.repoPaths,
+                                showingWindowIDs: switchToCreated ? [newWindow.windowID] : []
+                            )
+
+                            return ManageWorkspacesResponse(
+                                action: "create",
+                                workspaces: [summary],
+                                status: "ok",
+                                windowID: newWindow.windowID
+                            )
                         }
-
-                        // Wait for initial workspace setup before creating
-                        await newWindow.workspaceManager.awaitInitialized()
-
-                        let created = try await Self.createWorkspaceForRouting(
-                            workspaceManager: newWindow.workspaceManager,
-                            name: workspaceName,
-                            repoPaths: initialRepoPaths,
-                            windowID: newWindow.windowID,
-                            switchToCreated: switchToCreated,
-                            openedNewWindow: true
-                        )
-                        let newWorkspace = created.workspace
-
-                        // Bind only after confirmed creation and any requested activation.
-                        do {
-                            try await routingService.networkMgr.setActiveWindowForCurrentConnection(newWindow.windowID)
-                        } catch {
-                            throw MCPError.invalidRequest("Workspace \(newWorkspace.id) creation operation \(created.operationID) committed in new window \(newWindow.windowID), but connection binding failed: \(error.localizedDescription) No automatic close, rollback or deletion was performed.")
-                        }
-
-                        let summary = MCPWorkspaceSummary(
-                            id: newWorkspace.id,
-                            name: newWorkspace.name,
-                            allRepoPaths: newWorkspace.repoPaths,
-                            showingWindowIDs: switchToCreated ? [newWindow.windowID] : []
-                        )
-
-                        return ManageWorkspacesResponse(
-                            action: "create",
-                            workspaces: [summary],
-                            status: "ok",
-                            windowID: newWindow.windowID
-                        )
                     }
 
                     let created = try await Self.createWorkspaceForRouting(
@@ -2623,36 +2685,21 @@ final class WindowRoutingService: Service {
                     }
 
                     if closeWindow {
-                        let fallback = await MainActor.run {
-                            targetWindow.workspaceManager.getOrCreateSystemWorkspace()
-                        }
-                        let switchResult = await targetWindow.workspaceManager.requestWorkspaceSwitch(to: fallback, saveState: false)
-                        if !switchResult.didSwitch {
-                            throw MCPError.invalidRequest(switchResult.message ?? "Workspace switch was cancelled.")
+                        let result = await routingService.deletionExecutor(targetWindow, workspace)
+                        switch result {
+                        case let .closeRequested(windowID):
+                            return ManageWorkspacesResponse(action: "delete", workspaces: nil, status: "ok", closedWindowID: windowID)
+                        case let .notSwitched(message), let .deleteFailed(message), let .targetChanged(message), let .deletionCommittedWithoutClose(message):
+                            throw MCPError.invalidRequest(message)
+                        case let .closeFailed(error):
+                            throw error
                         }
                     }
 
-                    // Delete the workspace
                     await MainActor.run {
                         targetWindow.workspaceManager.deleteWorkspace(workspace)
                     }
-
-                    if closeWindow {
-                        let authorization = Self.workspaceDeleteCloseAuthorization()
-                        try await MainActor.run {
-                            try routingService.windowStates.requestCloseWindow(
-                                windowID: targetWindow.windowID,
-                                authorization: authorization
-                            )
-                        }
-                    }
-
-                    return ManageWorkspacesResponse(
-                        action: "delete",
-                        workspaces: nil,
-                        status: "ok",
-                        closedWindowID: closeWindow ? targetWindow.windowID : nil
-                    )
+                    return ManageWorkspacesResponse(action: "delete", workspaces: nil, status: "ok")
 
                 case "add_folder":
                     // Add a folder to a workspace

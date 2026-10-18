@@ -145,6 +145,56 @@ extension AgentModeViewModel {
             && !selectionState.showsSelectionPresentation
     }
 
+    func fleetSidebarCanStash(
+        tabID: UUID,
+        sessionID: UUID,
+        workspaceID: UUID,
+        promptManager: PromptViewModel
+    ) -> Bool {
+        fleetSidebarRow(tabID: tabID, sessionID: sessionID, workspaceID: workspaceID, promptManager: promptManager)?.canStash == true
+    }
+
+    func performFleetSidebarCommand(
+        _ action: AgentSidebarBulkActionKind,
+        tabID: UUID,
+        sessionID: UUID,
+        workspaceID: UUID,
+        promptManager: PromptViewModel,
+        sink: (@MainActor (AgentSidebarBulkActionKind, AgentSidebarBulkActionOrigin, AgentSidebarCommandProgressPlacement?, SidebarBulkMutationTargets, PromptViewModel) async -> Void)? = nil
+    ) async -> Bool {
+        guard action == .stash || action == .delete,
+              let row = fleetSidebarRow(tabID: tabID, sessionID: sessionID, workspaceID: workspaceID, promptManager: promptManager),
+              action != .stash || row.canStash,
+              canPerformDirectSidebarCommand(workspaceID: workspaceID)
+        else { return false }
+        let targets = SidebarBulkMutationTargets(
+            workspaceID: workspaceID,
+            activeDeleteTabIDs: action == .delete ? [tabID] : [],
+            archivedDeleteTargets: [],
+            stashTabIDs: action == .stash ? [tabID] : [],
+            pinTabIDs: [],
+            unpinTabIDs: []
+        )
+        if let sink {
+            await sink(action, .command, .row, targets, promptManager)
+        } else {
+            await performSidebarBulkAction(action, origin: .command, commandProgressPlacement: .row, targets: targets, promptManager: promptManager)
+        }
+        return true
+    }
+
+    private func fleetSidebarRow(
+        tabID: UUID,
+        sessionID: UUID,
+        workspaceID: UUID,
+        promptManager: PromptViewModel
+    ) -> SidebarSession? {
+        guard workspaceManager?.activeWorkspaceID == workspaceID,
+              sessions[tabID]?.activeAgentSessionID == sessionID
+        else { return nil }
+        return sidebarSessions(for: promptManager.currentComposeTabs).first { $0.tabID == tabID && $0.sessionID == sessionID }
+    }
+
     func performSidebarBulkAction(
         _ action: AgentSidebarBulkActionKind,
         origin: AgentSidebarBulkActionOrigin,

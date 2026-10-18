@@ -136,16 +136,18 @@ struct RepoPromptSwiftUIApp: App {
         WindowStatesManager.shared
     }
 
+    @StateObject private var fleetCommandCenter = FleetCommandCenter.live()
+
     /// Root font scaling source so inherited SwiftUI text updates when the preset changes.
     @StateObject private var fontScale = FontScaleManager.shared
 
     // MARK: - Body
 
     var body: some Scene {
-        WindowGroup(id: "main") {
+        WindowGroup(id: "main", for: UUID.self) { openRequestID in
             // IMPORTANT: Each time a new SwiftUI window/scene is created,
             // we instantiate a fresh WindowContentView (and thus a new WindowState)
-            WindowContentView()
+            WindowContentView(openRequestID: openRequestID.wrappedValue)
                 .environmentObject(versionManager)
                 .environmentObject(appDelegate.sparkleManager)
                 .environmentObject(windowStatesManager)
@@ -185,13 +187,18 @@ struct RepoPromptSwiftUIApp: App {
             }
 
             // ➜ New File-menu commands (Save Workspace / Exit Workspace)
-            WorkspaceCommands(windowStatesManager: windowStatesManager)
+            WorkspaceCommands(windowStatesManager: windowStatesManager, center: fleetCommandCenter)
 
             CommandGroup(before: .saveItem) {
-                Button("Close Window") {
-                    NSApplication.shared.keyWindow?.performClose(nil)
+                ForEach(fleetCommandCenter.descriptors(for: .beforeSaveItem)) { descriptor in
+                    FleetCommandButton(descriptor: descriptor, center: fleetCommandCenter)
                 }
-                .keyboardShortcut("w", modifiers: [.command, .shift])
+            }
+
+            CommandGroup(after: .windowArrangement) {
+                ForEach(fleetCommandCenter.descriptors(for: .afterWindowArrangement)) { descriptor in
+                    FleetCommandButton(descriptor: descriptor, center: fleetCommandCenter)
+                }
             }
 
             CommandGroup(replacing: .help) {

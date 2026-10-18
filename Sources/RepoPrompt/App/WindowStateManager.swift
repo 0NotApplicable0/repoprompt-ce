@@ -34,9 +34,209 @@ struct WindowSessionCaptureCandidate {
     let entry: WindowSessionEntry?
 }
 
-struct WindowInitialRefreshDeferral: Equatable {
+struct WindowOpenRequest: Equatable {
     let id: UUID
-    let waiterID: UUID
+    let refreshDeferralID: UUID?
+    let parkOnOpen: Bool
+}
+
+struct ClaimedWindowOpenRequest {
+    let request: WindowOpenRequest
+    let parkHandle: WindowParkOnOpenHandle?
+}
+
+struct WindowOpenResult {
+    let window: WindowState
+    let requestID: UUID?
+    let parkHandle: WindowParkOnOpenHandle?
+}
+
+/// One time source defines the park deadline for both attach admission and the outcome wait.
+struct WindowParkOnOpenClock {
+    var now: @MainActor () -> TimeInterval
+    var sleep: @MainActor (TimeInterval) async throws -> Void
+
+    static let system = WindowParkOnOpenClock(
+        now: { ProcessInfo.processInfo.systemUptime },
+        sleep: { try await Task.sleep(nanoseconds: UInt64(max($0, 0) * 1_000_000_000)) }
+    )
+}
+
+/// Owns one agent-opened window's park outcome: one absolute deadline, at most one outcome
+/// continuation and at most one timeout task. The coordinator alone parks and unparks.
+@MainActor
+final class WindowParkOnOpenHandle {
+    static let parkDeadline: TimeInterval = 5
+
+    enum Phase: Equatable {
+        case pending, parked, timedOut, abandoned
+    }
+
+    enum Outcome: Equatable {
+        case parked, timedOut
+    }
+
+    private let clock: WindowParkOnOpenClock
+    private let park: @MainActor (Int) -> Bool
+    private let unpark: @MainActor (Int) -> Void
+    private(set) var phase: Phase = .pending
+    private(set) var windowID: Int?
+    private(set) var deadline: TimeInterval?
+    private var outcomeContinuation: CheckedContinuation<Outcome, Error>?
+    private var timeoutTask: Task<Void, Never>?
+    private var timeoutToken: UUID?
+    private(set) var didReveal = false
+
+    init(
+        clock: WindowParkOnOpenClock,
+        park: @escaping @MainActor (Int) -> Bool = { FleetParkingCoordinator.shared.park(windowID: $0, reason: .onOpen) },
+        unpark: @escaping @MainActor (Int) -> Void = { FleetParkingCoordinator.shared.unpark(windowID: $0) }
+    ) {
+        self.clock = clock
+        self.park = park
+        self.unpark = unpark
+    }
+
+    deinit {
+        timeoutTask?.cancel()
+    }
+
+    var hasActiveWaiter: Bool {
+        outcomeContinuation != nil || timeoutTask != nil
+    }
+
+    func markRegistered(windowID: Int) {
+        guard self.windowID == nil else { return }
+        self.windowID = windowID
+        deadline = clock.now() + Self.parkDeadline
+    }
+
+    /// Parks only while pending, registered and strictly before the deadline; the deadline instant is late.
+    func attemptParkIfAdmitted() {
+        guard phase == .pending, let windowID, let deadline else { return }
+        guard clock.now() < deadline else {
+            settle(.timedOut)
+            return
+        }
+        if park(windowID) {
+            settle(.parked)
+        }
+    }
+
+    func awaitOutcome() async throws -> Outcome {
+        try Task.checkCancellation()
+        switch phase {
+        case .parked: return .parked
+        case .timedOut: return .timedOut
+        case .abandoned: throw CancellationError()
+        case .pending: break
+        }
+        let remaining = (deadline ?? clock.now()) - clock.now()
+        guard remaining > 0 else {
+            settle(.timedOut)
+            return .timedOut
+        }
+        return try await withCheckedThrowingContinuation { continuation in
+            guard !Task.isCancelled else {
+                settle(.abandoned)
+                continuation.resume(throwing: CancellationError())
+                return
+            }
+            outcomeContinuation = continuation
+            let token = UUID()
+            timeoutToken = token
+            timeoutTask = Task { [weak self, clock] in
+                do { try await clock.sleep(remaining) } catch { return }
+                self?.timeoutFired(token: token)
+            }
+        }
+    }
+
+    /// Cancels a pending outcome, or reveals an already parked window once.
+    func cancelOwned() {
+        if phase == .parked {
+            revealParkedOnce()
+        } else {
+            settle(.abandoned)
+        }
+    }
+
+    func revealParkedOnce() {
+        guard phase == .parked, !didReveal, let windowID else { return }
+        didReveal = true
+        unpark(windowID)
+    }
+
+    private func timeoutFired(token: UUID) {
+        guard token == timeoutToken, phase == .pending else { return }
+        settle(.timedOut)
+    }
+
+    private func settle(_ newPhase: Phase) {
+        guard phase == .pending else { return }
+        phase = newPhase
+        let continuation = outcomeContinuation
+        outcomeContinuation = nil
+        timeoutTask?.cancel()
+        timeoutTask = nil
+        timeoutToken = nil
+        switch newPhase {
+        case .parked: continuation?.resume(returning: .parked)
+        case .timedOut: continuation?.resume(returning: .timedOut)
+        case .abandoned, .pending: continuation?.resume(throwing: CancellationError())
+        }
+    }
+}
+
+/// Route-local owner of a new agent window: allocated before opening, covers waiting, adoption
+/// and every later await of the route. Before adoption the manager owns delivery.
+@MainActor
+final class WindowParkOnOpenScope {
+    let requestID = UUID()
+    private unowned let manager: WindowStatesManager
+    private var handle: WindowParkOnOpenHandle?
+    private var isAdopted = false
+    private(set) var adoptedWindowID: Int?
+    private(set) var isCancelled = false
+
+    init(manager: WindowStatesManager) {
+        self.manager = manager
+    }
+
+    func cancel() {
+        guard !isCancelled else { return }
+        isCancelled = true
+        if isAdopted {
+            handle?.cancelOwned()
+        } else {
+            manager.cancelOpen(requestID: requestID)
+        }
+    }
+
+    func adopt() throws -> WindowState {
+        let result = try manager.adoptOpen(requestID: requestID)
+        isAdopted = true
+        adoptedWindowID = result.window.windowID
+        handle = result.parkHandle
+        if isCancelled || Task.isCancelled {
+            handle?.cancelOwned()
+            // The route caller never receives the window, so its deferral `defer` will not run.
+            result.window.agentModeViewModel.finishInitialSystemWorkspaceSessionListRefreshDeferral(refreshIfStillSystem: true)
+            throw CancellationError()
+        }
+        return result.window
+    }
+
+    func requireParked(windowID: Int) async throws {
+        try Task.checkCancellation()
+        guard let handle else { return }
+        switch try await handle.awaitOutcome() {
+        case .parked:
+            try Task.checkCancellation()
+        case .timedOut:
+            throw WindowOpenError.notParked(windowID: windowID)
+        }
+    }
 }
 
 enum WindowSessionSnapshotBuilder {
@@ -622,26 +822,39 @@ class WindowStatesManager: ObservableObject {
     /// Numbers are consumed as windows for that workspace are restored.
     private var restoredInstanceNumbersByWorkspace: [UUID: [Int]] = [:]
 
-    /// Waiters for programmatic window creation.
-    /// Each waiter is waiting for a new window to be registered that wasn't in the excluded set.
-    private struct WindowOpenWaiter {
-        let id: UUID
-        let excludeWindowIDs: Set<Int>
-        let expectedInitialRefreshDeferralID: UUID?
-        let continuation: CheckedContinuation<WindowState, Error>
-
-        var defersInitialAgentSystemWorkspaceRefresh: Bool {
-            expectedInitialRefreshDeferralID != nil
-        }
+    /// Delivery state of one programmatic window open. The manager owns delivery until atomic adoption.
+    private enum OpenDelivery {
+        case waiting(CheckedContinuation<WindowOpenResult, Error>)
+        case resumed(WindowOpenResult)
+        case cancelled(WindowOpenResult?)
     }
 
-    private var windowOpenWaiters: [WindowOpenWaiter] = []
-    private var pendingInitialRefreshDeferrals: [WindowInitialRefreshDeferral] = []
+    private struct OpenOperation {
+        let request: WindowOpenRequest
+        let excludeWindowIDs: Set<Int>
+        let handle: WindowParkOnOpenHandle?
+        var isClaimed = false
+        var delivery: OpenDelivery
+    }
+
+    private var openOperations: [OpenOperation] = []
+    var parkOnOpenClock: WindowParkOnOpenClock = .system
+    var pendingOpenOperationCount: Int {
+        openOperations.count
+    }
+
+    #if DEBUG
+        /// Held after the first registration resumed the result and before the caller can adopt it.
+        var afterOpenResultGateForTesting: (@MainActor () async -> Void)?
+        /// Held by the routing service right after adoption, before its workspace/bind awaits.
+        var afterOpenAdoptionGateForTesting: (@MainActor () async -> Void)?
+    #endif
 
     private let windowSessionWriter = WindowSessionDiskWriter(
         fileURL: WindowSessionStore.sessionFileURL()
     )
     private var explicitlyClosingWindowIDs: Set<Int> = []
+    private var unregisteringWindowIDs: Set<Int> = []
     /// A closing window may leave `allWindows` before app termination starts. Weak retention
     /// lets termination join any still-live teardown without extending the window's lifetime.
     private var closingWindowReferences: [WeakWindowState] = []
@@ -704,13 +917,17 @@ class WindowStatesManager: ObservableObject {
         return .completeAllEntriesConsumed
     }
 
-    func claimInitialRefreshDeferralForNewWindow() -> WindowInitialRefreshDeferral? {
-        guard !pendingInitialRefreshDeferrals.isEmpty else { return nil }
-        return pendingInitialRefreshDeferrals.removeFirst()
-    }
-
-    private func clearPendingInitialRefreshDeferral(waiterID: UUID) {
-        pendingInitialRefreshDeferrals.removeAll { $0.waiterID == waiterID }
+    /// Only an exact, unconsumed request identity claims; nil, stale, consumed and duplicate values do not.
+    func claimOpenRequest(id: UUID?) -> ClaimedWindowOpenRequest? {
+        guard let id,
+              let index = openOperations.firstIndex(where: { $0.request.id == id }),
+              !openOperations[index].isClaimed
+        else { return nil }
+        openOperations[index].isClaimed = true
+        return ClaimedWindowOpenRequest(
+            request: openOperations[index].request,
+            parkHandle: openOperations[index].handle
+        )
     }
 
     nonisolated static func initialAgentSystemWorkspaceRefreshDeferralClaimMatches(
@@ -837,59 +1054,103 @@ class WindowStatesManager: ObservableObject {
     ///
     /// - Returns: The newly created `WindowState`
     /// - Throws: `WindowOpenError.openerUnavailable` if no opener is installed
-    func openNewMainWindow(deferringInitialAgentSystemWorkspaceRefresh: Bool = false) async throws -> WindowState {
+    func openNewMainWindow(
+        deferringInitialAgentSystemWorkspaceRefresh: Bool = false,
+        parkOnOpen: Bool = false,
+        requestID: UUID = UUID()
+    ) async throws -> WindowOpenResult {
+        if parkOnOpen { try Task.checkCancellation() }
         // Capture existing window IDs to identify the new one
         let excludeWindowIDs = Set(allWindows.map(\.windowID))
-        let waiterID = UUID()
-        let refreshDeferral = deferringInitialAgentSystemWorkspaceRefresh
-            ? WindowInitialRefreshDeferral(id: UUID(), waiterID: waiterID)
-            : nil
-        if let refreshDeferral {
-            pendingInitialRefreshDeferrals.append(refreshDeferral)
-        }
+        let request = WindowOpenRequest(
+            id: requestID,
+            refreshDeferralID: deferringInitialAgentSystemWorkspaceRefresh ? UUID() : nil,
+            parkOnOpen: parkOnOpen
+        )
+        let handle = parkOnOpen ? WindowParkOnOpenHandle(clock: parkOnOpenClock) : nil
 
         // Wait for the new window to be registered
-        return try await withTaskCancellationHandler {
+        let result = try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { continuation in
-                // Add waiter
-                windowOpenWaiters.append(WindowOpenWaiter(
-                    id: waiterID,
+                openOperations.append(OpenOperation(
+                    request: request,
                     excludeWindowIDs: excludeWindowIDs,
-                    expectedInitialRefreshDeferralID: refreshDeferral?.id,
-                    continuation: continuation
+                    handle: handle,
+                    delivery: .waiting(continuation)
                 ))
 
                 // Trigger window creation via SwiftUI
                 do {
-                    try AppWindowOpener.shared.openMainWindow()
+                    try AppWindowOpener.shared.openMainWindow(requestID: requestID)
                 } catch {
-                    self.cancelWindowOpenWaiter(id: waiterID, error: error)
+                    self.failOpen(requestID: requestID, error: error)
                     return
                 }
             }
         } onCancel: { [weak self] in
             Task { @MainActor in
-                self?.cancelWindowOpenWaiter(id: waiterID, error: CancellationError())
+                self?.cancelOpen(requestID: requestID)
             }
+        }
+        #if DEBUG
+            await afterOpenResultGateForTesting?()
+        #endif
+        return result
+    }
+
+    /// Cancels one open request. Waiting delivery resumes once with `CancellationError`; a resumed
+    /// but unadopted park result is retained as cancelled and an already parked window is revealed once.
+    func cancelOpen(requestID: UUID) {
+        guard let index = openOperations.firstIndex(where: { $0.request.id == requestID }) else { return }
+        switch openOperations[index].delivery {
+        case .waiting:
+            failOpen(requestID: requestID, error: CancellationError())
+        case let .resumed(result):
+            // A plain open has no handle and no handoff to retain: a late cancel must not touch the routed window.
+            guard let handle = openOperations[index].handle else { return }
+            openOperations[index].delivery = .cancelled(result)
+            handle.cancelOwned()
+            if openOperations[index].request.refreshDeferralID != nil {
+                // Registration armed the deferral for a caller that will now never adopt the window.
+                result.window.agentModeViewModel.finishInitialSystemWorkspaceSessionListRefreshDeferral(refreshIfStillSystem: true)
+            }
+        case .cancelled:
+            return
         }
     }
 
-    private func cancelWindowOpenWaiter(id waiterID: UUID, error: Error) {
-        guard let index = windowOpenWaiters.firstIndex(where: { $0.id == waiterID }) else {
-            // If the waiter is already gone, it may have been fulfilled and resumed; do not clear a
-            // routed window's claimed deferral from a late cancellation handler.
-            clearPendingInitialRefreshDeferral(waiterID: waiterID)
-            return
+    /// Atomically takes a resumed result for route adoption, cleaning up a cancelled one.
+    func adoptOpen(requestID: UUID) throws -> WindowOpenResult {
+        guard let index = openOperations.firstIndex(where: { $0.request.id == requestID }) else {
+            throw CancellationError()
         }
-        let waiter = windowOpenWaiters.remove(at: index)
-        if waiter.defersInitialAgentSystemWorkspaceRefresh {
-            cleanupInitialRefreshDeferral(waiterID: waiter.id, reason: "waiterCancelled")
+        let operation = openOperations.remove(at: index)
+        switch operation.delivery {
+        case let .resumed(result):
+            return result
+        case .cancelled:
+            operation.handle?.cancelOwned()
+            throw CancellationError()
+        case let .waiting(continuation):
+            operation.handle?.cancelOwned()
+            continuation.resume(throwing: CancellationError())
+            throw CancellationError()
         }
-        waiter.continuation.resume(throwing: error)
+    }
+
+    private func failOpen(requestID: UUID, error: Error) {
+        guard let index = openOperations.firstIndex(where: { $0.request.id == requestID }),
+              case let .waiting(continuation) = openOperations[index].delivery
+        else { return }
+        let operation = openOperations.remove(at: index)
+        if operation.request.refreshDeferralID != nil {
+            cleanupInitialRefreshDeferral(waiterID: operation.request.id, reason: "waiterCancelled")
+        }
+        operation.handle?.cancelOwned()
+        continuation.resume(throwing: error)
     }
 
     private func cleanupInitialRefreshDeferral(waiterID: UUID, reason: String) {
-        clearPendingInitialRefreshDeferral(waiterID: waiterID)
         let claimedWindows = allWindows.filter { $0.claimedInitialRefreshDeferralWaiterID == waiterID }
         for window in claimedWindows {
             #if DEBUG
@@ -916,48 +1177,52 @@ class WindowStatesManager: ObservableObject {
 
     /// Notifies waiters when a new window is registered.
     private func notifyWindowOpenWaiters(newState: WindowState) {
-        guard let index = windowOpenWaiterIndex(for: newState) else { return }
+        guard let index = openOperationIndex(for: newState),
+              case let .waiting(continuation) = openOperations[index].delivery
+        else { return }
 
-        let waiter = windowOpenWaiters.remove(at: index)
-        if waiter.defersInitialAgentSystemWorkspaceRefresh {
-            verifyInitialRefreshDeferralClaim(waiter: waiter, newState: newState)
+        let operation = openOperations[index]
+        if operation.request.refreshDeferralID != nil {
+            verifyInitialRefreshDeferralClaim(request: operation.request, newState: newState)
         }
-        waiter.continuation.resume(returning: newState)
+        operation.handle?.markRegistered(windowID: newState.windowID)
+        let result = WindowOpenResult(window: newState, requestID: operation.request.id, parkHandle: operation.handle)
+        if operation.handle != nil {
+            openOperations[index].delivery = .resumed(result)
+        } else {
+            openOperations.remove(at: index)
+        }
+        continuation.resume(returning: result)
+        operation.handle?.attemptParkIfAdmitted()
     }
 
-    private func windowOpenWaiterIndex(for newState: WindowState) -> Int? {
-        if let claimedWaiterID = newState.claimedInitialRefreshDeferralWaiterID,
-           let claimedDeferralID = newState.claimedInitialRefreshDeferralID
-        {
-            if let claimedWaiterIndex = windowOpenWaiters.firstIndex(where: { waiter in
-                waiter.id == claimedWaiterID
-                    && waiter.expectedInitialRefreshDeferralID == claimedDeferralID
-                    && !waiter.excludeWindowIDs.contains(newState.windowID)
-            }) {
-                return claimedWaiterIndex
+    private func openOperationIndex(for newState: WindowState) -> Int? {
+        func isOpen(_ operation: OpenOperation) -> Bool {
+            if case .waiting = operation.delivery { return !operation.excludeWindowIDs.contains(newState.windowID) }
+            return false
+        }
+        if let claimedID = newState.claimedOpenRequestID {
+            if let index = openOperations.firstIndex(where: { $0.request.id == claimedID && isOpen($0) }) {
+                return index
             }
-
             cleanupClaimedInitialRefreshDeferral(
                 for: newState,
                 reason: "noMatchingClaimedWindowOpenWaiter"
             )
-            return windowOpenWaiters.firstIndex(where: { waiter in
-                !waiter.defersInitialAgentSystemWorkspaceRefresh
-                    && !waiter.excludeWindowIDs.contains(newState.windowID)
-            })
+            return nil
         }
-
-        return windowOpenWaiters.firstIndex(where: { waiter in
-            !waiter.defersInitialAgentSystemWorkspaceRefresh
-                && !waiter.excludeWindowIDs.contains(newState.windowID)
+        // A request-aware opener delivers every request identity: only the window claiming it may fulfil it.
+        guard !AppWindowOpener.shared.deliversRequestIdentity else { return nil }
+        return openOperations.firstIndex(where: { operation in
+            isOpen(operation) && !operation.isClaimed
+                && operation.request.refreshDeferralID == nil && !operation.request.parkOnOpen
         })
     }
 
-    private func verifyInitialRefreshDeferralClaim(waiter: WindowOpenWaiter, newState: WindowState) {
-        clearPendingInitialRefreshDeferral(waiterID: waiter.id)
+    private func verifyInitialRefreshDeferralClaim(request: WindowOpenRequest, newState: WindowState) {
         let matches = Self.initialAgentSystemWorkspaceRefreshDeferralClaimMatches(
-            waiterID: waiter.id,
-            expectedDeferralID: waiter.expectedInitialRefreshDeferralID,
+            waiterID: request.id,
+            expectedDeferralID: request.refreshDeferralID,
             claimedWaiterID: newState.claimedInitialRefreshDeferralWaiterID,
             claimedDeferralID: newState.claimedInitialRefreshDeferralID
         )
@@ -965,12 +1230,12 @@ class WindowStatesManager: ObservableObject {
 
         #if DEBUG
             WorkspaceRestorePerfLog.log(
-                "agentSessionIndex.initialSystemRefreshDeferral attributionMismatch routedWindowID=\(newState.windowID) waiterID=\(waiter.id.uuidString.prefix(8)) expectedDeferralID=\(waiter.expectedInitialRefreshDeferralID?.uuidString.prefix(8).description ?? "nil") claimedWaiterID=\(newState.claimedInitialRefreshDeferralWaiterID?.uuidString.prefix(8).description ?? "nil") claimedDeferralID=\(newState.claimedInitialRefreshDeferralID?.uuidString.prefix(8).description ?? "nil")"
+                "agentSessionIndex.initialSystemRefreshDeferral attributionMismatch routedWindowID=\(newState.windowID) waiterID=\(request.id.uuidString.prefix(8)) expectedDeferralID=\(request.refreshDeferralID?.uuidString.prefix(8).description ?? "nil") claimedWaiterID=\(newState.claimedInitialRefreshDeferralWaiterID?.uuidString.prefix(8).description ?? "nil") claimedDeferralID=\(newState.claimedInitialRefreshDeferralID?.uuidString.prefix(8).description ?? "nil")"
             )
             assertionFailure("Programmatic new-window Agent refresh deferral was claimed by a different window than the routed waiter.")
         #endif
 
-        for window in allWindows where window !== newState && window.claimedInitialRefreshDeferralWaiterID == waiter.id {
+        for window in allWindows where window !== newState && window.claimedInitialRefreshDeferralWaiterID == request.id {
             window.agentModeViewModel.finishInitialSystemWorkspaceSessionListRefreshDeferral(refreshIfStillSystem: true)
         }
     }
@@ -1099,13 +1364,31 @@ class WindowStatesManager: ObservableObject {
         #endif
     }
 
-    func unregisterWindowState(_ state: WindowState) {
+    func handleWindowClosed(_ state: WindowState) {
+        guard state.claimWindowCloseCleanup() else { return }
+        SettingsWindowCoordinator.shared.closeIfTargeting(state)
         state.beginClose()
-        if let idx = allWindows.firstIndex(where: { $0 === state }) {
-            allWindows.remove(at: idx)
-            closingWindowReferences.removeAll { $0.value == nil || $0.value === state }
-            closingWindowReferences.append(WeakWindowState(state))
+        if !isTerminating {
+            state.workspaceManager.pollAndSaveState()
         }
+        guard !isTerminating else {
+            state.aiQueriesService.cancelQuery()
+            state.mcpServer.stopServiceObservation()
+            return
+        }
+        unregisterWindowState(state)
+        Task { await state.tearDown() }
+    }
+
+    func unregisterWindowState(_ state: WindowState) {
+        guard unregisteringWindowIDs.insert(state.windowID).inserted else { return }
+        defer { unregisteringWindowIDs.remove(state.windowID) }
+        guard allWindows.contains(where: { $0 === state }) else { return }
+        state.beginClose()
+        guard let idx = allWindows.firstIndex(where: { $0 === state }) else { return }
+        allWindows.remove(at: idx)
+        closingWindowReferences.removeAll { $0.value == nil || $0.value === state }
+        closingWindowReferences.append(WeakWindowState(state))
         // Eager revocation for both endpoints of every link this window held. Operation-time identity
         // revalidation still catches a missed hook, but the surviving endpoint should learn now.
         invalidateAgentSessionLinks(forClosedWindowID: state.windowID)

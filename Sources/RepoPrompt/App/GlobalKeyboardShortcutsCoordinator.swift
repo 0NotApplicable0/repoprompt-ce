@@ -9,6 +9,7 @@ final class GlobalKeyboardShortcutsCoordinator {
     static let shared = GlobalKeyboardShortcutsCoordinator()
 
     private var didRegisterHandlers = false
+    var isApplicationActive: () -> Bool = { NSApplication.shared.isActive }
 
     private init() {}
 
@@ -40,7 +41,7 @@ final class GlobalKeyboardShortcutsCoordinator {
     }
 
     private func focusedOrLatestWindowState() -> WindowState? {
-        focusedWindowState() ?? WindowStatesManager.shared.latestWindowState
+        FleetCommandTargeting.liveTargetWindow()
     }
 
     private func guardedFocusedWindowState() -> WindowState? {
@@ -53,7 +54,7 @@ final class GlobalKeyboardShortcutsCoordinator {
     /// before our SwiftUI focus flag has updated. Route to the front/latest
     /// RepoPrompt window so the first press still opens the HUD.
     private func guardedHUDWindowState() -> WindowState? {
-        guard NSApplication.shared.isActive else { return nil }
+        guard isApplicationActive() else { return nil }
         return focusedOrLatestWindowState()
     }
 
@@ -286,7 +287,7 @@ final class GlobalKeyboardShortcutsCoordinator {
         }
     }
 
-    private func showAgentNavigationHUD(mode: AgentNavigationHUDMode, eventTimestamp: TimeInterval?, callbackAt: TimeInterval) {
+    func showAgentNavigationHUD(mode: AgentNavigationHUDMode, eventTimestamp: TimeInterval?, callbackAt: TimeInterval) {
         guard let win = guardedHUDWindowState() else {
             #if DEBUG
                 focusedOrLatestWindowState()?.agentModeViewModel.perfRecorder.event("hud.command.ignored", fields: ["reason": "inactiveOrNoWindow"])

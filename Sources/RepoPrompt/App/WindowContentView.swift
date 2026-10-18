@@ -21,9 +21,14 @@ struct WindowContentView: View {
     @Environment(\.openWindow) private var openWindow
 
     /// The WindowState itself (your big manager of fileManager, promptManager, etc.)
-    @StateObject private var windowState = WindowState(
-        domainRuntime: AppDomainRuntimeComposition.shared.runtime
-    )
+    @StateObject private var windowState: WindowState
+
+    init(openRequestID: UUID? = nil) {
+        _windowState = StateObject(wrappedValue: WindowState(
+            domainRuntime: AppDomainRuntimeComposition.shared.runtime,
+            openRequestID: openRequestID
+        ))
+    }
 
     var body: some View {
         ContentView(windowState: windowState)
@@ -40,11 +45,9 @@ struct WindowContentView: View {
             .navigationTitle(windowState.displayedWindowTitle)
             .removingSystemToolbarTitle()
             .background(
-                WindowAccessor { newWindow in
-                    // IMPORTANT: do not mutate SwiftUI @State here.
-                    // Attach is internally guarded and safe even if called multiple times.
-                    windowState.attachWindow(newWindow)
-                }
+                // IMPORTANT: do not mutate SwiftUI @State from the attach callback.
+                // Attach is internally guarded and safe even if called multiple times.
+                WindowAccessor.attaching(windowState)
             )
             // Once the view appears, register it with WindowStatesManager
             .onAppear {
@@ -53,31 +56,17 @@ struct WindowContentView: View {
                 MCPExternalEventsMonitor.shared.scheduleCleanupOnce()
 
                 // Install the openWindow action into AppWindowOpener for programmatic window creation
-                AppWindowOpener.shared.install {
-                    openWindow(id: "main")
+                AppWindowOpener.shared.installRequestAware { requestID in
+                    if let requestID {
+                        openWindow(id: "main", value: requestID)
+                    } else {
+                        openWindow(id: "main")
+                    }
                 }
             }
             // Cleanup if the window goes away
             .onDisappear {
-                SettingsWindowCoordinator.shared.closeIfTargeting(windowState)
-
-                // Stop focus/title side-effects early to avoid SwiftUI observation crashes during teardown.
-                windowState.beginClose()
-
-                // Save the current workspace state before closing, but avoid extra teardown work
-                // or publish-heavy persistence once app termination has begun.
-                if !windowStatesManager.isTerminating {
-                    windowState.workspaceManager.pollAndSaveState()
-                }
-
-                guard !windowStatesManager.isTerminating else {
-                    windowState.aiQueriesService.cancelQuery()
-                    windowState.mcpServer.stopServiceObservation()
-                    return
-                }
-
-                windowStatesManager.unregisterWindowState(windowState)
-                Task { await windowState.tearDown() }
+                windowStatesManager.handleWindowClosed(windowState)
             }
             // Example sheets or popups
             .sheet(isPresented: $versionManager.shouldShowWelcomeView) {

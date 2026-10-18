@@ -894,6 +894,14 @@ private enum AppSettingsMCPRegistry {
             write: { try $0.setCodexReasoningSummariesEnabled(requiredBool(from: $1)) }
         ),
         boolSetting(
+            key: "agent_mode.fleet_park_agent_windows",
+            group: "agent_mode",
+            label: "Park Agent Windows",
+            description: "Whether newly opened Agent Mode windows are parked after opening. Defaults off.",
+            read: { .bool($0.fleetParkAgentWindows()) },
+            write: { try $0.setFleetParkAgentWindows(requiredBool(from: $1)) }
+        ),
+        boolSetting(
             key: "agent_mode.claude_usage_quota_enabled",
             group: "agent_mode",
             label: "Claude Run Rate-Limit Telemetry (Passive)",

@@ -25,6 +25,7 @@ class AppDelegate: NSObject, ObservableObject, NSApplicationDelegate {
     /// Prevents re-entrant termination (Cmd+Q twice, menu + dock quit, etc.)
     private var terminationInProgress = false
     private let dockMenuController = DockMenuController()
+    private let fleetManagerWindowCoordinator = FleetManagerWindowCoordinator()
     /// The app delegate retains signal routing so its Dispatch sources remain active for the
     /// entire application lifetime.
     private lazy var terminationSignalRouter = AppTerminationSignalRouter(
@@ -139,6 +140,7 @@ class AppDelegate: NSObject, ObservableObject, NSApplicationDelegate {
         let launchConfiguration = AppLaunchConfiguration.current
         ProcessTermination.resetAppTerminationFastPath()
         terminationSignalRouter.install()
+        fleetManagerWindowCoordinator.install(into: FleetParkingCoordinator.shared)
 
         if launchConfiguration.isUITestSession {
             NSApp.setActivationPolicy(.regular)
@@ -196,16 +198,25 @@ class AppDelegate: NSObject, ObservableObject, NSApplicationDelegate {
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
-        // Keep the app running if we intentionally backgrounded the last window.
-        !MCPBackgroundModeCoordinator.shared.isBackgrounded
+        FleetAppLifecycleDecision.shouldTerminateAfterLastWindowClosed(
+            fleetLifecycleInputs(hasVisibleWindows: false)
+        )
     }
 
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
-        if !flag, MCPBackgroundModeCoordinator.shared.isBackgrounded {
-            MCPBackgroundModeCoordinator.shared.restore()
-            return true
-        }
-        return false
+        FleetAppLifecycleDecision.handleReopen(
+            fleetLifecycleInputs(hasVisibleWindows: flag),
+            restore: { MCPBackgroundModeCoordinator.shared.restore() },
+            openFleetManager: FleetParkingCoordinator.shared.openFleetManager
+        )
+    }
+
+    private func fleetLifecycleInputs(hasVisibleWindows: Bool) -> FleetAppLifecycleInputs {
+        FleetAppLifecycleInputs(
+            backgroundModeHasWindow: MCPBackgroundModeCoordinator.shared.isBackgrounded,
+            fleetParkedCount: FleetParkingCoordinator.shared.parkedWindowIDs.count,
+            visibleWindowCount: hasVisibleWindows ? 1 : 0
+        )
     }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
@@ -219,6 +230,7 @@ class AppDelegate: NSObject, ObservableObject, NSApplicationDelegate {
         WindowStatesManager.shared.signalTermination()
         ProcessTermination.beginAppTerminationFastPath()
         MCPBackgroundModeCoordinator.shared.resetForTermination()
+        FleetParkingCoordinator.shared.resetForTermination()
         // Synchronous oversight freeze, before any async teardown can run: quitting closes every
         // window, and an unfrozen bridge would treat that cascade as ordinary lifecycle and delete
         // exactly the saved oversight the next launch is supposed to restore.
@@ -255,6 +267,7 @@ class AppDelegate: NSObject, ObservableObject, NSApplicationDelegate {
         // Defensive fallback: ensure termination flag is set and session is persisted.
         // These are fast, synchronous, and idempotent.
         MCPBackgroundModeCoordinator.shared.resetForTermination()
+        FleetParkingCoordinator.shared.resetForTermination()
         WindowStatesManager.shared.signalTermination()
         ProcessTermination.beginAppTerminationFastPath()
         // Idempotent and synchronous only. Correctness comes from the write-through store and the
