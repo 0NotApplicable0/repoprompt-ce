@@ -283,6 +283,7 @@ class WindowState: ObservableObject {
 
     /// Reference to the NSWindow this state is associated with
     weak var nsWindow: NSWindow?
+    private weak var accessorAttachmentSource: AnyObject?
     #if DEBUG
         var test_beforePostActivationReveal: (@MainActor () -> Void)?
     #endif
@@ -847,7 +848,25 @@ class WindowState: ObservableObject {
     /// Uses deferred title update to avoid triggering layout during window lifecycle events
     /// (REPOPROMPT-1K4 fix).
     func attachWindow(_ window: NSWindow?) {
-        performWindowAttachment(window, update: updateAttachedWindow)
+        performWindowAttachment(window) { acceptedWindow in
+            accessorAttachmentSource = nil
+            updateAttachedWindow(acceptedWindow)
+        }
+    }
+
+    func attachWindow(_ window: NSWindow?, source: AnyObject) {
+        guard window != nil || accessorAttachmentSource === source else { return }
+        performWindowAttachment(window) { acceptedWindow in
+            updateAttachedWindow(acceptedWindow)
+            accessorAttachmentSource = acceptedWindow == nil ? nil : source
+        }
+    }
+
+    func accessorAttachmentIsCurrent(_ window: NSWindow?, source: AnyObject) -> Bool {
+        if window == nil {
+            return nsWindow == nil && accessorAttachmentSource == nil
+        }
+        return nsWindow === window && accessorAttachmentSource === source
     }
 
     /// The admission boundary is window-independent so a deferred attach can be tested without

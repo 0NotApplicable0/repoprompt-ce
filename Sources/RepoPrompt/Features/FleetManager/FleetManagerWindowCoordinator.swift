@@ -138,7 +138,19 @@ final class FleetManagerActions: ObservableObject {
         let chat: ChatTarget?
     }
 
+    private struct FeedbackTarget: Hashable {
+        let windowID: Int
+        let workspaceID: UUID
+        let sessionID: UUID
+    }
+
+    private struct StaleFeedback {
+        let target: FeedbackTarget
+        var pendingFirstRefresh: Bool
+    }
+
     @Published private(set) var staleMessages: [UUID: String] = [:]
+    @Published private(set) var parkMessages: [Int: String] = [:]
     @Published private(set) var confirmation: Confirmation?
     @Published private(set) var isDeletionInFlight = false
     @Published private(set) var deletionError: String?
@@ -183,6 +195,10 @@ final class FleetManagerActions: ObservableObject {
         staleMessages[rowID]
     }
 
+    func parkMessage(for windowID: Int) -> String? {
+        parkMessages[windowID]
+    }
+
     func show(rowID: UUID, windowID: Int, workspaceID: UUID, sessionID: UUID) async {
         guard let target = handle(windowID),
               !target.isClosing,
@@ -190,7 +206,7 @@ final class FleetManagerActions: ObservableObject {
               target.activeWorkspaceID == workspaceID,
               let tabID = target.tabID(holding: sessionID)
         else {
-            markStale(rowID: rowID, windowID: windowID)
+            markStale(rowID: rowID, windowID: windowID, workspaceID: workspaceID, sessionID: sessionID)
             return
         }
         // Invariant: no await between the pre-check above and route(); with isInitialized true
@@ -211,8 +227,9 @@ final class FleetManagerActions: ObservableObject {
         )
         if result == .routed {
             staleMessages[rowID] = nil
+            staleFeedback[rowID] = nil
         } else {
-            markStale(rowID: rowID, windowID: windowID)
+            markStale(rowID: rowID, windowID: windowID, workspaceID: workspaceID, sessionID: sessionID)
         }
     }
 
@@ -224,7 +241,7 @@ final class FleetManagerActions: ObservableObject {
     func archive(rowID: UUID, windowID: Int, workspaceID: UUID, sessionID: UUID) async {
         guard !isDeletionInFlight else { return }
         guard let (target, tabID) = sessionTarget(windowID: windowID, workspaceID: workspaceID, sessionID: sessionID) else {
-            markStale(rowID: rowID, windowID: windowID)
+            markStale(rowID: rowID, windowID: windowID, workspaceID: workspaceID, sessionID: sessionID)
             return
         }
         if await target.performSidebarCommand(.stash, tabID: tabID, sessionID: sessionID, workspaceID: workspaceID) {
@@ -235,7 +252,7 @@ final class FleetManagerActions: ObservableObject {
     func requestDeleteChat(rowID: UUID, windowID: Int, workspaceID: UUID, sessionID: UUID) {
         guard !isDeletionInFlight else { return }
         guard let (_, tabID) = sessionTarget(windowID: windowID, workspaceID: workspaceID, sessionID: sessionID) else {
-            markStale(rowID: rowID, windowID: windowID)
+            markStale(rowID: rowID, windowID: windowID, workspaceID: workspaceID, sessionID: sessionID)
             return
         }
         deletionError = nil
@@ -276,7 +293,7 @@ final class FleetManagerActions: ObservableObject {
             guard let (target, tabID) = sessionTarget(windowID: pending.windowID, workspaceID: pending.workspaceID, sessionID: chat.sessionID),
                   tabID == chat.tabID
             else {
-                markStale(rowID: chat.rowID, windowID: pending.windowID)
+                markStale(rowID: chat.rowID, windowID: pending.windowID, workspaceID: pending.workspaceID, sessionID: chat.sessionID)
                 deletionError = Self.staleMessage(windowID: pending.windowID)
                 return
             }
@@ -308,11 +325,15 @@ final class FleetManagerActions: ObservableObject {
     }
 
     func park(windowID: Int) {
-        _ = parking.park(windowID: windowID, reason: .operator)
+        let didPark = parking.park(windowID: windowID, reason: .operator)
+        parkMessages[windowID] = didPark
+            ? nil
+            : "Window \(windowID) could not be parked. Try again."
         parkingChanged()
     }
 
     func unpark(windowID: Int) {
+        parkMessages[windowID] = nil
         if let target = handle(windowID), target.isBackgrounded {
             target.restoreBackground()
         }
@@ -320,7 +341,36 @@ final class FleetManagerActions: ObservableObject {
         parkingChanged()
     }
 
-    private func markStale(rowID: UUID, windowID: Int) {
+    func reconcileFeedback(with roster: FleetRoster) {
+        let live = Set(roster.sections.flatMap { section in
+            section.allRows.map {
+                FeedbackTarget(windowID: section.windowID, workspaceID: section.workspaceID, sessionID: $0.id)
+            }
+        })
+        for rowID in Array(staleFeedback.keys) {
+            guard var entry = staleFeedback[rowID] else { continue }
+            if entry.pendingFirstRefresh {
+                entry.pendingFirstRefresh = false
+                staleFeedback[rowID] = entry
+            } else if live.contains(entry.target) {
+                staleMessages[rowID] = nil
+                staleFeedback[rowID] = nil
+            }
+        }
+        let visibleWindowIDs = Set(roster.sections.filter { !$0.isParked }.map(\.windowID))
+        let nextParkMessages = parkMessages.filter { visibleWindowIDs.contains($0.key) }
+        if nextParkMessages != parkMessages {
+            parkMessages = nextParkMessages
+        }
+    }
+
+    private var staleFeedback: [UUID: StaleFeedback] = [:]
+
+    private func markStale(rowID: UUID, windowID: Int, workspaceID: UUID, sessionID: UUID) {
+        staleFeedback[rowID] = StaleFeedback(
+            target: FeedbackTarget(windowID: windowID, workspaceID: workspaceID, sessionID: sessionID),
+            pendingFirstRefresh: true
+        )
         staleMessages[rowID] = Self.staleMessage(windowID: windowID)
         requestRefresh()
     }
@@ -382,15 +432,18 @@ final class FleetManagerWindowCoordinator: NSObject, NSWindowDelegate {
 
         let source = FleetManagerRosterSource(inner: makeSource())
         let parking = parking
-        let model = FleetRosterModel(
-            source: source,
-            parked: { parking.parkedWindowIDs },
-            ticker: makeTicker()
-        )
         let actions = FleetManagerActions(
             handle: handle,
             parking: parking,
             requestRefresh: { [weak source] in source?.requestRefresh() }
+        )
+        let model = FleetRosterModel(
+            source: source,
+            parked: { parking.parkedWindowIDs },
+            ticker: makeTicker(),
+            didRefresh: { [weak actions] roster in
+                actions?.reconcileFeedback(with: roster)
+            }
         )
         let window = NSWindow(
             contentRect: NSRect(x: 0, y: 0, width: 760, height: 560),

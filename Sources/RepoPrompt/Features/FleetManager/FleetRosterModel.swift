@@ -293,6 +293,7 @@ final class FleetRosterModel: ObservableObject {
     private let source: FleetRosterWindowSource
     private let parked: @MainActor () -> Set<Int>
     private let ticker: FleetRosterTicker
+    private let didRefresh: @MainActor (FleetRoster) -> Void
     private var changes: AnyCancellable?
     private var refreshScheduled = false
     private var running = false
@@ -300,11 +301,13 @@ final class FleetRosterModel: ObservableObject {
     init(
         source: FleetRosterWindowSource,
         parked: @escaping @MainActor () -> Set<Int> = { [] },
-        ticker: FleetRosterTicker? = nil
+        ticker: FleetRosterTicker? = nil,
+        didRefresh: @escaping @MainActor (FleetRoster) -> Void = { _ in }
     ) {
         self.source = source
         self.parked = parked
         self.ticker = ticker ?? TimerFleetRosterTicker()
+        self.didRefresh = didRefresh
         roster = FleetRosterProjection.derive(source.windows(), parked: parked())
     }
 
@@ -338,6 +341,7 @@ final class FleetRosterModel: ObservableObject {
         if next != roster {
             roster = next
         }
+        didRefresh(next)
     }
 }
 

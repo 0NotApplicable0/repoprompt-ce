@@ -10,25 +10,45 @@ import SwiftUI
 
 struct WindowAccessor: NSViewRepresentable {
     let callback: (NSWindow?) -> Void
-    /// Asked when the backing view joins a window. Only while it answers true is that window handed to
-    /// `callback` at once; otherwise delivery waits for the SwiftUI update through the 50 ms debounce.
+    /// Asked when the backing view joins a window. Normal native attachment and SwiftUI updates
+    /// use the 50 ms debounce; a pending park-on-open intent delivers a non-nil attachment at once.
     let deliversAttachEarly: () -> Bool
+    private let attachmentIsCurrent: (NSWindow?) -> Bool
+    private let allowsNonNilScheduling: () -> Bool
 
-    fileprivate init(deliversAttachEarly: @escaping () -> Bool, callback: @escaping (NSWindow?) -> Void) {
+    fileprivate init(
+        deliversAttachEarly: @escaping () -> Bool,
+        attachmentIsCurrent: @escaping (NSWindow?) -> Bool,
+        allowsNonNilScheduling: @escaping () -> Bool,
+        callback: @escaping (NSWindow?) -> Void
+    ) {
         self.deliversAttachEarly = deliversAttachEarly
+        self.attachmentIsCurrent = attachmentIsCurrent
+        self.allowsNonNilScheduling = allowsNonNilScheduling
         self.callback = callback
     }
 
-    /// The only construction of this accessor for a window: attach is delivered at the native attach
-    /// while the window still holds a pending park intent, and through the SwiftUI update otherwise.
+    /// The only construction of this accessor for a window: pending park-on-open attaches immediately;
+    /// otherwise native attachment and SwiftUI updates are delivered through the debounce.
     static func attaching(_ windowState: WindowState) -> WindowAccessor {
-        WindowAccessor(deliversAttachEarly: { windowState.holdsPendingParkIntent }) { newWindow in
-            windowState.attachWindow(newWindow)
-        }
+        let source = NSObject()
+        return WindowAccessor(
+            deliversAttachEarly: { windowState.holdsPendingParkIntent },
+            attachmentIsCurrent: { windowState.accessorAttachmentIsCurrent($0, source: source) },
+            allowsNonNilScheduling: { !windowState.isClosing },
+            callback: { newWindow in
+                windowState.attachWindow(newWindow, source: source)
+            }
+        )
     }
 
     func makeCoordinator() -> Coordinator {
-        Coordinator(callback: callback, deliversAttachEarly: deliversAttachEarly)
+        Coordinator(
+            callback: callback,
+            deliversAttachEarly: deliversAttachEarly,
+            attachmentIsCurrent: attachmentIsCurrent,
+            allowsNonNilScheduling: allowsNonNilScheduling
+        )
     }
 
     func makeNSView(context: Context) -> NSView {
@@ -55,62 +75,75 @@ struct WindowAccessor: NSViewRepresentable {
     final class Coordinator {
         private let callback: (NSWindow?) -> Void
         private let deliversAttachEarly: () -> Bool
-        private weak var lastWindow: NSWindow?
-        private var tokens: [NSObjectProtocol] = []
+        private let attachmentIsCurrent: (NSWindow?) -> Bool
+        private let allowsNonNilScheduling: () -> Bool
+        private weak var nativeWindow: NSWindow?
+        private var hasNativeObservation = false
+        private weak var swiftUICandidate: NSWindow?
         private var pendingCallback: DispatchWorkItem?
         private let callbackWorkGate = WorkItemGate()
 
-        init(callback: @escaping (NSWindow?) -> Void, deliversAttachEarly: @escaping () -> Bool) {
+        init(
+            callback: @escaping (NSWindow?) -> Void,
+            deliversAttachEarly: @escaping () -> Bool,
+            attachmentIsCurrent: @escaping (NSWindow?) -> Bool,
+            allowsNonNilScheduling: @escaping () -> Bool
+        ) {
             self.callback = callback
             self.deliversAttachEarly = deliversAttachEarly
+            self.attachmentIsCurrent = attachmentIsCurrent
+            self.allowsNonNilScheduling = allowsNonNilScheduling
         }
 
         func backingViewMoved(to window: NSWindow?) {
-            guard let window, deliversAttachEarly() else { return }
-            deliverNow(window: window)
+            hasNativeObservation = true
+            nativeWindow = window
+            if let window, deliversAttachEarly() {
+                deliverNow(window: window)
+            } else {
+                scheduleNativeDelivery()
+            }
         }
 
         private func deliverNow(window: NSWindow) {
-            guard lastWindow !== window else { return }
-            lastWindow = window
-            installObservers(for: window) // also cancels any obsolete queued legacy delivery
+            cancelPendingCallback()
+            guard !attachmentIsCurrent(window) else { return }
             callback(window)
         }
 
         func schedule(window: NSWindow?) {
-            guard lastWindow !== window else { return }
-            lastWindow = window
-            installObservers(for: window)
-            fireCallbackDebounced(for: window)
+            guard window == nil || allowsNonNilScheduling() else { return }
+            guard !hasNativeObservation else { return }
+            guard swiftUICandidate !== window || pendingCallback == nil else { return }
+            swiftUICandidate = window
+            scheduleDelivery()
         }
 
-        private func fireCallbackDebounced(for window: NSWindow?, delay: TimeInterval = 0.05) {
-            pendingCallback?.cancel()
-            callbackWorkGate.cancel()
-            pendingCallback = callbackWorkGate.schedule(after: delay) { [weak self, weak window] in
+        private func scheduleNativeDelivery() {
+            guard nativeWindow == nil || allowsNonNilScheduling() else { return }
+            scheduleDelivery()
+        }
+
+        private func scheduleDelivery(delay: TimeInterval = 0.05) {
+            cancelPendingCallback()
+            pendingCallback = callbackWorkGate.schedule(after: delay) { [weak self] in
                 guard let self else { return }
+                pendingCallback = nil
+                let window = hasNativeObservation ? nativeWindow : swiftUICandidate
+                guard window != nil || hasNativeObservation else { return }
+                guard !attachmentIsCurrent(window) else { return }
                 callback(window)
             }
         }
 
-        private func installObservers(for window: NSWindow?) {
-            removeObservers()
-            guard window != nil else { return }
-            // Intentionally no extra observers; WindowState handles focus/title updates.
-        }
-
-        private func removeObservers() {
-            for t in tokens {
-                NotificationCenter.default.removeObserver(t)
-            }
-            tokens.removeAll()
+        private func cancelPendingCallback() {
             pendingCallback?.cancel()
             pendingCallback = nil
             callbackWorkGate.cancel()
         }
 
         deinit {
-            removeObservers()
+            cancelPendingCallback()
         }
     }
 }

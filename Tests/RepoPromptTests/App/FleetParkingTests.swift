@@ -784,6 +784,417 @@ final class FleetParkingTests: XCTestCase {
         XCTAssertTrue(target.nsWindow?.isVisible == true)
         XCTAssertFalse(other.nsWindow?.isVisible == true)
     }
+
+    // MARK: - Feedback lifetime (zero real WindowStates)
+
+    private let v6Text = "This session is no longer in window 1"
+
+    private func awaitRefresh(_ source: FeedbackSource, _ trigger: () async -> Void) async {
+        let refreshed = expectation(description: "roster refresh completed")
+        source.arm(refreshed)
+        await trigger()
+        await fulfillment(of: [refreshed], timeout: 5)
+    }
+
+    @MainActor
+    private struct ParentChildFixture {
+        let workspace = UUID()
+        let parent = UUID()
+        let child = UUID()
+        let parentTab = UUID()
+        let childTab = UUID()
+        let handle: FeedbackHandle
+
+        init(route: AgentSessionRouteResult) {
+            handle = FeedbackHandle(windowID: 1, workspaceID: workspace, sessions: [:], route: route)
+            handle.sessions = [parent: parentTab, child: childTab]
+        }
+
+        func snapshots(childActivity: Date = Date(timeIntervalSince1970: 1000)) -> [FleetRosterWindowSnapshot] {
+            [feedbackWindow(1, workspace, [
+                feedbackSession(parent, tab: parentTab),
+                feedbackSession(child, tab: childTab, parent: parent, state: .running, at: childActivity)
+            ])]
+        }
+    }
+
+    private func openRig(_ fixture: ParentChildFixture) throws -> (rig: FeedbackRig, model: FleetRosterModel, actions: FleetManagerActions) {
+        let rig = FeedbackRig(snapshots: fixture.snapshots(), handles: [fixture.handle])
+        let (actions, model) = try rig.open()
+        XCTAssertEqual(model.roster.sections.first?.rows.map(\.id), [fixture.parent])
+        XCTAssertEqual(model.roster.sections.first?.rows.first?.children.map(\.id), [fixture.child])
+        return (rig, model, actions)
+    }
+
+    func testTransientStaleFeedbackSurvivesOwnRefreshThenClearsOnLaterLiveRefresh() async throws {
+        let fixture = ParentChildFixture(route: .tabUnavailable)
+        let (rig, model, actions) = try openRig(fixture)
+        defer { rig.close() }
+        await awaitRefresh(rig.source) {
+            await actions.show(rowID: fixture.child, windowID: 1, workspaceID: fixture.workspace, sessionID: fixture.child)
+        }
+        XCTAssertEqual(actions.staleMessage(for: fixture.child), v6Text)
+
+        let later = Date(timeIntervalSince1970: 2000)
+        rig.source.snapshots = fixture.snapshots(childActivity: later)
+        await awaitRefresh(rig.source) { rig.source.emit() }
+        XCTAssertEqual(model.roster.sections.first?.rows.first?.children.first?.lastActivityAt, later)
+        XCTAssertNil(actions.staleMessage(for: fixture.child), "a later live refresh clears the obsolete stale assertion")
+        XCTAssertEqual(fixture.handle.routes.count, 1)
+        XCTAssertEqual(fixture.handle.routes.first?.sessionID, fixture.child)
+        XCTAssertEqual(fixture.handle.calls, ["reveal", "route"])
+        XCTAssertEqual(fixture.handle.activeWorkspaceID, fixture.workspace)
+    }
+
+    func testPersistentNonGoneFailureRemainsVisibleThroughEachRequestedRefresh() async throws {
+        let fixture = ParentChildFixture(route: .blockedByActiveDifferentSession)
+        let (rig, _, actions) = try openRig(fixture)
+        defer { rig.close() }
+        for click in 1 ... 2 {
+            await awaitRefresh(rig.source) {
+                await actions.show(rowID: fixture.child, windowID: 1, workspaceID: fixture.workspace, sessionID: fixture.child)
+            }
+            XCTAssertEqual(actions.staleMessage(for: fixture.child), v6Text, "click \(click): present after its own requested refresh")
+        }
+        await awaitRefresh(rig.source) { rig.ticker.tick() }
+        XCTAssertNil(actions.staleMessage(for: fixture.child), "a later ticker refresh clears the still-listed row's stale text")
+        XCTAssertEqual(fixture.handle.routes.count, 2)
+        XCTAssertEqual(fixture.handle.calls, ["reveal", "route", "reveal", "route"])
+    }
+
+    func testEqualLaterRosterRefreshClearsFeedbackWithoutRepublishingOrSuccessfulShow() async throws {
+        let fixture = ParentChildFixture(route: .tabUnavailable)
+        let (rig, model, actions) = try openRig(fixture)
+        defer { rig.close() }
+        var publications = 0
+        let sink = model.$roster.dropFirst().sink { _ in publications += 1 }
+        defer { sink.cancel() }
+        let readsBefore = rig.source.reads
+        await awaitRefresh(rig.source) {
+            await actions.show(rowID: fixture.child, windowID: 1, workspaceID: fixture.workspace, sessionID: fixture.child)
+        }
+        XCTAssertEqual(actions.staleMessage(for: fixture.child), v6Text)
+        await awaitRefresh(rig.source) { rig.ticker.tick() }
+        XCTAssertNil(actions.staleMessage(for: fixture.child), "an equal later refresh clears the obsolete stale text")
+        XCTAssertEqual(publications, 0)
+        XCTAssertGreaterThanOrEqual(rig.source.reads - readsBefore, 2)
+        XCTAssertEqual(fixture.handle.routes.count, 1)
+    }
+
+    func testTrulyGoneSessionKeepsV6StaleMessageAfterRepeatedRefreshes() async throws {
+        let fixture = ParentChildFixture(route: .routed)
+        let (rig, model, actions) = try openRig(fixture)
+        defer { rig.close() }
+        fixture.handle.sessions[fixture.child] = nil
+        rig.source.snapshots = [feedbackWindow(1, fixture.workspace, [feedbackSession(fixture.parent, tab: fixture.parentTab)])]
+        await awaitRefresh(rig.source) { rig.source.emit() }
+        XCTAssertEqual(model.roster.sections.first?.allRows.map(\.id), [fixture.parent])
+        await awaitRefresh(rig.source) {
+            await actions.show(rowID: fixture.child, windowID: 1, workspaceID: fixture.workspace, sessionID: fixture.child)
+        }
+        XCTAssertEqual(actions.staleMessage(for: fixture.child), v6Text)
+        await awaitRefresh(rig.source) { rig.source.emit() }
+        await awaitRefresh(rig.source) { rig.ticker.tick() }
+        XCTAssertEqual(actions.staleMessage(for: fixture.child), v6Text)
+        XCTAssertEqual(model.roster.sections.first?.allRows.map(\.id), [fixture.parent])
+        XCTAssertEqual(fixture.handle.calls, [])
+        XCTAssertTrue(fixture.handle.routes.isEmpty)
+        XCTAssertTrue(rig.parking.parkCalls.isEmpty && rig.parking.unparkCalls.isEmpty)
+        XCTAssertEqual(fixture.handle.activeWorkspaceID, fixture.workspace)
+    }
+
+    // MARK: - Feedback lifetime (Park failures)
+
+    private func parkMessage(windowID: Int) -> String {
+        "Window \(windowID) could not be parked. Try again."
+    }
+
+    func testFailedParkShowsRetryableMessageInAgentFreeSection() async throws {
+        let workspace = UUID()
+        let rig = FeedbackRig(snapshots: [feedbackWindow(1, workspace, [])], handles: [])
+        rig.parking.parkResults[1] = false
+        let (actions, model) = try rig.open()
+        defer { rig.close() }
+
+        await awaitRefresh(rig.source) { actions.park(windowID: 1) }
+
+        XCTAssertEqual(actions.parkMessage(for: 1), parkMessage(windowID: 1))
+        XCTAssertFalse(model.roster.sections[0].isParked)
+    }
+
+    func testSuccessfulParkRetryClearsOnlyThatSectionsFailure() async throws {
+        let workspace1 = UUID(), workspace2 = UUID()
+        let rig = FeedbackRig(
+            snapshots: [feedbackWindow(1, workspace1, []), feedbackWindow(2, workspace2, [])],
+            handles: []
+        )
+        rig.parking.parkResults = [1: false, 2: false]
+        let (actions, _) = try rig.open()
+        defer { rig.close() }
+
+        await awaitRefresh(rig.source) { actions.park(windowID: 1) }
+        await awaitRefresh(rig.source) { actions.park(windowID: 2) }
+        XCTAssertEqual(actions.parkMessage(for: 1), parkMessage(windowID: 1))
+        XCTAssertEqual(actions.parkMessage(for: 2), parkMessage(windowID: 2))
+
+        rig.parking.parkResults[1] = true
+        await awaitRefresh(rig.source) { actions.park(windowID: 1) }
+
+        XCTAssertNil(actions.parkMessage(for: 1))
+        XCTAssertEqual(actions.parkMessage(for: 2), parkMessage(windowID: 2))
+    }
+
+    func testExternalParkAndUnparkRemovesPriorParkFailureWithoutResurrection() async throws {
+        let workspace = UUID()
+        let rig = FeedbackRig(snapshots: [feedbackWindow(1, workspace, [])], handles: [])
+        rig.parking.parkResults[1] = false
+        let (actions, model) = try rig.open()
+        defer { rig.close() }
+
+        await awaitRefresh(rig.source) { actions.park(windowID: 1) }
+        XCTAssertEqual(actions.parkMessage(for: 1), parkMessage(windowID: 1))
+
+        rig.parking.parkedWindowIDs.insert(1)
+        await awaitRefresh(rig.source) { rig.source.emit() }
+        XCTAssertTrue(model.roster.sections[0].isParked)
+        XCTAssertNil(actions.parkMessage(for: 1))
+
+        rig.parking.parkedWindowIDs.remove(1)
+        await awaitRefresh(rig.source) { rig.source.emit() }
+        XCTAssertFalse(model.roster.sections[0].isParked)
+        XCTAssertNil(actions.parkMessage(for: 1))
+    }
+
+    func testRemovedSectionEvictsParkFailureBeforeWindowIsReintroduced() async throws {
+        let workspace = UUID()
+        let rig = FeedbackRig(snapshots: [feedbackWindow(1, workspace, [])], handles: [])
+        rig.parking.parkResults[1] = false
+        let (actions, _) = try rig.open()
+        defer { rig.close() }
+
+        await awaitRefresh(rig.source) { actions.park(windowID: 1) }
+        XCTAssertEqual(actions.parkMessage(for: 1), parkMessage(windowID: 1))
+
+        rig.source.snapshots = []
+        await awaitRefresh(rig.source) { rig.source.emit() }
+        XCTAssertNil(actions.parkMessage(for: 1))
+
+        rig.source.snapshots = [feedbackWindow(1, workspace, [])]
+        await awaitRefresh(rig.source) { rig.source.emit() }
+        XCTAssertNil(actions.parkMessage(for: 1))
+    }
+
+    func testStaleFeedbackReconcilesFailedTargetNotMessageRowID() async throws {
+        let workspace1 = UUID(), workspace2 = UUID(), otherWorkspace = UUID(), workspace3 = UUID()
+        let child = UUID(), parent = UUID(), childTab = UUID(), parentTab = UUID()
+        let parentHandle = FeedbackHandle(windowID: 2, workspaceID: workspace2, sessions: [parent: parentTab], route: .tabUnavailable)
+        let childSnapshot = feedbackSession(child, tab: childTab, parent: parent, state: .running)
+        func childWindow() -> FleetRosterWindowSnapshot {
+            feedbackWindow(1, workspace1, [childSnapshot])
+        }
+        let rig = FeedbackRig(
+            snapshots: [childWindow(), feedbackWindow(2, workspace2, [feedbackSession(parent, tab: parentTab)])],
+            handles: [parentHandle]
+        )
+        let (actions, model) = try rig.open()
+        defer { rig.close() }
+        guard case .otherWindow(windowID: 2, sessionID: parent, name: _)? = model.roster.sections.first?.rows.first?.parent
+        else { return XCTFail("SETUP: child row links to the parent in window 2") }
+
+        await awaitRefresh(rig.source) {
+            await actions.show(rowID: child, windowID: 2, workspaceID: workspace2, sessionID: parent)
+        }
+        let expected = FleetManagerActions.staleMessage(windowID: 2)
+        XCTAssertEqual(actions.staleMessage(for: child), expected)
+
+        let negatives: [(String, [FleetRosterWindowSnapshot])] = [
+            ("target absent, message row live", [childWindow(), feedbackWindow(2, workspace2, [])]),
+            ("target only in another window", [
+                childWindow(), feedbackWindow(2, workspace2, []),
+                feedbackWindow(3, workspace3, [feedbackSession(parent, tab: UUID())])
+            ]),
+            ("target only in another workspace", [
+                childWindow(), feedbackWindow(2, otherWorkspace, [feedbackSession(parent, tab: parentTab)])
+            ])
+        ]
+        for (label, snapshots) in negatives {
+            rig.source.snapshots = snapshots
+            await awaitRefresh(rig.source) { rig.source.emit() }
+            XCTAssertEqual(actions.staleMessage(for: child), expected, label)
+        }
+
+        rig.source.snapshots = [childWindow(), feedbackWindow(2, workspace2, [feedbackSession(parent, tab: parentTab)])]
+        await awaitRefresh(rig.source) { rig.ticker.tick() }
+        XCTAssertNil(actions.staleMessage(for: child), "restoring the exact failed target clears the feedback on a later refresh")
+        XCTAssertEqual(parentHandle.routes.count, 1)
+    }
+}
+
+private func feedbackSession(
+    _ id: UUID,
+    tab: UUID,
+    parent: UUID? = nil,
+    state: AgentSessionRunState = .idle,
+    at: Date = Date(timeIntervalSince1970: 1000)
+) -> FleetRosterSessionSnapshot {
+    FleetRosterSessionSnapshot(
+        tabID: tab, sessionID: id, parentSessionID: parent, indexParentSessionID: nil,
+        composeTabName: "S-\(id.uuidString.prefix(4))", indexEntryName: nil,
+        agent: "claude", model: "m", runState: state, lastActivityAt: at
+    )
+}
+
+private func feedbackWindow(_ id: Int, _ workspace: UUID, _ sessions: [FleetRosterSessionSnapshot]) -> FleetRosterWindowSnapshot {
+    FleetRosterWindowSnapshot(
+        windowID: id, workspaceID: workspace, workspaceName: "Workspace\(id)",
+        isSystemWorkspace: false, isClosing: false, sessions: sessions
+    )
+}
+
+@MainActor
+private final class FeedbackSource: FleetRosterWindowSource {
+    var snapshots: [FleetRosterWindowSnapshot]
+    private(set) var reads = 0
+    private var armed: XCTestExpectation?
+    private let subject = PassthroughSubject<Void, Never>()
+
+    init(snapshots: [FleetRosterWindowSnapshot]) {
+        self.snapshots = snapshots
+    }
+
+    func windows() -> [FleetRosterWindowSnapshot] {
+        reads += 1
+        armed?.fulfill()
+        armed = nil
+        return snapshots
+    }
+
+    var changes: AnyPublisher<Void, Never> {
+        subject.eraseToAnyPublisher()
+    }
+
+    func arm(_ expectation: XCTestExpectation) {
+        armed = expectation
+    }
+
+    func emit() {
+        subject.send()
+    }
+}
+
+@MainActor
+private final class FeedbackTicker: FleetRosterTicker {
+    private var fire: (@MainActor () -> Void)?
+
+    func start(interval: TimeInterval, fire: @escaping @MainActor () -> Void) {
+        self.fire = fire
+    }
+
+    func stop() {
+        fire = nil
+    }
+
+    func tick() {
+        fire?()
+    }
+}
+
+@MainActor
+private final class FeedbackParking: FleetParkingControlling {
+    var parkedWindowIDs: Set<Int> = []
+    var parkCalls: [Int] = []
+    var unparkCalls: [Int] = []
+    var parkResults: [Int: Bool] = [:]
+
+    func park(windowID: Int, reason: FleetParkReason) -> Bool {
+        parkCalls.append(windowID)
+        let result = parkResults[windowID] ?? true
+        if result {
+            parkedWindowIDs.insert(windowID)
+        }
+        return result
+    }
+
+    func unpark(windowID: Int) {
+        unparkCalls.append(windowID)
+        parkedWindowIDs.remove(windowID)
+    }
+}
+
+@MainActor
+private final class FeedbackHandle: FleetWindowHandle {
+    let windowID: Int
+    var activeWorkspaceID: UUID?
+    var isInitialized = true
+    var isClosing = false
+    var isBackgrounded = false
+    var sessions: [UUID: UUID]
+    var route: AgentSessionRouteResult
+    var calls: [String] = []
+    var routes: [AgentSessionDeepLinkRoute] = []
+
+    init(windowID: Int, workspaceID: UUID, sessions: [UUID: UUID], route: AgentSessionRouteResult) {
+        self.windowID = windowID
+        activeWorkspaceID = workspaceID
+        self.sessions = sessions
+        self.route = route
+    }
+
+    func tabID(holding sessionID: UUID) -> UUID? {
+        sessions[sessionID]
+    }
+
+    func restoreBackground() {
+        calls.append("restore")
+    }
+
+    func reveal() {
+        calls.append("reveal")
+    }
+
+    func route(_ route: AgentSessionDeepLinkRoute) async -> AgentSessionRouteResult {
+        calls.append("route")
+        routes.append(route)
+        return self.route
+    }
+}
+
+@MainActor
+private final class FeedbackRig {
+    let source: FeedbackSource
+    let ticker: FeedbackTicker
+    let parking: FeedbackParking
+    let coordinator: FleetManagerWindowCoordinator
+
+    init(snapshots: [FleetRosterWindowSnapshot], handles: [FeedbackHandle]) {
+        let source = FeedbackSource(snapshots: snapshots)
+        let ticker = FeedbackTicker()
+        let parking = FeedbackParking()
+        let table = Dictionary(uniqueKeysWithValues: handles.map { ($0.windowID, $0) })
+        self.source = source
+        self.ticker = ticker
+        self.parking = parking
+        coordinator = FleetManagerWindowCoordinator(
+            makeSource: { source },
+            makeTicker: { ticker },
+            parking: parking,
+            handle: { table[$0] },
+            present: { _ in }
+        )
+    }
+
+    func open() throws -> (FleetManagerActions, FleetRosterModel) {
+        coordinator.open()
+        let window = try XCTUnwrap(coordinator.windowForTesting)
+        let host = try XCTUnwrap(window.contentViewController as? NSHostingController<FleetManagerView>)
+        let model = try XCTUnwrap(coordinator.modelForTesting)
+        XCTAssertTrue(host.rootView.model === model)
+        return (host.rootView.actions, model)
+    }
+
+    func close() {
+        coordinator.windowForTesting?.close()
+    }
 }
 
 private enum FleetFixtureError: Error {
@@ -1741,19 +2152,262 @@ final class FleetAgentWindowParkingTests: XCTestCase {
         }
     }
 
-    func testNativeAttachWithoutParkIntentDeliversNothingUntilTheSwiftUIUpdate() async throws {
+    private func settle() async throws {
+        try await Task.sleep(nanoseconds: 300_000_000)
+    }
+
+    private func requireSetup(_ condition: Bool, _ message: String) throws {
+        guard condition else {
+            XCTFail("SETUP: \(message)")
+            throw FleetFixtureError.notReady
+        }
+    }
+
+    private func registerNormalState(_ fixture: LifecycleFixture) throws -> WindowState {
+        let state = fixture.makeState(openRequestID: nil)
+        WindowStatesManager.shared.registerWindowState(state)
+        try requireSetup(WindowStatesManager.shared.window(withID: state.windowID) === state, "shared lookup identity")
+        try requireSetup(!state.isClosing, "state is not closing")
+        try requireSetup(state.parkOnOpenHandle == nil && WindowStatesManager.shared.pendingOpenOperationCount == 0, "no open intent")
+        return state
+    }
+
+    private struct AccessorDriver {
+        let coordinator: WindowAccessor.Coordinator
+        let view: WindowAccessor.AttachObservingView
+    }
+
+    private func makeAccessorDriver(for state: WindowState) -> AccessorDriver {
+        let coordinator = WindowAccessor.attaching(state).makeCoordinator()
+        let view = WindowAccessor.AttachObservingView(frame: .zero)
+        view.onWindowChange = coordinator.backingViewMoved(to:)
+        return AccessorDriver(coordinator: coordinator, view: view)
+    }
+
+    private func attachInitially(_ driver: AccessorDriver, to window: NSWindow, state: WindowState) async throws {
+        window.contentView = driver.view
+        try requireSetup(driver.view.window === window, "accessor view joined the window")
+        driver.coordinator.schedule(window: driver.view.window)
+        try await settle()
+        try requireSetup(state.nsWindow === window, "initial SwiftUI-update attachment completed")
+    }
+
+    private func assertAttachedAndParkable(_ state: WindowState, _ window: NSWindow, file: StaticString = #filePath, line: UInt = #line) {
+        window.orderFront(nil)
+        XCTAssertTrue(state.nsWindow === window, "state.nsWindow is the live native window", file: file, line: line)
+        XCTAssertTrue(FleetParkingCoordinator.shared.park(windowID: state.windowID), "park(windowID:) returns true", file: file, line: line)
+        XCTAssertTrue(FleetParkingCoordinator.shared.isParked(windowID: state.windowID), "window ID is parked", file: file, line: line)
+        XCTAssertTrue(WindowStatesManager.shared.window(withID: state.windowID) === state, "registration retained", file: file, line: line)
+        XCTAssertFalse(state.isClosing, "state is not closing", file: file, line: line)
+        XCTAssertFalse(window.isVisible, "parked NSWindow is off screen", file: file, line: line)
+    }
+
+    private func normalNativeAttachEventuallyAttachesAndCanPark(parkSetting: Bool) async throws {
+        let store = GlobalSettingsStore.shared
+        let previous = store.fleetParkAgentWindows()
+        store.setFleetParkAgentWindows(parkSetting, commit: false)
+        defer { store.setFleetParkAgentWindows(previous, commit: false) }
         try await withLifecycleFixture { fixture, _ in
-            let state = fixture.makeState(openRequestID: nil)
-            XCTAssertNil(state.parkOnOpenHandle)
-            XCTAssertEqual(WindowStatesManager.shared.pendingOpenOperationCount, 0)
+            let state = try self.registerNormalState(fixture)
             let window = self.makeHiddenWindow(fixture)
             let counter = NativeAttachCounter()
             _ = self.hostNatively(state, in: window, counter: counter)
-            XCTAssertEqual(counter.count, 1, "harness precondition: the backing views attached natively during layout")
+            try self.requireSetup(counter.count == 1, "the backing views attached natively during layout")
             XCTAssertNil(state.nsWindow)
-            try await Task.sleep(nanoseconds: 300_000_000)
-            XCTAssertNil(state.nsWindow)
-            XCTAssertEqual(WindowStatesManager.shared.pendingOpenOperationCount, 0)
+            try await self.settle()
+            self.assertAttachedAndParkable(state, window)
+        }
+    }
+
+    func testNormalNativeAttachWithoutParkIntentEventuallyAttachesAndCanPark() async throws {
+        try await normalNativeAttachEventuallyAttachesAndCanPark(parkSetting: false)
+    }
+
+    func testNormalNativeAttachWithFleetParkSettingEnabledEventuallyAttachesAndCanPark() async throws {
+        try await normalNativeAttachEventuallyAttachesAndCanPark(parkSetting: true)
+    }
+
+    func testStaleNilUpdateCannotClearCurrentNativeAttachment() async throws {
+        try await withLifecycleFixture { fixture, _ in
+            let state = try self.registerNormalState(fixture)
+            let window = self.makeHiddenWindow(fixture)
+            let driver = self.makeAccessorDriver(for: state)
+            try await self.attachInitially(driver, to: window, state: state)
+            driver.coordinator.schedule(window: nil)
+            try self.requireSetup(driver.view.window === window, "view is still in the live window")
+            try await self.settle()
+            self.assertAttachedAndParkable(state, window)
+        }
+    }
+
+    func testNativeDetachAndQuickRehostSameWindowRemainsParkable() async throws {
+        try await withLifecycleFixture { fixture, _ in
+            let state = try self.registerNormalState(fixture)
+            let window = self.makeHiddenWindow(fixture)
+            let driver = self.makeAccessorDriver(for: state)
+            try await self.attachInitially(driver, to: window, state: state)
+            window.contentView = nil
+            try self.requireSetup(driver.view.window == nil, "native detach observed")
+            driver.coordinator.schedule(window: nil)
+            window.contentView = driver.view
+            try self.requireSetup(driver.view.window === window, "native rehost observed")
+            try await self.settle()
+            self.assertAttachedAndParkable(state, window)
+        }
+    }
+
+    func testNativeDetachThenReattachOtherWindowRecoversAttachment() async throws {
+        try await withLifecycleFixture { fixture, _ in
+            let state = try self.registerNormalState(fixture)
+            let windowA = self.makeHiddenWindow(fixture)
+            let windowB = self.makeHiddenWindow(fixture)
+            let driver = self.makeAccessorDriver(for: state)
+            try await self.attachInitially(driver, to: windowA, state: state)
+            windowA.contentView = nil
+            try self.requireSetup(driver.view.window == nil, "native detach observed")
+            driver.coordinator.schedule(window: nil)
+            try await self.settle()
+            try self.requireSetup(state.nsWindow == nil, "detach completed")
+            windowB.contentView = driver.view
+            try self.requireSetup(driver.view.window === windowB, "native reattach to the other window observed")
+            try await self.settle()
+            let oldWindowVisibility = windowA.isVisible
+            self.assertAttachedAndParkable(state, windowB)
+            XCTAssertEqual(windowA.isVisible, oldWindowVisibility)
+        }
+    }
+
+    func testOldAccessorNilCannotDetachNewAccessorForSameState() async throws {
+        try await withLifecycleFixture { fixture, _ in
+            let state = try self.registerNormalState(fixture)
+            let window = self.makeHiddenWindow(fixture)
+            let accessorA = self.makeAccessorDriver(for: state)
+            let accessorB = self.makeAccessorDriver(for: state)
+            try await self.attachInitially(accessorA, to: window, state: state)
+            window.contentView = accessorB.view
+            try self.requireSetup(accessorA.view.window == nil && accessorB.view.window === window, "only accessor B is hosted")
+            accessorB.coordinator.schedule(window: accessorB.view.window)
+            try await self.settle()
+            try self.requireSetup(state.nsWindow === window, "accessor B attachment completed")
+            accessorA.coordinator.schedule(window: nil)
+            try await self.settle()
+            self.assertAttachedAndParkable(state, window)
+        }
+    }
+
+    func testReplacedAccessorDeinitDoesNotDeliverNilOrHideVisibility() async throws {
+        try await withLifecycleFixture { fixture, _ in
+            let state = try self.registerNormalState(fixture)
+            let window = self.makeHiddenWindow(fixture)
+            var accessorA: AccessorDriver? = self.makeAccessorDriver(for: state)
+            try await self.attachInitially(XCTUnwrap(accessorA), to: window, state: state)
+            var visibilityChanges: [Bool] = []
+            let visibilitySink = state.$isPresentationVisible.dropFirst().sink { visibilityChanges.append($0) }
+            defer { visibilitySink.cancel() }
+            accessorA?.coordinator.schedule(window: nil)
+            let accessorB = self.makeAccessorDriver(for: state)
+            window.contentView = accessorB.view
+            accessorA = nil
+            accessorB.coordinator.schedule(window: accessorB.view.window)
+            var sawDetached = false
+            for _ in 0 ..< 60 {
+                try await Task.sleep(nanoseconds: 5_000_000)
+                if state.nsWindow == nil { sawDetached = true }
+            }
+            XCTAssertFalse(sawDetached, "state.nsWindow was never nil after the replacement")
+            XCTAssertTrue(visibilityChanges.isEmpty, "presentation visibility never changed: \(visibilityChanges)")
+            self.assertAttachedAndParkable(state, window)
+        }
+    }
+
+    private func bareWindowBecomesKey() async throws -> Bool {
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 320, height: 200),
+            styleMask: [.titled, .closable],
+            backing: .buffered,
+            defer: false
+        )
+        window.title = "FM-01 key calibration"
+        window.isReleasedWhenClosed = false
+        defer { window.orderOut(nil) }
+        NSApplication.shared.activate(ignoringOtherApps: true)
+        window.makeKeyAndOrderFront(nil)
+        try await Task.sleep(nanoseconds: 200_000_000)
+        return window.isKeyWindow
+    }
+
+    func testCalibrationBareTitledWindowKeyabilityUnderXCTest() async throws {
+        let becameKey = try await bareWindowBecomesKey()
+        print("CALIBRATION bareTitledWindow.isKeyWindow=\(becameKey)")
+    }
+
+    private func awaitInitializedWorkspace(_ state: WindowState) async throws {
+        let initialized = expectation(description: "workspace initialized")
+        var waiting = true
+        defer { waiting = false }
+        state.workspaceManager.onceInitialized {
+            if waiting {
+                initialized.fulfill()
+            }
+        }
+        await fulfillment(of: [initialized], timeout: 5)
+        guard state.workspaceManager.isInitialized, !state.workspaceManager.isSwitchingWorkspace
+        else { throw FleetFixtureError.notReady }
+        await state.workspaceManager.awaitInitialized()
+    }
+
+    func testShowOnNormallyAttachedWindowRaisesAndKeysIt() async throws {
+        let keyable = try await bareWindowBecomesKey()
+        try await withLifecycleFixture { fixture, _ in
+            let state = fixture.makeState(openRequestID: nil)
+            WindowStatesManager.shared.registerWindowState(state)
+            try await self.awaitInitializedWorkspace(state)
+            let window = self.makeHiddenWindow(fixture)
+            _ = self.hostNatively(state, in: window, counter: NativeAttachCounter())
+            try await self.settle()
+            XCTAssertTrue(state.nsWindow === window, "normal native attach delivered the window before Show")
+
+            let manager = state.workspaceManager
+            let workspace = try XCTUnwrap(manager.activeWorkspaceID)
+            let index = try XCTUnwrap(manager.workspaces.firstIndex { $0.id == workspace })
+            let tab = ComposeTabState(id: UUID())
+            manager.workspaces[index].composeTabs.append(tab)
+            manager.workspaces[index].activeComposeTabID = tab.id
+            state.promptManager.loadComposeTabsFromWorkspace(manager.workspaces[index])
+            let session = AgentModeViewModel.TabSession(tabID: tab.id)
+            session.hasLoadedPersistedState = true
+            session.runState = .idle
+            state.agentModeViewModel.test_installLiveSession(session)
+            let sessionID = UUID()
+            try self.requireSetup(
+                state.agentModeViewModel.test_installPersistentSessionBinding(sessionID: sessionID, on: session) != nil,
+                "session binding installed"
+            )
+
+            window.orderOut(nil)
+            try self.requireSetup(!window.isVisible && !window.isKeyWindow, "fixture window starts hidden")
+            var completedRouteHooks = 0
+            state.test_beforePostActivationReveal = { completedRouteHooks += 1 }
+            defer { state.test_beforePostActivationReveal = nil }
+            let actions = FleetManagerActions(
+                handle: { $0 == state.windowID ? WindowStateFleetHandle(state: state) : nil },
+                parking: FleetParkingCoordinator.shared,
+                requestRefresh: {},
+                notificationCenter: NotificationCenter()
+            )
+            let rowID = UUID()
+            await actions.show(rowID: rowID, windowID: state.windowID, workspaceID: workspace, sessionID: sessionID)
+            try await Task.sleep(nanoseconds: 200_000_000)
+
+            XCTAssertTrue(window.isVisible, "Show ordered the window on screen")
+            if keyable {
+                XCTAssertTrue(window.isKeyWindow, "Show made the window key")
+            } else {
+                XCTAssertTrue(NSApp.orderedWindows.first { fixture.nsWindows.contains($0) } === window, "window is first among this test's ordered windows")
+            }
+            XCTAssertNil(actions.staleMessage(for: rowID), "no stale message")
+            XCTAssertEqual(completedRouteHooks, 1, "real route reached the reveal hook once")
+            XCTAssertEqual(state.workspaceManager.activeWorkspaceID, workspace, "workspace unchanged")
         }
     }
 

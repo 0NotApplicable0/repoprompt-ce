@@ -155,6 +155,11 @@ private struct FleetManagerSectionView: View {
             .padding(.vertical, 8)
             .background(Color.primary.opacity(0.05))
             Divider()
+            if !section.isParked, let message = actions.parkMessage(for: section.windowID) {
+                Text(message).font(.caption).foregroundStyle(.orange)
+                    .padding(.horizontal, 12)
+                    .padding(.bottom, 6)
+            }
             ForEach(Array(section.rows.enumerated()), id: \.element.id) { index, row in
                 if index > 0 { Divider() }
                 FleetManagerRowView(
