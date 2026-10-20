@@ -29,6 +29,7 @@ public final class WorkspaceApprovalManager: ObservableObject {
     private var requestsByID: [UUID: WorkspaceApprovalRequest] = [:]
     private var outstandingRequestIDs: Set<UUID> = []
     private var presenterRegistered = false
+    private var windowlessCreateApproval: (requestID: UUID, alert: NSAlert)?
 
     private init() {
         if let data = UserDefaults.standard.data(forKey: Self.settingsKey),
@@ -117,6 +118,7 @@ public final class WorkspaceApprovalManager: ObservableObject {
         let ids = outstandingRequestIDs
         requestsByID.removeAll()
         outstandingRequestIDs.removeAll()
+        if let pendingRequest { clearPresentedRequestIfMatching(pendingRequest.id) }
         pendingRequest = nil
         presentedTargetWindowID = nil
         isApprovalOverlayVisible = false
@@ -204,10 +206,41 @@ public final class WorkspaceApprovalManager: ObservableObject {
         guard let appRequest = requestsByID[request.id] else { return false }
         pendingRequest = appRequest
         presentedTargetWindowID = livePresentationTarget(for: appRequest.windowID)
+        if appRequest.operation == .createWorkspace, WindowStatesManager.shared.allWindows.isEmpty {
+            return presentWindowlessCreateApproval(appRequest)
+        }
         isApprovalOverlayVisible = true
         bringWindowToFront(windowID: appRequest.windowID)
         if !NSApp.isActive {
             NSApp.requestUserAttention(.criticalRequest)
+        }
+        return true
+    }
+
+    private func presentWindowlessCreateApproval(_ request: WorkspaceApprovalRequest) -> Bool {
+        guard let fleetWindow = NSApp.windows.first(where: {
+            $0.identifier?.rawValue == FleetManagerWindowCoordinator.windowIdentifier
+        }) else {
+            clearPresentedRequestIfMatching(request.id)
+            return false
+        }
+        let alert = NSAlert()
+        alert.messageText = request.summary
+        alert.informativeText = "\(request.clientID)\n\(request.detailedDescription)"
+        alert.addButton(withTitle: "Allow")
+        alert.addButton(withTitle: "Deny")
+        alert.addButton(withTitle: "Always Allow")
+        alert.buttons[1].keyEquivalent = "\u{1b}"
+        windowlessCreateApproval = (request.id, alert)
+        NSApp.activate(ignoringOtherApps: true)
+        fleetWindow.makeKeyAndOrderFront(nil)
+        alert.beginSheetModal(for: fleetWindow) { [weak self] response in
+            Task { @MainActor in
+                guard let manager = self, manager.pendingRequest?.id == request.id else { return }
+                let allow = response == .alertFirstButtonReturn || response == .alertThirdButtonReturn
+                manager.clearPresentedRequestIfMatching(request.id)
+                await manager.broker.resolve(requestID: request.id, approved: allow, alwaysAllow: response == .alertThirdButtonReturn)
+            }
         }
         return true
     }
@@ -221,6 +254,13 @@ public final class WorkspaceApprovalManager: ObservableObject {
         pendingRequest = nil
         presentedTargetWindowID = nil
         isApprovalOverlayVisible = false
+        if let presentation = windowlessCreateApproval, presentation.requestID == requestID {
+            windowlessCreateApproval = nil
+            if presentation.alert.window.sheetParent != nil {
+                NSApp.endSheet(presentation.alert.window, returnCode: NSApplication.ModalResponse.abort.rawValue)
+            }
+            presentation.alert.window.orderOut(nil)
+        }
     }
 
     private func updatePolicyLastUsed(clientID: String) {

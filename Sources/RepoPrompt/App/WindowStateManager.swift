@@ -902,6 +902,18 @@ class WindowStatesManager: ObservableObject {
     private var restoreQueue: [WindowSessionEntry] = []
     private var hasLoadedRestoreSession = false
     private var restorePersistenceGate = WindowSessionRestorePersistenceGate()
+    private var initialWindowRestoreCompletion: (() -> Void)?
+
+    var isInitialWindowRestorePending: Bool {
+        autoRestoreWorkspacesEnabled
+            && !AppLaunchConfiguration.current.suppressesWindowRestore
+            && (!hasLoadedRestoreSession || restorePersistenceGate.isRestoreInProgress)
+    }
+
+    func afterPendingInitialWindowRestore(_ completion: @escaping () -> Void) {
+        guard isInitialWindowRestorePending else { return }
+        initialWindowRestoreCompletion = completion
+    }
 
     /// Why the restore gate became idle, published for automatic oversight restoration.
     ///
@@ -1523,6 +1535,11 @@ class WindowStatesManager: ObservableObject {
     }
 
     private func flushDeferredWindowSessionPersistIfRestoreIdle() {
+        if hasLoadedRestoreSession, !restorePersistenceGate.isRestoreInProgress {
+            let completion = initialWindowRestoreCompletion
+            initialWindowRestoreCompletion = nil
+            completion?()
+        }
         guard let reason = restorePersistenceGate.takeFlushableDeferredReason() else { return }
         persistWindowSession(reason: "deferredDuringRestore:\(reason)")
     }

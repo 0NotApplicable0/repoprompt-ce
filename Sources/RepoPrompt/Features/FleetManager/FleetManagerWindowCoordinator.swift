@@ -392,6 +392,11 @@ final class FleetManagerWindowCoordinator: NSObject, NSWindowDelegate {
     private let present: (NSWindow) -> Void
     private var controller: NSWindowController?
     private var model: FleetRosterModel?
+    private var workspaceCatalog: FleetManagerWorkspaceCatalog?
+    private weak var launchWindowStates: WindowStatesManager?
+    private var didOpenAtLaunch = false
+    private var launchPresentationPending = false
+    private var launchPresentationScheduled = false
 
     var windowForTesting: NSWindow? {
         controller?.window
@@ -422,6 +427,35 @@ final class FleetManagerWindowCoordinator: NSObject, NSWindowDelegate {
 
     func install(into coordinator: FleetParkingCoordinator) {
         coordinator.openFleetManager = { [weak self] in self?.open() }
+    }
+
+    func openAtLaunch(windowStates: WindowStatesManager) {
+        guard !didOpenAtLaunch else { return }
+        didOpenAtLaunch = true
+        launchWindowStates = windowStates
+        launchPresentationPending = true
+        open()
+        windowStates.afterPendingInitialWindowRestore { [weak self] in
+            self?.finishLaunchRestoration()
+        }
+        finishLaunchRestoration()
+    }
+
+    func finishLaunchRestoration() {
+        guard launchPresentationPending, !launchPresentationScheduled,
+              launchWindowStates?.isInitialWindowRestorePending == false
+        else { return }
+        launchPresentationScheduled = true
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            launchPresentationScheduled = false
+            guard launchPresentationPending,
+                  launchWindowStates?.isInitialWindowRestorePending == false,
+                  let window = controller?.window
+            else { return }
+            launchPresentationPending = false
+            present(window)
+        }
     }
 
     func open() {
@@ -455,19 +489,43 @@ final class FleetManagerWindowCoordinator: NSObject, NSWindowDelegate {
         window.identifier = NSUserInterfaceItemIdentifier(Self.windowIdentifier)
         window.tabbingMode = .disallowed
         window.isReleasedWhenClosed = false
-        window.contentViewController = NSHostingController(rootView: FleetManagerView(model: model, actions: actions))
+        let workspaceCatalog = FleetManagerWorkspaceCatalog()
+        let content = FleetManagerView(
+            model: model,
+            actions: actions,
+            workspaceCatalog: workspaceCatalog,
+            workspaceActions: FleetManagerWorkspaceActions()
+        )
+        window.contentViewController = NSHostingController(rootView: FleetManagerWindowRoot(content: content))
+        #if DEBUG
+            let badge = NSHostingView(rootView: DebugBuildToolbarBadge())
+            badge.frame.size = badge.fittingSize
+            let accessory = NSTitlebarAccessoryViewController()
+            accessory.view = badge
+            accessory.layoutAttribute = .right
+            window.addTitlebarAccessoryViewController(accessory)
+        #endif
         window.setFrameAutosaveName(Self.windowIdentifier)
         window.delegate = self
         self.model = model
+        self.workspaceCatalog = workspaceCatalog
         controller = NSWindowController(window: window)
         model.start()
+        workspaceCatalog.start()
         present(window)
     }
 
     func windowWillClose(_ notification: Notification) {
+        launchPresentationPending = false
         model?.stop()
         model = nil
+        workspaceCatalog?.stop()
+        workspaceCatalog = nil
         controller?.window?.delegate = nil
         controller = nil
+    }
+
+    func windowDidBecomeKey(_ notification: Notification) {
+        AppSettingsCommand.installNativeMenuAction()
     }
 }

@@ -140,7 +140,8 @@ class AppDelegate: NSObject, ObservableObject, NSApplicationDelegate {
         let launchConfiguration = AppLaunchConfiguration.current
         ProcessTermination.resetAppTerminationFastPath()
         terminationSignalRouter.install()
-        fleetManagerWindowCoordinator.install(into: FleetParkingCoordinator.shared)
+        Self.configureFleetManagerAtLaunch(fleetManagerWindowCoordinator)
+        AppSettingsCommand.installNotificationRouting()
 
         if launchConfiguration.isUITestSession {
             NSApp.setActivationPolicy(.regular)
@@ -192,6 +193,19 @@ class AppDelegate: NSObject, ObservableObject, NSApplicationDelegate {
     }
 
     // MARK: - Application Lifecycle
+
+    func applicationDidFinishRestoringWindows(_ notification: Notification) {
+        fleetManagerWindowCoordinator.finishLaunchRestoration()
+    }
+
+    static func configureFleetManagerAtLaunch(_ coordinator: FleetManagerWindowCoordinator) {
+        coordinator.install(into: FleetParkingCoordinator.shared)
+        coordinator.openAtLaunch(windowStates: .shared)
+    }
+
+    func applicationShouldOpenUntitledFile(_ sender: NSApplication) -> Bool {
+        false
+    }
 
     func applicationDockMenu(_ sender: NSApplication) -> NSMenu? {
         dockMenuController.makeMenu()

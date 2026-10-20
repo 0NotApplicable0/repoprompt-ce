@@ -108,7 +108,10 @@ struct WorkspaceLandingView: View {
                 WorkspaceChooserResultsView(
                     workspaceManager: workspaceManager,
                     query: .expanded(collection: showTemporaryWorkspaces ? .temporary : .saved, searchText: searchText),
-                    onOpenWorkspace: onOpenWorkspace
+                    onOpenWorkspace: onOpenWorkspace,
+                    onSetLibraryMembership: { workspace, saved in
+                        await workspaceManager.setWorkspaceLibraryMembership(workspace, saved: saved)
+                    }
                 )
             }
             .frame(minHeight: 180, idealHeight: 350, maxHeight: 440)
@@ -189,12 +192,29 @@ struct WorkspaceLandingView: View {
     }
 }
 
-/// Both Landing layouts consume one captured presentation and one production query.
-struct WorkspaceChooserResultsView: View {
-    @ObservedObject var workspaceManager: WorkspaceManagerViewModel
+@MainActor
+protocol WorkspaceChooserSource: ObservableObject {
+    var workspaceChooserPresentation: WorkspaceChooserPresentation { get }
+    func retryWorkspaceChooser()
+    #if DEBUG
+        func didConsumeWorkspaceChooserForTesting(_ value: WorkspaceChooserConsumption)
+    #endif
+}
+
+extension WorkspaceManagerViewModel: WorkspaceChooserSource {}
+
+#if DEBUG
+    extension WorkspaceChooserSource {
+        func didConsumeWorkspaceChooserForTesting(_ value: WorkspaceChooserConsumption) {}
+    }
+#endif
+
+struct WorkspaceChooserResultsView<Source: WorkspaceChooserSource>: View {
+    @ObservedObject var workspaceManager: Source
     @ObservedObject private var fontScale = FontScaleManager.shared
     let query: WorkspaceChooserQuery
     let onOpenWorkspace: (WorkspaceModel) -> Void
+    var onSetLibraryMembership: ((WorkspaceModel, Bool) async -> Void)?
 
     var body: some View {
         let captured = workspaceManager.workspaceChooserPresentation
@@ -245,10 +265,10 @@ struct WorkspaceChooserResultsView: View {
                                     onOpenWorkspace(workspace)
                                 }
                                 .contextMenu {
-                                    if !workspace.isEphemeral {
+                                    if !workspace.isEphemeral, let onSetLibraryMembership {
                                         Button(workspace.isTemporaryWorkspace ? "Keep in Saved Workspaces" : "Move to Temporary Workspaces") {
                                             Task {
-                                                await workspaceManager.setWorkspaceLibraryMembership(workspace, saved: workspace.isTemporaryWorkspace)
+                                                await onSetLibraryMembership(workspace, workspace.isTemporaryWorkspace)
                                             }
                                         }
                                     }

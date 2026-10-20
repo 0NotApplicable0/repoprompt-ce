@@ -1,38 +1,52 @@
 import SwiftUI
 
+struct FleetManagerWindowRoot: View {
+    let content: FleetManagerView
+
+    var body: some View {
+        content.debugBuildWindowEdge()
+    }
+}
+
 struct FleetManagerView: View {
     @ObservedObject var model: FleetRosterModel
     @ObservedObject var actions: FleetManagerActions
+    let workspaceCatalog: FleetManagerWorkspaceCatalog
+    let workspaceActions: FleetManagerWorkspaceActions
     @State private var collapsed: Set<FleetRosterDisplay.Occurrence> = []
 
     var body: some View {
-        ScrollView {
-            // The roster publishes only when it changes; age text must still re-render every tick.
-            TimelineView(.periodic(from: .now, by: FleetRosterModel.tickInterval)) { context in
-                LazyVStack(alignment: .leading, spacing: 12) {
-                    if model.roster.sections.isEmpty {
-                        let empty = FleetRosterDisplay.emptyState()
-                        VStack(spacing: 4) {
-                            Text(empty.title).font(.headline)
-                            Text(empty.message).foregroundStyle(.secondary)
+        VStack(spacing: 0) {
+            ScrollView {
+                TimelineView(.periodic(from: .now, by: FleetRosterModel.tickInterval)) { context in
+                    LazyVStack(alignment: .leading, spacing: 12) {
+                        if model.roster.sections.isEmpty {
+                            let empty = FleetRosterDisplay.emptyState()
+                            VStack(spacing: 4) {
+                                Text(empty.title).font(.headline)
+                                Text(empty.message).foregroundStyle(.secondary)
+                            }
+                            .frame(maxWidth: .infinity)
+                            .padding(.top, 48)
+                        } else {
+                            FleetManagerSummaryView(summary: FleetRosterDisplay.summary(model.roster.sections))
                         }
-                        .frame(maxWidth: .infinity)
-                        .padding(.top, 48)
-                    } else {
-                        FleetManagerSummaryView(summary: FleetRosterDisplay.summary(model.roster.sections))
+                        ForEach(model.roster.sections, id: \.windowID) { section in
+                            FleetManagerSectionView(
+                                section: section,
+                                sections: model.roster.sections,
+                                actions: actions,
+                                collapsed: $collapsed,
+                                now: context.date
+                            )
+                        }
                     }
-                    ForEach(model.roster.sections, id: \.windowID) { section in
-                        FleetManagerSectionView(
-                            section: section,
-                            sections: model.roster.sections,
-                            actions: actions,
-                            collapsed: $collapsed,
-                            now: context.date
-                        )
-                    }
+                    .padding(16)
                 }
-                .padding(16)
             }
+            Divider()
+            FleetManagerWorkspacesView(workspaceManager: workspaceCatalog, actions: workspaceActions)
+                .padding(16)
         }
         .frame(minWidth: 700, minHeight: 360)
         .popover(isPresented: Binding(

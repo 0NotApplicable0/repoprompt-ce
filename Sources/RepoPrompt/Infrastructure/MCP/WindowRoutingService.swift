@@ -253,10 +253,26 @@ final class WindowRoutingService: Service {
         )
     }
 
-    private func loadWorkspaceDiskSnapshot() async throws -> [WorkspaceModel] {
+    private func loadWindowlessWorkspaceInventory(includeHidden: Bool) async throws -> [WorkspaceModel] {
+        let runtime = AppDomainRuntimeComposition.shared.runtime
+        try await runtime.start()
+        let snapshot = await runtime.workspaceStore.snapshot()
+        guard snapshot.isBootstrapped, snapshot.unavailableWorkspaceIDs.isEmpty else {
+            throw MCPError.internalError("Workspace inventory is unavailable. Retry after workspace recovery completes.")
+        }
+        let workspaces = try snapshot.workspaces.map {
+            try WorkspaceManagerViewModel.decodeDomainWorkspaceCatalogRecordBytes($0)
+        }
+        return Self.workspaceInventoryModels(workspaces, authorityIncompleteWorkspaceIDs: [], includeHidden: includeHidden)
+    }
+
+    private func loadWorkspaceDiskSnapshot(allowWindowless: Bool = false) async throws -> [WorkspaceModel] {
         guard let referenceManager = await MainActor.run(body: {
             self.windowStates.allWindows.first?.workspaceManager
         }) else {
+            if allowWindowless {
+                return try await loadWindowlessWorkspaceInventory(includeHidden: true)
+            }
             throw MCPError.invalidParams("No windows available to load workspace list. Open at least one window first.")
         }
         return await loadWorkspaceInventorySnapshot(
@@ -343,7 +359,7 @@ final class WindowRoutingService: Service {
     }
 
     private func resolveWorkspaceForSwitch(rawWorkspaceParam: String, includeHidden: Bool) async throws -> WorkspaceModel {
-        let diskWorkspaces = try await loadWorkspaceDiskSnapshot()
+        let diskWorkspaces = try await loadWorkspaceDiskSnapshot(allowWindowless: true)
         return try Self.resolveWorkspaceReference(
             rawWorkspaceParam,
             in: diskWorkspaces,
@@ -914,14 +930,12 @@ final class WindowRoutingService: Service {
         kind: WorkingDirsWorkspaceMatchKind
     ) async throws -> [WorkspaceMatch] {
         let windows = windowStates.allWindows
-        guard let inventoryWindow = windows.first else {
-            throw MCPError.invalidParams("No windows available to load workspace list. Open at least one window first.")
-        }
         let activeWindowSnapshots = Self.activeWorkspaceSnapshots(from: windows)
-        let diskWorkspaces = await loadWorkspaceInventorySnapshot(
-            from: inventoryWindow.workspaceManager,
-            includeHidden: false
-        )
+        let diskWorkspaces: [WorkspaceModel] = if let inventoryWindow = windows.first {
+            await loadWorkspaceInventorySnapshot(from: inventoryWindow.workspaceManager, includeHidden: false)
+        } else {
+            try await loadWindowlessWorkspaceInventory(includeHidden: false)
+        }
         return Self.collapsedWorkspaceMatches(
             normalizedWorkingDirs: normalizedWorkingDirs,
             kind: kind,
@@ -937,14 +951,12 @@ final class WindowRoutingService: Service {
         kind: WorkingDirsWorkspaceMatchKind
     ) async throws -> [WorkspaceMatch] {
         let windows = windowStates.allWindows
-        guard let inventoryWindow = windows.first else {
-            throw MCPError.invalidParams("No windows available to load workspace list. Open at least one window first.")
-        }
         let activeWindowSnapshots = Self.activeWorkspaceSnapshots(from: windows)
-        let diskWorkspaces = await loadWorkspaceInventorySnapshot(
-            from: inventoryWindow.workspaceManager,
-            includeHidden: false
-        )
+        let diskWorkspaces: [WorkspaceModel] = if let inventoryWindow = windows.first {
+            await loadWorkspaceInventorySnapshot(from: inventoryWindow.workspaceManager, includeHidden: false)
+        } else {
+            try await loadWindowlessWorkspaceInventory(includeHidden: false)
+        }
         return Self.collapsedWorkspaceMatches(
             normalizedWorkingDirs: normalizedWorkingDirs,
             kind: kind,
@@ -1167,7 +1179,7 @@ final class WindowRoutingService: Service {
     private func resolveWorkspaceApprovalWindow(
         requestedWindowID: Int?,
         openInNewWindow: Bool
-    ) async throws -> WindowState {
+    ) async throws -> WindowState? {
         let windows = windowStates.allWindows
         let focusedWindowID = windows.first(where: { $0.isCurrentlyFocused })?.windowID
         let approvalWindow: WindowState? = {
@@ -1189,7 +1201,7 @@ final class WindowRoutingService: Service {
         if !openInNewWindow, requestedWindowID == nil, windows.count != 1 {
             throw MCPError.invalidParams(Self.bindContextWindowSelectionMessage)
         }
-        guard let approvalWindow else {
+        if approvalWindow == nil, !(openInNewWindow && windows.isEmpty && requestedWindowID == nil) {
             throw MCPError.invalidParams("No windows available to create workspace. Open at least one window first.")
         }
         return approvalWindow
@@ -1609,10 +1621,11 @@ final class WindowRoutingService: Service {
         }
 
         let approvalWindow = try await resolveWorkspaceApprovalWindow(requestedWindowID: windowID, openInNewWindow: true)
-        let existingWorkspaces = await loadWorkspaceInventorySnapshot(
-            from: approvalWindow.workspaceManager,
-            includeHidden: true
-        )
+        let existingWorkspaces: [WorkspaceModel] = if let approvalWindow {
+            await loadWorkspaceInventorySnapshot(from: approvalWindow.workspaceManager, includeHidden: true)
+        } else {
+            try await loadWindowlessWorkspaceInventory(includeHidden: true)
+        }
         let workspaceName = derivedWorkspaceName(
             normalizedWorkingDirs: normalizedWorkingDirs,
             creationNameHint: tabName,
@@ -1622,7 +1635,7 @@ final class WindowRoutingService: Service {
         let approvalResult = await WorkspaceApprovalManager.shared.requestCreateWorkspaceApproval(
             clientID: clientID,
             workspaceName: workspaceName,
-            windowID: approvalWindow.windowID
+            windowID: approvalWindow?.windowID
         )
         guard approvalResult.isApproved else {
             throw MCPError.invalidRequest("Workspace creation was denied by the user.")
@@ -2441,35 +2454,10 @@ final class WindowRoutingService: Service {
 
                     // Determine target window for approval
                     let targetWindowIDArg = args["window_id"]?.intValue
-                    let (windows, focusedWindowID) = await MainActor.run { () -> ([WindowState], Int?) in
-                        let allWindows = routingService.windowStates.allWindows
-                        let focusedID = allWindows.first(where: { $0.isCurrentlyFocused })?.windowID
-                        return (allWindows, focusedID)
-                    }
-
-                    let approvalWindowOpt: WindowState? = {
-                        if let wid = targetWindowIDArg {
-                            return windows.first(where: { $0.windowID == wid })
-                        }
-                        if openInNewWindow {
-                            if let focusedID = focusedWindowID {
-                                return windows.first(where: { $0.windowID == focusedID })
-                            }
-                            return windows.last ?? windows.first
-                        }
-                        return windows.only
-                    }()
-
-                    if let wid = targetWindowIDArg, approvalWindowOpt == nil {
-                        let validIDs = windows.map { String($0.windowID) }.joined(separator: ", ")
-                        throw MCPError.invalidParams("Unknown window_id \(wid). Valid window IDs: \(validIDs)")
-                    }
-                    if !openInNewWindow, targetWindowIDArg == nil, windows.count != 1 {
-                        throw MCPError.invalidParams(Self.bindContextWindowSelectionMessage)
-                    }
-                    guard let approvalWindow = approvalWindowOpt else {
-                        throw MCPError.invalidParams("No windows available to create workspace. Open at least one window first.")
-                    }
+                    let approvalWindow = try await routingService.resolveWorkspaceApprovalWindow(
+                        requestedWindowID: targetWindowIDArg,
+                        openInNewWindow: openInNewWindow
+                    )
 
                     // Get client ID for approval
                     let clientID = invocationContext.metadata.clientName ?? "unknown-client"
@@ -2478,7 +2466,7 @@ final class WindowRoutingService: Service {
                     let approvalResult = await WorkspaceApprovalManager.shared.requestCreateWorkspaceApproval(
                         clientID: clientID,
                         workspaceName: workspaceName,
-                        windowID: approvalWindow.windowID
+                        windowID: approvalWindow?.windowID
                     )
 
                     guard approvalResult.isApproved else {
@@ -2540,6 +2528,9 @@ final class WindowRoutingService: Service {
                         }
                     }
 
+                    guard let approvalWindow else {
+                        throw MCPError.invalidParams("No windows available to create workspace. Open at least one window first.")
+                    }
                     let created = try await Self.createWorkspaceForRouting(
                         workspaceManager: approvalWindow.workspaceManager,
                         name: workspaceName,

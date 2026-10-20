@@ -1,8 +1,10 @@
 import Combine
 import Foundation
+import MCP
 @_spi(TestSupport) @testable import RepoPromptApp
 import RepoPromptSettingsCore
 import RepoPromptShared
+import SwiftUI
 import XCTest
 
 final class FleetRosterModelTests: XCTestCase {
@@ -755,6 +757,243 @@ final class FleetRosterDisplayTests: XCTestCase {
 }
 
 @MainActor
+final class FleetManagerWorkspacesTests: XCTestCase {
+    private var previousAutoStart = false
+    private var previousStorage: String?
+    private var storageRoot: URL?
+    private var states: [WindowState] = []
+    private var coordinators: [FleetManagerWindowCoordinator] = []
+
+    override func setUp() async throws {
+        try await super.setUp()
+        let sandbox = try XCTUnwrap(ProcessInfo.processInfo.environment["REPOPROMPT_TEST_SANDBOX_ROOT"])
+        let prefix = URL(fileURLWithPath: sandbox).resolvingSymlinksInPath().path + "/"
+        try XCTSkipUnless(AppProfileLocations.current.applicationSupportRoot.resolvingSymlinksInPath().path.hasPrefix(prefix))
+        _ = NSApplication.shared
+        previousAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
+        previousStorage = UserDefaults.standard.string(forKey: "GlobalCustomStorageURL")
+        let root = AppProfileLocations.current.applicationSupportRoot.appendingPathComponent("FleetWorkspaces-\(UUID())", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        storageRoot = root
+        UserDefaults.standard.set(AppProfileLocations.current.customWorkspaceDirectory(selectedDirectory: root).path, forKey: "GlobalCustomStorageURL")
+        GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)
+    }
+
+    override func tearDown() async throws {
+        for coordinator in coordinators {
+            coordinator.windowForTesting?.close()
+        }
+        coordinators.removeAll()
+        for state in states {
+            state.beginClose()
+            await state.tearDown()
+        }
+        states.removeAll()
+        await WorkspaceDiskWriterComposition.processWriter.removeAllForTesting()
+        if let storageRoot {
+            GlobalSettingsStore.shared.setMCPAutoStart(previousAutoStart, commit: false)
+            if let previousStorage { UserDefaults.standard.set(previousStorage, forKey: "GlobalCustomStorageURL") }
+            else { UserDefaults.standard.removeObject(forKey: "GlobalCustomStorageURL") }
+            try FileManager.default.removeItem(at: storageRoot)
+        }
+        storageRoot = nil
+        try await super.tearDown()
+    }
+
+    func testFleetShowsDebugBadgeInDebugBuilds() throws {
+        let coordinator = FleetManagerWindowCoordinator(present: { _ in })
+        coordinators.append(coordinator)
+        coordinator.open()
+        let window = try XCTUnwrap(coordinator.windowForTesting)
+        XCTAssertEqual(window.title, "Fleet Manager")
+        XCTAssertTrue(window.titlebarAccessoryViewControllers.contains {
+            $0.view is NSHostingView<DebugBuildToolbarBadge>
+        }, "Fleet must install the same titlebar badge as workspace windows")
+
+        XCTAssertTrue(
+            window.contentViewController is NSHostingController<FleetManagerWindowRoot>,
+            "Fleet must host the root that installs the shared DEBUG window-edge rule"
+        )
+    }
+
+    func testRecentWorkspacesMatchChooserOrderAndLimit() async throws {
+        let state = await makeState()
+        let manager = state.workspaceManager
+        var saved = (1 ... 7).map { index in
+            var workspace = WorkspaceModel(name: "Saved \(index)", repoPaths: [], isSavedWorkspace: true)
+            workspace.lastUsed = Date(timeIntervalSince1970: TimeInterval(index))
+            return workspace
+        }
+        var hidden = WorkspaceModel(name: "Hidden", repoPaths: [], isHiddenInMenus: true, isSavedWorkspace: true)
+        hidden.lastUsed = Date(timeIntervalSince1970: 100)
+        var temporary = WorkspaceModel(name: "Temporary", repoPaths: [], isSavedWorkspace: false)
+        temporary.lastUsed = Date(timeIntervalSince1970: 101)
+        var system = WorkspaceModel(name: "System", repoPaths: [], isSystemWorkspace: true)
+        system.lastUsed = Date(timeIntervalSince1970: 102)
+        saved.append(contentsOf: [hidden, temporary, system])
+        manager.workspaces = saved
+        let probe = OpenProbe(destination: state)
+        let actions = makeActions(probe)
+        var consumed: [WorkspaceChooserConsumption] = []
+        manager.setWorkspaceChooserConsumptionHandlerForTesting { consumed.append($0) }
+        defer { manager.setWorkspaceChooserConsumptionHandlerForTesting(nil) }
+        let chooser = NSHostingView(rootView: WorkspaceLandingView(
+            workspaceManager: manager, onOpenWorkspace: { _ in }, onManageWorkspaces: {}, onSelectFolder: {}
+        ))
+        chooser.frame = NSRect(x: 0, y: 0, width: 400, height: 600)
+        chooser.layoutSubtreeIfNeeded()
+        let chooserRows = try XCTUnwrap(consumed.last)
+        consumed.removeAll()
+        let fleet = hostSection(manager: manager, actions: actions)
+        let fleetRows = try XCTUnwrap(consumed.last)
+        let expected = Array(saved[2 ... 6].reversed().map(\.id))
+
+        XCTAssertEqual(fleetRows.kind, .ready)
+        XCTAssertEqual(fleetRows.orderedIDs, expected)
+        XCTAssertEqual(fleetRows.orderedIDs, chooserRows.orderedIDs)
+        XCTAssertEqual(fleetRows.query, chooserRows.query)
+        XCTAssertEqual(fleetRows.source, chooserRows.source)
+        XCTAssertEqual(fleetRows.orderedIDs.count, 5)
+        XCTAssertEqual(probe.openCount, 0)
+        withExtendedLifetime((chooser, fleet)) {}
+    }
+
+    func testRecentRowFocusesWindowAlreadyShowingWorkspace() async throws {
+        let state = await makeState(authorityBacked: true)
+        let workspace = try await savedWorkspace(in: state, name: "Already open")
+        let switched = await state.workspaceManager.requestWorkspaceSwitch(to: workspace, saveState: false)
+        XCTAssertTrue(switched.didSwitch)
+        let probe = OpenProbe(destination: state)
+        probe.windows = [state]
+        let actions = makeActions(probe)
+
+        try await actions.openRecentWorkspace(workspace)
+
+        XCTAssertEqual(probe.revealed, [state.windowID])
+        XCTAssertEqual(probe.openCount, 0)
+        XCTAssertEqual(state.workspaceManager.activeWorkspaceID, workspace.id)
+    }
+
+    func testRecentRowOpensNewWindowWhenNoneShowsWorkspace() async throws {
+        let destination = await makeState(authorityBacked: true)
+        let other = await makeState()
+        let workspace = try await savedWorkspace(in: destination, name: "Recent")
+        let fallback = destination.workspaceManager.getOrCreateSystemWorkspace()
+        let otherWorkspace = other.workspaceManager.activeWorkspaceID
+        for hasOtherWindow in [false, true] {
+            _ = await destination.workspaceManager.requestWorkspaceSwitch(to: fallback, saveState: false)
+            XCTAssertEqual(destination.workspaceManager.activeWorkspaceID, fallback.id)
+            let probe = OpenProbe(destination: destination)
+            probe.windows = hasOtherWindow ? [other] : []
+            let actions = makeActions(probe)
+
+            try await actions.openRecentWorkspace(workspace)
+
+            XCTAssertEqual(probe.openCount, 1)
+            XCTAssertTrue(probe.revealed.isEmpty)
+            XCTAssertEqual(destination.workspaceManager.activeWorkspaceID, workspace.id)
+            XCTAssertEqual(other.workspaceManager.activeWorkspaceID, otherWorkspace)
+        }
+    }
+
+    func testAddWorkspaceUsesOpenFolderFlow() async throws {
+        let destination = await makeState()
+        let root = try XCTUnwrap(storageRoot).appendingPathComponent("Chosen Folder", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let probe = OpenProbe(destination: destination)
+        probe.selection = root
+        let actions = makeActions(probe)
+
+        try await actions.addWorkspace()
+
+        XCTAssertEqual(probe.pickerTitles, ["Open Folder"])
+        XCTAssertEqual(probe.pickerMessages, ["Choose a folder to open. If it matches an existing workspace root, that workspace will reopen."])
+        XCTAssertEqual(probe.openCount, 1)
+        let opened = try XCTUnwrap(destination.workspaceManager.activeWorkspace)
+        XCTAssertEqual(opened.repoPaths, [root.path])
+        XCTAssertFalse(opened.isSystemWorkspace)
+        XCTAssertFalse(opened.isEphemeral)
+        let workspaceIDs = destination.workspaceManager.workspaces.map(\.id)
+        probe.selection = nil
+
+        try await actions.addWorkspace()
+
+        XCTAssertEqual(probe.pickerTitles.count, 2)
+        XCTAssertEqual(probe.openCount, 1, "Cancel must not request another workspace window")
+        XCTAssertEqual(destination.workspaceManager.activeWorkspaceID, opened.id)
+        XCTAssertEqual(destination.workspaceManager.workspaces.map(\.id), workspaceIDs)
+    }
+
+    func testFleetWorkspaceSectionOpensNothingUntilClicked() async {
+        let state = await makeState()
+        let probe = OpenProbe(destination: state)
+        let actions = makeActions(probe)
+        let registered = WindowStatesManager.shared.allWindows.map(\.windowID)
+        let active = state.workspaceManager.activeWorkspaceID
+        let host = hostSection(manager: state.workspaceManager, actions: actions)
+
+        XCTAssertNil(host.window)
+        XCTAssertEqual(probe.openCount, 0)
+        XCTAssertTrue(probe.revealed.isEmpty)
+        XCTAssertTrue(probe.pickerTitles.isEmpty)
+        XCTAssertEqual(WindowStatesManager.shared.allWindows.map(\.windowID), registered)
+        XCTAssertEqual(state.workspaceManager.activeWorkspaceID, active)
+        withExtendedLifetime(host) {}
+    }
+
+    private func makeState(authorityBacked: Bool = false) async -> WindowState {
+        let state = authorityBacked ? WindowState(domainRuntime: AppDomainRuntimeComposition.shared.runtime) : WindowState()
+        states.append(state)
+        await state.workspaceManager.awaitInitialized()
+        return state
+    }
+
+    private func savedWorkspace(in state: WindowState, name: String) async throws -> WorkspaceModel {
+        let root = try XCTUnwrap(storageRoot).appendingPathComponent(name, isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let creation = try state.workspaceManager.createPersistentWorkspace(name: name, repoPaths: [root.path], savedInLibrary: true)
+        return try await creation.publishedWorkspace()
+    }
+
+    private func hostSection(manager: WorkspaceManagerViewModel, actions: FleetManagerWorkspaceActions) -> NSHostingView<FleetManagerWorkspacesView<WorkspaceManagerViewModel>> {
+        let host = NSHostingView(rootView: FleetManagerWorkspacesView(workspaceManager: manager, actions: actions))
+        host.frame = NSRect(x: 0, y: 0, width: 700, height: 300)
+        host.layoutSubtreeIfNeeded()
+        return host
+    }
+
+    private func makeActions(_ probe: OpenProbe) -> FleetManagerWorkspaceActions {
+        FleetManagerWorkspaceActions(
+            windows: { probe.windows },
+            openWindow: {
+                probe.openCount += 1
+                return probe.destination
+            },
+            revealWindow: { probe.revealed.append($0.windowID) },
+            pickFolder: { title, message in
+                probe.pickerTitles.append(title)
+                probe.pickerMessages.append(message)
+                return probe.selection
+            }
+        )
+    }
+
+    private final class OpenProbe {
+        let destination: WindowState
+        var windows: [WindowState] = []
+        var openCount = 0
+        var revealed: [Int] = []
+        var selection: URL?
+        var pickerTitles: [String] = []
+        var pickerMessages: [String] = []
+
+        init(destination: WindowState) {
+            self.destination = destination
+        }
+    }
+}
+
+@MainActor
 final class FleetManagerWindowTests: XCTestCase {
     private var previousAutoStart = false
     private var previousHUDActive: (() -> Bool)?
@@ -817,8 +1056,8 @@ final class FleetManagerWindowTests: XCTestCase {
         FleetCommandWindowCandidate(windowID: id, isFocused: focused, isParked: parked)
     }
 
-    private func makeLiveWindow() async throws -> WindowState {
-        let state = WindowState()
+    private func makeLiveWindow(authorityBacked: Bool = false) async throws -> WindowState {
+        let state = authorityBacked ? WindowState(domainRuntime: AppDomainRuntimeComposition.shared.runtime) : WindowState()
         windows.append(state)
         WindowStatesManager.shared.registerWindowState(state)
         await state.workspaceManager.awaitInitialized()
@@ -1136,7 +1375,7 @@ final class FleetManagerWindowTests: XCTestCase {
     private var sources: [FleetCountingSource] = []
     private var windowSnapshots: [FleetRosterWindowSnapshot] = []
 
-    private func makeCoordinator(parking: FleetParkingControlling? = nil) -> FleetManagerWindowCoordinator {
+    private func makeCoordinator(parking: FleetParkingControlling? = nil, present: @escaping (NSWindow) -> Void = { _ in }) -> FleetManagerWindowCoordinator {
         let coordinator = FleetManagerWindowCoordinator(
             makeSource: { [unowned self] in
                 let source = FleetCountingSource()
@@ -1146,7 +1385,7 @@ final class FleetManagerWindowTests: XCTestCase {
             },
             makeTicker: { FleetManualTicker() },
             parking: parking ?? FleetParkingCoordinator.shared,
-            present: { _ in }
+            present: present
         )
         coordinators.append(coordinator)
         return coordinator
@@ -1176,6 +1415,344 @@ final class FleetManagerWindowTests: XCTestCase {
             windowID: window, workspaceID: workspace, workspaceName: "W\(window)",
             isSystemWorkspace: false, isClosing: false, sessions: []
         )
+    }
+
+    func testLaunchOpensFleetManagerInFront() {
+        var presented: [NSWindow] = []
+        let coordinator = makeCoordinator(present: { presented.append($0) })
+        AppDelegate.configureFleetManagerAtLaunch(coordinator)
+        XCTAssertNotNil(coordinator.windowForTesting)
+        XCTAssertTrue(presented.last === coordinator.windowForTesting)
+        XCTAssertEqual(presented.count, 1)
+        AppDelegate.configureFleetManagerAtLaunch(coordinator)
+        XCTAssertEqual(fleetWindowCount(), 1)
+        XCTAssertEqual(sources.count, 1)
+    }
+
+    private final class LaunchWindowOrder {
+        var frontToBack: [NSWindow] = []
+        var events: [String] = []
+
+        func makeKeyAndOrderFront(_ window: NSWindow, event: String) {
+            frontToBack.removeAll { $0 === window }
+            frontToBack.insert(window, at: 0)
+            events.append(event)
+        }
+    }
+
+    private func appearLaunchWorkspace(order: LaunchWindowOrder, name: String) -> WindowState {
+        let state = WindowState(domainRuntime: AppDomainRuntimeComposition.shared.runtime)
+        windows.append(state)
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 640, height: 420),
+            styleMask: [.titled, .closable, .resizable], backing: .buffered, defer: false
+        )
+        window.isReleasedWhenClosed = false
+        window.tabbingMode = .disallowed
+        nsWindows.append(window)
+        state.attachWindow(window)
+        order.makeKeyAndOrderFront(window, event: "appear:\(name)")
+        WindowStatesManager.shared.registerWindowState(state)
+        return state
+    }
+
+    private func drainLaunchOrdering() async {
+        await withCheckedContinuation { continuation in
+            DispatchQueue.main.async { continuation.resume() }
+        }
+    }
+
+    func testFleetManagerStaysFrontAfterLaunchWindowsAppear() async throws {
+        let manager = WindowStatesManager.shared
+        let previousRestore = manager.autoRestoreWorkspacesEnabled
+        manager.autoRestoreWorkspacesEnabled = true
+        defer { manager.autoRestoreWorkspacesEnabled = previousRestore }
+        let sessionURL = WindowSessionStore.sessionFileURL()
+        let previousSession = try? Data(contentsOf: sessionURL)
+        await manager.persistWindowSessionImmediately(reason: "fleetLaunchFixture")
+        addTeardownBlock {
+            await manager.persistWindowSessionImmediately(reason: "fleetLaunchFixtureCleanup")
+            if let previousSession {
+                try previousSession.write(to: sessionURL, options: .atomic)
+            } else if FileManager.default.fileExists(atPath: sessionURL.path) {
+                try FileManager.default.removeItem(at: sessionURL)
+            }
+        }
+        let entry = WindowSessionEntry(
+            windowKind: .standard, workspaceID: nil, workspaceName: nil,
+            isSystemWorkspace: true, isEphemeral: false, primaryRepoPath: nil,
+            lastFocused: false, workspaceInstanceNumber: nil
+        )
+        await WindowSessionDiskWriter(fileURL: sessionURL).writeImmediately(
+            WindowSessionSnapshot(version: 4, windows: [entry, entry])
+        )
+        let order = LaunchWindowOrder()
+        let settled = expectation(description: "Fleet ordered front after both restored windows appear")
+        let coordinator = makeCoordinator(present: {
+            order.makeKeyAndOrderFront($0, event: "fleet:key-front")
+            if order.events.contains("appear:last") { settled.fulfill() }
+        })
+
+        manager.loadWindowRestoreSessionIfNeeded()
+        AppDelegate.configureFleetManagerAtLaunch(coordinator)
+        let fleet = try XCTUnwrap(coordinator.windowForTesting)
+        coordinator.finishLaunchRestoration()
+        let first = appearLaunchWorkspace(order: order, name: "first")
+        await first.workspaceManager.awaitInitialized()
+        await drainLaunchOrdering()
+        XCTAssertTrue(manager.isInitialWindowRestorePending)
+        XCTAssertEqual(order.events.count(where: { $0 == "fleet:key-front" }), 1)
+        let last = appearLaunchWorkspace(order: order, name: "last")
+        await fulfillment(of: [settled], timeout: 10)
+
+        let firstWindow = try XCTUnwrap(first.nsWindow)
+        let lastWindow = try XCTUnwrap(last.nsWindow)
+        XCTAssertEqual(order.frontToBack.map(ObjectIdentifier.init), [fleet, lastWindow, firstWindow].map(ObjectIdentifier.init))
+        let lastAppearance = try XCTUnwrap(order.events.lastIndex(of: "appear:last"))
+        let finalFleetRequest = try XCTUnwrap(order.events.lastIndex(of: "fleet:key-front"))
+        XCTAssertGreaterThan(finalFleetRequest, lastAppearance)
+        XCTAssertEqual(order.events.suffix(from: lastAppearance + 1).count(where: { $0 == "fleet:key-front" }), 1)
+        XCTAssertTrue(manager.allWindows.contains { $0 === first })
+        XCTAssertTrue(manager.allWindows.contains { $0 === last })
+        XCTAssertFalse(manager.allWindows.contains { $0.nsWindow === fleet })
+    }
+
+    func testUserActivatedWorkspaceWindowAfterLaunchComesFront() async throws {
+        let order = LaunchWindowOrder()
+        let coordinator = makeCoordinator(present: { order.makeKeyAndOrderFront($0, event: "fleet:key-front") })
+        AppDelegate.configureFleetManagerAtLaunch(coordinator)
+        coordinator.finishLaunchRestoration()
+        let workspace = appearLaunchWorkspace(order: order, name: "workspace")
+        await drainLaunchOrdering()
+        let window = try XCTUnwrap(workspace.nsWindow)
+        let fleet = try XCTUnwrap(coordinator.windowForTesting)
+
+        order.makeKeyAndOrderFront(window, event: "user:key-front")
+        NotificationCenter.default.post(name: NSWindow.didBecomeKeyNotification, object: window)
+        await drainLaunchOrdering()
+
+        XCTAssertEqual(order.frontToBack.map(ObjectIdentifier.init), [window, fleet].map(ObjectIdentifier.init))
+        XCTAssertEqual(order.events.last, "user:key-front")
+    }
+
+    func testLaunchWithNothingToRestoreOpensOnlyFleetManager() {
+        let manager = WindowStatesManager.shared
+        let previousRestore = manager.autoRestoreWorkspacesEnabled
+        defer { manager.autoRestoreWorkspacesEnabled = previousRestore }
+        let delegate: NSApplicationDelegate = AppDelegate()
+        let coordinator = makeCoordinator()
+        XCTAssertTrue(manager.allWindows.isEmpty)
+
+        for restoreEnabled in [false, true] {
+            manager.autoRestoreWorkspacesEnabled = restoreEnabled
+            AppDelegate.configureFleetManagerAtLaunch(coordinator)
+            let requestsDefaultWindow = delegate.applicationShouldOpenUntitledFile?(NSApplication.shared) ?? true
+
+            XCTAssertFalse(requestsDefaultWindow, "Launch must not request a default workspace window; restore=\(restoreEnabled)")
+            XCTAssertTrue(manager.allWindows.isEmpty)
+            XCTAssertNotNil(coordinator.windowForTesting)
+            XCTAssertEqual(fleetWindowCount(), 1)
+        }
+    }
+
+    func testLaunchRestoresWorkspaceWindowsBehindFleet() async throws {
+        let first = try await makeLiveWindow()
+        let second = try await makeLiveWindow()
+        XCTAssertTrue(FleetParkingCoordinator.shared.park(windowID: second.windowID, reason: .operator))
+        let before = WindowStatesManager.shared.allWindows.map(\.windowID)
+        let workspaces = [first, second].map(\.workspaceManager.activeWorkspaceID)
+        var presented: [NSWindow] = []
+        let coordinator = makeCoordinator(present: { presented.append($0) })
+        AppDelegate.configureFleetManagerAtLaunch(coordinator)
+        XCTAssertEqual(WindowStatesManager.shared.allWindows.map(\.windowID), before)
+        XCTAssertEqual([first, second].map(\.workspaceManager.activeWorkspaceID), workspaces)
+        XCTAssertTrue(FleetParkingCoordinator.shared.isParked(windowID: second.windowID))
+        XCTAssertFalse(FleetParkingCoordinator.shared.isParked(windowID: first.windowID))
+        XCTAssertEqual(presented.count, 1)
+        XCTAssertTrue(presented.last === coordinator.windowForTesting)
+    }
+
+    func testLaunchFleetDoesNotChangeAllWindowsCount() {
+        let before = WindowStatesManager.shared.allWindows.map(\.windowID)
+        let coordinator = makeCoordinator()
+        AppDelegate.configureFleetManagerAtLaunch(coordinator)
+        AppDelegate.configureFleetManagerAtLaunch(coordinator)
+        XCTAssertEqual(WindowStatesManager.shared.allWindows.map(\.windowID), before)
+        XCTAssertNil(WindowStatesManager.shared.latestWindowState)
+    }
+
+    private func registerProgrammaticWindow(requestID: UUID?) {
+        let state = WindowState(domainRuntime: AppDomainRuntimeComposition.shared.runtime, openRequestID: requestID)
+        windows.append(state)
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 640, height: 420),
+            styleMask: [.titled, .closable, .resizable], backing: .buffered, defer: false
+        )
+        nsWindows.append(window)
+        state.attachWindow(window)
+        WindowStatesManager.shared.registerWindowState(state)
+    }
+
+    private func withFleetOnlyRouting(_ body: (WindowRoutingService, UUID, String) async throws -> Void) async throws {
+        XCTAssertTrue(WindowStatesManager.shared.allWindows.isEmpty)
+        let previousPark = GlobalSettingsStore.shared.fleetParkAgentWindows()
+        GlobalSettingsStore.shared.setFleetParkAgentWindows(false, commit: false)
+        AppWindowOpener.shared.resetForTesting()
+        AppWindowOpener.shared.installRequestAware { [unowned self] requestID in
+            registerProgrammaticWindow(requestID: requestID)
+        }
+        let connectionID = UUID()
+        let client = "FleetOnly-\(connectionID)"
+        WorkspaceApprovalManager.shared.addAutoApproval(clientID: client, operation: .createWorkspace)
+        let coordinator = makeCoordinator()
+        coordinator.open()
+        let service = WindowRoutingService(windowStates: .shared, networkMgr: .shared)
+        await service.prepareDomainTools()
+        func cleanup() async {
+            await ServerNetworkManager.shared.debugRemoveConnection(connectionID)
+            WorkspaceApprovalManager.shared.removeAutoApproval(clientID: client, operation: .createWorkspace)
+            AppWindowOpener.shared.resetForTesting()
+            GlobalSettingsStore.shared.setFleetParkAgentWindows(previousPark, commit: false)
+        }
+        do {
+            try await body(service, connectionID, client)
+        } catch {
+            await cleanup()
+            throw error
+        }
+        await cleanup()
+    }
+
+    private func callFleetRouting(_ service: WindowRoutingService, connectionID: UUID, client: String, toolName: String = "manage_workspaces", args: [String: Value]) async throws -> Value {
+        let tools = await service.tools
+        let tool = try XCTUnwrap(tools.first { $0.name == toolName })
+        let metadata = MCPRequestMetadata(connectionID: connectionID, clientName: client, windowID: nil)
+        let invocation = ToolInvocationContext.trustedLocal(toolName: toolName, metadata: metadata)
+        return try await ServerNetworkManager.currentConnectionIDTaskLocal.withValue(connectionID) {
+            try await MCPInvocationContextBridge.withInvocation(invocation) { try await tool(args) }
+        }
+    }
+
+    func testMCPOpenWorkspaceWithOnlyFleetOpenCreatesWindow() async throws {
+        let state = try await makeLiveWindow(authorityBacked: true)
+        let name = "Fleet reopen \(UUID())"
+        let creation = try state.workspaceManager.createPersistentWorkspace(name: name, repoPaths: [], savedInLibrary: true)
+        let workspace = try await creation.publishedWorkspace()
+        WindowStatesManager.shared.unregisterWindowState(state)
+        try await withFleetOnlyRouting { service, connectionID, client in
+            let response = try await self.callFleetRouting(service, connectionID: connectionID, client: client, args: [
+                "action": .string("switch"), "workspace": .string(name), "open_in_new_window": .bool(true)
+            ])
+            XCTAssertEqual(response.objectValue?["status"]?.stringValue, "ok")
+            XCTAssertEqual(WindowStatesManager.shared.allWindows.count, 1)
+            XCTAssertEqual(WindowStatesManager.shared.latestWindowState?.workspaceManager.activeWorkspaceID, workspace.id)
+        }
+    }
+
+    func testMCPOpenWorkspaceBeforeAnyWorkspaceWindowAppeared() async throws {
+        try await withFleetOnlyRouting { service, connectionID, client in
+            let name = "Fleet first \(UUID())"
+            let response = try await self.callFleetRouting(service, connectionID: connectionID, client: client, args: [
+                "action": .string("create"), "name": .string(name), "open_in_new_window": .bool(true)
+            ])
+            XCTAssertEqual(response.objectValue?["status"]?.stringValue, "ok")
+            XCTAssertEqual(WindowStatesManager.shared.allWindows.count, 1)
+            XCTAssertEqual(WindowStatesManager.shared.latestWindowState?.workspaceManager.activeWorkspace?.name, name)
+        }
+    }
+
+    func testMCPCallNeedingExistingWindowStillErrorsWithNone() async throws {
+        try await withFleetOnlyRouting { service, connectionID, client in
+            do {
+                _ = try await self.callFleetRouting(service, connectionID: connectionID, client: client, args: ["action": .string("list_tabs")])
+                XCTFail("An existing-window call must not create a workspace window")
+            } catch {
+                XCTAssertFalse(String(describing: error).isEmpty)
+            }
+            XCTAssertTrue(WindowStatesManager.shared.allWindows.isEmpty)
+        }
+    }
+
+    func testSettingsCommandWithFleetKeyTargetsWorkspaceWindow() async throws {
+        let first = try await makeLiveWindow()
+        let second = try await makeLiveWindow()
+        makeCoordinator().open()
+        first.isCurrentlyFocused = true
+        XCTAssertTrue(FleetParkingCoordinator.shared.park(windowID: first.windowID, reason: .operator))
+        first.isCurrentlyFocused = true
+        var targets: [Int] = []
+        try await AppSettingsCommand.open(present: { targets.append($0.windowID)
+            XCTAssertNil($1)
+        })
+        XCTAssertEqual(targets, [second.windowID])
+        first.isCurrentlyFocused = false
+        second.isCurrentlyFocused = true
+        try await AppSettingsCommand.open(selectedTab: .mcp, present: { targets.append($0.windowID)
+            XCTAssertEqual($1, .mcp)
+        })
+        XCTAssertEqual(targets, [second.windowID, second.windowID])
+    }
+
+    func testSettingsCommandWithNoWorkspaceWindowsOpensSettings() async throws {
+        XCTAssertTrue(WindowStatesManager.shared.allWindows.isEmpty)
+        makeCoordinator().open()
+        AppWindowOpener.shared.installRequestAware { [unowned self] requestID in
+            registerProgrammaticWindow(requestID: requestID)
+        }
+        defer { AppWindowOpener.shared.resetForTesting() }
+        var targets: [Int] = []
+        try await AppSettingsCommand.open(present: { targets.append($0.windowID)
+            XCTAssertNil($1)
+        })
+        XCTAssertEqual(targets.count, 1)
+        XCTAssertEqual(targets.first, WindowStatesManager.shared.latestWindowState?.windowID)
+    }
+
+    func testMCPBindContextCreateIfMissingWithOnlyFleetOpen() async throws {
+        let root = FileManager.default.temporaryDirectory.resolvingSymlinksInPath().appendingPathComponent("FleetBind-\(UUID())", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        try await withFleetOnlyRouting { service, connectionID, client in
+            let response = try await self.callFleetRouting(service, connectionID: connectionID, client: client, toolName: "bind_context", args: [
+                "op": .string("bind"), "working_dirs": .array([.string(root.path)]), "create_if_missing": .bool(true)
+            ])
+            XCTAssertNotNil(response.objectValue?["binding"])
+            XCTAssertEqual(WindowStatesManager.shared.allWindows.count, 1)
+            XCTAssertEqual(WindowStatesManager.shared.latestWindowState?.workspaceManager.activeWorkspace?.repoPaths, [root.path])
+        }
+    }
+
+    func testSettingsDeepLinkWithNoWorkspaceWindowsUsesCommandTarget() async throws {
+        XCTAssertTrue(WindowStatesManager.shared.allWindows.isEmpty)
+        makeCoordinator().open()
+        AppWindowOpener.shared.installRequestAware { [unowned self] requestID in
+            registerProgrammaticWindow(requestID: requestID)
+        }
+        defer { AppWindowOpener.shared.resetForTesting() }
+        var targets: [Int] = []
+        try await AppSettingsCommand.open(notification: Notification(name: .showMCPSettingsTab), selectedTab: .mcp, present: {
+            targets.append($0.windowID)
+            XCTAssertEqual($1, .mcp)
+        })
+        XCTAssertEqual(targets.count, 1)
+        XCTAssertEqual(targets.first, WindowStatesManager.shared.latestWindowState?.windowID)
+    }
+
+    func testFleetSettingsMenuDispatchesToApplicationCommandWithoutSceneTarget() throws {
+        let menu = NSMenu()
+        let appMenu = NSMenu()
+        let applicationItem = NSMenuItem()
+        applicationItem.submenu = appMenu
+        menu.addItem(applicationItem)
+        let item = NSMenuItem(title: "Settings…", action: nil, keyEquivalent: ",")
+        item.keyEquivalentModifierMask = .command
+        appMenu.addItem(item)
+        var opens = 0
+        let target = AppSettingsMenuTarget(open: { opens += 1 })
+        AppSettingsCommand.installNativeMenuAction(in: menu, target: target)
+        let action = try XCTUnwrap(item.action)
+        XCTAssertTrue(NSApp.sendAction(action, to: item.target, from: item))
+        XCTAssertEqual(opens, 1)
     }
 
     func testOpenTwiceYieldsOneFleetManagerWindow() {
