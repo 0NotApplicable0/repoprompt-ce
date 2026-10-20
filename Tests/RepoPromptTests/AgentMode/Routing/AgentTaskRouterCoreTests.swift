@@ -5,6 +5,19 @@ import RepoPromptSettingsCore
 import XCTest
 
 final class AgentTaskRouterCoreTests: XCTestCase {
+    func testAntigravityEffortSplitHandlesNonFlashGeminiBases() {
+        for effort in ["low", "medium", "high", "x-high"] {
+            let split = RoutingModelIdentity.antigravityEffortSplit("gemini-4-argon-\(effort)")
+            XCTAssertEqual(split?.base, "gemini-4-argon", effort)
+            XCTAssertEqual(split?.effort, effort, effort)
+        }
+        for raw in ["claude-opus-5-5-high", "claude-sonnet-5-5-low", "gpt-oss-120b-medium", "grok-4.7-high", "gemini-4-argon"] {
+            XCTAssertNil(RoutingModelIdentity.antigravityEffortSplit(raw), raw)
+            XCTAssertEqual(RoutingModelIdentity.profileLookupID(provider: .antigravity, raw: raw), raw)
+        }
+        XCTAssertEqual(RoutingModelIdentity.profileLookupID(provider: .cursor, raw: "gemini-4-argon-high"), "gemini-4-argon-high")
+    }
+
     func testLongRoutingExcerptIsDeterministicBoundedAndMasksBothEnds() {
         let task = "Investigate the parser. password=openingSecret "
             + String(repeating: "irrelevant middle ", count: 300)

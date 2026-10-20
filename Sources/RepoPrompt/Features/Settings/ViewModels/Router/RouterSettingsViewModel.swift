@@ -176,6 +176,11 @@ final class RouterSettingsViewModel: ObservableObject {
             .receive(on: RunLoop.main)
             .sink { [weak self] _ in _ = self?.agentExecutionCatalogDidChange() }
             .store(in: &cancellables)
+        NotificationCenter.default.publisher(for: .antigravityModelsChanged)
+            .merge(with: NotificationCenter.default.publisher(for: .grokModelsChanged))
+            .receive(on: RunLoop.main)
+            .sink { [weak self] _ in _ = self?.agentExecutionCatalogDidChange() }
+            .store(in: &cancellables)
         Publishers.CombineLatest(
             apiSettingsViewModel.$contextBuilderVerifiedCLIProviders,
             apiSettingsViewModel.$isContextBuilderProviderValidationComplete

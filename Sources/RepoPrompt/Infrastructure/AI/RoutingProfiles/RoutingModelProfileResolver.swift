@@ -82,10 +82,8 @@ enum RoutingModelIdentity {
         guard lowered.hasPrefix("gemini-") else { return nil }
         for suffix in antigravityEffortSuffixes where lowered.hasSuffix("-\(suffix)") {
             let base = String(raw.dropLast(suffix.count + 1))
-            let loweredBase = base.lowercased()
-            if loweredBase.hasSuffix("-flash") || loweredBase.hasSuffix("-pro") {
-                return (base, String(raw.suffix(suffix.count)))
-            }
+            guard base.count > "gemini-".count else { return nil }
+            return (base, String(raw.suffix(suffix.count)))
         }
         return nil
     }

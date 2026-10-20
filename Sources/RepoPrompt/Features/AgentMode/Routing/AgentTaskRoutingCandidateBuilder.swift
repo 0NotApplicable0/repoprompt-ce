@@ -41,10 +41,9 @@ struct AgentTaskRoutingCandidateBuilder {
         case insufficientCapacity
     }
 
-    /// Selects the newest advertised base model shaped `<prefix><dotted version><suffix>`.
     private struct NewestVersionedBase {
         let prefix: String
-        let suffix: String
+        let suffix: String?
     }
 
     private struct ModelDefinition {
@@ -490,7 +489,7 @@ struct AgentTaskRoutingCandidateBuilder {
             provider: .antigravity,
             baseModelAliases: [],
             modelClass: "gemini-pro",
-            newestVersionedBase: .init(prefix: "gemini-", suffix: "-pro"),
+            newestVersionedBase: .init(prefix: "gemini-", suffix: nil),
             rubric: "Judge Gemini Pro as a base model using its capability, expected completion reliability, and price."
         ),
         .init(
@@ -600,10 +599,17 @@ struct AgentTaskRoutingCandidateBuilder {
         var newestVersion: [Int] = []
         for model in models {
             let base = model.baseModelRaw.lowercased()
-            guard base.hasPrefix(rule.prefix), base.hasSuffix(rule.suffix),
-                  base.count > rule.prefix.count + rule.suffix.count else { continue }
-            let components = base.dropFirst(rule.prefix.count).dropLast(rule.suffix.count)
-                .split(separator: ".", omittingEmptySubsequences: false)
+            guard base.hasPrefix(rule.prefix) else { continue }
+            let versionedBase = base.dropFirst(rule.prefix.count)
+            let versionText: Substring
+            if let suffix = rule.suffix {
+                guard versionedBase.hasSuffix(suffix), versionedBase.count > suffix.count else { continue }
+                versionText = versionedBase.dropLast(suffix.count)
+            } else {
+                guard !versionedBase.hasSuffix("-flash") else { continue }
+                versionText = versionedBase.prefix { $0 != "-" }
+            }
+            let components = versionText.split(separator: ".", omittingEmptySubsequences: false)
             let version = components.compactMap { Int($0) }
             guard !version.isEmpty, version.count == components.count else { continue }
             if newest == nil || isEarlier(newestVersion, than: version) {

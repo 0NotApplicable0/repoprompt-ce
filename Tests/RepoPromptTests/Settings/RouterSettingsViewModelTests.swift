@@ -1234,6 +1234,104 @@ final class RouterSettingsViewModelTests: XCTestCase {
         XCTAssertEqual(accounting.previewBuildCount, failedBuildCount + 1)
     }
 
+    private static func frontierCatalogOptions(_ raws: [String]) -> [AgentModelOption] {
+        [AgentModelOption(
+            rawValue: AgentModel.defaultModel.rawValue,
+            displayName: AgentModel.defaultModel.displayName,
+            description: nil,
+            isPlaceholderDefault: true,
+            isProviderDefault: false
+        )] + raws.map {
+            AgentModelOption(
+                rawValue: $0,
+                displayName: $0,
+                description: nil,
+                isPlaceholderDefault: false,
+                isProviderDefault: false
+            )
+        }
+    }
+
+    private static let advertisedFrontierCatalogs: [AgentProviderKind: [AgentModelOption]] = [
+        .antigravity: frontierCatalogOptions([
+            "gemini-4-argon-medium", "gemini-4-argon-high", "gemini-4-argon-low",
+            "gemini-3.8-flash-high", "gemini-3.8-flash-medium", "gemini-3.8-flash-low",
+            "claude-opus-5-5-low", "claude-opus-5-5-medium", "claude-opus-5-5-high",
+            "claude-sonnet-5-5-low", "claude-sonnet-5-5-medium", "claude-sonnet-5-5-high",
+            "gpt-oss-120b-medium"
+        ]),
+        .grok: frontierCatalogOptions(["grok-4.7", "grok-4.7-build-fast", "grok-4.6", "grok-4.5"])
+    ]
+
+    func testRouterFamiliesResolveAdvertisedAntigravityAndGrokModels() throws {
+        let availability = fiveProviderAvailability(claudeAndCodex: false, antigravity: true, grok: true)
+        let options: @MainActor (AgentProviderKind, AgentModelCatalog.AvailabilityContext) -> [AgentModelOption] = { provider, _ in
+            Self.advertisedFrontierCatalogs[provider] ?? []
+        }
+        let previews = try RouterSettingsViewModel.buildTargetPreviews(availability: availability, catalogOptions: options)
+        XCTAssertEqual(previews.map(\.target.modelRaw), ["gemini-3.8-flash", "gemini-4-argon", "grok-4.7"])
+        XCTAssertEqual(previews.map(\.familyDisplayName), ["Gemini Flash", "Gemini Pro", "Grok"])
+        let unavailable = RouterSettingsViewModel.buildUnavailableTargetPreviews(availability: availability, catalogOptions: options)
+        XCTAssertFalse(unavailable.contains { $0.provider == .antigravity || $0.provider == .grok })
+
+        let families = AgentTaskRoutingCandidateBuilder(modelOptions: options).modelFamilyAvailability(availability: availability)
+        for base in ["gemini-3.8-flash", "gemini-4-argon"] {
+            let model = try XCTUnwrap(families.first { $0.model?.baseModelRaw == base }?.model, base)
+            XCTAssertEqual(Set(model.efforts.map(\.id.rawValue)), Set(["low", "medium", "high"]), base)
+            XCTAssertEqual(
+                Set(model.efforts.compactMap { $0.executableTarget?.modelRaw }),
+                Set(["\(base)-low", "\(base)-medium", "\(base)-high"]),
+                base
+            )
+            XCTAssertTrue(model.efforts.allSatisfy { $0.executableTarget?.reasoningEffortRaw == nil }, base)
+        }
+    }
+
+    func testRouterFamilyStaysUnavailableWithoutMatchingModel() {
+        let availability = fiveProviderAvailability(claudeAndCodex: false, antigravity: true, grok: true)
+        let options: @MainActor (AgentProviderKind, AgentModelCatalog.AvailabilityContext) -> [AgentModelOption] = { provider, _ in
+            Self.frontierCatalogOptions(provider == .antigravity ? ["claude-opus-5-5-high", "gpt-oss-120b-medium"] : ["grok-4.7-build-fast"])
+        }
+        let unavailable = RouterSettingsViewModel.buildUnavailableTargetPreviews(availability: availability, catalogOptions: options)
+            .filter { $0.provider == .antigravity || $0.provider == .grok }
+        XCTAssertEqual(unavailable.map(\.displayName), ["Gemini Flash", "Gemini Pro", "Grok"])
+        for family in unavailable {
+            XCTAssertEqual(family.reason, "\(family.provider.displayName) does not advertise a supported \(family.displayName) model.")
+        }
+    }
+
+    func testRouterFamiliesRefreshWhenDiscoveredProviderModelsArrive() async throws {
+        let availability = fiveProviderAvailability(claudeAndCodex: false, antigravity: true, grok: true)
+        var catalogs: [AgentProviderKind: [AgentModelOption]] = [:]
+        let options: @MainActor (AgentProviderKind, AgentModelCatalog.AvailabilityContext) -> [AgentModelOption] = { provider, _ in
+            catalogs[provider] ?? Self.frontierCatalogOptions([])
+        }
+        let accounting = PreviewRefreshAccounting()
+        let fixture = try makeFixture(
+            availability: availability,
+            targetPreviewBuilder: { try RouterSettingsViewModel.buildTargetPreviews(availability: $0, catalogOptions: options) },
+            unavailableTargetPreviewBuilder: { RouterSettingsViewModel.buildUnavailableTargetPreviews(availability: $0, catalogOptions: options) },
+            refreshCompletionObserver: { accounting.recordRefreshCompletion($0) }
+        )
+        await fixture.viewModel.refresh()
+        await drainMainRunLoop()
+        XCTAssertTrue(fixture.viewModel.targetPreviews.isEmpty)
+        XCTAssertEqual(fixture.viewModel.unavailableTargetPreviews.count(where: { $0.provider == .antigravity || $0.provider == .grok }), 3)
+
+        let arrivals: [(AgentProviderKind, Notification.Name, [String])] = [
+            (.antigravity, .antigravityModelsChanged, ["gemini-3.8-flash", "gemini-4-argon"]),
+            (.grok, .grokModelsChanged, ["grok-4.7"])
+        ]
+        for (provider, notification, expectedModels) in arrivals {
+            let refreshed = accounting.expectRefreshCompletion(description: "\(provider.rawValue) catalog arrival") { _ in true }
+            catalogs[provider] = Self.advertisedFrontierCatalogs[provider]
+            NotificationCenter.default.post(name: notification, object: nil)
+            await fulfillment(of: [refreshed], timeout: 1)
+            XCTAssertEqual(fixture.viewModel.targetPreviews.filter { $0.provider == provider }.map(\.target.modelRaw), expectedModels)
+            XCTAssertFalse(fixture.viewModel.unavailableTargetPreviews.contains { $0.provider == provider })
+        }
+    }
+
     private static let fiveProviderCatalogs: [AgentProviderKind: [String]] = [
         .codexExec: ["gpt-6-luna", "gpt-5.6-terra", "gpt-6.1-sol", "gpt-6-astra"],
         .claudeCode: ["claude-haiku-4-5", "claude-sonnet-5-5", "claude-opus-5-5", "claude-fable-5-1"],
