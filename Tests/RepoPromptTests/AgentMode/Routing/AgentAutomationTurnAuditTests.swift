@@ -3,6 +3,7 @@ import MCP
 @testable import RepoPromptApp
 import RepoPromptProviderQuota
 import RepoPromptSettingsCore
+import RepoPromptShared
 import XCTest
 
 final class AgentAutomationTurnAuditTests: XCTestCase {
@@ -812,6 +813,132 @@ final class AgentTaskRoutingDecisionLogTests: XCTestCase {
         }
     }
 
+    func testDecisionLogAppendIsSafeAcrossConcurrentWriters() async throws {
+        if try await runDecisionLogWriterIfRequested(rotating: false) { return }
+        let directory = try makeDirectory()
+        try await runConcurrentDecisionLogWriters(in: directory, rotating: false)
+        let url = directory.appendingPathComponent("jev-decisions.jsonl")
+        let rows = try concurrentWriterRows(at: url)
+        XCTAssertEqual(rows.count, 4 * 128)
+        XCTAssertEqual(Set(rows), Set((0 ..< 4).flatMap { writer in
+            (0 ..< 128).map { "\(writer):\($0)" }
+        }))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: url.path + ".1"))
+    }
+
+    func testDecisionLogRotationIsSafeAcrossConcurrentWriters() async throws {
+        if try await runDecisionLogWriterIfRequested(rotating: true) { return }
+        let directory = try makeDirectory()
+        try await runConcurrentDecisionLogWriters(in: directory, rotating: true)
+        let url = directory.appendingPathComponent("jev-decisions.jsonl")
+        let rotated = URL(fileURLWithPath: url.path + ".1")
+        var rows: [String] = []
+        for file in [rotated, url] {
+            XCTAssertTrue(FileManager.default.fileExists(atPath: file.path), file.path)
+            guard FileManager.default.fileExists(atPath: file.path) else { continue }
+            let size = try file.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? Int.max
+            XCTAssertLessThanOrEqual(size, AgentTaskRoutingDecisionLog.minimumMaxBytes)
+            rows += try concurrentWriterRows(at: file)
+        }
+        XCTAssertEqual(rows.count, 12)
+        XCTAssertEqual(Set(rows), Set((0 ..< 4).flatMap { writer in
+            (0 ..< 3).map { "\(writer):\($0)" }
+        }))
+    }
+
+    private func runDecisionLogWriterIfRequested(rotating: Bool) async throws -> Bool {
+        let environment = ProcessInfo.processInfo.environment
+        guard let path = environment["RPCE_ROUTING_LOG_WRITER_DIRECTORY"],
+              let writer = environment["RPCE_ROUTING_LOG_WRITER_INDEX"].flatMap(Int.init)
+        else { return false }
+        let directory = URL(fileURLWithPath: path, isDirectory: true)
+        let log = AgentTaskRoutingDecisionLog(
+            fileURL: directory.appendingPathComponent("jev-decisions.jsonl"),
+            maxBytes: rotating ? AgentTaskRoutingDecisionLog.minimumMaxBytes : 32 * 1024 * 1024
+        )
+        if rotating {
+            await log.append(concurrentWriterLine(writer: writer, row: 0))
+            await log.flush()
+        }
+        try Data().write(to: directory.appendingPathComponent("ready-\(writer)"))
+        try await AsyncTestWait.waitUntil("concurrent log writers released", timeout: 30) {
+            FileManager.default.fileExists(atPath: directory.appendingPathComponent("go").path)
+        }
+        for row in rotating ? 1 ..< 3 : 0 ..< 128 {
+            await log.append(concurrentWriterLine(writer: writer, row: row))
+            await log.flush()
+        }
+        let snapshot = await log.snapshot()
+        XCTAssertEqual(snapshot.droppedCount, 0)
+        return true
+    }
+
+    private func runConcurrentDecisionLogWriters(in directory: URL, rotating: Bool) async throws {
+        let method = rotating
+            ? "testDecisionLogRotationIsSafeAcrossConcurrentWriters"
+            : "testDecisionLogAppendIsSafeAcrossConcurrentWriters"
+        var processes: [Process] = []
+        defer {
+            for process in processes where process.isRunning {
+                process.terminate()
+            }
+        }
+        for writer in 0 ..< 4 {
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: "/usr/bin/xcrun")
+            process.arguments = [
+                "xctest", "-XCTest", "\(String(reflecting: Self.self))/\(method)",
+                Bundle(for: Self.self).bundleURL.path
+            ]
+            var environment = ProcessInfo.processInfo.environment
+            environment["RPCE_ROUTING_LOG_WRITER_DIRECTORY"] = directory.path
+            environment["RPCE_ROUTING_LOG_WRITER_INDEX"] = String(writer)
+            let home = directory.appendingPathComponent("home-\(writer)", isDirectory: true)
+            try FileManager.default.createDirectory(at: home, withIntermediateDirectories: true)
+            environment["HOME"] = home.path
+            environment["CFFIXED_USER_HOME"] = home.path
+            process.environment = environment
+            let output = directory.appendingPathComponent("writer-\(writer).log")
+            XCTAssertTrue(FileManager.default.createFile(atPath: output.path, contents: nil))
+            let handle = try FileHandle(forWritingTo: output)
+            defer { try? handle.close() }
+            process.standardOutput = handle
+            process.standardError = handle
+            try process.run()
+            processes.append(process)
+        }
+        try await AsyncTestWait.waitUntil("all concurrent log writers ready", timeout: 30) {
+            (0 ..< 4).allSatisfy {
+                FileManager.default.fileExists(atPath: directory.appendingPathComponent("ready-\($0)").path)
+            } || processes.contains { !$0.isRunning }
+        }
+        XCTAssertTrue((0 ..< 4).allSatisfy {
+            FileManager.default.fileExists(atPath: directory.appendingPathComponent("ready-\($0)").path)
+        })
+        try Data().write(to: directory.appendingPathComponent("go"))
+        try await AsyncTestWait.waitUntil("concurrent log writers finished", timeout: 30) {
+            processes.allSatisfy { !$0.isRunning }
+        }
+        for (writer, process) in processes.enumerated() {
+            let output = try String(contentsOf: directory.appendingPathComponent("writer-\(writer).log"), encoding: .utf8)
+            XCTAssertEqual(process.terminationStatus, 0, output)
+            XCTAssertTrue(output.contains("\(method)]' passed"), output)
+        }
+    }
+
+    private func concurrentWriterLine(writer: Int, row: Int) -> Data {
+        let json = "{\"writer\":\(writer),\"row\":\(row)}"
+        return Data((json + String(repeating: " ", count: 8192 - json.utf8.count - 1) + "\n").utf8)
+    }
+
+    private func concurrentWriterRows(at url: URL) throws -> [String] {
+        try String(contentsOf: url, encoding: .utf8).split(separator: "\n").map { line in
+            XCTAssertEqual(line.utf8.count, 8191)
+            let object = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Int])
+            return try "\(XCTUnwrap(object["writer"])):\(XCTUnwrap(object["row"]))"
+        }
+    }
+
     private enum StartScenario: CaseIterable { case applied, fallback, rejected }
 
     @MainActor
@@ -834,9 +961,10 @@ final class AgentTaskRoutingDecisionLogTests: XCTestCase {
     }
 
     private func makeDirectory() throws -> URL {
-        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("DecisionLogTests-\(UUID())", isDirectory: true)
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("DecisionLogTests-\(UUID())", isDirectory: true)
+        let directory = root.appendingPathComponent("ModelRouter", isDirectory: true)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-        addTeardownBlock { try? FileManager.default.removeItem(at: directory) }
+        addTeardownBlock { try? FileManager.default.removeItem(at: root) }
         return directory
     }
 
@@ -1165,7 +1293,7 @@ final class AgentTaskRoutingMakerDiversityTests: XCTestCase {
             backendID: .jev, roles: Set(AgentModelCatalog.TaskLabelKind.allCases), providers: [.claudeCode, .codexExec]
         )
         let backend = DecisionLogBackend(ready: ready, maximumChoices: maximumChoices)
-        let url = root.appendingPathComponent("jev-decisions.jsonl")
+        let url = root.appendingPathComponent("ModelRouter", isDirectory: true).appendingPathComponent("jev-decisions.jsonl")
         let log = AgentTaskRoutingDecisionLog(fileURL: url)
         let runtime = try AgentTaskRouterRuntime(registrations: [.init(service: backend)], demandSource: store, decisionLog: log)
         runtime.candidateBuilderFactory = {
@@ -1208,6 +1336,29 @@ final class AgentTaskRoutingMakerDiversityTests: XCTestCase {
 final class AgentTaskRoutingExplorationTests: XCTestCase {
     private let opus = "claude-opus-5-5"
     private let sonnet = "claude-sonnet-5-5"
+
+    func testDebugAndReleaseUseSeparateRoutingStateLocations() {
+        let home = FileManager.default.temporaryDirectory.appendingPathComponent("RoutingLocations-\(UUID())", isDirectory: true)
+        let debug = AppProfileLocations(identity: .repoPromptCE(.debug), homeDirectory: home, releaseCustomStorageRoots: [])
+        let release = AppProfileLocations(identity: .repoPromptCE(.release), homeDirectory: home)
+        XCTAssertNotEqual(debug.applicationSupportRoot, release.applicationSupportRoot)
+        let counter = AgentTaskRoutingExplorationAdvisor.defaultFileURL()
+        let log = AgentTaskRoutingDecisionLog.defaultFileURL()
+        let counterRoot = counter.deletingLastPathComponent().deletingLastPathComponent()
+        let logRoot = log.deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+        #if DEBUG
+            let expected = debug.applicationSupportRoot.lastPathComponent
+            let other = release.applicationSupportRoot.lastPathComponent
+        #else
+            let expected = release.applicationSupportRoot.lastPathComponent
+            let other = debug.applicationSupportRoot.lastPathComponent
+        #endif
+        XCTAssertEqual(counterRoot.lastPathComponent, expected)
+        XCTAssertEqual(logRoot.lastPathComponent, expected)
+        XCTAssertNotEqual(counterRoot.lastPathComponent, other)
+        XCTAssertNotEqual(logRoot.lastPathComponent, other)
+        XCTAssertEqual(counterRoot, logRoot)
+    }
 
     func testOffNeverExplores() async throws {
         let fixture = try await makeFixture(randomness: .off)
@@ -1398,7 +1549,7 @@ final class AgentTaskRoutingExplorationTests: XCTestCase {
         store.enableModelRouterWithCurrentPolicy(backendID: backend.id, roles: Set(AgentModelCatalog.TaskLabelKind.allCases), providers: [.claudeCode, .codexExec])
         store.setRandomness(randomness)
         let advisor = AgentTaskRoutingExplorationAdvisor(fileURL: url)
-        let logURL = root.appendingPathComponent("decisions.jsonl")
+        let logURL = root.appendingPathComponent("ModelRouter", isDirectory: true).appendingPathComponent("decisions.jsonl")
         let log = AgentTaskRoutingDecisionLog(fileURL: logURL)
         let runtime = try AgentTaskRouterRuntime(registrations: [.init(service: backend)], demandSource: store, decisionLog: log, explorationAdvisor: advisor)
         runtime.candidateBuilderFactory = {

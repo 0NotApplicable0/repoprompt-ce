@@ -1,12 +1,13 @@
 # Model Routing Decision Log
 
-RepoPrompt CE appends JSON Lines records for routed task starts and Auto Effort judgments to a local diagnostics file:
+RepoPrompt CE appends JSON Lines records for routed task starts and Auto Effort judgments under the build-flavored application-support root supplied by `AppProfileLocations`:
 
 ```text
-~/Library/Application Support/RepoPrompt CE/Diagnostics/ModelRouter/jev-decisions.jsonl
+Release: ~/Library/Application Support/RepoPrompt CE/Diagnostics/ModelRouter/jev-decisions.jsonl
+Debug:   ~/Library/Application Support/RepoPrompt CE Debug/Diagnostics/ModelRouter/jev-decisions.jsonl
 ```
 
-When the active file would exceed `5 MiB` (`5_242_880` bytes), the logger rotates `jev-decisions.jsonl` to `jev-decisions.jsonl.1` (replacing any prior `.1` file) before writing the new line. At most two files exist on disk.
+When the active file would exceed `5 MiB` (`5_242_880` bytes), the logger rotates `jev-decisions.jsonl` to `jev-decisions.jsonl.1` (replacing any prior `.1` file) before writing the new line. The log directory contains at most those two files. The persistent lock file lives outside it, at `Diagnostics/.ModelRouter-locks/jev-decisions.jsonl.lock` under the same build-flavored application-support root. A cross-process exclusive lock covers the fresh size check, rotation, and append as one transaction; its separate location keeps the lock identity stable across rotation without creating a third file in the log directory. The logger never rotates or removes the lock file. Lock acquisition waits at most 250 ms before using the ordinary dropped-row/error-diagnostic path.
 
 The log is enabled by default. It never records task text, prompt excerpts, file paths, or API keys.
 
@@ -90,6 +91,8 @@ Fields:
 `DecisionEvidence` supplies `policyVersion` (`acceptancePolicyVersion`), `confidence`, per-key `probabilities`, and usage counts. Missing evidence remains JSON `null`; scores are not converted into probabilities. `jevModel` retains the legacy field name and identifies the pinned evaluator only when evidence matches the backend's validated acceptance policy. Upstream adapters validate that model before exposing evidence. `latencyMs` is measured by `DecisionCoordinator`; it is not a backend-reported duration. Auto Effort uses the service's acceptance policy version, not the consumer's prompt-policy version. Rationale is always `null`.
 
 ## Inspecting with `jq`
+
+The commands below use the release path; substitute `RepoPrompt CE Debug` for a debug build.
 
 Count `decision` events by chosen provider:
 

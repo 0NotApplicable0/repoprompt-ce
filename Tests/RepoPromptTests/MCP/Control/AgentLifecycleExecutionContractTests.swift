@@ -1,7 +1,8 @@
 import Foundation
 import MCP
-@testable import RepoPromptApp
+@_spi(TestSupport) @testable import RepoPromptApp
 import RepoPromptDomainRuntime
+import RepoPromptInstrumentation
 import RepoPromptSettingsCore
 import RepoPromptShared
 import XCTest
@@ -68,6 +69,192 @@ final class AgentLifecycleExecutionContractTests: XCTestCase {
         XCTAssertEqual(AgentRunMCPToolService.capturedDefaultWaitTimeoutSeconds(from: store), 120)
     }
 
+    func testCleanupSessionsRepliesAfterDelete() async throws {
+        try await exerciseCleanupTransport(stalled: false, cancelRequest: false)
+    }
+
+    func testCleanupSessionsStalledTeardownIsBounded() async throws {
+        for cancelRequest in [false, true] {
+            try await exerciseCleanupTransport(stalled: true, cancelRequest: cancelRequest)
+        }
+    }
+
+    private func exerciseCleanupTransport(stalled: Bool, cancelRequest: Bool) async throws {
+        try await MCPSharedServerTestLease.shared.withLease { lease in
+            let fixture = try await PersistentMCPTestFixture.make(
+                lease: lease, domainRuntime: AppDomainRuntimeComposition.shared.runtime
+            )
+            let manager = fixture.networkManager
+            let context = fixture.contextA
+            let workspace = try XCTUnwrap(context.window.workspaceManager.workspaces.first { $0.id == context.workspaceID })
+            await context.window.workspaceManager.switchWorkspace(to: workspace, saveState: false, reason: "cleanupTransport")
+            context.window.promptManager.loadComposeTabsFromWorkspace(workspace, syncPromptText: true)
+            try await fixture.registerDomainWorkspace(context)
+            let endpoint = try fixture.endpointA()
+            let clock = StartStallClock()
+            let teardown = StartStallGate()
+            let observation = CleanupTransportObservation()
+            let recorder = CleanupExecutionTraceRecorder()
+            var responseTask: Task<Void, Never>?
+            let sessionID = UUID()
+            let persisted = AgentSession(
+                id: sessionID, workspaceID: workspace.id, name: "Cleanup transport",
+                savedAt: Date(timeIntervalSinceReferenceDate: 42), itemCount: 0,
+                agentKind: AgentProviderKind.codexExec.rawValue,
+                lastRunState: AgentSessionRunState.completed.rawValue, autoEditEnabled: true,
+                isMCPOriginated: true
+            )
+            let sessionURL = try await AgentSessionDataService.shared.saveAgentSession(
+                persisted, for: workspace, preparation: .alreadyCanonicalTranscript, trustedCanonicalItemCount: 0
+            )
+            XCTAssertTrue(FileManager.default.fileExists(atPath: sessionURL.path))
+            let live = AgentManageMCPToolService.CleanupDependencies.live
+            let args: [String: Value] = [
+                "op": .string("cleanup_sessions"), "session_ids": .array([.string(sessionID.uuidString)])
+            ]
+            let service = AgentManageMCPToolService(
+                toolName: MCPWindowToolName.agentManage,
+                captureRequestMetadata: { .init(connectionID: nil, clientName: "cleanup-transport", windowID: context.window.windowID) },
+                requireTargetWindow: { context.window }, resolveSpawnSourceTabID: { _ in nil },
+                resolveSpawnParentSessionID: { _, _ in nil }, bindCurrentRequestToTab: { _, _ in },
+                cleanupDependencies: .init(
+                    loadPersistedMetadata: live.loadPersistedMetadata,
+                    loadPersistedSession: { _, _ in nil },
+                    deleteOpenSession: live.deleteOpenSession,
+                    deletePersistedSession: live.deletePersistedSession,
+                    finalizePersistedReferences: { viewModel, id, workspaceID in
+                        await teardown.suspend()
+                        return await live.finalizePersistedReferences(viewModel, id, workspaceID)
+                    },
+                    checkCancellation: live.checkCancellation
+                )
+            )
+            MCPToolExecutionTracer.setTestSink { recorder.append($0) }
+            await manager.debugSetToolExecutionWatchdogEnvironment(.init(
+                now: { clock.now }, sleep: { try await clock.sleep(for: $0) }
+            ))
+            await manager.debugSetResolvedToolOperationOverride(toolName: MCPWindowToolName.agentManage) {
+                do {
+                    let value = try await service.execute(args: args)
+                    await MainActor.run { observation.handlerFinished = true }
+                    return value
+                } catch {
+                    await MainActor.run { observation.handlerFinished = true }
+                    throw error
+                }
+            }
+            await manager.debugSetDomainPeerIdentityForTesting(
+                connectionID: endpoint.connectionID,
+                identity: .verified(processID: Int(ProcessInfo.processInfo.processIdentifier), fingerprint: "test:cleanup-transport")
+            )
+            do {
+                _ = try await endpoint.callTool(name: "bind_context", arguments: ["op": "bind", "context_id": context.tabID.uuidString])
+                await context.window.mcpServer.domainRoutingPublishTask?.value
+                let requestID = endpoint.client.nextRequestIDForTesting()
+                let task = Task { @MainActor in
+                    do {
+                        let response = try await endpoint.callTool(
+                            name: MCPWindowToolName.agentManage,
+                            arguments: ["op": "cleanup_sessions", "session_ids": [sessionID.uuidString], "_rawJSON": true]
+                        )
+                        observation.response = .success(response)
+                    } catch { observation.response = .failure(error) }
+                }
+                responseTask = task
+                await drainCleanupScheduler(until: { teardown.hasEntered || observation.response != nil })
+                XCTAssertTrue(teardown.hasEntered, "The real cleanup handler must reach post-delete reference teardown")
+                XCTAssertFalse(FileManager.default.fileExists(atPath: sessionURL.path), "Deletion must be durable before teardown")
+                XCTAssertNil(observation.response)
+                await drainCleanupScheduler()
+                XCTAssertGreaterThan(clock.sleeperCount, 0, "Dispatcher must arm a finite cleanup deadline")
+                if stalled {
+                    if cancelRequest {
+                        try endpoint.client.sendNotification(method: "notifications/cancelled", params: ["requestId": requestID, "reason": "test stalled teardown"])
+                        await drainCleanupScheduler(until: { clock.sleeperCount == 0 })
+                        XCTAssertEqual(clock.sleeperCount, 0, "Request cancellation must retire the execution deadline")
+                        XCTAssertNil(observation.response, "MCP cancellation suppresses the cancelled request's reply")
+                        _ = try await endpoint.client.request(method: "tools/list", params: [:])
+                        XCTAssertNil(observation.response, "The cancelled request must stay unanswered during a subsequent round trip")
+                        task.cancel()
+                    } else {
+                        clock.advance(to: .seconds(60))
+                        await drainCleanupScheduler()
+                        clock.advance(to: .seconds(65))
+                        await drainCleanupScheduler(until: { observation.response != nil })
+                        XCTAssertNotNil(observation.response, "Stalled teardown must settle the transport within deadline plus cleanup grace")
+                    }
+                    XCTAssertFalse(teardown.isOpen, "Transport settlement must not require a non-cooperative teardown to return")
+                } else {
+                    clock.advance(to: .seconds(31))
+                    await drainCleanupScheduler()
+                    XCTAssertNil(observation.response, "The old ordinary-tool deadline must not lose the landed-delete receipt")
+                }
+                teardown.release()
+                await task.value
+                await drainCleanupScheduler(until: { observation.handlerFinished })
+                XCTAssertTrue(observation.handlerFinished)
+                if cancelRequest {
+                    if case let .failure(error)? = observation.response {
+                        XCTAssertTrue(error is CancellationError, "The client must abandon its own cancelled request, not time out")
+                    } else {
+                        XCTFail("Expected local cancellation of the client waiter, not a server response")
+                    }
+                } else {
+                    let response = try XCTUnwrap(observation.response).get()
+                    if !stalled {
+                        XCTAssertFalse(response.rawJSON.contains("\"isError\":true"), response.rawJSON)
+                        let envelope = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(response.rawJSON.utf8)) as? [String: Any])
+                        let result = try XCTUnwrap(envelope["result"] as? [String: Any])
+                        let content = try XCTUnwrap(result["content"] as? [[String: Any]])
+                        let text = content.compactMap { $0["text"] as? String }.joined()
+                        let payload = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(text.utf8)) as? [String: Any])
+                        let deleted = try XCTUnwrap(payload["deleted_sessions"] as? [[String: Any]])
+                        XCTAssertEqual(deleted.count, 1)
+                        XCTAssertEqual(deleted.first?["session_id"] as? String, sessionID.uuidString)
+                        XCTAssertEqual(deleted.first?["durable"] as? Bool, true)
+                    }
+                }
+                XCTAssertFalse(FileManager.default.fileExists(atPath: sessionURL.path))
+                let terminal = await manager.debugIsExecutionWatchdogTerminal(connectionID: endpoint.connectionID)
+                XCTAssertFalse(terminal)
+                let events = recorder.snapshot().filter { $0.connectionID == endpoint.connectionID && $0.toolName == MCPWindowToolName.agentManage }
+                XCTAssertFalse(events.contains { $0.phase == .connectionForceDisconnectRequested })
+                if stalled, !cancelRequest {
+                    XCTAssertTrue(events.contains { $0.phase == .deadlineExpired })
+                }
+                if cancelRequest {
+                    XCTAssertTrue(events.contains { $0.phase == .cancellationRequested && $0.cancellationOrigin == .requestCancellation })
+                }
+                _ = try await endpoint.client.request(method: "tools/list", params: [:])
+            } catch {
+                teardown.release()
+                responseTask?.cancel()
+                if let responseTask { await responseTask.value }
+                await manager.debugSetResolvedToolOperationOverride(toolName: MCPWindowToolName.agentManage, operation: nil)
+                await manager.debugResetToolExecutionWatchdogEnvironment()
+                await manager.debugSetDomainPeerIdentityForTesting(connectionID: endpoint.connectionID, identity: nil)
+                MCPToolExecutionTracer.setTestSink(nil)
+                clock.cancelAll()
+                await fixture.cleanup()
+                throw error
+            }
+            await manager.debugSetResolvedToolOperationOverride(toolName: MCPWindowToolName.agentManage, operation: nil)
+            await manager.debugResetToolExecutionWatchdogEnvironment()
+            await manager.debugSetDomainPeerIdentityForTesting(connectionID: endpoint.connectionID, identity: nil)
+            MCPToolExecutionTracer.setTestSink(nil)
+            clock.cancelAll()
+            await fixture.cleanup()
+            try await fixture.assertCleanedUp()
+        }
+    }
+
+    private func drainCleanupScheduler(until predicate: @MainActor () -> Bool = { false }) async {
+        for _ in 0 ..< 20000 {
+            if predicate() { return }
+            await Task.yield()
+        }
+    }
+
     func testAgentExploreStartSharesLifecycleWaitPolicy() throws {
         XCTAssertEqual(
             try AgentExploreMCPToolService.resolvedStartTimeoutSeconds(
@@ -88,6 +275,25 @@ final class AgentLifecycleExecutionContractTests: XCTestCase {
             1800
         )
     }
+}
+
+private final class CleanupExecutionTraceRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var events: [MCPToolExecutionTraceEvent] = []
+
+    func append(_ event: MCPToolExecutionTraceEvent) {
+        lock.withLock { events.append(event) }
+    }
+
+    func snapshot() -> [MCPToolExecutionTraceEvent] {
+        lock.withLock { events }
+    }
+}
+
+@MainActor
+private final class CleanupTransportObservation {
+    var response: Result<PersistentMCPTestRPCResponse, Error>?
+    var handlerFinished = false
 }
 
 // MARK: - SessionAdminExecutionContractTests regressions

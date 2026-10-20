@@ -57,6 +57,9 @@ final class HeadlessAgentModeRunner {
         }
         let ownership = session.beginRunAttempt(source: "headless")
         let runAttemptID = ownership.attemptID
+        session.mcpStartupAttempt?.installRuntimeCleanup(ownership: ownership) {
+            await lease.failAndCleanup()
+        }
         session.recordRunProgress(ownership: ownership, kind: .stageTransition, stage: .preparingRuntime)
         session.runningStatusText = nil
         session.runningStatusSource = nil
@@ -160,6 +163,7 @@ final class HeadlessAgentModeRunner {
         ownership: AgentRunOwnership,
         attachmentReservationID: UUID?
     ) async {
+        guard session.mcpStartupAttempt?.hasFailed != true else { return }
         hooks.providerInput.recordPendingHandoffSendOutcome(session, false)
         await terminalCommitBarrier.commit(.init(
             binding: hooks.bindTerminalSession(session),
@@ -233,6 +237,10 @@ final class HeadlessAgentModeRunner {
             let released = hooks.providerInput.handoffAgentSessionLinkProviderInput(session, .headlessRun(runID: runID), monitoring.claim, proof)
             guard !released.mustAbortDispatch else { throw CancellationError() }
             let stream = try await provider.streamAgentMessage(released.message(initialMessage), runID: runID)
+            try Task.checkCancellation()
+            guard session.isCurrentRunAttempt(ownership, expectedRunID: runID),
+                  session.mcpStartupAttempt?.hasFailed != true else { throw CancellationError() }
+            session.mcpStartupAttempt?.runtimeReady(ownership: ownership)
             // Successful stream creation is the acceptance signal for every headless provider,
             // including Claude headless. A throwing creation leaves the claim pending for the retry.
             hooks.providerInput.acceptAgentSessionLinkPrompt(session, monitoring.dispatchContext, released.claim)
@@ -247,10 +255,17 @@ final class HeadlessAgentModeRunner {
                 session.recordRunProgress(ownership: ownership, kind: .stageTransition, stage: .running)
             }
 
+            var hasAntigravityOutput = false
             for try await result in stream {
                 guard !Task.isCancelled else { break }
                 guard session.isCurrentRunAttempt(ownership, expectedRunID: runID) else {
                     return .superseded
+                }
+                if session.selectedAgent == .antigravity,
+                   result.type == "content" || result.type == "final_content",
+                   result.text?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+                {
+                    hasAntigravityOutput = true
                 }
                 session.recordRunProgress(ownership: ownership, kind: .providerEvent, stage: .running)
                 await hooks.transcript.handleHeadlessStreamResult(result, session, runID, runAttemptID)
@@ -261,10 +276,17 @@ final class HeadlessAgentModeRunner {
             else {
                 return .superseded
             }
+            if session.selectedAgent == .antigravity {
+                try Task.checkCancellation()
+                guard hasAntigravityOutput else {
+                    throw AIProviderError.invalidConfiguration(detail: AntigravityAgentProvider.noMeaningfulOutputMessage)
+                }
+            }
             return .completed(assistantText: nil)
         }
 
-        guard case let .terminal(outcome) = report.result else { return }
+        guard case let .terminal(outcome) = report.result,
+              session.mcpStartupAttempt?.hasFailed != true else { return }
         if !providerInitializationCompleted {
             hooks.providerInput.recordAgentSessionLinkPhysicalDispatchFailure(
                 session,

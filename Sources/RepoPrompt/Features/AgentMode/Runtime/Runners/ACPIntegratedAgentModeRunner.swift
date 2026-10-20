@@ -298,6 +298,9 @@ final class ACPIntegratedAgentModeRunner {
         }
         let runID = AgentModeProcessRunIdentity.startFreshProcessRun(for: session)
         let lease = makeLease(runID)
+        session.mcpStartupAttempt?.installRuntimeCleanup(ownership: ownership) {
+            await lease.failAndCleanup()
+        }
         guard isStartupStillCurrent(session: session, runID: runID, runAttemptID: runAttemptID) else { return }
 
         let provider: any ACPAgentProvider
@@ -950,6 +953,10 @@ final class ACPIntegratedAgentModeRunner {
                     runRequest: runRequest
                 ) else {
                     return .superseded
+                }
+                guard isStartupStillCurrent(session: session, runID: runID, runAttemptID: runAttemptID) else { return .superseded }
+                if let ownership = session.activeRunOwnership {
+                    session.mcpStartupAttempt?.runtimeReady(ownership: ownership)
                 }
                 setRunningStatus(waitingForConnectionStatusText(for: runRequest.agentKind), source: .transport, session: session, urgent: true)
 
@@ -1705,7 +1712,8 @@ final class ACPIntegratedAgentModeRunner {
         lease _: MCPBootstrapLease,
         attachmentReservationID: UUID?
     ) async {
-        guard let ownership = session.activeRunOwnership,
+        guard session.mcpStartupAttempt?.hasFailed != true,
+              let ownership = session.activeRunOwnership,
               ownership.attemptID == runAttemptID
         else { return }
         hooks.providerInput.recordPendingHandoffSendOutcome(session, false)
@@ -1738,7 +1746,8 @@ final class ACPIntegratedAgentModeRunner {
         controller: ACPAgentSessionController,
         attachmentReservationID: UUID?
     ) async {
-        guard case let .terminal(outcome) = classification.report.result else { return }
+        guard case let .terminal(outcome) = classification.report.result,
+              session.mcpStartupAttempt?.hasFailed != true else { return }
         let terminalState: AgentSessionRunState = switch outcome.kind {
         case .completed:
             .completed

@@ -203,6 +203,10 @@ final class AgentModeRunService {
             startOutcome?.recordStartFailure(message: message)
             return session.selectedAgent == .codexExec ? .preDispatchRejected(message: message) : nil
         }
+        if session.mcpStartupAttempt?.hasFailed == true {
+            session.mcpStartupAttempt = nil
+            session.runningStatusText = nil
+        }
         let selectedAgent = session.selectedAgent
         if let selfCompactDispatchID {
             guard session.selfCompactState.active?.id == selfCompactDispatchID.requestID,
@@ -696,16 +700,22 @@ final class AgentModeRunService {
         return description.isEmpty ? String(describing: error) : description
     }
 
-    private func failBeforeProviderStartup(session: AgentTabSession, message: String) async {
+    func failBeforeProviderStartup(
+        session: AgentTabSession,
+        message: String,
+        terminalState: AgentSessionRunState = .failed,
+        failureReason: AgentRunMCPSnapshot.FailureReason? = nil
+    ) async {
         let ownership = session.activeRunOwnership ?? session.beginRunAttempt(source: "runService.startupFailure")
         hooks.providerInput.recordPendingHandoffSendOutcome(session, false)
         await terminalCommitBarrier.commit(.init(
             binding: hooks.bindTerminalSession(session),
             ownership: ownership,
             expectedRunID: session.runID,
-            terminalState: .failed,
+            terminalState: terminalState,
             source: "runService.startupFailure",
             errorText: message,
+            failureReason: failureReason,
             attachmentDisposition: .deleteFiles,
             finalizeNonCodexUsage: session.selectedAgent != .codexExec,
             supportsFollowUp: false,

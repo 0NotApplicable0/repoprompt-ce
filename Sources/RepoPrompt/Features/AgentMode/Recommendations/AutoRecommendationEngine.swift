@@ -351,14 +351,25 @@ final class AutoRecommendationEngine {
         return nil
     }
 
-    /// Restores a usable saved Context Builder agent, using its catalog default when the saved model is absent or blank.
-    /// Invalid nonempty models or unavailable agents fall back through the same recommendation ranking as the wizard.
+    /// Preserves restored CLI identities for explicit execution validation rather than silently replacing them.
+    /// Other saved agents use their catalog default for absent or blank models, or recommendations when unusable.
     static func resolveContextBuilderSelection(
         persistedAgentRaw: String?,
         persistedModelRaw: String?,
         availability: AgentModelCatalog.AvailabilityContext,
         enabledRecommendationProviders: Set<RecommendationProviderKind> = Set(RecommendationProviderKind.allCases)
     ) -> AgentModelCatalog.NormalizedAgentSelection? {
+        if let agentRaw = persistedAgentRaw?.trimmingCharacters(in: .whitespacesAndNewlines),
+           let agent = AgentProviderKind(rawValue: agentRaw),
+           agent.preservesSavedSelection
+        {
+            return AgentModelCatalog.normalizePersistedSelection(
+                agentRaw: agentRaw,
+                modelRaw: persistedModelRaw,
+                availability: availability,
+                surface: .headless
+            )
+        }
         if let agentRaw = persistedAgentRaw?.trimmingCharacters(in: .whitespacesAndNewlines),
            let agent = AgentProviderKind(rawValue: agentRaw),
            AgentModelCatalog.AgentSelectionSurface.headless.allows(agent),

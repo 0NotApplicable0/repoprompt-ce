@@ -828,3 +828,280 @@ final class WorkspaceCodemapGraphIncrementalIndexTests: XCTestCase {
         }
     }
 }
+
+/// Code Map Generation stays on. A burst of writes must not restart extraction once per write,
+/// a non-codemap path must not enter the graph, and an unchanged apply must not re-pull.
+final class WorkspaceCodemapChurnTests: XCTestCase {
+    private let reextractionBound = 2
+
+    func testRepeatedWritesToOneSourceFileCoalesceReextraction() async throws {
+        let gate = TestReleaseFence(name: "codemap churn extraction")
+        let stalled = CodemapLockedValues<String>()
+        let repository = try ReviewGitRepositoryFixture(name: #function)
+        let rootURL = try repository.makeRepository(
+            named: "root",
+            files: ["Sources/App.swift": "struct App { let id: Int }\n"]
+        )
+        let fixture = try CodemapStoreFixture(
+            name: #function,
+            beforeArtifactBuild: { text in
+                guard text.contains("burst"), stalled.values.isEmpty else { return }
+                stalled.append(text)
+                await gate.enterAndWait()
+            }
+        )
+        let store = fixture.makeStore()
+        addTeardownBlock {
+            gate.release()
+            await fixture.shutdown()
+            repository.cleanup()
+        }
+
+        let loaded = try await store.loadRoot(path: rootURL.path)
+        addTeardownBlock { await store.unloadRoot(id: loaded.id) }
+        let engine = try fixture.runtime().bindingEngine()
+        _ = try await waitForGraphCompletion(engine: engine, rootID: loaded.id)
+        let buildsBeforeBurst = fixture.builtSourceTexts.values.count
+        let rootFiles = await store.files(inRoot: loaded.id)
+        let file = try XCTUnwrap(
+            rootFiles.first { $0.standardizedRelativePath == "Sources/App.swift" }
+        )
+
+        let burstCount = 8
+        try repository.write(burstSource(1), to: "Sources/App.swift", at: rootURL)
+        await store.replayObservedFileSystemDeltas(
+            rootID: loaded.id,
+            deltas: [.fileModified("Sources/App.swift", Date())]
+        )
+        try await waitUntil { !stalled.values.isEmpty }
+        for generation in 2 ... burstCount {
+            try repository.write(burstSource(generation), to: "Sources/App.swift", at: rootURL)
+            await store.replayObservedFileSystemDeltas(
+                rootID: loaded.id,
+                deltas: [.fileModified("Sources/App.swift", Date())]
+            )
+        }
+        gate.release()
+
+        try await waitForCodemapText(store: store, fileID: file.id, contains: "burst\(burstCount)")
+        let reextractions = fixture.builtSourceTexts.values.count - buildsBeforeBurst
+        XCTAssertLessThanOrEqual(
+            reextractions,
+            reextractionBound,
+            "A burst of \(burstCount) writes started \(reextractions) extractions; bound is one in flight plus one follow-up"
+        )
+        XCTAssertGreaterThan(reextractions, 0)
+    }
+
+    func testUnchangedContentEventDoesNotReextract() async throws {
+        let repository = try ReviewGitRepositoryFixture(name: #function)
+        let rootURL = try repository.makeRepository(
+            named: "root",
+            files: ["Sources/App.swift": "struct App { let id: Int }\n"]
+        )
+        let fixture = try CodemapStoreFixture(name: #function)
+        let store = fixture.makeStore()
+        addTeardownBlock {
+            await fixture.shutdown()
+            repository.cleanup()
+        }
+        let loaded = try await store.loadRoot(path: rootURL.path)
+        addTeardownBlock { await store.unloadRoot(id: loaded.id) }
+        let engine = try fixture.runtime().bindingEngine()
+        _ = try await waitForGraphCompletion(engine: engine, rootID: loaded.id)
+        let buildsBefore = fixture.builtSourceTexts.values.count
+        let startedBefore = await engine.accounting().counters.graphIndexArtifactBuildsStarted
+
+        for _ in 0 ..< 5 {
+            await store.replayObservedFileSystemDeltas(
+                rootID: loaded.id,
+                deltas: [.fileModified("Sources/App.swift", Date())]
+            )
+        }
+        try await Task.sleep(for: .milliseconds(500))
+
+        XCTAssertEqual(fixture.builtSourceTexts.values.count, buildsBefore)
+        let startedAfter = await engine.accounting().counters.graphIndexArtifactBuildsStarted
+        XCTAssertEqual(startedAfter, startedBefore)
+    }
+
+    func testNonCodemapFileChurnSchedulesNoCodemapWork() async throws {
+        let repository = try ReviewGitRepositoryFixture(name: #function)
+        let rootURL = try repository.makeRepository(
+            named: "root",
+            files: [
+                "Sources/App.swift": "struct App { let id: Int }\n",
+                "verify.log": "start\n"
+            ]
+        )
+        let fixture = try CodemapStoreFixture(name: #function)
+        let store = fixture.makeStore()
+        addTeardownBlock {
+            await fixture.shutdown()
+            repository.cleanup()
+        }
+        let loaded = try await store.loadRoot(path: rootURL.path)
+        addTeardownBlock { await store.unloadRoot(id: loaded.id) }
+        let engine = try fixture.runtime().bindingEngine()
+        let completed = try await waitForGraphCompletion(engine: engine, rootID: loaded.id)
+        let catalogFiles = await store.files(inRoot: loaded.id)
+        XCTAssertNotNil(catalogFiles.first { $0.standardizedRelativePath == "verify.log" })
+        let selectionGraph = await engine.selectionGraph(rootEpoch: completed.rootEpoch)
+        let graph = try XCTUnwrap(selectionGraph)
+        let runsBefore = await engine.accounting().counters.graphIndexRunsStarted
+        let pullsBefore = await graph.incrementalAccounting().diffPullCount
+        let buildsBefore = fixture.builtSourceTexts.values.count
+
+        for index in 0 ..< 12 {
+            try repository.write("start\nline \(index)\n", to: "verify.log", at: rootURL)
+            await store.replayObservedFileSystemDeltas(
+                rootID: loaded.id,
+                deltas: [.fileModified("verify.log", Date())]
+            )
+        }
+        try await Task.sleep(for: .milliseconds(500))
+
+        let runsAfter = await engine.accounting().counters.graphIndexRunsStarted
+        let pullsAfter = await graph.incrementalAccounting().diffPullCount
+        XCTAssertEqual(runsAfter, runsBefore)
+        XCTAssertEqual(pullsAfter, pullsBefore)
+        XCTAssertEqual(fixture.builtSourceTexts.values.count, buildsBefore)
+    }
+
+    func testUnchangedGraphApplyDoesNotSpinPull() async throws {
+        let repository = try ReviewGitRepositoryFixture(name: #function)
+        let rootURL = try repository.makeRepository(
+            named: "root",
+            files: ["Sources/App.swift": "struct App { let id: Int }\n"]
+        )
+        let fixture = try CodemapStoreFixture(name: #function)
+        let store = fixture.makeStore()
+        addTeardownBlock {
+            await fixture.shutdown()
+            repository.cleanup()
+        }
+        let loaded = try await store.loadRoot(path: rootURL.path)
+        addTeardownBlock { await store.unloadRoot(id: loaded.id) }
+        let engine = try fixture.runtime().bindingEngine()
+        let completed = try await waitForGraphCompletion(engine: engine, rootID: loaded.id)
+        let selectionGraph = await engine.selectionGraph(rootEpoch: completed.rootEpoch)
+        let graph = try XCTUnwrap(selectionGraph)
+        let settled = try await waitForStableDiffPullCount(graph: graph)
+        try await Task.sleep(for: .milliseconds(300))
+        let pullsAfterSettle = await graph.incrementalAccounting().diffPullCount
+        XCTAssertEqual(pullsAfterSettle, settled)
+    }
+
+    func testEditedSourceFileStillUpdatesAfterWritesStop() async throws {
+        let repository = try ReviewGitRepositoryFixture(name: #function)
+        let rootURL = try repository.makeRepository(
+            named: "root",
+            files: ["Sources/App.swift": "struct App { let id: Int }\n"]
+        )
+        let fixture = try CodemapStoreFixture(name: #function)
+        let store = fixture.makeStore()
+        addTeardownBlock {
+            await fixture.shutdown()
+            repository.cleanup()
+        }
+        let loaded = try await store.loadRoot(path: rootURL.path)
+        addTeardownBlock { await store.unloadRoot(id: loaded.id) }
+        let engine = try fixture.runtime().bindingEngine()
+        _ = try await waitForGraphCompletion(engine: engine, rootID: loaded.id)
+        let rootFiles = await store.files(inRoot: loaded.id)
+        let file = try XCTUnwrap(
+            rootFiles.first { $0.standardizedRelativePath == "Sources/App.swift" }
+        )
+
+        for generation in 1 ... 3 {
+            try repository.write(settledSource(generation), to: "Sources/App.swift", at: rootURL)
+            await store.replayObservedFileSystemDeltas(
+                rootID: loaded.id,
+                deltas: [.fileModified("Sources/App.swift", Date())]
+            )
+        }
+
+        try await waitForCodemapText(store: store, fileID: file.id, contains: "settled3")
+    }
+
+    private func burstSource(_ generation: Int) -> String {
+        "struct App { let burst\(generation): Int }\n"
+    }
+
+    private func settledSource(_ generation: Int) -> String {
+        "struct App { let settled\(generation): Int }\n"
+    }
+
+    private func waitUntil(
+        _ condition: @escaping @Sendable () -> Bool,
+        timeoutSeconds: Double = 20
+    ) async throws {
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: .seconds(timeoutSeconds))
+        while clock.now < deadline {
+            if condition() { return }
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        XCTAssertTrue(condition())
+    }
+
+    private func waitForGraphCompletion(
+        engine: WorkspaceCodemapBindingEngine,
+        rootID: UUID
+    ) async throws -> WorkspaceCodemapBindingEngineGraphIndexRootAccounting {
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: .seconds(30))
+        while clock.now < deadline {
+            let accounting = await engine.accounting()
+            if let root = accounting.graphIndexRoots.first(where: { $0.rootEpoch.rootID == rootID }),
+               root.phase == .complete
+            {
+                return root
+            }
+            try await Task.sleep(for: .milliseconds(25))
+        }
+        throw CodemapGraphIndexHarnessError.timedOut
+    }
+
+    private func waitForCodemapText(
+        store: WorkspaceFileContextStore,
+        fileID: UUID,
+        contains needle: String
+    ) async throws {
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: .seconds(30))
+        var last = ""
+        while clock.now < deadline {
+            let structure = try await WorkspaceCodemapPresentationCoordinator(store: store)
+                .presentation(
+                    for: .exact(fileIDs: [fileID], completeRootSet: false),
+                    rootScope: .allLoaded
+                )
+            last = structure.renderedEntriesByFileID[fileID]?.text ?? ""
+            if last.contains(needle) { return }
+            try await Task.sleep(for: .milliseconds(50))
+        }
+        XCTFail("Timed out waiting for \(needle) in \(last)")
+    }
+
+    private func waitForStableDiffPullCount(
+        graph: WorkspaceCodemapSelectionGraph
+    ) async throws -> UInt64 {
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: .seconds(5))
+        var last = await graph.incrementalAccounting().diffPullCount
+        var stableSamples = 0
+        while clock.now < deadline {
+            try await Task.sleep(for: .milliseconds(50))
+            let next = await graph.incrementalAccounting().diffPullCount
+            if next == last {
+                stableSamples += 1
+                if stableSamples >= 3 { return next }
+            } else {
+                stableSamples = 0
+                last = next
+            }
+        }
+        return last
+    }
+}

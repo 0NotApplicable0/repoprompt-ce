@@ -2,6 +2,7 @@ import Foundation
 import MCP
 @_spi(TestSupport) @testable import RepoPromptApp
 import RepoPromptDomainRuntime
+import RepoPromptProcess
 import RepoPromptSecureStorage
 import RepoPromptSettingsCore
 import XCTest
@@ -497,10 +498,58 @@ final class RoutedStartDispatchRecorder: @unchecked Sendable {
         let model: String?
     }
 
+    struct DeliveredTurn: Equatable {
+        let agent: AgentProviderKind
+        let model: String?
+        let parameters: [ACPModelParameterSelection]
+        let message: String
+    }
+
     private let lock = NSLock()
+    private let cursorPromptLogURL: URL?
+    private var deliveredHeadless: [DeliveredTurn] = []
+    private var deliveredACP: [DeliveredTurn] = []
     private var headless: [HeadlessStart] = []
     private var acp: [ACPRunRequest] = []
     private var claudeStarts = 0
+
+    init(cursorPromptLogURL: URL? = nil) {
+        self.cursorPromptLogURL = cursorPromptLogURL
+    }
+
+    func receivedCursorTurns() throws -> [[String: String]] {
+        guard let cursorPromptLogURL,
+              FileManager.default.fileExists(atPath: cursorPromptLogURL.path)
+        else { return [] }
+        return try String(contentsOf: cursorPromptLogURL, encoding: .utf8)
+            .split(separator: "\n")
+            .map { try JSONDecoder().decode([String: String].self, from: Data($0.utf8)) }
+    }
+
+    var headlessTurns: [DeliveredTurn] {
+        lock.withLock { deliveredHeadless }
+    }
+
+    var acpTurns: [DeliveredTurn] {
+        lock.withLock { deliveredACP }
+    }
+
+    func recordHeadlessTurn(agent: AgentProviderKind, model: String?, message: AgentMessage) {
+        lock.withLock {
+            deliveredHeadless.append(.init(agent: agent, model: model, parameters: [], message: message.userMessage))
+        }
+    }
+
+    func recordACPTurn(request: ACPRunRequest, message: AgentMessage) {
+        lock.withLock {
+            deliveredACP.append(.init(
+                agent: request.agentKind,
+                model: request.modelString,
+                parameters: request.modelParameterSelections,
+                message: message.userMessage
+            ))
+        }
+    }
 
     var headlessStarts: [HeadlessStart] {
         lock.withLock { headless }
@@ -527,6 +576,73 @@ final class RoutedStartDispatchRecorder: @unchecked Sendable {
     }
 }
 
+private actor RoutedStartRecordingHeadlessProvider: HeadlessAgentProvider {
+    private let base = AgentSessionLinkCapturingHeadlessProvider(failuresRemaining: 1)
+    private let agent: AgentProviderKind
+    private let model: String?
+    private let recorder: RoutedStartDispatchRecorder
+
+    init(agent: AgentProviderKind, model: String?, recorder: RoutedStartDispatchRecorder) {
+        self.agent = agent
+        self.model = model
+        self.recorder = recorder
+    }
+
+    func streamAgentMessage(_ message: AgentMessage, runID: UUID?) async throws -> AsyncThrowingStream<AIStreamResult, Error> {
+        recorder.recordHeadlessTurn(agent: agent, model: model, message: message)
+        return try await base.streamAgentMessage(message, runID: runID)
+    }
+
+    func dispose() async {
+        await base.dispose()
+    }
+}
+
+private struct RoutedStartRecordingACPProvider: ACPAgentProvider {
+    let base: AgentSessionLinkCapturingACPProvider
+    let recorder: RoutedStartDispatchRecorder
+
+    var providerID: ACPProviderID {
+        base.providerID
+    }
+
+    var supportsParameterizedModelPicker: Bool {
+        true
+    }
+
+    func modelParameterKind(for input: ACPModelParameterClassificationInput) -> ACPModelParameterKind? {
+        input.configID == "reasoning_effort" ? .thinking : nil
+    }
+
+    func support(for request: ACPRunRequest) async throws -> ACPSupportResult {
+        try await base.support(for: request)
+    }
+
+    func makeLaunchConfiguration(for request: ACPRunRequest) throws -> ACPLaunchConfiguration {
+        try base.makeLaunchConfiguration(for: request)
+    }
+
+    func makeSessionConfiguration(
+        for request: ACPRunRequest,
+        mcpServer: RepoPromptMCPServerConfiguration
+    ) throws -> ACPSessionConfiguration {
+        try base.makeSessionConfiguration(for: request, mcpServer: mcpServer)
+    }
+
+    func buildPromptBlocks(for message: AgentMessage, request: ACPRunRequest) throws -> [[String: Any]] {
+        recorder.recordACPTurn(request: request, message: message)
+        return try base.buildPromptBlocks(for: message, request: request)
+    }
+
+    func normalizeSessionUpdate(_ payload: [String: Any], sessionID: String) -> [NormalizedAgentRuntimeEvent] {
+        base.normalizeSessionUpdate(payload, sessionID: sessionID)
+    }
+
+    func normalizeError(_ error: Error) -> Error {
+        base.normalizeError(error)
+    }
+}
+
 /// Selects the one choice whose role reference names the fixture's model class, then its effort.
 actor RoutedStartDecisionService: DecisionService {
     nonisolated let id = DecisionServiceID(rawValue: "routed-start")
@@ -545,6 +661,7 @@ actor RoutedStartDecisionService: DecisionService {
     private let fallbackModelClasses: [String]
     private(set) var questionNames: [String] = []
     private(set) var modelChoiceDescriptions: [String] = []
+    private var nextDecisionGate: StartStallGate?
 
     init(modelClass: String, effortRaw: String?, fallbackModelClasses: [String] = []) {
         self.modelClass = modelClass
@@ -556,7 +673,14 @@ actor RoutedStartDecisionService: DecisionService {
         .ready(generation: 1, policyVersion: "routed-start-v1")
     }
 
-    func decide(_ request: FiniteChoiceDecisionRequest) -> DecisionOutcome {
+    fileprivate func suspendNextDecision(on gate: StartStallGate) {
+        nextDecisionGate = gate
+    }
+
+    func decide(_ request: FiniteChoiceDecisionRequest) async -> DecisionOutcome {
+        let gate = nextDecisionGate
+        nextDecisionGate = nil
+        await gate?.suspend()
         questionNames.append(request.question.name)
         let label: String
         if request.question.name == "effort_route" {
@@ -591,6 +715,7 @@ final class RoutedStartFixture {
     let service: RoutedStartDecisionService
     let window: WindowState
     let recorder: RoutedStartDispatchRecorder
+    let workspaceRoot: URL
     private var capture: Capture?
     private var caller: (tabID: UUID, sessionID: UUID)?
 
@@ -598,10 +723,11 @@ final class RoutedStartFixture {
         window.agentModeViewModel.sessions.count
     }
 
-    private init(service: RoutedStartDecisionService, window: WindowState, recorder: RoutedStartDispatchRecorder) {
+    private init(service: RoutedStartDecisionService, window: WindowState, recorder: RoutedStartDispatchRecorder, workspaceRoot: URL) {
         self.service = service
         self.window = window
         self.recorder = recorder
+        self.workspaceRoot = workspaceRoot
     }
 
     static func cursorGrokThinking(_ value: String) -> ACPModelParameterSelection {
@@ -620,7 +746,10 @@ final class RoutedStartFixture {
         effortRaw: String?,
         grokCLIConnected: Bool = true,
         fallbackModelClasses: [String] = [],
-        routerEnabled: Bool = true
+        routerEnabled: Bool = true,
+        recordTurnDelivery: Bool = false,
+        headlessProviderFactory: AgentModeViewModel.HeadlessProviderFactory? = nil,
+        prepareRoot: ((URL) throws -> Void)? = nil
     ) async throws -> RoutedStartFixture {
         GlobalSettingsStore.installApplicationModelIdentityPolicy()
         installProviderCatalogs(testCase: testCase)
@@ -631,6 +760,7 @@ final class RoutedStartFixture {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("RoutedStart-\(UUID())", isDirectory: true)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         testCase.addTeardownBlock { try? FileManager.default.removeItem(at: root) }
+        try prepareRoot?(root)
         let suiteName = "RoutedStartFixture.\(UUID())"
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
         testCase.addTeardownBlock { defaults.removePersistentDomain(forName: suiteName) }
@@ -648,7 +778,9 @@ final class RoutedStartFixture {
         let runtime = try AgentTaskRouterRuntime(registrations: [.init(service: service)], demandSource: store)
         testCase.addTeardownBlock { await runtime.teardown() }
 
-        let recorder = RoutedStartDispatchRecorder()
+        let cursorPromptLogURL = recordTurnDelivery ? root.appendingPathComponent("cursor-prompts.jsonl") : nil
+        let cursorCommand = recordTurnDelivery ? try writeCursorServer(to: root) : nil
+        let recorder = RoutedStartDispatchRecorder(cursorPromptLogURL: cursorPromptLogURL)
         let workspacePath = root.path
         let previousAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
         GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)
@@ -664,17 +796,42 @@ final class RoutedStartFixture {
                     },
                     headlessProviderFactory: { agent, model, _, _, _ in
                         recorder.recordHeadless(agent, model)
+                        if let headlessProviderFactory {
+                            return headlessProviderFactory(agent, model, workspacePath, nil, nil)
+                        }
+                        if recordTurnDelivery {
+                            return RoutedStartRecordingHeadlessProvider(agent: agent, model: model, recorder: recorder)
+                        }
                         return AgentSessionLinkCapturingHeadlessProvider(failuresRemaining: 1)
                     },
                     acpProviderFactory: { agent, _ in
                         guard agent == .cursor else { throw MCPError.internalError("Only Cursor may start over ACP") }
-                        return AgentSessionLinkCapturingACPProvider(providerID: .cursor, commandPath: "/usr/bin/true")
+                        let provider = AgentSessionLinkCapturingACPProvider(
+                            providerID: .cursor,
+                            commandPath: cursorCommand?.path ?? "/usr/bin/true",
+                            environment: cursorPromptLogURL.map { ["ROUTED_CURSOR_PROMPT_LOG": $0.path] } ?? [:]
+                        )
+                        if recordTurnDelivery {
+                            return RoutedStartRecordingACPProvider(base: provider, recorder: recorder)
+                        }
+                        return provider
                     },
-                    acpControllerFactory: { _, request in
+                    acpControllerFactory: { provider, request in
                         recorder.recordACP(request)
-                        throw MCPError.internalError("ACP controller recorded")
+                        guard recordTurnDelivery else { throw MCPError.internalError("ACP controller recorded") }
+                        return try ACPAgentSessionController(
+                            provider: provider, runRequest: request, allowsProviderProcessLaunchForTesting: true
+                        )
                     },
-                    connectionPolicyInstaller: { _, _, _, _, _, _, _, _, _, _, _, _, _ in },
+                    connectionPolicyInstaller: { client, window, restricted, oneShot, reason, ttl, tab, run, additional, purpose, label, external, expectedPID in
+                        guard headlessProviderFactory != nil || recordTurnDelivery else { return }
+                        await ServerNetworkManager.shared.installClientConnectionPolicy(
+                            for: client, windowID: window, restrictedTools: restricted, oneShot: oneShot,
+                            reason: reason, ttl: ttl, tabID: tab, runID: run, additionalTools: additional,
+                            purpose: purpose, taskLabelKind: label, allowsAgentExternalControlTools: external,
+                            requiresExpectedAgentPID: expectedPID
+                        )
+                    },
                     mcpRunRoutingCleaner: { _, _, _ in },
                     mcpServerEnabler: { true },
                     testMCPServer: server,
@@ -723,7 +880,66 @@ final class RoutedStartFixture {
                 runtime.isBackendReady(service.id)
             }
         }
-        return RoutedStartFixture(service: service, window: window, recorder: recorder)
+        return RoutedStartFixture(service: service, window: window, recorder: recorder, workspaceRoot: root)
+    }
+
+    private static func writeCursorServer(to root: URL) throws -> URL {
+        let scriptURL = root.appendingPathComponent("routed_cursor_acp.py")
+        let script = #"""
+        #!/usr/bin/python3
+        import json
+        import os
+        import sys
+        model = "composer-2.5"
+        effort = "high"
+        mode = "ask"
+        def select(config_id, category, current, values):
+            return {
+                "id": config_id, "name": config_id, "category": category,
+                "type": "select", "currentValue": current,
+                "options": [{"value": value, "name": value} for value in values]
+            }
+        def config_options():
+            return [
+                select("model", "model", model, ["composer-2.5", "grok-4.7"]),
+                select("reasoning_effort", "thinking", effort, ["low", "medium", "high", "xhigh"]),
+                select("mode", "mode", mode, ["ask", "auto_edit", "repoprompt_acp", "repoprompt_acp_full_access"])
+            ]
+        for line in sys.stdin:
+            request = json.loads(line)
+            if "id" not in request:
+                continue
+            method = request.get("method")
+            params = request.get("params") or {}
+            result = {}
+            if method == "initialize":
+                result = {"agentCapabilities": {}, "authMethods": []}
+            elif method == "session/new":
+                result = {"sessionId": "routed-cursor-session", "configOptions": config_options()}
+            elif method == "cursor/list_available_models":
+                result = {"models": [
+                    {"value": value, "name": value, "configOptions": config_options()}
+                    for value in ["composer-2.5", "grok-4.7"]
+                ]}
+            elif method == "session/set_config_option":
+                config_id = params.get("configId")
+                if config_id == "model":
+                    model = params["value"]
+                elif config_id == "reasoning_effort":
+                    effort = params["value"]
+                elif config_id == "mode":
+                    mode = params["value"]
+                result = {"configOptions": config_options()}
+            elif method == "session/prompt":
+                message = "".join(block["text"] for block in params["prompt"] if block.get("type") == "text")
+                with open(os.environ["ROUTED_CURSOR_PROMPT_LOG"], "a") as log:
+                    log.write(json.dumps({"model": model, "reasoning_effort": effort, "message": message}) + "\n")
+                result = {"stopReason": "end_turn"}
+            print(json.dumps({"jsonrpc": "2.0", "id": request["id"], "result": result}), flush=True)
+        """#
+        try script.write(to: scriptURL, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: scriptURL.path)
+        return scriptURL
     }
 
     /// Antigravity and Grok CLI catalogs come from their model registries; Cursor's from ACP discovery.
@@ -900,6 +1116,888 @@ final class RoutedStartFixture {
         )
         caller = (session.tabID, sessionID)
         return sessionID
+    }
+}
+
+@MainActor
+final class AgentRunMCPStartStallTests: XCTestCase {
+    func testDeferredPreparationAfterStartupTimeoutDoesNotLaunch() async throws {
+        let runtime = try makeRuntimeProbe()
+        var providerConstructions = 0
+        let clock = StartStallClock()
+        let observation = StartStallObservation()
+        let (window, service, recorder) = try await makeDeferredPreparationStart(
+            runtime: runtime, clock: clock, observation: observation,
+            providerConstructed: { providerConstructions += 1 }
+        )
+        let viewModel = window.agentModeViewModel
+        let gate = StartStallGate()
+        viewModel.test_afterProviderInputAugmentation = { await gate.suspend() }
+        _ = launch(
+            service, args: ["model_id": .string("cursor:composer-2.5")],
+            observation: observation, gate: gate, clock: clock
+        )
+        await drainScheduler(until: { gate.hasEntered })
+        XCTAssertTrue(gate.hasEntered)
+        let target = try XCTUnwrap(observation.target)
+        let session = try XCTUnwrap(viewModel.session(for: target.tabID, createIfNeeded: false))
+        XCTAssertNil(session.agentTask, "The producer must still be in pre-run preparation")
+        XCTAssertEqual(providerConstructions, 0)
+        await drainScheduler()
+        clock.advance(to: .seconds(60))
+        await drainScheduler(until: { session.runState == .failed && session.activeRunOwnership == nil })
+        XCTAssertEqual(session.runState, .failed)
+        XCTAssertEqual(try viewModel.mcpSnapshot(sessionID: XCTUnwrap(target.sessionID))?.failureReason, .timeout)
+
+        gate.release()
+        await drainScheduler()
+        XCTAssertEqual(providerConstructions, 0, "A timed-out producer must not construct a provider when preparation resumes")
+        XCTAssertTrue(recorder.acpRunRequests.isEmpty, "No ACP controller or turn may be dispatched")
+        XCTAssertFalse(runtime.processEntered)
+        XCTAssertEqual(session.runState, .failed)
+        let snapshot = try viewModel.mcpSnapshot(sessionID: XCTUnwrap(target.sessionID))
+        XCTAssertEqual(snapshot?.status, .failed)
+        XCTAssertEqual(snapshot?.failureReason, .timeout)
+    }
+
+    func testDeferredPreparationAfterStopDoesNotLaunch() async throws {
+        let runtime = try makeRuntimeProbe()
+        var providerConstructions = 0
+        let clock = StartStallClock()
+        let observation = StartStallObservation()
+        let (window, service, recorder) = try await makeDeferredPreparationStart(
+            runtime: runtime, clock: clock, observation: observation,
+            providerConstructed: { providerConstructions += 1 }
+        )
+        let viewModel = window.agentModeViewModel
+        let gate = StartStallGate()
+        viewModel.test_afterProviderInputAugmentation = { await gate.suspend() }
+        _ = launch(
+            service, args: ["model_id": .string("cursor:composer-2.5")],
+            observation: observation, gate: gate, clock: clock
+        )
+        await drainScheduler(until: { gate.hasEntered })
+        XCTAssertTrue(gate.hasEntered)
+        let target = try XCTUnwrap(observation.target)
+        let session = try XCTUnwrap(viewModel.session(for: target.tabID, createIfNeeded: false))
+        XCTAssertNil(session.agentTask, "Stop must happen before a runner owns the producer")
+        XCTAssertEqual(providerConstructions, 0)
+        await viewModel.cancelAgentRun(tabID: target.tabID)
+        await drainScheduler(until: { session.runState == .cancelled && session.activeRunOwnership == nil })
+        XCTAssertEqual(session.runState, .cancelled)
+
+        gate.release()
+        await drainScheduler()
+        XCTAssertEqual(providerConstructions, 0, "A stopped producer must not construct a provider when preparation resumes")
+        XCTAssertTrue(recorder.acpRunRequests.isEmpty, "No ACP controller or turn may be dispatched")
+        XCTAssertFalse(runtime.processEntered)
+        XCTAssertEqual(session.runState, .cancelled)
+        let snapshot = try viewModel.mcpSnapshot(sessionID: XCTUnwrap(target.sessionID))
+        XCTAssertEqual(snapshot?.status, .cancelled)
+        XCTAssertEqual(snapshot?.failureReason, .cancelled)
+    }
+
+    func testNewSubmissionAfterFailedStartupStillStarts() async throws {
+        let runtime = try makeRuntimeProbe()
+        let clock = StartStallClock()
+        let observation = StartStallObservation()
+        let (window, service, _) = try await makeDeferredPreparationStart(
+            runtime: runtime, clock: clock, observation: observation, providerConstructed: {}
+        )
+        let viewModel = window.agentModeViewModel
+        let gate = StartStallGate()
+        viewModel.test_afterProviderInputAugmentation = { await gate.suspend() }
+        _ = launch(
+            service, args: ["model_id": .string("cursor:composer-2.5")],
+            observation: observation, gate: gate, clock: clock
+        )
+        await drainScheduler(until: { gate.hasEntered })
+        XCTAssertTrue(gate.hasEntered)
+        let target = try XCTUnwrap(observation.target)
+        let session = try XCTUnwrap(viewModel.session(for: target.tabID, createIfNeeded: false))
+        await drainScheduler()
+        clock.advance(to: .seconds(60))
+        await drainScheduler(until: { session.runState == .failed && session.activeRunOwnership == nil })
+        XCTAssertEqual(session.runState, .failed)
+        gate.release()
+        await drainScheduler()
+        viewModel.test_afterProviderInputAugmentation = nil
+        session.selectedAgent = .antigravity
+        session.selectedModelRaw = "gemini-3.8-flash-high"
+        runtime.initialization.release()
+
+        let submission = viewModel.submitUserTurn(text: "A genuinely new submission", tabID: target.tabID)
+        guard case .submitted = submission else {
+            XCTFail("A new submission after startup failure must be admitted: \(submission)")
+            return
+        }
+        await drainScheduler(until: { runtime.processEntered })
+        XCTAssertTrue(runtime.processEntered, "A new submission must reach the shipped provider's process dispatch")
+        XCTAssertEqual(session.runState, .running)
+        XCTAssertNotNil(session.provider)
+        XCTAssertEqual(session.activeAgentSessionID, target.sessionID)
+        XCTAssertEqual(try viewModel.mcpSnapshot(sessionID: XCTUnwrap(target.sessionID))?.status, .running)
+    }
+
+    private func makeDeferredPreparationStart(
+        runtime: StartRuntimeProbe,
+        clock: StartStallClock,
+        observation: StartStallObservation,
+        providerConstructed: @escaping () -> Void
+    ) async throws -> (WindowState, AgentRunMCPToolService, RoutedStartDispatchRecorder) {
+        let fixture = try await RoutedStartFixture.make(
+            testCase: self, modelClass: "composer", effortRaw: nil, routerEnabled: false
+        )
+        let root = try XCTUnwrap(fixture.window.workspaceManager.activeWorkspace?.repoPaths.first)
+        let recorder = RoutedStartDispatchRecorder()
+        let priorAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
+        GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)
+        let window = WindowState(
+            agentModeViewModelFactory: { windowID, prompt, manager, server in
+                let viewModel = AgentModeViewModel(
+                    testWindowID: windowID,
+                    testWorkspacePath: root,
+                    codexControllerFactory: { _, _, _, _, _, _ in preconditionFailure("Deferred preparation must not launch Codex") },
+                    headlessProviderFactory: { _, _, _, _, _ in
+                        providerConstructed()
+                        return runtime.provider
+                    },
+                    acpProviderFactory: { _, _ in
+                        providerConstructed()
+                        return AgentSessionLinkCapturingACPProvider(providerID: .cursor, commandPath: "/usr/bin/true")
+                    },
+                    acpControllerFactory: { _, request in
+                        recorder.recordACP(request)
+                        throw MCPError.internalError("Unexpected deferred ACP dispatch")
+                    },
+                    connectionPolicyInstaller: { client, window, restricted, oneShot, reason, ttl, tab, run, additional, purpose, label, external, expectedPID in
+                        await ServerNetworkManager.shared.installClientConnectionPolicy(
+                            for: client, windowID: window, restrictedTools: restricted, oneShot: oneShot,
+                            reason: reason, ttl: ttl, tabID: tab, runID: run, additionalTools: additional,
+                            purpose: purpose, taskLabelKind: label, allowsAgentExternalControlTools: external,
+                            requiresExpectedAgentPID: expectedPID
+                        )
+                    },
+                    mcpRunRoutingCleaner: { _, _, _ in },
+                    mcpServerEnabler: { true },
+                    testMCPServer: server,
+                    testWorkspaceFileContextStore: prompt.workspaceFileContextStore
+                )
+                viewModel.promptManager = prompt
+                viewModel.workspaceManager = manager
+                viewModel.modelRouterSettingsStore = fixture.window.agentModeViewModel.modelRouterSettingsStore
+                return viewModel
+            },
+            contextBuilderProviderFactory: { _, _, _, _ in AgentSessionLinkCapturingHeadlessProvider(failuresRemaining: 1) }
+        )
+        GlobalSettingsStore.shared.setMCPAutoStart(priorAutoStart, commit: false)
+        WindowStatesManager.shared.registerWindowState(window)
+        addTeardownBlock { @MainActor in
+            window.agentModeViewModel.test_afterProviderInputAugmentation = nil
+            window.beginClose()
+            await window.tearDown()
+            WindowStatesManager.shared.unregisterWindowState(window)
+        }
+        await window.workspaceManager.awaitInitialized()
+        window.apiSettingsViewModel.isCursorConnected = true
+        window.apiSettingsViewModel.test_completeContextBuilderProviderValidation(verifiedProviders: [.cursor, .antigravity])
+        let workspace = window.workspaceManager.createWorkspace(name: "Deferred preparation \(UUID())", repoPaths: [root], ephemeral: true)
+        await window.workspaceManager.switchWorkspace(to: workspace, saveState: false, reason: "deferredPreparationStart")
+        try window.promptManager.loadComposeTabsFromWorkspace(XCTUnwrap(window.workspaceManager.activeWorkspace), syncPromptText: true)
+        await drainScheduler(until: { window.apiSettingsViewModel.isAntigravityConnected })
+        XCTAssertTrue(window.apiSettingsViewModel.isAntigravityConnected)
+
+        var service = AgentRunMCPToolService(
+            toolName: MCPWindowToolName.agentRun,
+            captureRequestMetadata: { .init(connectionID: nil, clientName: "deferred-preparation-test", windowID: window.windowID) },
+            requireTargetWindow: { window },
+            resolveRequestedTabID: { _ in nil },
+            resolveSpawnParentSourceTabID: { _ in nil },
+            resolveSpawnParentSessionID: { _, _ in nil },
+            withHeartbeat: { _, _, _, _, operation in try await operation() },
+            startRun: { target, message, metadata, viewModel, agent, model, effort, taskLabel, workflow, parentID, source, preserve in
+                try await AgentExternalMCPRunStarter.startPreservingCallerBinding(
+                    target: target, message: message, metadata: metadata, agentModeVM: viewModel,
+                    agentRaw: agent, modelRaw: model, reasoningEffortRaw: effort, taskLabelKind: taskLabel,
+                    workflow: workflow, expectedParentSessionID: parentID, oracleReviewSource: source,
+                    preserveRoutedInitialEffort: preserve
+                )
+            }
+        )
+        service.resolveOracleReviewLaunchSource = makeService(fixture, clock: clock, observation: observation).resolveOracleReviewLaunchSource
+        service.testAfterTargetResolution = { observation.target = $0 }
+        service.testStartupNow = { clock.now }
+        service.testStartupSleep = { try await clock.sleep(for: $0) }
+        return (window, service, recorder)
+    }
+
+    func testStalledProviderInitializationFailsAndReleasesLease() async throws {
+        let runtime = try makeRuntimeProbe()
+        let fixture = try await makeRuntimeFixture(runtime)
+        let clock = StartStallClock()
+        let observation = StartStallObservation()
+        let service = makeService(fixture, clock: clock, observation: observation, shippedRuntime: true)
+        _ = launch(
+            service, args: ["model_id": .string("antigravity:gemini-3.8-flash-high")],
+            observation: observation, gate: runtime.initialization, clock: clock
+        )
+        await drainScheduler(until: { runtime.initialization.hasEntered })
+        XCTAssertTrue(runtime.initialization.hasEntered, "The shipped provider must reach prepareContext")
+        let target = try XCTUnwrap(observation.target)
+        let session = try XCTUnwrap(fixture.window.agentModeViewModel.session(for: target.tabID, createIfNeeded: false))
+        let runID = try XCTUnwrap(session.runID)
+        await drainScheduler()
+        clock.advance(to: .seconds(1))
+        await drainScheduler(until: { observation.result != nil })
+        XCTAssertNotNil(observation.reply?.objectValue?["session_id"]?.stringValue)
+        clock.advance(to: .seconds(60))
+        await drainScheduler(until: { session.provider == nil && session.runState == .failed })
+
+        let snapshot = try fixture.window.agentModeViewModel.mcpSnapshot(sessionID: XCTUnwrap(target.sessionID))
+        XCTAssertEqual(snapshot?.status, .failed)
+        XCTAssertEqual(snapshot?.failureReason, .timeout)
+        XCTAssertFalse(snapshot?.statusText?.isEmpty ?? true)
+        XCTAssertNil(session.provider, "Timeout must detach the initializing provider")
+        XCTAssertFalse(runtime.initialization.isOpen, "Lease cleanup must not depend on initializer cooperation")
+        let history = await ServerNetworkManager.shared.debugRunRoutingHistoryPayload(runID: runID, limit: 100)
+        let events = history["events"] as? [[String: Any]] ?? []
+        XCTAssertTrue(events.contains { event in
+            guard event["event"] as? String == "lease_cleanup_completed",
+                  let fields = event["fields"] as? [String: String] else { return false }
+            return fields["policy_cleared"] == "true" && fields["routing_cleaned"] == "true"
+        }, "The timed-out startup must revoke its bootstrap policy and routing state")
+        runtime.initialization.release()
+        await drainScheduler()
+        XCTAssertEqual(try fixture.window.agentModeViewModel.mcpSnapshot(sessionID: XCTUnwrap(target.sessionID))?.status, .failed)
+        XCTAssertFalse(runtime.processEntered, "Late initialization must not start a process")
+    }
+
+    func testStalledStartDoesNotQueueLaterHeadlessStart() async throws {
+        let firstRuntime = try makeRuntimeProbe()
+        let laterRuntime = try makeRuntimeProbe()
+        let probes = [firstRuntime, laterRuntime]
+        var next = 0
+        let fixture = try await RoutedStartFixture.make(
+            testCase: self, modelClass: "gemini-flash", effortRaw: nil,
+            headlessProviderFactory: { _, _, _, _, _ in
+                let probe = probes[min(next, probes.count - 1)]
+                next += 1
+                return probe.provider
+            }
+        )
+        let clock = StartStallClock()
+        let first = StartStallObservation()
+        _ = launch(
+            makeService(fixture, clock: clock, observation: first, shippedRuntime: true),
+            args: ["model_id": .string("antigravity:gemini-3.8-flash-high")],
+            observation: first, gate: firstRuntime.initialization, clock: clock
+        )
+        await drainScheduler(until: { firstRuntime.initialization.hasEntered })
+        XCTAssertTrue(firstRuntime.initialization.hasEntered)
+        await drainScheduler()
+        clock.advance(to: .seconds(60))
+        await drainScheduler()
+        let firstID = try XCTUnwrap(first.sessionID)
+        XCTAssertEqual(fixture.window.agentModeViewModel.mcpSnapshot(sessionID: firstID)?.status, .failed)
+
+        let later = StartStallObservation()
+        _ = launch(
+            makeService(fixture, clock: clock, observation: later, shippedRuntime: true),
+            args: ["model_id": .string("antigravity:gemini-3.8-flash-high")],
+            observation: later, gate: laterRuntime.initialization, clock: clock
+        )
+        await drainScheduler(until: { laterRuntime.initialization.hasEntered })
+        XCTAssertTrue(laterRuntime.initialization.hasEntered, "A stalled earlier initializer must not retain startup admission")
+        XCTAssertFalse(firstRuntime.initialization.isOpen)
+        let gate = await HeadlessAgentConnectionGate.snapshot()
+        XCTAssertEqual(gate.queueDepth, 0)
+        clock.advance(to: .seconds(61))
+        await drainScheduler(until: { later.result != nil })
+        XCTAssertNotNil(later.reply?.objectValue?["session_id"]?.stringValue)
+    }
+
+    func testStartedRunIsNotCutOffBySupervision() async throws {
+        let runtime = try makeRuntimeProbe()
+        runtime.initialization.release()
+        let fixture = try await makeRuntimeFixture(runtime)
+        let clock = StartStallClock()
+        let observation = StartStallObservation()
+        _ = launch(
+            makeService(fixture, clock: clock, observation: observation, shippedRuntime: true),
+            args: ["model_id": .string("antigravity:gemini-3.8-flash-high")],
+            observation: observation, gate: runtime.initialization, clock: clock
+        )
+        await drainScheduler(until: { runtime.processEntered })
+        XCTAssertTrue(runtime.processEntered)
+        let target = try XCTUnwrap(observation.target)
+        let session = try XCTUnwrap(fixture.window.agentModeViewModel.session(for: target.tabID, createIfNeeded: false))
+        await drainScheduler()
+        clock.advance(to: .seconds(120))
+        await drainScheduler()
+        XCTAssertEqual(session.runState, .running)
+        XCTAssertNotNil(session.provider)
+        XCTAssertFalse(session.agentTask?.isCancelled ?? true)
+        XCTAssertEqual(try fixture.window.agentModeViewModel.mcpSnapshot(sessionID: XCTUnwrap(target.sessionID))?.status, .running)
+    }
+
+    func testDetachedRoutedStartRepliesWhileRoutingIsSlow() async throws {
+        let fixture = try await makeFixture()
+        let gate = StartStallGate()
+        await fixture.service.suspendNextDecision(on: gate)
+        let clock = StartStallClock()
+        let observation = StartStallObservation()
+        let service = makeService(fixture, clock: clock, observation: observation)
+        let request = launch(service, observation: observation, gate: gate, clock: clock)
+        await gate.waitUntilEntered()
+        XCTAssertTrue(gate.hasEntered)
+
+        await drainScheduler()
+        clock.advance(to: .seconds(1))
+        await drainScheduler(until: { observation.result != nil })
+        let earlyReply = observation.reply
+        XCTAssertNotNil(
+            earlyReply?.objectValue?["session_id"]?.stringValue,
+            "Detached start must acknowledge a session within 1 virtual second without a routing answer"
+        )
+        XCTAssertEqual(earlyReply?.objectValue?["status"], .string("running"))
+        XCTAssertFalse(gate.isOpen)
+        XCTAssertEqual(observation.dispatchCount, 0)
+
+        if let sessionID = earlyReply?.objectValue?["session_id"]?.stringValue {
+            let waitRequest = Task { @MainActor in
+                do {
+                    observation.waitReply = try await service.execute(args: [
+                        "op": .string("wait"), "session_id": .string(sessionID), "timeout": .int(30)
+                    ])
+                } catch { XCTFail("Pending-start wait failed: \(error)") }
+            }
+            addTeardownBlock { @MainActor in
+                waitRequest.cancel()
+                await waitRequest.value
+            }
+            await drainScheduler()
+            XCTAssertNil(observation.waitReply, "A positive wait must not time out immediately before registration")
+            gate.release()
+            await request.value
+            await drainScheduler(until: { observation.waitEntered && observation.dispatchCount == 1 })
+            XCTAssertNil(observation.waitReply)
+            try await completeRun(fixture, observation: observation)
+            await waitRequest.value
+            XCTAssertEqual(observation.waitReply?.objectValue?["status"], .string("completed"))
+        } else {
+            gate.release()
+            await request.value
+        }
+    }
+
+    func testNeverSettlingTargetFailsWithReasonWithinBound() async throws {
+        for phase in ["routing", "provider target", "activated provider"] {
+            let stallRouting = phase == "routing"
+            let stallAfterActivation = phase == "activated provider"
+            let fixture = try await makeFixture()
+            let gate = StartStallGate()
+            if stallRouting { await fixture.service.suspendNextDecision(on: gate) }
+            let clock = StartStallClock()
+            let observation = StartStallObservation()
+            let service = makeService(
+                fixture, clock: clock, observation: observation,
+                providerGate: stallRouting || stallAfterActivation ? nil : gate,
+                dispatchGate: stallAfterActivation ? gate : nil
+            )
+            let args: [String: Value] = stallRouting ? [:] : ["model_id": .string("cursor:composer-2.5")]
+            let request = launch(service, args: args, observation: observation, gate: gate, clock: clock)
+            await gate.waitUntilEntered()
+            XCTAssertTrue(gate.hasEntered)
+            if stallAfterActivation {
+                let registration = try XCTUnwrap(observation.sessionID.flatMap(fixture.window.agentModeViewModel.mcpRegistration(sessionID:)))
+                let waiter = Task { @MainActor in
+                    observation.waitResult = await AgentRunSessionStore.waitUntilInteresting(registration: registration)
+                }
+                addTeardownBlock { waiter.cancel() }
+            }
+            await drainScheduler()
+            clock.advance(to: .seconds(1))
+            await drainScheduler()
+            clock.advance(to: .seconds(60))
+            await drainScheduler(until: {
+                observation.sessionID.flatMap(fixture.window.agentModeViewModel.mcpSnapshot(sessionID:))?.status == .failed
+            })
+
+            let snapshot = observation.sessionID.flatMap(fixture.window.agentModeViewModel.mcpSnapshot(sessionID:))
+            XCTAssertEqual(snapshot?.status, .failed, "A never-settling \(phase) must fail within 60 virtual seconds")
+            XCTAssertEqual(snapshot?.failureReason, .timeout, phase)
+            XCTAssertFalse(snapshot?.statusText?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true, phase)
+            XCTAssertFalse(gate.isOpen)
+
+            gate.release()
+            await request.value
+            await drainScheduler()
+            XCTAssertEqual(observation.dispatchCount, 0, "A late \(phase) answer must not dispatch a timed-out start")
+            if stallAfterActivation {
+                await drainScheduler(until: { observation.waitResult != nil })
+                guard case let .snapshotReady(terminal)? = observation.waitResult else {
+                    XCTFail("An already-suspended epoch waiter must receive terminal failure, not expire or remain parked")
+                    continue
+                }
+                XCTAssertEqual(terminal.status, .failed)
+                XCTAssertEqual(terminal.failureReason, .timeout)
+            }
+        }
+    }
+
+    func testStuckStartCanBeStoppedAndCleanedUp() async throws {
+        let fixture = try await makeFixture()
+        let gate = StartStallGate()
+        let clock = StartStallClock()
+        let observation = StartStallObservation()
+        let service = makeService(fixture, clock: clock, observation: observation, providerGate: gate)
+        let request = launch(
+            service, args: ["model_id": .string("cursor:composer-2.5")],
+            observation: observation, gate: gate, clock: clock
+        )
+        await gate.waitUntilEntered()
+        await drainScheduler()
+        clock.advance(to: .seconds(1))
+        await drainScheduler()
+        clock.advance(to: .seconds(60))
+        await drainScheduler(until: {
+            observation.sessionID.flatMap(fixture.window.agentModeViewModel.mcpSnapshot(sessionID:))?.status == .failed
+        })
+        let sessionID = try XCTUnwrap(observation.sessionID)
+        let manage = makeManageService(fixture)
+        do {
+            let stopped = try await manage.execute(args: ["op": .string("stop_session"), "session_id": .string(sessionID.uuidString)])
+            XCTAssertEqual(stopped.objectValue?["session_id"], .string(sessionID.uuidString))
+        } catch {
+            XCTFail("A timed-out target must not remain forever provisional: \(error)")
+            return
+        }
+        let cleaned = try await manage.execute(args: [
+            "op": .string("cleanup_sessions"), "session_ids": .array([.string(sessionID.uuidString)])
+        ])
+        let deleted = cleaned.objectValue?["deleted_sessions"]?.arrayValue ?? []
+        XCTAssertEqual(deleted.compactMap { $0.objectValue?["session_id"]?.stringValue }, [sessionID.uuidString])
+        XCTAssertEqual(deleted.first?.objectValue?["durable"], .bool(true))
+        XCTAssertFalse(fixture.window.agentModeViewModel.sessions.values.contains { $0.activeAgentSessionID == sessionID })
+
+        gate.release()
+        await request.value
+        await drainScheduler()
+        XCTAssertEqual(observation.dispatchCount, 0)
+        XCTAssertFalse(
+            fixture.window.agentModeViewModel.sessions.values.contains { $0.activeAgentSessionID == sessionID },
+            "Late provider settlement must not resurrect the deleted target"
+        )
+    }
+
+    func testStuckStartDoesNotBlockLaterWorktreeStart() async throws {
+        let (fixture, worktree) = try await makeWorktreeFixture()
+        let gate = StartStallGate()
+        await fixture.service.suspendNextDecision(on: gate)
+        let clock = StartStallClock()
+        let first = StartStallObservation()
+        _ = launch(makeService(fixture, clock: clock, observation: first), observation: first, gate: gate, clock: clock)
+        await gate.waitUntilEntered()
+        XCTAssertTrue(gate.hasEntered)
+        let later = StartStallObservation()
+        let laterService = makeService(fixture, clock: clock, observation: later)
+        _ = launch(laterService, args: [
+            "model_id": .string("cursor:composer-2.5"), "worktree": .string(worktree.path)
+        ], observation: later, gate: gate, clock: clock)
+        await drainScheduler(until: { later.result != nil })
+        clock.advance(to: .seconds(1))
+        await drainScheduler(until: { later.result != nil })
+
+        XCTAssertNotNil(
+            later.reply?.objectValue?["session_id"]?.stringValue,
+            "The later pinned worktree start must reply within 1 virtual second while routing is suspended"
+        )
+        XCTAssertFalse(gate.isOpen)
+        let sessionID = try XCTUnwrap(later.sessionID)
+        try await AsyncTestWait.waitUntil("later pinned worktree binding and provider dispatch", timeout: 10) {
+            await MainActor.run {
+                let bindings = fixture.window.agentModeViewModel.worktreeBindings(forAgentSessionID: sessionID)
+                return bindings.count == 1
+                    && bindings.first?.worktreeRootPath == worktree.standardizedFileURL.path
+                    && later.dispatchCount == 1
+            }
+        }
+        let bindings = fixture.window.agentModeViewModel.worktreeBindings(forAgentSessionID: sessionID)
+        XCTAssertEqual(bindings.count, 1)
+        XCTAssertEqual(bindings.first?.worktreeRootPath, worktree.standardizedFileURL.path)
+        XCTAssertEqual(later.dispatchedWorktreeRoots, [worktree.standardizedFileURL.path])
+        XCTAssertEqual(first.dispatchCount, 0)
+    }
+
+    func testSettlingStartsUnchanged() async throws {
+        let (fixture, worktree) = try await makeWorktreeFixture()
+        for routed in [false, true] {
+            let clock = StartStallClock()
+            let observation = StartStallObservation()
+            let service = makeService(fixture, clock: clock, observation: observation)
+            var args = startArgs(["worktree": .string(worktree.path)])
+            if !routed { args["model_id"] = .string("cursor:composer-2.5") }
+            let reply = try await service.execute(args: args)
+            await drainScheduler(until: { observation.dispatchCount == 1 })
+            let target = try XCTUnwrap(observation.target)
+            let sessionID = try XCTUnwrap(target.sessionID)
+            XCTAssertEqual(reply.objectValue?["session_id"], .string(sessionID.uuidString))
+            let session = try XCTUnwrap(fixture.window.agentModeViewModel.session(for: target.tabID, createIfNeeded: false))
+            XCTAssertEqual(session.activeAgentSessionID, sessionID)
+            XCTAssertEqual(session.selectedAgent, .cursor)
+            XCTAssertEqual(session.selectedModelRaw, "composer-2.5")
+            XCTAssertEqual(
+                fixture.window.agentModeViewModel.worktreeBindings(forAgentSessionID: sessionID).first?.worktreeRootPath,
+                worktree.standardizedFileURL.path
+            )
+            try await completeRun(fixture, observation: observation)
+            clock.cancelAll()
+        }
+
+        let clock = StartStallClock()
+        let observation = StartStallObservation()
+        let gate = StartStallGate()
+        let service = makeService(fixture, clock: clock, observation: observation)
+        let request = launch(service, args: [
+            "model_id": .string("cursor:composer-2.5"), "detach": .bool(false)
+        ], observation: observation, gate: gate, clock: clock)
+        await drainScheduler(until: { observation.waitEntered })
+        XCTAssertTrue(observation.waitEntered, "Non-detached start must enter the shipped run waiter")
+        XCTAssertNil(observation.result, "A running non-detached start must not return a pending acknowledgment")
+        try await completeRun(fixture, observation: observation)
+        await request.value
+        XCTAssertEqual(observation.reply?.objectValue?["status"], .string("completed"))
+    }
+}
+
+private extension AgentRunMCPStartStallTests {
+    func makeRuntimeProbe() throws -> StartRuntimeProbe {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("StartRuntime-\(UUID())", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let probe = StartRuntimeProbe(root: root)
+        addTeardownBlock { @MainActor in
+            probe.initialization.release()
+            probe.process.continuation.finish()
+            probe.progressClock.cancelAll()
+            await probe.provider.dispose()
+            try? FileManager.default.removeItem(at: root)
+        }
+        return probe
+    }
+
+    func makeRuntimeFixture(_ probe: StartRuntimeProbe) async throws -> RoutedStartFixture {
+        try await RoutedStartFixture.make(
+            testCase: self, modelClass: "gemini-flash", effortRaw: nil,
+            headlessProviderFactory: { _, _, _, _, _ in probe.provider }
+        )
+    }
+
+    func makeFixture(prepareRoot: ((URL) throws -> Void)? = nil) async throws -> RoutedStartFixture {
+        try await RoutedStartFixture.make(
+            testCase: self, modelClass: "composer", effortRaw: nil, prepareRoot: prepareRoot
+        )
+    }
+
+    func makeWorktreeFixture() async throws -> (RoutedStartFixture, URL) {
+        let git = try ReviewGitRepositoryFixture()
+        addTeardownBlock { git.cleanup() }
+        let fixture = try await makeFixture { root in
+            try git.initializeRepository(at: root)
+            try git.write("fixture\n", to: "README.md", at: root)
+            try git.stage("README.md", at: root)
+            try git.commit("Fixture", at: root)
+        }
+        let root = try XCTUnwrap(fixture.window.workspaceManager.activeWorkspace?.repoPaths.first)
+        let worktree = git.sandbox.appendingPathComponent("bound")
+        _ = try git.runGit(["worktree", "add", "--detach", worktree.path, "HEAD"], at: URL(fileURLWithPath: root))
+        return (fixture, worktree)
+    }
+
+    func makeService(
+        _ fixture: RoutedStartFixture,
+        clock: StartStallClock,
+        observation: StartStallObservation,
+        providerGate: StartStallGate? = nil,
+        dispatchGate: StartStallGate? = nil,
+        shippedRuntime: Bool = false
+    ) -> AgentRunMCPToolService {
+        let window = fixture.window
+        var service = AgentRunMCPToolService(
+            toolName: MCPWindowToolName.agentRun,
+            captureRequestMetadata: { .init(connectionID: nil, clientName: "start-stall-test", windowID: window.windowID) },
+            requireTargetWindow: { window },
+            resolveRequestedTabID: { _ in nil },
+            resolveSpawnParentSourceTabID: { _ in nil },
+            resolveSpawnParentSessionID: { _, _ in nil },
+            withHeartbeat: { _, _, _, _, operation in
+                await MainActor.run { observation.waitEntered = true }
+                return try await operation()
+            },
+            startRun: { target, message, metadata, viewModel, agent, model, effort, taskLabel, workflow, parentID, source, preserve in
+                await providerGate?.suspend()
+                try Task.checkCancellation()
+                return try await AgentExternalMCPRunStarter.startPreservingCallerBinding(
+                    target: target, message: message, metadata: metadata, agentModeVM: viewModel,
+                    agentRaw: agent, modelRaw: model, reasoningEffortRaw: effort, taskLabelKind: taskLabel,
+                    workflow: workflow, expectedParentSessionID: parentID, oracleReviewSource: source,
+                    preserveRoutedInitialEffort: preserve,
+                    dispatchInstruction: { _, tabID, message, _, viewModel in
+                        if shippedRuntime {
+                            _ = await viewModel.startAgentRun(tabID: tabID, initialMessage: message)
+                            observation.dispatchCount += 1
+                            return .startedRun
+                        }
+                        let session = try XCTUnwrap(viewModel.session(for: tabID, createIfNeeded: false))
+                        await viewModel.prepareMCPWaitTrackingForRunStart(
+                            session: session, stopFence: AgentRunStartStopFence(session: session)
+                        )
+                        await dispatchGate?.suspend()
+                        try Task.checkCancellation()
+                        observation.dispatchedWorktreeRoots = session.worktreeBindings.map(\.worktreeRootPath)
+                        observation.ownership = session.beginRunAttempt(source: "start-stall-fixture")
+                        session.runState = .running
+                        session.mcpFollowUpRunPending = false
+                        observation.dispatchCount += 1
+                        return .startedRun
+                    }
+                )
+            }
+        )
+        service.resolveOracleReviewLaunchSource = { _, window in
+            let workspace = try XCTUnwrap(window.workspaceManager.activeWorkspace)
+            let tabID = try XCTUnwrap(workspace.activeComposeTabID)
+            return ResolvedAgentRunOracleReviewLaunchSource(
+                snapshot: AgentRunOracleReviewLaunchSnapshot(
+                    route: .explicitWindowActiveCompose, windowID: window.windowID, workspaceID: workspace.id,
+                    tabID: tabID, selectionRevision: 0, promptText: "", selection: StoredSelection(),
+                    sourceAgentSessionID: nil, routedRunID: nil
+                ),
+                source: .unavailable(.init(
+                    delegationID: UUID(), sourceTabID: tabID, workspaceID: workspace.id, sourceAgentSessionID: nil,
+                    sourceAgentRunID: nil, reason: .sourceCaptureFailed("start-stall fixture")
+                ))
+            )
+        }
+        service.testAfterTargetResolution = { observation.target = $0 }
+        service.testStartupNow = { clock.now }
+        service.testStartupSleep = { try await clock.sleep(for: $0) }
+        return service
+    }
+
+    func makeManageService(_ fixture: RoutedStartFixture) -> AgentManageMCPToolService {
+        let window = fixture.window
+        return AgentManageMCPToolService(
+            toolName: MCPWindowToolName.agentManage,
+            captureRequestMetadata: { .init(connectionID: nil, clientName: "start-stall-test", windowID: window.windowID) },
+            requireTargetWindow: { window },
+            resolveSpawnSourceTabID: { _ in nil },
+            resolveSpawnParentSessionID: { _, _ in nil },
+            bindCurrentRequestToTab: { _, _ in }
+        )
+    }
+
+    func startArgs(_ extra: [String: Value]) -> [String: Value] {
+        var args: [String: Value] = [
+            "op": .string("start"), "message": .string("Start this fixture task"), "detach": .bool(true)
+        ]
+        args.merge(extra, uniquingKeysWith: { _, new in new })
+        return args
+    }
+
+    func launch(
+        _ service: AgentRunMCPToolService,
+        args: [String: Value] = [:],
+        observation: StartStallObservation,
+        gate: StartStallGate,
+        clock: StartStallClock
+    ) -> Task<Void, Never> {
+        let args = startArgs(args)
+        let request = Task { @MainActor in
+            do {
+                let value = try await service.execute(args: args)
+                observation.result = .success(value)
+            } catch {
+                observation.result = .failure(error)
+                gate.finishWithoutEntering()
+            }
+        }
+        addTeardownBlock { @MainActor in
+            request.cancel()
+            gate.release()
+            clock.cancelAll()
+            await request.value
+        }
+        return request
+    }
+
+    func drainScheduler(until predicate: @MainActor () -> Bool = { false }) async {
+        for _ in 0 ..< 20000 {
+            if predicate() { return }
+            await Task.yield()
+        }
+    }
+
+    func completeRun(_ fixture: RoutedStartFixture, observation: StartStallObservation) async throws {
+        let viewModel = fixture.window.agentModeViewModel
+        let target = try XCTUnwrap(observation.target)
+        let sessionID = try XCTUnwrap(target.sessionID)
+        let session = try XCTUnwrap(viewModel.session(for: target.tabID, createIfNeeded: false))
+        let ownership = try XCTUnwrap(observation.ownership)
+        let envelope = try XCTUnwrap(viewModel.test_makeTerminalPublicationEnvelope(
+            for: session, ownership: ownership, terminalState: .completed
+        ))
+        let registration = try XCTUnwrap(viewModel.mcpRegistration(sessionID: sessionID))
+        session.runState = .completed
+        let publication = await AgentRunSessionStore.publishTerminal(
+            envelope, registration: registration, commitID: UUID(), successorKind: nil
+        )
+        XCTAssertEqual(publication, .accepted(successorEpoch: nil))
+    }
+}
+
+@MainActor
+private final class StartRuntimeProbe {
+    let initialization = StartStallGate()
+    let process = AsyncThrowingStream<CLIProcessRunner.StreamEvent, Error>.makeStream()
+    let progressClock = StartStallClock()
+    private(set) var processEntered = false
+    let root: URL
+
+    init(root: URL) {
+        self.root = root
+    }
+
+    lazy var provider = AntigravityAgentProvider(
+        runner: CLIProcessRunner(config: CLIProcessConfiguration(command: "/never-launch-agy", additionalPaths: [])),
+        config: AntigravityAgentConfig(maxPrintResumes: 0),
+        runtimeOverrides: .init(
+            prepareContext: { [self] runID in
+                await initialization.suspend()
+                try Task.checkCancellation()
+                let runID = try XCTUnwrap(runID)
+                await MCPRoutingWaiter.notifyRouted(runID: runID)
+                return HeadlessAgentContext(runID: runID, configURL: nil, environment: ["HOME": root.path])
+            },
+            processEvents: { [self] _, _ in
+                await MainActor.run { self.processEntered = true }
+                return process.stream
+            },
+            logDirectory: root.appendingPathComponent("logs"),
+            diagnosticsDirectory: root.appendingPathComponent("diagnostics"),
+            now: { 0 },
+            waitForProgressCheck: { [progressClock] in try await progressClock.sleep(for: .seconds(3600)) },
+            cancelProcess: { [process] in process.continuation.finish() }
+        )
+    )
+}
+
+@MainActor
+private final class StartStallObservation {
+    var result: Result<Value, Error>?
+    var target: AgentModeViewModel.MCPSessionTarget?
+    var ownership: AgentRunOwnership?
+    var dispatchCount = 0
+    var dispatchedWorktreeRoots: [String]?
+    var waitEntered = false
+    var waitResult: AgentRunSessionStore.WaitDisposition?
+    var waitReply: Value?
+
+    var reply: Value? {
+        guard let result, case let .success(value) = result else { return nil }
+        return value
+    }
+
+    var sessionID: UUID? {
+        reply?.objectValue?["session_id"]?.stringValue.flatMap(UUID.init(uuidString:)) ?? target?.sessionID
+    }
+}
+
+@MainActor
+final class StartStallGate {
+    private(set) var hasEntered = false
+    private(set) var isOpen = false
+    private var finished = false
+    private var entryWaiters: [CheckedContinuation<Void, Never>] = []
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+
+    func suspend() async {
+        hasEntered = true
+        entryWaiters.forEach { $0.resume() }
+        entryWaiters.removeAll()
+        guard !isOpen else { return }
+        await withCheckedContinuation { waiters.append($0) }
+    }
+
+    func waitUntilEntered() async {
+        guard !hasEntered, !finished else { return }
+        await withCheckedContinuation { entryWaiters.append($0) }
+    }
+
+    func finishWithoutEntering() {
+        finished = true
+        entryWaiters.forEach { $0.resume() }
+        entryWaiters.removeAll()
+    }
+
+    func release() {
+        isOpen = true
+        waiters.forEach { $0.resume() }
+        waiters.removeAll()
+    }
+}
+
+final class StartStallClock: @unchecked Sendable {
+    private let lock = NSLock()
+    private var instant: Duration = .zero
+    private var closed = false
+    private var sleepers: [UUID: (deadline: Duration, continuation: CheckedContinuation<Void, Error>)] = [:]
+
+    var now: Duration {
+        lock.withLock { instant }
+    }
+
+    var sleeperCount: Int {
+        lock.withLock { sleepers.count }
+    }
+
+    func sleep(for duration: Duration) async throws {
+        try Task.checkCancellation()
+        guard duration > .zero else { return }
+        let id = UUID()
+        try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                let installed = lock.withLock {
+                    guard !closed, !Task.isCancelled else { return false }
+                    sleepers[id] = (instant + duration, continuation)
+                    return true
+                }
+                if !installed { continuation.resume(throwing: CancellationError()) }
+            }
+        } onCancel: {
+            self.lock.withLock { self.sleepers.removeValue(forKey: id) }?.continuation.resume(throwing: CancellationError())
+        }
+    }
+
+    func advance(to value: Duration) {
+        let ready = lock.withLock {
+            instant = value
+            let ready = sleepers.filter { $0.value.deadline <= instant }
+            for id in ready.keys {
+                sleepers.removeValue(forKey: id)
+            }
+            return ready.values.map(\.continuation)
+        }
+        ready.forEach { $0.resume() }
+    }
+
+    func cancelAll() {
+        let pending = lock.withLock {
+            closed = true
+            let pending = sleepers.values.map(\.continuation)
+            sleepers.removeAll()
+            return pending
+        }
+        pending.forEach { $0.resume(throwing: CancellationError()) }
     }
 }
 

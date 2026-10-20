@@ -233,9 +233,11 @@ enum AntigravityTrajectoryToolLogStream {
         },
         storeFactory: @Sendable @escaping (String) -> (any AntigravityTrajectoryStoreReading)? = {
             AntigravityTrajectoryStore(path: $0)
-        }
+        },
+        onProgress: (@Sendable () -> Void)? = nil
     ) async -> AntigravityTrajectoryStore.FailureKind? {
         var currentPath: String?
+        var progressFingerprint: Int?
         var emitter = AntigravityTrajectoryEmitter() // invocation-id dedup persists across DB switches
         var store: (any AntigravityTrajectoryStoreReading)?
         var after: Int64 = 0
@@ -247,7 +249,9 @@ enum AntigravityTrajectoryToolLogStream {
                 currentPath: &currentPath,
                 store: &store,
                 after: &after,
-                emitter: &emitter
+                emitter: &emitter,
+                progressFingerprint: &progressFingerprint,
+                onProgress: onProgress
             )
             await waitBetweenPolls(pollNanos)
         }
@@ -264,6 +268,8 @@ enum AntigravityTrajectoryToolLogStream {
                 store: &store,
                 after: &after,
                 emitter: &emitter,
+                progressFingerprint: &progressFingerprint,
+                onProgress: onProgress,
                 waitForRetry: waitForFinalDrainRetry
             )
         }
@@ -282,10 +288,13 @@ enum AntigravityTrajectoryToolLogStream {
         currentPath: inout String?,
         store: inout (any AntigravityTrajectoryStoreReading)?,
         after: inout Int64,
-        emitter: inout AntigravityTrajectoryEmitter
+        emitter: inout AntigravityTrajectoryEmitter,
+        progressFingerprint: inout Int?,
+        onProgress: (@Sendable () -> Void)?
     ) -> PollResult {
         if let newest = locate()?.path, newest != currentPath {
             currentPath = newest // a resume turn announced its exact forked DB → restart watermark
+            progressFingerprint = nil
             store = nil
             after = 0
         }
@@ -298,6 +307,19 @@ enum AntigravityTrajectoryToolLogStream {
             return .retryable
         }
         guard !rows.isEmpty else { return .drained }
+        if let onProgress, locate()?.path == path {
+            var hasher = Hasher()
+            for row in rows {
+                hasher.combine(row.idx)
+                hasher.combine(row.status)
+                hasher.combine(row.payload)
+            }
+            let fingerprint = hasher.finalize()
+            if fingerprint != progressFingerprint {
+                progressFingerprint = fingerprint
+                onProgress()
+            }
+        }
 
         let (events, advanceTo) = emitter.process(rows)
         for event in events {
@@ -320,6 +342,8 @@ enum AntigravityTrajectoryToolLogStream {
         store: inout (any AntigravityTrajectoryStoreReading)?,
         after: inout Int64,
         emitter: inout AntigravityTrajectoryEmitter,
+        progressFingerprint: inout Int?,
+        onProgress: (@Sendable () -> Void)?,
         waitForRetry: @Sendable (Duration) async -> Void
     ) async {
         let clock = ContinuousClock()
@@ -333,7 +357,9 @@ enum AntigravityTrajectoryToolLogStream {
                 currentPath: &currentPath,
                 store: &store,
                 after: &after,
-                emitter: &emitter
+                emitter: &emitter,
+                progressFingerprint: &progressFingerprint,
+                onProgress: onProgress
             ) {
             case .drained:
                 return

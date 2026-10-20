@@ -392,6 +392,17 @@ protocol AgentTaskRoutingDecisionLogStorage: Sendable {
     func activeFileSize() async throws -> Int
     func append(_ data: Data) async throws
     func rotate() async throws
+    func append(_ data: Data, maxBytes: Int) async throws
+}
+
+extension AgentTaskRoutingDecisionLogStorage {
+    func append(_ data: Data, maxBytes: Int) async throws {
+        let size = try await activeFileSize()
+        if size > 0, size + data.count > maxBytes {
+            try await rotate()
+        }
+        try await append(data)
+    }
 }
 
 struct AgentTaskRoutingDecisionLogFileStorage: AgentTaskRoutingDecisionLogStorage {
@@ -402,25 +413,65 @@ struct AgentTaskRoutingDecisionLogFileStorage: AgentTaskRoutingDecisionLogStorag
     }
 
     func activeFileSize() async throws -> Int {
+        try withLock { activeFileSizeUnlocked() }
+    }
+
+    func append(_ data: Data) async throws {
+        try withLock { try appendUnlocked(data) }
+    }
+
+    func rotate() async throws {
+        try withLock { try rotateUnlocked() }
+    }
+
+    func append(_ data: Data, maxBytes: Int) async throws {
+        try withLock {
+            let size = activeFileSizeUnlocked()
+            if size > 0, size + data.count > maxBytes {
+                try rotateUnlocked()
+            }
+            try appendUnlocked(data)
+        }
+    }
+
+    // ponytail: flock contention blocks the IO executor for at most 250 ms; use async acquisition if profiling warrants it.
+    private func withLock<T>(_ operation: () throws -> T) throws -> T {
+        let directory = activeURL.deletingLastPathComponent()
+        let lockDirectory = directory.deletingLastPathComponent()
+            .appendingPathComponent(".\(directory.lastPathComponent)-locks", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: lockDirectory, withIntermediateDirectories: true)
+        let lockURL = lockDirectory.appendingPathComponent(activeURL.lastPathComponent + ".lock")
+        let descriptor = open(lockURL.path, O_CREAT | O_RDWR | O_CLOEXEC | O_NOFOLLOW, 0o600)
+        guard descriptor >= 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
+        defer { close(descriptor) }
+        let deadline = DispatchTime.now().uptimeNanoseconds + 250_000_000
+        while flock(descriptor, LOCK_EX | LOCK_NB) != 0 {
+            let code = errno
+            guard code == EWOULDBLOCK || code == EINTR else {
+                throw POSIXError(POSIXErrorCode(rawValue: code) ?? .EIO)
+            }
+            guard DispatchTime.now().uptimeNanoseconds < deadline else { throw POSIXError(.ETIMEDOUT) }
+            if code == EWOULDBLOCK { usleep(10000) }
+        }
+        defer { flock(descriptor, LOCK_UN) }
+        return try operation()
+    }
+
+    private func activeFileSizeUnlocked() -> Int {
         let attributes = try? FileManager.default.attributesOfItem(atPath: activeURL.path)
         return (attributes?[.size] as? NSNumber)?.intValue ?? 0
     }
 
-    func append(_ data: Data) async throws {
-        let manager = FileManager.default
-        try manager.createDirectory(at: activeURL.deletingLastPathComponent(), withIntermediateDirectories: true)
-        if !manager.fileExists(atPath: activeURL.path) {
-            guard manager.createFile(atPath: activeURL.path, contents: nil, attributes: [.posixPermissions: 0o600]) else {
-                throw CocoaError(.fileWriteUnknown)
-            }
-        }
-        let handle = try FileHandle(forWritingTo: activeURL)
+    private func appendUnlocked(_ data: Data) throws {
+        let descriptor = open(activeURL.path, O_CREAT | O_WRONLY | O_APPEND | O_CLOEXEC | O_NOFOLLOW, 0o600)
+        guard descriptor >= 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
+        let handle = FileHandle(fileDescriptor: descriptor, closeOnDealloc: true)
         defer { try? handle.close() }
-        try handle.seekToEnd()
         try handle.write(contentsOf: data)
     }
 
-    func rotate() async throws {
+    private func rotateUnlocked() throws {
         let manager = FileManager.default
         if manager.fileExists(atPath: rotatedURL.path) {
             try manager.removeItem(at: rotatedURL)
@@ -463,7 +514,6 @@ actor AgentTaskRoutingDecisionLog {
     private var admittedBytes = 0
     private var waiters: [Waiter] = []
     private var isDraining = false
-    private var activeSize: Int?
     private var idleWaiters: [CheckedContinuation<Void, Never>] = []
     private(set) var droppedCount = 0
 
@@ -490,10 +540,7 @@ actor AgentTaskRoutingDecisionLog {
     }
 
     static func defaultFileURL() -> URL {
-        let support = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
-            ?? FileManager.default.temporaryDirectory
-        return support
-            .appendingPathComponent("RepoPrompt CE", isDirectory: true)
+        AppProfileLocations.current.applicationSupportRoot
             .appendingPathComponent("Diagnostics", isDirectory: true)
             .appendingPathComponent("ModelRouter", isDirectory: true)
             .appendingPathComponent("jev-decisions.jsonl", isDirectory: false)
@@ -619,20 +666,9 @@ actor AgentTaskRoutingDecisionLog {
 
     private func write(_ row: Data) async {
         do {
-            var size: Int = if let known = activeSize {
-                known
-            } else {
-                try await storage.activeFileSize()
-            }
-            if size > 0, size + row.count > maxBytes {
-                try await storage.rotate()
-                size = 0
-            }
-            try await storage.append(row)
-            activeSize = size + row.count
+            try await storage.append(row, maxBytes: maxBytes)
         } catch {
             droppedCount += 1
-            activeSize = nil
             let nsError = error as NSError
             errorSink("\(nsError.domain)#\(nsError.code)")
         }

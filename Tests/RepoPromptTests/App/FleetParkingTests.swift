@@ -1186,10 +1186,10 @@ private final class FeedbackRig {
     func open() throws -> (FleetManagerActions, FleetRosterModel) {
         coordinator.open()
         let window = try XCTUnwrap(coordinator.windowForTesting)
-        let host = try XCTUnwrap(window.contentViewController as? NSHostingController<FleetManagerView>)
+        let host = try XCTUnwrap(window.contentViewController as? NSHostingController<FleetManagerWindowRoot>)
         let model = try XCTUnwrap(coordinator.modelForTesting)
-        XCTAssertTrue(host.rootView.model === model)
-        return (host.rootView.actions, model)
+        XCTAssertTrue(host.rootView.content.model === model)
+        return (host.rootView.content.actions, model)
     }
 
     func close() {

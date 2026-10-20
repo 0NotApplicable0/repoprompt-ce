@@ -70,6 +70,13 @@ actor PathMatchWorker {
     /// Small FIFO cache for snapshots (handles selection toggling)
     private var snapshotCache: [SnapshotEntry] = []
     private let maxSnapshotEntries = 4
+    #if DEBUG
+        private var indexBuildCount = 0
+
+        func indexBuildCountForTesting() -> Int {
+            indexBuildCount
+        }
+    #endif
 
     // MARK: - Index Building
 
@@ -84,6 +91,9 @@ actor PathMatchWorker {
         }
 
         // Build indexes (this is the heavy work)
+        #if DEBUG
+            indexBuildCount += 1
+        #endif
         let built = PathMatchIndexes.build(
             files: staticData.filesByFullPath,
             folders: staticData.foldersByFullPath,

@@ -1,5 +1,6 @@
 import Foundation
 import os
+import RepoPromptShared
 
 private let explorationOSLog = Logger(subsystem: "com.repoprompt.ce", category: "ModelRouterExploration")
 
@@ -49,10 +50,7 @@ actor AgentTaskRoutingExplorationAdvisor {
     }
 
     nonisolated static func defaultFileURL() -> URL {
-        let support = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
-            ?? FileManager.default.temporaryDirectory
-        return support
-            .appendingPathComponent("RepoPrompt CE", isDirectory: true)
+        AppProfileLocations.current.applicationSupportRoot
             .appendingPathComponent("ModelRouter", isDirectory: true)
             .appendingPathComponent("exploration-counters.json", isDirectory: false)
     }

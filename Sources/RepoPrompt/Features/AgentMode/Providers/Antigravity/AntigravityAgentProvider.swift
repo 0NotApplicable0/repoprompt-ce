@@ -139,7 +139,18 @@ final class AntigravityAgentProvider: HeadlessAgentProvider {
     private static let processTimeoutSeconds: TimeInterval = 3900
     private static let printTimeoutSeconds = 3600
 
+    struct RuntimeOverrides {
+        let prepareContext: (UUID?) async throws -> HeadlessAgentContext
+        let processEvents: ([String], String) async throws -> AsyncThrowingStream<CLIProcessRunner.StreamEvent, Error>
+        let logDirectory: URL
+        let diagnosticsDirectory: URL
+        let now: @Sendable () -> TimeInterval
+        var waitForProgressCheck: (@Sendable () async throws -> Void)?
+        var cancelProcess: (@Sendable () async -> Void)?
+    }
+
     private let runner: CLIProcessRunner
+    private let runtimeOverrides: RuntimeOverrides?
     private let config: AntigravityAgentConfig
     private let workspacePath: String?
     private let toolTracking = AgentToolTrackingController()
@@ -156,10 +167,16 @@ final class AntigravityAgentProvider: HeadlessAgentProvider {
         config.enableDebugLogging
     }
 
-    init(runner: CLIProcessRunner, config: AntigravityAgentConfig, workspacePath: String? = nil) {
+    init(
+        runner: CLIProcessRunner,
+        config: AntigravityAgentConfig,
+        workspacePath: String? = nil,
+        runtimeOverrides: RuntimeOverrides? = nil
+    ) {
         self.runner = runner
         self.config = config
         self.workspacePath = workspacePath
+        self.runtimeOverrides = runtimeOverrides
     }
 
     // MARK: - Argument construction
@@ -292,6 +309,9 @@ final class AntigravityAgentProvider: HeadlessAgentProvider {
         if let policyFailure = Self.preparationPolicyFailureMessage(for: config) {
             throw AIProviderError.invalidConfiguration(detail: policyFailure)
         }
+        if let runtimeOverrides {
+            return try await runtimeOverrides.prepareContext(runID)
+        }
         let actualRunID = runID ?? UUID()
         guard await ServerNetworkManager.shared.isRunning() else {
             throw AIProviderError.invalidConfiguration(detail: "Could not start MCP server. Check MCP settings and try again.")
@@ -391,19 +411,17 @@ final class AntigravityAgentProvider: HeadlessAgentProvider {
                     runGate: runGate
                 ) { [weak self] in
                     guard let self else {
-                        continuation.finish()
+                        continuation.finish(throwing: AIProviderError.invalidConfiguration(detail: Self.noMeaningfulOutputMessage))
                         await runGate.unlock()
                         return
                     }
                     var runGateLocked = true
                     var toolLogTask: Task<AntigravityTrajectoryStore.FailureKind?, Never>?
-                    var turnLogFileURLs: [URL] = []
-                    // Keep every turn log available until the tailer completes its final bounded
-                    // drain. Removing the completed turn's log at loop exit could otherwise erase
-                    // the only conversation-id authority before a late trajectory DB appears.
+                    var turnDiagnostics: [AntigravityTurnDiagnostics] = []
                     defer {
-                        for logFileURL in turnLogFileURLs {
-                            Self.removeLogFile(logFileURL)
+                        let directory = runtimeOverrides?.diagnosticsDirectory ?? AntigravityTurnDiagnostics.directory
+                        for diagnostics in turnDiagnostics {
+                            diagnostics.finish(in: directory)
                         }
                     }
                     do {
@@ -425,10 +443,18 @@ final class AntigravityAgentProvider: HeadlessAgentProvider {
                         // live tool cards. Each turn's unique log announces its exact conversation id,
                         // so external agy runs cannot redirect the tailer or auto-resume path.
                         let activeToolLog = AntigravityTrajectoryToolLog(environment: context.environment)
+                        let clock: @Sendable () -> TimeInterval = runtimeOverrides?.now ?? { ProcessInfo.processInfo.systemUptime }
+                        let progress = Self.isResumeRecovery(message.userMessage) ? AntigravityTurnProgress(now: clock) : nil
+                        let recordTrajectoryProgress: (@Sendable () -> Void)? = if let progress {
+                            { progress.recordProgress() }
+                        } else {
+                            nil
+                        }
                         toolLogTask = Task {
                             await AntigravityTrajectoryToolLogStream.tail(
                                 into: continuation,
-                                locate: { activeToolLog.locate() }
+                                locate: { activeToolLog.locate() },
+                                onProgress: recordTrajectoryProgress
                             )
                         }
 
@@ -440,10 +466,9 @@ final class AntigravityAgentProvider: HeadlessAgentProvider {
                         var turn = 0
                         while true {
                             try Task.checkCancellation()
-                            let logFileURL = Self.makeLogFileURL(runID: UUID())
-                            if let logFileURL {
-                                turnLogFileURLs.append(logFileURL)
-                            }
+                            let logFileURL = Self.makeLogFileURL(runID: UUID(), directory: runtimeOverrides?.logDirectory)
+                            let diagnostics = AntigravityTurnDiagnostics(logFileURL: logFileURL)
+                            turnDiagnostics.append(diagnostics)
                             activeToolLog.beginTurn(logFileURL: logFileURL)
 
                             // agy honors `--model` only when the prompt is the `--print` argv value,
@@ -468,6 +493,8 @@ final class AntigravityAgentProvider: HeadlessAgentProvider {
                                 args: args,
                                 prompt: inlinePrompt ? "" : turnPrompt,
                                 logFileURL: logFileURL,
+                                diagnostics: diagnostics,
+                                progress: progress,
                                 toolLog: activeToolLog,
                                 expectedPIDRunID: context.runID,
                                 isFirstTurn: turn == 0,
@@ -511,6 +538,7 @@ final class AntigravityAgentProvider: HeadlessAgentProvider {
                         // Cancellation tells the tailer to perform its final bounded DB drain. Await
                         // that synchronization edge before releasing attribution or closing output.
                         let finalFailureKind = await Self.cancelAndAwaitToolLogTask(toolLogTask)
+                        try Task.checkCancellation()
                         if finalFailureKind == .conversationContextLost {
                             throw AIProviderError.invalidConfiguration(detail: Self.conversationContextLostMessage)
                         }
@@ -530,6 +558,7 @@ final class AntigravityAgentProvider: HeadlessAgentProvider {
                         }
                         runGateLocked = false
                     } catch is CancellationError {
+                        turnDiagnostics.last?.completed = false
                         await runner.cancelAll()
                         _ = await Self.cancelAndAwaitToolLogTask(toolLogTask)
                         if runGateLocked {
@@ -540,6 +569,7 @@ final class AntigravityAgentProvider: HeadlessAgentProvider {
                             runGateLocked = false
                         }
                     } catch {
+                        turnDiagnostics.last?.completed = false
                         let finalFailureKind = await Self.cancelAndAwaitToolLogTask(toolLogTask)
                         let terminalError = Self.terminalError(
                             error,
@@ -666,6 +696,33 @@ final class AntigravityAgentProvider: HeadlessAgentProvider {
         return await task.value
     }
 
+    private static func isResumeRecovery(_ message: String) -> Bool {
+        message.contains("<forked_session ")
+            && message.contains("You are continuing a session that was restarted after a native resume failed for Antigravity CLI.")
+    }
+
+    private func watchForNoProgress(_ progress: AntigravityTurnProgress) -> Task<Void, Never> {
+        let wait = runtimeOverrides?.waitForProgressCheck
+        let cancel = runtimeOverrides?.cancelProcess
+        let runner = runner
+        return Task {
+            while !Task.isCancelled {
+                do {
+                    if let wait { try await wait() }
+                    else { try await Task.sleep(nanoseconds: 1_000_000_000) }
+                } catch {
+                    return
+                }
+                guard !Task.isCancelled else { return }
+                if progress.claimIdleTimeout() {
+                    await cancel?()
+                    await runner.cancelAll()
+                    return
+                }
+            }
+        }
+    }
+
     /// Run ONE `agy --print` invocation: stream its stdout as live `content`, then classify the exit
     /// as `.completed` or `.capped` (poll-cap timeout). Throws on a hard failure (non-zero exit,
     /// runner timeout, or — on the first turn only — no output at all).
@@ -677,6 +734,8 @@ final class AntigravityAgentProvider: HeadlessAgentProvider {
         args: [String],
         prompt: String,
         logFileURL: URL?,
+        diagnostics: AntigravityTurnDiagnostics,
+        progress: AntigravityTurnProgress?,
         toolLog: AntigravityTrajectoryToolLog,
         expectedPIDRunID: UUID,
         isFirstTurn: Bool,
@@ -687,25 +746,37 @@ final class AntigravityAgentProvider: HeadlessAgentProvider {
         var stderrTail = Data()
         var exitStatus: Int32?
         var timedOut = false
+        var watchdog: Task<Void, Never>?
+        progress?.beginTurn()
+        defer { diagnostics.stderrTail = stderrTail }
 
         do {
-            let stream = try await runner.runStreaming(
-                args: args,
-                stdin: prompt,
-                outputMode: .none,
-                timeout: Self.processTimeoutSeconds,
-                onProcessStarted: { pid in
-                    await ServerNetworkManager.shared.registerExpectedAgentPID(
-                        pid, for: Self.antigravityMCPClientID, runID: expectedPIDRunID
-                    )
-                },
-                onProcessTerminated: { pid in
-                    await ServerNetworkManager.shared.clearExpectedAgentPID(
-                        pid, for: Self.antigravityMCPClientID, runID: expectedPIDRunID
-                    )
-                }
-            )
+            let stream: AsyncThrowingStream<CLIProcessRunner.StreamEvent, Error> = if let runtimeOverrides {
+                try await runtimeOverrides.processEvents(args, prompt)
+            } else {
+                try await runner.runStreaming(
+                    args: args,
+                    stdin: prompt,
+                    outputMode: .none,
+                    timeout: Self.processTimeoutSeconds,
+                    onProcessStarted: { pid in
+                        await ServerNetworkManager.shared.registerExpectedAgentPID(
+                            pid, for: Self.antigravityMCPClientID, runID: expectedPIDRunID
+                        )
+                    },
+                    onProcessTerminated: { pid in
+                        await ServerNetworkManager.shared.clearExpectedAgentPID(
+                            pid, for: Self.antigravityMCPClientID, runID: expectedPIDRunID
+                        )
+                    }
+                )
+            }
+            if let progress { watchdog = watchForNoProgress(progress) }
             for try await event in stream {
+                if case let .stdout(chunk) = event, !chunk.isEmpty { progress?.recordProgress() }
+                if progress?.claimIdleTimeout() == true || progress?.hasTimedOut == true {
+                    throw AIProviderError.invalidConfiguration(detail: AntigravityTurnProgress.failureMessage)
+                }
                 switch event {
                 case let .stdout(chunk):
                     stdoutData.append(chunk)
@@ -719,13 +790,19 @@ final class AntigravityAgentProvider: HeadlessAgentProvider {
                     }
                 case let .stderr(chunk):
                     stderrTail.append(chunk)
-                    if stderrTail.count > 64 * 1024 {
-                        stderrTail = Data(stderrTail.suffix(64 * 1024))
+                    if stderrTail.count > AntigravityTurnDiagnostics.stderrByteLimit {
+                        stderrTail = Data(stderrTail.suffix(AntigravityTurnDiagnostics.stderrByteLimit))
                     }
                 case let .terminated(status, didTimeout):
                     exitStatus = status
                     timedOut = didTimeout
                 }
+            }
+            progress?.endTurn()
+            watchdog?.cancel()
+            await watchdog?.value
+            if progress?.hasTimedOut == true {
+                throw AIProviderError.invalidConfiguration(detail: AntigravityTurnProgress.failureMessage)
             }
             // AsyncThrowingStream iteration may end normally when its consumer task is cancelled.
             // Reify that cancellation before classifying a missing termination event as a CLI error;
@@ -738,14 +815,24 @@ final class AntigravityAgentProvider: HeadlessAgentProvider {
                 }
             }
         } catch {
+            progress?.endTurn()
+            watchdog?.cancel()
+            await runtimeOverrides?.cancelProcess?()
             await runner.cancelAll()
-            throw error
+            await watchdog?.value
+            if progress?.hasTimedOut == true {
+                throw AIProviderError.invalidConfiguration(detail: AntigravityTurnProgress.failureMessage)
+            }
+            if error is CancellationError { throw error }
+            throw AIProviderError.invalidConfiguration(
+                detail: "Antigravity CLI stopped unexpectedly. Run `agy` interactively to inspect the failure."
+            )
         }
 
         let stderrString = String(decoding: stderrTail, as: UTF8.self)
         let logTail = Self.tailOfLogFile(logFileURL)
         let trajectoryFailureKind = try await toolLog.latestCorrelatedFailureKind()
-        return try Self.classifyTurn(
+        let outcome = try Self.classifyTurn(
             exitStatus: exitStatus,
             timedOut: timedOut,
             stdoutData: stdoutData,
@@ -754,6 +841,8 @@ final class AntigravityAgentProvider: HeadlessAgentProvider {
             isFirstTurn: isFirstTurn,
             trajectoryFailureKind: trajectoryFailureKind
         )
+        diagnostics.completed = outcome == .completed
+        return outcome
     }
 
     static func classifyTurn(
@@ -802,7 +891,7 @@ final class AntigravityAgentProvider: HeadlessAgentProvider {
         if !hasMeaningfulOutput {
             if isFirstTurn {
                 throw AIProviderError.invalidConfiguration(
-                    detail: "Antigravity CLI returned no meaningful output. Ensure you are signed in by running `agy` once interactively."
+                    detail: Self.noMeaningfulOutputMessage
                 )
             }
             return .incomplete
@@ -866,6 +955,7 @@ final class AntigravityAgentProvider: HeadlessAgentProvider {
     // MARK: - Errors & logging
 
     static let headlessPermissionDenialMessage = "Antigravity denied a tool because headless mode cannot prompt. In Agent Permissions, choose Sandboxed Auto-Approve (keeps the terminal sandbox but auto-approves every configured MCP server) or Full Access, then retry. For MCP-started sub-agents, use Custom per provider or Inherit provider settings instead of Safe Managed. If auto-approval is already selected, update `agy` or run it interactively to inspect the request."
+    static let noMeaningfulOutputMessage = "Antigravity CLI returned no meaningful output. Ensure you are signed in by running `agy` once interactively."
     static let conversationContextLostMessage = "Antigravity CLI lost the conversation while building its next request. This failure occurred inside AGY, not during authentication or the RepoPrompt MCP connection. Review completed tool actions before retrying. Splitting large file or tool batches may help; also update `agy` if a newer version is available."
     private static let timeoutMessage = "Antigravity CLI timed out."
 
@@ -874,20 +964,7 @@ final class AntigravityAgentProvider: HeadlessAgentProvider {
     }
 
     static func isHeadlessPermissionDenial(stderr: String?, logTail: String?) -> Bool {
-        let diagnostics = [stderr, logTail]
-            .compactMap(\.self)
-            .joined(separator: "\n")
-            .lowercased()
-        guard !diagnostics.isEmpty else { return false }
-
-        let headlessAutoDenial = diagnostics.contains("headless mode cannot prompt")
-            && (diagnostics.contains("required approval") || diagnostics.contains("auto-denied"))
-        let rejectedConfirmation = diagnostics.contains("tool confirmation")
-            && diagnostics.contains("approved=false")
-        return diagnostics.contains("soft-denying tool confirmation")
-            || diagnostics.contains("user denied permission for mcp(")
-            || headlessAutoDenial
-            || rejectedConfirmation
+        AntigravityTrajectoryStore.isHeadlessPermissionDenial(stderr: stderr, logTail: logTail)
     }
 
     /// Shown when `agy` exits because the signed-in account has no remaining quota for the
@@ -988,22 +1065,15 @@ final class AntigravityAgentProvider: HeadlessAgentProvider {
     ) -> Error {
         guard finalTrajectoryFailureKind == .conversationContextLost else { return error }
         if case let AIProviderError.invalidConfiguration(detail) = error,
-           detail == headlessPermissionDenialMessage || detail == timeoutMessage
+           detail == headlessPermissionDenialMessage || detail == timeoutMessage || detail == AntigravityTurnProgress.failureMessage
         {
             return error
         }
         return AIProviderError.invalidConfiguration(detail: conversationContextLostMessage)
     }
 
-    private static func makeLogFileURL(runID: UUID) -> URL? {
-        let dir = FileManager.default.temporaryDirectory
-            .appendingPathComponent("RepoPromptAntigravity", isDirectory: true)
-        do {
-            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        } catch {
-            return nil
-        }
-        return dir.appendingPathComponent("agy-\(runID.uuidString).log")
+    private static func makeLogFileURL(runID: UUID, directory: URL? = nil) -> URL? {
+        AntigravityTurnDiagnostics.makeLogFileURL(runID: runID, directory: directory)
     }
 
     private static func tailOfLogFile(_ url: URL?, maxBytes: Int = 4096) -> String? {
@@ -1021,10 +1091,5 @@ final class AntigravityAgentProvider: HeadlessAgentProvider {
         } catch {
             return nil
         }
-    }
-
-    private static func removeLogFile(_ url: URL?) {
-        guard let url else { return }
-        try? FileManager.default.removeItem(at: url)
     }
 }

@@ -534,6 +534,61 @@ final class AutoRecommendationEngineScopedSettingsTests: XCTestCase {
         }
     }
 
+    func testRestoredGrokSelectionIsPreservedWhenDisconnected() throws {
+        let availability = AgentModelCatalog.AvailabilityContext(
+            claudeCodeAvailable: false, codexAvailable: true, openCodeAvailable: false,
+            grokAvailable: false
+        )
+        let savedModel = "Saved Grok Model"
+        let selection = try XCTUnwrap(AutoRecommendationEngine.resolveContextBuilderSelection(
+            persistedAgentRaw: AgentProviderKind.grok.rawValue,
+            persistedModelRaw: savedModel,
+            availability: availability,
+            enabledRecommendationProviders: [.codex]
+        ))
+
+        XCTAssertEqual(selection.agent, .grok)
+        XCTAssertEqual(selection.modelRaw, savedModel)
+    }
+
+    func testRestoredAntigravitySelectionIsPreservedWhenModelTemporarilyUnadvertised() throws {
+        let registry = AntigravityModelRegistry.shared
+        let priorModels = registry.currentModels()
+        defer { registry.test_setModels(priorModels) }
+        registry.test_setModels([.init(id: "advertised-agy-model", displayName: "Advertised AGY Model")])
+        let availability = AgentModelCatalog.AvailabilityContext(
+            claudeCodeAvailable: false, codexAvailable: true, openCodeAvailable: false,
+            antigravityAvailable: true
+        )
+        let savedModel = "temporarily-unadvertised-agy-model"
+        XCTAssertFalse(AgentModelCatalog.isValid(rawModel: savedModel, for: .antigravity, availability: availability))
+        let selection = try XCTUnwrap(AutoRecommendationEngine.resolveContextBuilderSelection(
+            persistedAgentRaw: AgentProviderKind.antigravity.rawValue,
+            persistedModelRaw: savedModel,
+            availability: availability,
+            enabledRecommendationProviders: [.codex]
+        ))
+
+        XCTAssertEqual(selection.agent, .antigravity)
+        XCTAssertEqual(selection.modelRaw, savedModel)
+    }
+
+    func testNonPreservingProviderStillFallsBackToRecommendation() throws {
+        for claudeAvailable in [false, true] {
+            let availability = AgentModelCatalog.AvailabilityContext(
+                claudeCodeAvailable: claudeAvailable, codexAvailable: true, openCodeAvailable: false
+            )
+            let selection = try XCTUnwrap(AutoRecommendationEngine.resolveContextBuilderSelection(
+                persistedAgentRaw: AgentProviderKind.claudeCode.rawValue,
+                persistedModelRaw: claudeAvailable ? "not-a-claude-model" : AgentModel.claudeSonnet.rawValue,
+                availability: availability,
+                enabledRecommendationProviders: [.codex]
+            ))
+
+            XCTAssertEqual(selection.agent, .codexExec, "Claude available=\(claudeAvailable)")
+        }
+    }
+
     private func recommendedOpenAIModelRaw(from engine: AutoRecommendationEngine) throws -> String {
         let recommendations = engine.computeRecommendations(
             for: AgentModelsOperationIdentity(sourceWorkspaceID: UUID(), scope: .global),

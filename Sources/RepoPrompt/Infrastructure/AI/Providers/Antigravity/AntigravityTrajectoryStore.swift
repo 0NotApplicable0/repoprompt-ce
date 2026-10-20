@@ -50,6 +50,23 @@ final class AntigravityTrajectoryStore: AntigravityTrajectoryStoreReading {
         result == SQLITE_ERROR && message == "no such column: error_details"
     }
 
+    static func isHeadlessPermissionDenial(stderr: String?, logTail: String?) -> Bool {
+        let diagnostics = [stderr, logTail]
+            .compactMap(\.self)
+            .joined(separator: "\n")
+            .lowercased()
+        guard !diagnostics.isEmpty else { return false }
+
+        let headlessAutoDenial = diagnostics.contains("headless mode cannot prompt")
+            && (diagnostics.contains("required approval") || diagnostics.contains("auto-denied"))
+        let rejectedConfirmation = diagnostics.contains("tool confirmation")
+            && diagnostics.contains("approved=false")
+        return diagnostics.contains("soft-denying tool confirmation")
+            || diagnostics.contains("user denied permission for mcp(")
+            || headlessAutoDenial
+            || rejectedConfirmation
+    }
+
     private var db: OpaquePointer?
 
     init?(path: String) {
@@ -111,7 +128,7 @@ final class AntigravityTrajectoryStore: AntigravityTrajectoryStoreReading {
                 let details = Data(bytes: blob, count: Int(sqlite3_column_bytes(stmt, 3)))
                 if !details.isEmpty {
                     let diagnostics = String(decoding: details, as: UTF8.self)
-                    failureKind = AntigravityAgentProvider.isHeadlessPermissionDenial(
+                    failureKind = Self.isHeadlessPermissionDenial(
                         stderr: diagnostics,
                         logTail: nil
                     ) ? .headlessPermissionDenied : .other

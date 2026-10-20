@@ -20861,10 +20861,13 @@ actor WorkspaceFileContextStore {
         var commands: [CodemapInvalidationCommand] = []
         for prepared in deltas {
             switch prepared.delta {
-            case .fileAdded:
-                commands.append(.modified([prepared.relativePath]))
-            case .fileModified:
-                commands.append(.modified([prepared.relativePath]))
+            case .fileAdded, .fileModified:
+                // A content write must not fence or reschedule the graph unless this path can
+                // appear in the code-map projection; cataloged files without a code map (logs, for
+                // example) are excluded.
+                if codemapWatcherPathAffectsGraph(prepared.relativePath) {
+                    commands.append(.modified([prepared.relativePath]))
+                }
             case .fileRemoved:
                 commands.append(.deleted([prepared.relativePath]))
             case .folderRemoved:
@@ -20882,6 +20885,11 @@ actor WorkspaceFileContextStore {
             }
         }
         return (nil, commands)
+    }
+
+    private func codemapWatcherPathAffectsGraph(_ relativePath: String) -> Bool {
+        let fileExtension = (relativePath as NSString).pathExtension
+        return SyntaxManager.supportsCodeMap(fileExtension: fileExtension)
     }
 
     private func applyPreparedIndexDeltasBody(
@@ -22291,6 +22299,10 @@ actor WorkspaceFileContextStore {
     }
 
     #if DEBUG
+        func pathMatchIndexBuildCountForTesting() async -> Int {
+            await pathMatchWorker.indexBuildCountForTesting()
+        }
+
         func staticPathMatchSnapshotCacheCountForTesting() -> Int {
             staticPathMatchSnapshotsByScope.count
         }

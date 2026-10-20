@@ -20,19 +20,18 @@ final class AntigravityAgentProviderRunGateScopeTests: XCTestCase {
     }
 
     func testNoSharedRunGateSymbol() throws {
-        let antigravitySources = URL(fileURLWithPath: #filePath)
+        let repository = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent() // Antigravity
             .deletingLastPathComponent() // AgentMode
             .deletingLastPathComponent() // RepoPromptTests
             .deletingLastPathComponent() // Tests
             .deletingLastPathComponent() // repository root
-            .appendingPathComponent("Sources/RepoPrompt/Infrastructure/AI/Providers/Antigravity")
         let gateSource = try String(
-            contentsOf: antigravitySources.appendingPathComponent("AntigravityRunGate.swift"),
+            contentsOf: repository.appendingPathComponent("Sources/RepoPrompt/Infrastructure/AI/Providers/Antigravity/AntigravityRunGate.swift"),
             encoding: .utf8
         )
         let providerSource = try String(
-            contentsOf: antigravitySources.appendingPathComponent("AntigravityAgentProvider.swift"),
+            contentsOf: repository.appendingPathComponent("Sources/RepoPrompt/Features/AgentMode/Providers/Antigravity/AntigravityAgentProvider.swift"),
             encoding: .utf8
         )
 
@@ -92,6 +91,386 @@ final class AntigravityAgentProviderRunGateScopeTests: XCTestCase {
             return first
         }
         XCTAssertTrue(finished, "operation parked for more than \(seconds) s", file: file, line: line)
+    }
+}
+
+final class AntigravityRunDiagnosticsTests: XCTestCase {
+    private static let privateMarker = "synthetic-account@example.invalid private-diagnostic-marker"
+
+    private enum Scenario: Equatable {
+        case failed
+        case thrown
+        case cancelled
+        case capped
+        case completed
+        case empty
+        case stalledFork
+        case silentFork
+        case progressingFork
+    }
+
+    private final class Clock: @unchecked Sendable {
+        private let lock = NSLock()
+        private var instant: TimeInterval = 0
+
+        var now: TimeInterval {
+            lock.withLock { instant }
+        }
+
+        func advance(to instant: TimeInterval) {
+            lock.withLock { self.instant = instant }
+        }
+    }
+
+    private final class EventScript: @unchecked Sendable {
+        private let lock = NSLock()
+        private let clock: Clock
+        private var events: [(TimeInterval, CLIProcessRunner.StreamEvent)]
+        private let terminalError: Error?
+
+        init(clock: Clock, events: [(TimeInterval, CLIProcessRunner.StreamEvent)], terminalError: Error?) {
+            self.clock = clock
+            self.events = events
+            self.terminalError = terminalError
+        }
+
+        func next() throws -> CLIProcessRunner.StreamEvent? {
+            try lock.withLock {
+                guard !events.isEmpty else {
+                    if let terminalError { throw terminalError }
+                    return nil
+                }
+                let (instant, event) = events.removeFirst()
+                clock.advance(to: instant)
+                return event
+            }
+        }
+    }
+
+    private final class SilentProcess: @unchecked Sendable {
+        let stream: AsyncThrowingStream<CLIProcessRunner.StreamEvent, Error>
+        private let continuation: AsyncThrowingStream<CLIProcessRunner.StreamEvent, Error>.Continuation
+
+        init() {
+            let pair = AsyncThrowingStream<CLIProcessRunner.StreamEvent, Error>.makeStream()
+            stream = pair.stream
+            continuation = pair.continuation
+        }
+
+        func cancel() {
+            continuation.finish(throwing: CancellationError())
+        }
+    }
+
+    private final class TrajectoryProgressProbe: AntigravityTrajectoryStoreReading, @unchecked Sendable {
+        let clock = Clock()
+        private let lock = NSLock()
+        private let switchesTurn: Bool
+        private var phase = 0
+        private var progressCount = 0
+
+        init(switchesTurn: Bool) {
+            self.switchesTurn = switchesTurn
+        }
+
+        func locate() -> URL? {
+            lock.withLock {
+                switchesTurn && phase > 0 ? nil : URL(fileURLWithPath: "/synthetic-predecessor.db")
+            }
+        }
+
+        func steps(after _: Int64, limit _: Int32) -> [AntigravityTrajectoryStore.ToolStep]? {
+            lock.withLock {
+                [.init(idx: Int64(phase + 1), status: 0, payload: Data("row-\(phase)".utf8))]
+            }
+        }
+
+        func latestFailureKind() -> AntigravityTrajectoryStore.FailureKind? {
+            nil
+        }
+
+        func advance() -> Bool {
+            lock.withLock {
+                phase += 1
+                clock.advance(to: TimeInterval(phase * 119))
+                return phase == 2
+            }
+        }
+
+        func recordProgress() {
+            lock.withLock { progressCount += 1 }
+        }
+
+        var count: Int {
+            lock.withLock { progressCount }
+        }
+    }
+
+    private struct Fixture {
+        let root: URL
+        let diagnostics: URL
+        let activeLogs: URL
+        let provider: AntigravityAgentProvider
+    }
+
+    private struct Capture {
+        var events: [AIStreamResult] = []
+        var failure: String?
+    }
+
+    func testFailedTurnRetainsLogAndStderrTail() async throws {
+        for scenario in [Scenario.failed, .thrown, .cancelled, .capped] {
+            let fixture = try makeFixture(scenario)
+            defer { try? FileManager.default.removeItem(at: fixture.root) }
+            let captured = await capture(fixture.provider)
+            XCTAssertNotNil(captured.failure)
+            XCTAssertFalse(captured.failure?.contains(Self.privateMarker) == true)
+
+            let runs = retainedRuns(in: fixture.diagnostics)
+            XCTAssertEqual(runs.count, 1)
+            guard let run = runs.first else { continue }
+            let log = try String(contentsOf: run.appendingPathComponent("agy.log"), encoding: .utf8)
+            let stderr = try Data(contentsOf: run.appendingPathComponent("stderr-tail.txt"))
+            XCTAssertTrue(log.contains(Self.privateMarker))
+            XCTAssertEqual(stderr.count, 64 * 1024)
+            XCTAssertTrue(String(decoding: stderr, as: UTF8.self).hasSuffix(Self.privateMarker))
+            try assertPermissions(fixture.diagnostics, expected: 0o700)
+            try assertPermissions(run, expected: 0o700)
+            try assertPermissions(run.appendingPathComponent("agy.log"), expected: 0o600)
+            try assertPermissions(run.appendingPathComponent("stderr-tail.txt"), expected: 0o600)
+            XCTAssertTrue(retainedRuns(in: fixture.activeLogs).isEmpty)
+        }
+    }
+
+    func testCompletedTurnRemovesLog() async throws {
+        let fixture = try makeFixture(.completed)
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let captured = await capture(fixture.provider)
+
+        XCTAssertNil(captured.failure)
+        XCTAssertEqual(captured.events.filter { $0.type == "content" }.compactMap(\.text).joined(), "final answer\n")
+        XCTAssertEqual(captured.events.count(where: { $0.type == "message_stop" }), 1)
+        XCTAssertTrue(retainedRuns(in: fixture.activeLogs).isEmpty)
+        XCTAssertTrue(retainedRuns(in: fixture.diagnostics).isEmpty)
+    }
+
+    func testRetainedDiagnosticsAreBounded() async throws {
+        let root = try makeRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        for index in 0 ..< 22 {
+            let fixture = try makeFixture(.failed, root: root, marker: "run-marker-\(index)|")
+            let captured = await capture(fixture.provider)
+            XCTAssertNotNil(captured.failure)
+        }
+
+        let runs = retainedRuns(in: root.appendingPathComponent("diagnostics"))
+        XCTAssertEqual(runs.count, 20)
+        let logs = try runs.map { try String(contentsOf: $0.appendingPathComponent("agy.log"), encoding: .utf8) }
+        XCTAssertFalse(logs.contains { $0.contains("run-marker-0|") })
+        XCTAssertFalse(logs.contains { $0.contains("run-marker-1|") })
+        XCTAssertTrue(logs.contains { $0.contains("run-marker-21|") })
+
+        let blockedRoot = try makeRoot()
+        defer { try? FileManager.default.removeItem(at: blockedRoot) }
+        try Data().write(to: blockedRoot.appendingPathComponent("diagnostics"))
+        for _ in 0 ..< 22 {
+            let fixture = try makeFixture(.failed, root: blockedRoot)
+            _ = await capture(fixture.provider)
+        }
+        let preservedSources = retainedRuns(in: blockedRoot.appendingPathComponent("active"))
+        XCTAssertEqual(preservedSources.count, 20)
+        for source in preservedSources {
+            try assertPermissions(source, expected: 0o600)
+        }
+    }
+
+    @MainActor
+    func testEmptyFirstTurnFailsRunWithReason() async throws {
+        let fixture = try makeFixture(.empty)
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let fallback = AgentModeViewModel.composeClaudeResumeRecoveryHandoffPayload(
+            sourceTabName: "diagnostics test", sourceAgentName: "Antigravity CLI",
+            transcriptXML: "<transcript></transcript>", initialThreadContextBlock: nil, deliveryID: "test"
+        )
+        let providers: [(HeadlessAgentProvider, String)] = [
+            (fixture.provider, "first turn"),
+            (AgentSessionLinkCapturingHeadlessProvider(), "first turn"),
+            (AgentSessionLinkCapturingHeadlessProvider(), fallback)
+        ]
+        for (provider, prompt) in providers {
+            let harness = AgentSessionLinkRunnerHarness(headlessProviderFactory: { _, _, _, _, _ in provider })
+            let session = harness.makeSession(agent: .antigravity)
+            let runner = harness.makeHeadlessRunner()
+            await runner.startRun(
+                tabID: session.tabID, session: session,
+                initialUserMessage: prompt, initialMessageForRun: prompt, attachments: [],
+                makeLease: { harness.makeLease(runID: $0, tabID: session.tabID) }
+            )
+            await session.agentTask?.value
+            XCTAssertEqual(session.runState, .failed)
+            XCTAssertNotNil(session.lastTerminalCommitRevision?.failureReason)
+            XCTAssertTrue(session.items.contains {
+                $0.kind == .error && $0.text.localizedCaseInsensitiveContains("no meaningful output")
+            })
+            await harness.host.prepareForWindowClose()
+        }
+    }
+
+    func testForkFallbackWithoutProgressFailsWithinBound() async throws {
+        let prompt = AgentModeViewModel.composeClaudeResumeRecoveryHandoffPayload(
+            sourceTabName: "diagnostics test", sourceAgentName: "Antigravity CLI",
+            transcriptXML: "<transcript></transcript>", initialThreadContextBlock: nil, deliveryID: "test"
+        )
+        for scenario in [Scenario.stalledFork, .silentFork] {
+            let stalled = try makeFixture(scenario)
+            defer { try? FileManager.default.removeItem(at: stalled.root) }
+            let captured = await capture(stalled.provider, prompt: prompt)
+            XCTAssertTrue(captured.failure?.contains("120") == true)
+            XCTAssertTrue(captured.failure?.localizedCaseInsensitiveContains("no stdout or trajectory progress") == true)
+            XCTAssertFalse(captured.events.contains { $0.type == "message_stop" })
+            XCTAssertEqual(retainedRuns(in: stalled.diagnostics).count, 1)
+        }
+
+        let progressing = try makeFixture(.progressingFork)
+        defer { try? FileManager.default.removeItem(at: progressing.root) }
+        let successful = await capture(progressing.provider, prompt: prompt)
+        XCTAssertNil(successful.failure)
+        XCTAssertTrue(successful.events.contains { $0.type == "message_stop" })
+
+        for switchesTurn in [false, true] {
+            let probe = TrajectoryProgressProbe(switchesTurn: switchesTurn)
+            let progress = AntigravityTurnProgress(now: { probe.clock.now })
+            progress.beginTurn()
+            let pair = AsyncThrowingStream<AIStreamResult, Error>.makeStream()
+            let task = Task {
+                await AntigravityTrajectoryToolLogStream.tail(
+                    into: pair.continuation,
+                    locate: { probe.locate() },
+                    waitBetweenPolls: { _ in
+                        let finished = probe.advance()
+                        _ = progress.claimIdleTimeout()
+                        if finished { withUnsafeCurrentTask { $0?.cancel() } }
+                    },
+                    waitForFinalDrainRetry: { _ in },
+                    storeFactory: { _ in probe },
+                    onProgress: {
+                        probe.recordProgress()
+                        progress.recordProgress()
+                    }
+                )
+            }
+            _ = await task.value
+            pair.continuation.finish()
+            progress.endTurn()
+            XCTAssertEqual(progress.hasTimedOut, switchesTurn)
+            if switchesTurn { XCTAssertEqual(probe.count, 1) }
+        }
+    }
+
+    func testRetainedDiagnosticsNotShownInUI() async throws {
+        let fixture = try makeFixture(.failed)
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let captured = await capture(fixture.provider)
+        XCTAssertEqual(retainedRuns(in: fixture.diagnostics).count, 1)
+        XCTAssertFalse(captured.failure?.contains(Self.privateMarker) == true)
+        XCTAssertFalse(captured.failure?.contains(fixture.diagnostics.path) == true)
+        XCTAssertFalse(captured.events.contains {
+            ($0.text ?? "").contains(Self.privateMarker) || ($0.reasoning ?? "").contains(Self.privateMarker)
+        })
+        XCTAssertFalse(captured.events.contains { $0.type == "message_stop" })
+    }
+
+    private func makeRoot() throws -> URL {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("AntigravityRunDiagnosticsTests-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        return root
+    }
+
+    private func makeFixture(_ scenario: Scenario, root: URL? = nil, marker: String = "") throws -> Fixture {
+        let root = try root ?? makeRoot()
+        let activeLogs = root.appendingPathComponent("active", isDirectory: true)
+        let diagnostics = root.appendingPathComponent("diagnostics", isDirectory: true)
+        let clock = Clock()
+        let silentProcess = SilentProcess()
+        var runtime = AntigravityAgentProvider.RuntimeOverrides(
+            prepareContext: { runID in
+                HeadlessAgentContext(runID: runID ?? UUID(), configURL: nil, environment: ["HOME": root.path])
+            },
+            processEvents: { args, _ in
+                let logIndex = try XCTUnwrap(args.firstIndex(of: "--log-file"))
+                let logURL = URL(fileURLWithPath: args[logIndex + 1])
+                try Data((Self.privateMarker + marker).utf8).write(to: logURL)
+                var events: [(TimeInterval, CLIProcessRunner.StreamEvent)] = [
+                    (0, .stderr(Data((String(repeating: "x", count: 70 * 1024) + Self.privateMarker).utf8)))
+                ]
+                var terminalError: Error?
+                switch scenario {
+                case .failed:
+                    events.append((0, .terminated(status: 1, timedOut: false)))
+                case .thrown:
+                    terminalError = NSError(domain: Self.privateMarker, code: 1)
+                case .cancelled:
+                    terminalError = CancellationError()
+                case .capped:
+                    events += [
+                        (0, .stdout(Data("Error: timed out waiting for response\n".utf8))),
+                        (0, .terminated(status: 0, timedOut: false))
+                    ]
+                case .completed:
+                    events += [(0, .stdout(Data("final answer\n".utf8))), (0, .terminated(status: 0, timedOut: false))]
+                case .empty:
+                    events.append((0, .terminated(status: 0, timedOut: false)))
+                case .stalledFork:
+                    events += [(121, .stderr(Data("still waiting".utf8))), (121, .terminated(status: 0, timedOut: false))]
+                case .silentFork:
+                    return silentProcess.stream
+                case .progressingFork:
+                    events += [
+                        (119, .stdout(Data("working\n".utf8))),
+                        (238, .stdout(Data("final answer\n".utf8))),
+                        (238, .terminated(status: 0, timedOut: false))
+                    ]
+                }
+                let script = EventScript(clock: clock, events: events, terminalError: terminalError)
+                return AsyncThrowingStream(unfolding: { try script.next() })
+            },
+            logDirectory: activeLogs,
+            diagnosticsDirectory: diagnostics,
+            now: { clock.now }
+        )
+        if scenario == .silentFork {
+            runtime.waitForProgressCheck = { clock.advance(to: 120) }
+            runtime.cancelProcess = { silentProcess.cancel() }
+        }
+        let runner = CLIProcessRunner(config: CLIProcessConfiguration(command: "/never-launch-agy", additionalPaths: []))
+        let provider = AntigravityAgentProvider(
+            runner: runner, config: AntigravityAgentConfig(maxPrintResumes: 0), runtimeOverrides: runtime
+        )
+        return Fixture(root: root, diagnostics: diagnostics, activeLogs: activeLogs, provider: provider)
+    }
+
+    private func capture(_ provider: AntigravityAgentProvider, prompt: String = "diagnostics test") async -> Capture {
+        var captured = Capture()
+        do {
+            let stream = try await provider.streamAgentMessage(AgentMessage(userMessage: prompt))
+            for try await event in stream {
+                captured.events.append(event)
+            }
+        } catch {
+            captured.failure = error.localizedDescription
+        }
+        await provider.dispose()
+        return captured
+    }
+
+    private func retainedRuns(in directory: URL) -> [URL] {
+        (try? FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)) ?? []
+    }
+
+    private func assertPermissions(_ url: URL, expected: Int, file: StaticString = #filePath, line: UInt = #line) throws {
+        let attributes = try FileManager.default.attributesOfItem(atPath: url.path)
+        XCTAssertEqual((attributes[.posixPermissions] as? NSNumber)?.intValue, expected, file: file, line: line)
     }
 }
 
