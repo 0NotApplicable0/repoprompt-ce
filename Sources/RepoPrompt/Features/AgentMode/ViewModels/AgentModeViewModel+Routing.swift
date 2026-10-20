@@ -1,7 +1,7 @@
 import Foundation
 
 extension AgentModeViewModel {
-    enum GlobalModelRoutingError: LocalizedError {
+    enum GlobalModelRoutingError: String, LocalizedError {
         case unavailable
         case noTargets
         case failed
@@ -38,13 +38,57 @@ extension AgentModeViewModel {
         } else {
             nil
         }
+        let routedModelDisplayName: String? = if configuration.enabled,
+                                                 let session = activeSession,
+                                                 let audit = session.automationTurnAudit.last(where: { $0.router.eligible }),
+                                                 audit.router.decision == .selected,
+                                                 !audit.router.fallbackApplied,
+                                                 let modelRaw = audit.router.chosenModelRaw,
+                                                 modelRaw == session.selectedModelRaw,
+                                                 audit.acceptedProviderRaw == session.selectedAgent.rawValue,
+                                                 audit.router.application != .fallbackToManual,
+                                                 audit.router.application != .failed
+        {
+            routedModelDisplayName(
+                rawModel: modelRaw,
+                reasoningEffortRaw: session.selectedAgent.usesClaudeTooling
+                    ? session.selectedClaudeEffortRaw
+                    : session.selectedReasoningEffortRaw,
+                agentKind: session.selectedAgent,
+                showsEffort: !modelRouterSettingsStore.autoEffortEnabled()
+            )
+        } else {
+            nil
+        }
         return AgentModelRouterPillProps(
             isOn: configuration.enabled,
             isAvailable: available || configuration.enabled,
             isRouting: isRouting,
             disabledReason: disabledReason,
+            routedModelDisplayName: routedModelDisplayName,
             usageBalancing: configuration.usageBalancing.enabled
         )
+    }
+
+    private func routedModelDisplayName(
+        rawModel: String,
+        reasoningEffortRaw: String?,
+        agentKind: AgentProviderKind,
+        showsEffort: Bool
+    ) -> String {
+        let modelName = inputBarModelDisplayName(rawModel: rawModel, agentKind: agentKind)
+        guard showsEffort,
+              let reasoningEffortRaw
+        else { return modelName }
+
+        let effortName: String? = if agentKind == .codexExec {
+            CodexReasoningEffort.parse(reasoningEffortRaw)?.displayName
+        } else if agentKind.usesClaudeTooling {
+            ClaudeCodeEffortLevel.parse(reasoningEffortRaw)?.displayName
+        } else {
+            reasoningEffortRaw
+        }
+        return effortName.map { "\(modelName) \($0)" } ?? modelName
     }
 
     func autoEffortPillProps() -> AgentAutoEffortPillProps {
@@ -55,15 +99,18 @@ extension AgentModeViewModel {
         }
         return AgentAutoEffortPillProps(
             isOn: modelRouterSettingsStore.autoEffortEnabled(),
-            isAvailable: modelRouterRuntime?.isBackendReady(.jev) == true,
+            isAvailable: modelRouterSettingsStore.autoEffortConfiguration().selectedBackendID.map {
+                modelRouterRuntime?.isBackendReady($0) == true
+            } ?? false,
             isJudging: session?.autoEffortJudgmentID != nil,
             feedback: feedback
         )
     }
 
     func toggleAutoEffort() {
-        let enabled = modelRouterSettingsStore.autoEffortEnabled()
-        guard enabled || modelRouterRuntime?.isBackendReady(.jev) == true else { return }
+        let configuration = modelRouterSettingsStore.autoEffortConfiguration()
+        let enabled = configuration.enabled
+        guard enabled || configuration.selectedBackendID.map({ modelRouterRuntime?.isBackendReady($0) == true }) == true else { return }
         modelRouterSettingsStore.setAutoEffortEnabled(!enabled)
         syncStatusPillsUIState()
     }
@@ -94,7 +141,8 @@ extension AgentModeViewModel {
         guard let backendID = configuration.selectedBackendID,
               modelRouterRuntime?.isBackendReady(backendID) == true
         else { return }
-        guard (try? AgentTaskRoutingCandidateBuilder().build(
+        let builder = modelRouterRuntime?.candidateBuilderFactory() ?? AgentTaskRoutingCandidateBuilder()
+        guard (try? builder.build(
             allowedProviders: providers(for: .primarySession, configuration: configuration),
             availability: modelRouterAvailabilityContext
         )) != nil else { return }
@@ -252,14 +300,14 @@ extension AgentModeViewModel {
                     routerAudit: fallbackAudit
                 )
             }
+            await logContext?.recordPick(selected.target)
             let baseline = RoutedSelectionRollback(target: executableTarget(for: session))
-            guard applyRoutingTarget(selected.target, to: session) else {
+            guard applyRoutingTarget(selected, to: session) else {
                 return await submitUserTurnAfterAutoEffort(
                     text: text, claim: claim, session: session, destinationTabID: destinationTabID,
                     routerAudit: fallbackAudit
                 )
             }
-            await logContext?.recordPick(selected.target)
             routedAudit.chosenModelRaw = selected.target.modelRaw
             routedAudit.chosenEffortRaw = selected.target.reasoningEffortRaw
             guard composerSubmitClaimIsCurrent(claim),
@@ -274,6 +322,7 @@ extension AgentModeViewModel {
                 text: text,
                 tabID: destinationTabID,
                 rawDraftText: claim.attempt.rawDraftSnapshot,
+                composerOrigin: .localComposer,
                 routerAudit: routedAudit
             )
             if result != .submitted {
@@ -281,6 +330,7 @@ extension AgentModeViewModel {
             } else {
                 session.isDirty = true
                 scheduleSave(for: session.tabID)
+                if currentTabID == session.tabID { syncStatusPillsUIState() }
             }
             return result
         case .abstained, .failed:
@@ -307,6 +357,7 @@ extension AgentModeViewModel {
                 text: text,
                 tabID: destinationTabID,
                 rawDraftText: claim.attempt.rawDraftSnapshot,
+                composerOrigin: .localComposer,
                 routerAudit: routerAudit
             )
         }
@@ -331,6 +382,7 @@ extension AgentModeViewModel {
             text: text,
             tabID: destinationTabID,
             rawDraftText: claim.attempt.rawDraftSnapshot,
+            composerOrigin: .localComposer,
             autoEffortSelection: selection,
             autoEffortAudit: choice.audit,
             routerAudit: routerAudit
@@ -348,7 +400,8 @@ extension AgentModeViewModel {
         session: TabSession,
         workflow: AgentWorkflowDefinition?
     ) async -> (selection: AutoEffortTurnSelection?, audit: AgentAutomationTurnAudit.Feature) {
-        guard modelRouterSettingsStore.autoEffortEnabled() else {
+        let autoEffortConfiguration = modelRouterSettingsStore.autoEffortConfiguration()
+        guard autoEffortConfiguration.enabled else {
             return (nil, .init(configured: false, eligible: false, judgmentRequested: false, decision: .disabled))
         }
         guard !session.runState.isActive,
@@ -358,7 +411,10 @@ extension AgentModeViewModel {
         else {
             return (nil, .init(configured: true, eligible: false, judgmentRequested: false, decision: .ineligible))
         }
-        guard let runtime = modelRouterRuntime, runtime.isBackendReady(.jev) else {
+        guard let runtime = modelRouterRuntime,
+              let backendID = autoEffortConfiguration.selectedBackendID,
+              runtime.isBackendReady(backendID)
+        else {
             return (nil, .init(configured: true, eligible: true, judgmentRequested: false, decision: .unavailable))
         }
 
@@ -396,7 +452,12 @@ extension AgentModeViewModel {
             return ineligibleAutoEffortChoice()
         }
         guard efforts.count >= 2 else { return ineligibleAutoEffortChoice() }
-        let judgmentID = UUID()
+        let logScope: AgentTaskRoutingLogScope = session.mcpControlContext != nil ? .subagent : .primarySession
+        let logContext = AgentTaskRoutingJudgeLogging.current
+            ?? AgentTaskRoutingRouteScope.live?.context
+            ?? AgentTaskRoutingRouteContext(requestID: UUID(), scope: logScope, log: runtime.decisionLog)
+        await logContext.attachSessionID(session.activeAgentSessionID)
+        let judgmentID = logContext.requestID
         session.autoEffortJudgmentID = judgmentID
         if currentTabID == session.tabID { syncStatusPillsUIState() }
         defer {
@@ -405,14 +466,37 @@ extension AgentModeViewModel {
                 if currentTabID == session.tabID { syncStatusPillsUIState() }
             }
         }
-        let chosen = await runtime.chooseAutoEffort(
-            maskedTaskExcerpt: maskedExcerpt,
-            selectedModelID: modelID,
-            builtInWorkflow: workflow?.builtInWorkflow,
-            efforts: efforts,
-            logScope: session.mcpControlContext != nil ? .subagent : .primarySession
+        guard let registration = await runtime.registry.registration(for: backendID),
+              let prepared = try? AutoEffortDecisionPolicy().build(
+                  requestID: judgmentID,
+                  maskedTaskExcerpt: maskedExcerpt,
+                  selectedModelID: modelID,
+                  builtInWorkflow: workflow?.builtInWorkflow,
+                  efforts: efforts,
+                  capabilities: registration.capabilities
+              )
+        else {
+            var failed = AgentTaskRoutingDecisionDraft(stage: .autoEffort, outcome: .failed)
+            failed.backend = backendID.rawValue
+            failed.failure = DecisionFailureCategory.invalidRequest.rawValue
+            await logContext.emitDecision(failed)
+            return (nil, .init(configured: true, eligible: true, judgmentRequested: false, decision: .fallback, fallbackApplied: true))
+        }
+        let outcome = await tracedAutoEffortRoute(
+            runtime: runtime,
+            backendID: backendID,
+            prepared: prepared,
+            providerRaw: provider.rawValue,
+            modelID: modelID,
+            consumerRevision: autoEffortConfiguration.revision,
+            context: logContext
         )
-        guard modelRouterSettingsStore.autoEffortEnabled(),
+        let chosen = prepared.effort(for: outcome)
+        let currentAutoEffortConfiguration = modelRouterSettingsStore.autoEffortConfiguration()
+        guard currentAutoEffortConfiguration.enabled,
+              currentAutoEffortConfiguration.revision == autoEffortConfiguration.revision,
+              currentAutoEffortConfiguration.selectedBackendRawValue == autoEffortConfiguration.selectedBackendRawValue,
+              currentAutoEffortConfiguration.selectedBackendID == backendID,
               sessions[session.tabID] === session,
               session.autoEffortJudgmentID == judgmentID,
               session.selectedWorkflow == selectedWorkflow,
@@ -437,7 +521,9 @@ extension AgentModeViewModel {
                 provider: provider,
                 selectedModelRaw: modelRaw,
                 manualEffortRaw: manualEffortRaw,
-                effortRaw: chosen
+                effortRaw: chosen,
+                backendID: backendID,
+                autoEffortRevision: autoEffortConfiguration.revision
             ),
             .init(
                 configured: true, eligible: true, judgmentRequested: true, decision: .selected,
@@ -466,28 +552,29 @@ extension AgentModeViewModel {
         surface: AgentModelCatalog.AgentSelectionSurface,
         baseline: AgentRoutingExecutableTarget? = nil,
         allowUsageBalance: Bool = true,
-        logContext: AgentTaskRoutingRouteContext? = nil,
-        diversity: AgentTaskRoutingDiversityOptions = .none
+        diversity: AgentTaskRoutingDiversityOptions = .none,
+        logContext: AgentTaskRoutingRouteContext? = nil
     ) async throws -> AgentRoutingExecutableTarget? {
         await logContext?.attachMakerExclusions(diversity.canonicalMakerExclusions)
         let configuration = modelRouterSettingsStore.modelRouterConfiguration()
         let fallback = { [self] in
             baseline.flatMap { allowUsageBalance ? localUsageDecision(basedOn: $0, scope: .subagent, surface: surface)?.candidate.target : nil }
         }
-        /// With exclusions, a fallback needs a proven-allowed baseline; a swap is taken only when it is allowed too.
-        /// `preRouteReason` is set when no route ran, so the single model row is written here.
         func fencedFallback(preRouteReason: String?) async throws -> AgentRoutingExecutableTarget? {
             guard !diversity.exclusions.isEmpty else { return fallback() }
             guard Self.isAllowed(baseline, by: diversity) else {
                 if preRouteReason != nil {
-                    await emitFailedDecision(.model, candidates: [], failure: .fallbackDiversityExcluded, context: logContext)
+                    await emitFailedDecision(
+                        .model, candidates: [], failure: GlobalModelRoutingError.fallbackDiversityExcluded.rawValue, context: logContext
+                    )
                 }
                 await logContext?.finish(.rejected)
                 throw GlobalModelRoutingError.fallbackDiversityExcluded
             }
             if let preRouteReason {
                 await emitFailedDecision(
-                    .model, candidates: [], failure: .policyUnavailable, reasonCode: preRouteReason, context: logContext
+                    .model, candidates: [], failure: DecisionFailureCategory.policyUnavailable.rawValue,
+                    reasonCode: preRouteReason, context: logContext
                 )
             }
             guard let swap = fallback(), Self.isAllowed(swap, by: diversity) else { return nil }
@@ -499,7 +586,7 @@ extension AgentModeViewModel {
               let backendID = configuration.selectedBackendID,
               runtime.isBackendReady(backendID)
         else { return try await fencedFallback(preRouteReason: "backend_not_ready") }
-        let result = await routeModelThenEffort(
+        let result = try await routeModelThenEffort(
             requestID: logContext?.requestID ?? UUID(),
             text: task,
             scope: .subagent,
@@ -509,8 +596,8 @@ extension AgentModeViewModel {
             backendID: backendID,
             runtime: runtime,
             allowUsageBalance: allowUsageBalance,
-            logContext: logContext,
-            diversity: diversity
+            diversity: diversity,
+            logContext: logContext
         )
         guard modelRouterConfigurationIsCurrent(configuration, backendID: backendID) else {
             await logContext?.finish(.rejected)
@@ -518,21 +605,24 @@ extension AgentModeViewModel {
         }
         switch result.outcome {
         case let .selected(opaqueKey, _):
-            let target = result.candidates.only(where: { $0.opaqueKey == opaqueKey })?.target
-            await logContext?.recordPick(target)
-            return target
+            guard let selected = result.candidates.only(where: { $0.opaqueKey == opaqueKey }) else {
+                if diversity.exclusions.isEmpty { return nil }
+                return try await fencedFallback(preRouteReason: nil)
+            }
+            await logContext?.recordPick(selected.target)
+            guard routingCandidateIsCurrent(selected) else {
+                if diversity.exclusions.isEmpty { return nil }
+                return try await fencedFallback(preRouteReason: nil)
+            }
+            return selected.target
         case .cancelled:
             await logContext?.finish(.rejected)
             throw GlobalModelRoutingError.cancelled
-        case .failed(.allCandidatesExcluded, _, _):
-            await logContext?.finish(.rejected)
-            throw GlobalModelRoutingError.allCandidatesExcluded
         case .abstained, .failed:
             return try await fencedFallback(preRouteReason: nil)
         }
     }
 
-    /// A target is allowed only when its maker is known and not excluded; unknown makers never pass.
     private static func isAllowed(_ target: AgentRoutingExecutableTarget?, by diversity: AgentTaskRoutingDiversityOptions) -> Bool {
         guard let target, let maker = AgentTaskRoutingMakerCatalog.maker(for: target) else { return false }
         return diversity.exclusions[maker.rawValue] == nil
@@ -545,50 +635,82 @@ extension AgentModeViewModel {
         surface: AgentModelCatalog.AgentSelectionSurface,
         providers: Set<AgentProviderKind>,
         configuration: AgentTaskRouterConfiguration,
-        backendID: AgentTaskRouterBackendID,
+        backendID: DecisionServiceID,
         runtime: AgentTaskRouterRuntime,
         allowUsageBalance: Bool = true,
-        logContext: AgentTaskRoutingRouteContext? = nil,
-        diversity: AgentTaskRoutingDiversityOptions = .none
+        logContext: AgentTaskRoutingRouteContext? = nil
     ) async -> StagedTaskRoutingResult {
+        do {
+            return try await routeModelThenEffort(
+                requestID: requestID, text: text, scope: scope, surface: surface, providers: providers,
+                configuration: configuration, backendID: backendID, runtime: runtime,
+                allowUsageBalance: allowUsageBalance, diversity: .none, logContext: logContext
+            )
+        } catch {
+            return StagedTaskRoutingResult(
+                candidates: [], outcome: .failed(category: .invalidRequest, retryable: false, evidence: nil)
+            )
+        }
+    }
+
+    private func routeModelThenEffort(
+        requestID: UUID,
+        text: String,
+        scope: AgentTaskRoutingScope,
+        surface: AgentModelCatalog.AgentSelectionSurface,
+        providers: Set<AgentProviderKind>,
+        configuration: AgentTaskRouterConfiguration,
+        backendID: DecisionServiceID,
+        runtime: AgentTaskRouterRuntime,
+        allowUsageBalance: Bool = true,
+        diversity: AgentTaskRoutingDiversityOptions,
+        logContext: AgentTaskRoutingRouteContext? = nil
+    ) async throws -> StagedTaskRoutingResult {
         let builder = runtime.candidateBuilderFactory()
-        let routingText = AgentTaskRoutingTaskExcerpt.make(from: text)
-        guard let built = try? builder.build(
+        let snapshot = builder.capture(
             allowedProviders: providers,
             availability: modelRouterAvailabilityContext,
-            surface: surface,
-            roleDefaults: agentModelRoleDefaultReferences()
-        ), !built.isEmpty else {
+            surface: surface
+        )
+        guard let registration = await runtime.registry.registration(for: backendID),
+              let models = try? builder.build(
+                  snapshot: snapshot,
+                  roleDefaults: agentModelRoleDefaultReferences(),
+                  excludedMakers: Set(diversity.exclusions.keys),
+                  maximumChoices: registration.capabilities.finiteChoice.maximumChoices
+              )
+        else {
             await emitFailedDecision(.model, candidates: [], context: logContext)
             return StagedTaskRoutingResult(
                 candidates: [],
                 outcome: .failed(category: .invalidRequest, retryable: false, evidence: nil)
             )
         }
-        let models = diversity.exclusions.isEmpty ? built : built.filter { Self.isAllowed($0.target, by: diversity) }
+
         guard let firstModel = models.first else {
-            await emitFailedDecision(.model, candidates: [], failure: .allCandidatesExcluded, context: logContext)
-            return StagedTaskRoutingResult(
-                candidates: [],
-                outcome: .failed(category: .allCandidatesExcluded, retryable: false, evidence: nil)
+            await emitFailedDecision(
+                .model, candidates: [], failure: GlobalModelRoutingError.allCandidatesExcluded.rawValue, context: logContext
             )
+            await logContext?.finish(.rejected)
+            throw GlobalModelRoutingError.allCandidatesExcluded
         }
 
         var selectedModel: AgentTaskRoutingCandidateBuilder.Candidate
         var usageBalancingReason: String?
-        var modelEvidence: AgentTaskRoutingDecisionEvidence?
+        var modelEvidence: DecisionEvidence?
         var judgmentRequested = false
         if models.count == 1 {
             selectedModel = firstModel
             await logContext?.emitDecision(Self.localDecisionDraft(stage: .model, chosen: firstModel, candidates: models))
         } else {
-            guard let modelRequest = try? AgentTaskRoutingEnvelopeBuilder().build(
+            guard let modelRequest = try? ModelRouterDecisionPolicy().build(
                 requestID: requestID,
-                text: routingText,
+                task: text,
                 scope: scope,
-                decisionStage: .model,
-                customInstructions: configuration.customInstructions,
-                candidates: models.map(\.descriptor)
+                stage: .model,
+                directive: configuration.customInstructions,
+                candidates: models,
+                capabilities: registration.capabilities
             ) else {
                 await emitFailedDecision(.model, candidates: models, context: logContext)
                 return StagedTaskRoutingResult(
@@ -597,16 +719,21 @@ extension AgentModeViewModel {
                 )
             }
             judgmentRequested = true
-            let traced = await runtime.routeTraced(backendID: backendID, request: modelRequest)
+            let traced = await runtime.decideTraced(
+                serviceID: backendID, request: modelRequest, consumerRevision: configuration.revision
+            )
             let modelOutcome = traced.outcome
             var exploration: AgentTaskRoutingExplorationRecord?
-            // ponytail: counted before the model row, so a nil log context and later cancellation still count.
-            if case let .selected(modelKey, evidence) = modelOutcome, traced.trace.backendID == .jev,
+            if case let .selected(modelKey, evidence) = modelOutcome, traced.trace.serviceID == .jev,
                models.only(where: { $0.opaqueKey == modelKey }) != nil
             {
+                let probabilities = evidence?.probabilities.flatMap { values -> [String: Double]? in
+                    guard Set(values.map(\.opaqueKey)).count == values.count else { return nil }
+                    return Dictionary(uniqueKeysWithValues: values.map { ($0.opaqueKey, $0.value) })
+                }
                 exploration = await runtime.explorationAdvisor.decide(
                     scope: scope, randomness: configuration.randomness, chosenKey: modelKey,
-                    orderedKeys: models.map(\.opaqueKey), scores: evidence?.scores
+                    orderedKeys: models.map(\.opaqueKey), scores: probabilities
                 )
             }
             await emitTracedDecision(traced, stage: .model, candidates: models, override: exploration, context: logContext)
@@ -643,8 +770,9 @@ extension AgentModeViewModel {
         )
         guard let efforts = try? builder.buildEfforts(
             for: selectedModel,
-            availability: modelRouterAvailabilityContext,
-            allowPaidFast: configuration.allowPaidFastRouting
+            snapshot: snapshot,
+            allowPaidFast: configuration.allowPaidFastRouting,
+            maximumChoices: registration.capabilities.finiteChoice.maximumChoices
         ), let firstEffort = efforts.first else {
             await emitFailedDecision(.effort, candidates: [], context: logContext)
             return modelFallback
@@ -658,21 +786,27 @@ extension AgentModeViewModel {
                 usageBalancingReason: usageBalancingReason
             )
         }
-        guard let effortRequest = try? AgentTaskRoutingEnvelopeBuilder().build(
+        guard let effortRequest = try? ModelRouterDecisionPolicy().build(
             requestID: requestID,
-            text: routingText,
+            task: text,
             scope: scope,
-            decisionStage: .effort,
-            customInstructions: configuration.customInstructions,
-            candidates: efforts.map(\.descriptor)
+            stage: .effort,
+            directive: configuration.customInstructions,
+            candidates: efforts,
+            capabilities: registration.capabilities
         ) else {
             await emitFailedDecision(.effort, candidates: efforts, context: logContext)
             return modelFallback
         }
         judgmentRequested = true
         let effortOutcome = await tracedRoute(
-            runtime: runtime, backendID: backendID, request: effortRequest,
-            candidates: efforts, context: logContext
+            runtime: runtime,
+            backendID: backendID,
+            stage: .effort,
+            request: effortRequest,
+            candidates: efforts,
+            consumerRevision: configuration.revision,
+            context: logContext
         )
         switch effortOutcome {
         case let .selected(key, _):
@@ -695,13 +829,13 @@ extension AgentModeViewModel {
     private func emitFailedDecision(
         _ stage: AgentTaskRoutingLogStage,
         candidates: [AgentTaskRoutingCandidateBuilder.Candidate],
-        failure: AgentTaskRoutingBackendFailureCategory = .invalidRequest,
+        failure: String = DecisionFailureCategory.invalidRequest.rawValue,
         reasonCode: String? = nil,
         context: AgentTaskRoutingRouteContext?
     ) async {
         var draft = AgentTaskRoutingDecisionDraft(stage: stage, outcome: .failed)
         draft.candidates = candidates.map { .init(key: $0.opaqueKey, target: .init($0.target)) }
-        draft.failure = failure.rawValue
+        draft.failure = failure
         draft.reasonCode = reasonCode
         await context?.emitDecision(draft)
     }
@@ -719,25 +853,52 @@ extension AgentModeViewModel {
         return draft
     }
 
+    private static func populateDecisionDraft(
+        _ draft: inout AgentTaskRoutingDecisionDraft,
+        trace: DecisionTrace,
+        candidates: [AgentTaskRoutingLogCandidate],
+        evidence: DecisionEvidence?
+    ) {
+        draft.backend = trace.serviceID.rawValue
+        draft.jevModel = trace.jevModel
+        draft.latencyMs = trace.latencyMs
+        draft.candidates = candidates
+        if let evidence {
+            draft.policyVersion = evidence.acceptancePolicyVersion
+            draft.confidence = evidence.confidence
+            if let probabilities = evidence.probabilities {
+                draft.probabilities = Dictionary(
+                    probabilities.map { ($0.opaqueKey, $0.value) },
+                    uniquingKeysWith: { _, latest in latest }
+                )
+            }
+            draft.inputTokens = evidence.usage?.inputTokens
+            draft.outputTokens = evidence.usage?.outputTokens
+        }
+    }
+
     /// Routes through the traced coordinator path and writes the stage's one decision row. The returned
     /// outcome is exactly what the untraced coordinator would have returned.
     private func tracedRoute(
         runtime: AgentTaskRouterRuntime,
-        backendID: AgentTaskRouterBackendID,
-        request: AgentTaskRoutingRequest,
+        backendID: DecisionServiceID,
+        stage: AgentTaskRoutingLogStage,
+        request: FiniteChoiceDecisionRequest,
         candidates: [AgentTaskRoutingCandidateBuilder.Candidate],
+        consumerRevision: UInt64?,
         context: AgentTaskRoutingRouteContext?
-    ) async -> AgentTaskRoutingBackendOutcome {
-        let traced = await runtime.routeTraced(backendID: backendID, request: request)
-        await emitTracedDecision(
-            traced, stage: request.decisionStage == .model ? .model : .effort,
-            candidates: candidates, override: nil, context: context
+    ) async -> DecisionOutcome {
+        let traced = await runtime.decideTraced(
+            serviceID: backendID,
+            request: request,
+            consumerRevision: consumerRevision
         )
+        await emitTracedDecision(traced, stage: stage, candidates: candidates, override: nil, context: context)
         return traced.outcome
     }
 
     private func emitTracedDecision(
-        _ traced: AgentTaskRoutingTracedOutcome,
+        _ traced: DecisionTracedOutcome,
         stage: AgentTaskRoutingLogStage,
         candidates: [AgentTaskRoutingCandidateBuilder.Candidate],
         override: AgentTaskRoutingExplorationRecord?,
@@ -745,7 +906,7 @@ extension AgentModeViewModel {
     ) async {
         guard let context else { return }
         var draft: AgentTaskRoutingDecisionDraft
-        var evidence: AgentTaskRoutingDecisionEvidence?
+        var evidence: DecisionEvidence?
         switch traced.outcome {
         case let .selected(key, selectedEvidence):
             evidence = selectedEvidence
@@ -755,12 +916,12 @@ extension AgentModeViewModel {
                 draft.chosenTarget = .init(chosen.target)
             } else {
                 draft = AgentTaskRoutingDecisionDraft(stage: stage, outcome: .failed)
-                draft.failure = AgentTaskRoutingBackendFailureCategory.invalidResponse.rawValue
+                draft.failure = DecisionFailureCategory.invalidResponse.rawValue
             }
-        case let .abstained(reason, abstainedEvidence):
+        case let .abstained(reasonCode, abstainedEvidence):
             evidence = abstainedEvidence
             draft = AgentTaskRoutingDecisionDraft(stage: stage, outcome: .abstained)
-            draft.reasonCode = abstainedEvidence?.reasonCode ?? reason
+            draft.reasonCode = reasonCode
         case let .failed(category, _, failedEvidence):
             evidence = failedEvidence
             draft = AgentTaskRoutingDecisionDraft(stage: stage, outcome: .failed)
@@ -768,25 +929,76 @@ extension AgentModeViewModel {
         case .cancelled:
             draft = AgentTaskRoutingDecisionDraft(stage: stage, outcome: .cancelled)
         }
+        Self.populateDecisionDraft(
+            &draft,
+            trace: traced.trace,
+            candidates: candidates.map { .init(key: $0.opaqueKey, target: .init($0.target)) },
+            evidence: evidence
+        )
         draft.routingOverride = override
-        draft.backend = traced.trace.backendID.rawValue
-        draft.jevModel = traced.trace.jevModel
-        draft.latencyMs = traced.trace.latencyMs
-        draft.candidates = candidates.map { .init(key: $0.opaqueKey, target: .init($0.target)) }
-        if let evidence {
-            draft.policyVersion = evidence.policyVersion
-            draft.confidence = evidence.confidence
-            draft.probabilities = evidence.scores
-            draft.inputTokens = evidence.inputTokens
-            draft.outputTokens = evidence.outputTokens
-            draft.reasonCode = draft.reasonCode ?? evidence.reasonCode
-        }
         await context.emitDecision(draft)
+    }
+
+    private func tracedAutoEffortRoute(
+        runtime: AgentTaskRouterRuntime,
+        backendID: DecisionServiceID,
+        prepared: AutoEffortDecisionPolicy.PreparedDecision,
+        providerRaw: String,
+        modelID: String,
+        consumerRevision: UInt64?,
+        context: AgentTaskRoutingRouteContext
+    ) async -> DecisionOutcome {
+        let traced = await runtime.decideTraced(
+            serviceID: backendID,
+            request: prepared.request,
+            consumerRevision: consumerRevision
+        )
+        var draft: AgentTaskRoutingDecisionDraft
+        var evidence: DecisionEvidence?
+        switch traced.outcome {
+        case let .selected(key, selectedEvidence):
+            evidence = selectedEvidence
+            if let effort = prepared.effortByOpaqueKey[key] {
+                draft = AgentTaskRoutingDecisionDraft(stage: .autoEffort, outcome: .selected)
+                draft.chosenKey = key
+                draft.chosenTarget = AgentTaskRoutingLogTarget(
+                    provider: providerRaw,
+                    model: modelID,
+                    effort: effort
+                )
+            } else {
+                draft = AgentTaskRoutingDecisionDraft(stage: .autoEffort, outcome: .failed)
+                draft.failure = DecisionFailureCategory.invalidResponse.rawValue
+            }
+        case let .abstained(reasonCode, abstainedEvidence):
+            evidence = abstainedEvidence
+            draft = AgentTaskRoutingDecisionDraft(stage: .autoEffort, outcome: .abstained)
+            draft.reasonCode = reasonCode
+        case let .failed(category, _, failedEvidence):
+            evidence = failedEvidence
+            draft = AgentTaskRoutingDecisionDraft(stage: .autoEffort, outcome: .failed)
+            draft.failure = category.rawValue
+        case .cancelled:
+            draft = AgentTaskRoutingDecisionDraft(stage: .autoEffort, outcome: .cancelled)
+        }
+        let candidates = prepared.request.question.choices.map { choice in
+            AgentTaskRoutingLogCandidate(
+                key: choice.opaqueKey,
+                target: AgentTaskRoutingLogTarget(
+                    provider: providerRaw,
+                    model: modelID,
+                    effort: prepared.effortByOpaqueKey[choice.opaqueKey]
+                )
+            )
+        }
+        Self.populateDecisionDraft(&draft, trace: traced.trace, candidates: candidates, evidence: evidence)
+        await context.emitDecision(draft)
+        return traced.outcome
     }
 
     private func modelRouterConfigurationIsCurrent(
         _ configuration: AgentTaskRouterConfiguration,
-        backendID: AgentTaskRouterBackendID
+        backendID: DecisionServiceID
     ) -> Bool {
         let current = modelRouterSettingsStore.modelRouterConfiguration()
         return current.enabled
@@ -794,21 +1006,12 @@ extension AgentModeViewModel {
             && current.selectedBackendID == backendID
     }
 
-    private func providers(
-        for scope: AgentTaskRoutingScope,
-        configuration: AgentTaskRouterConfiguration
-    ) -> Set<AgentProviderKind> {
-        let limit = switch scope {
-        case .primarySession: configuration.primaryProvider
-        case .subagent: configuration.subagentProvider
-        }
-        let available = AgentTaskRoutingCandidateBuilder.availableProviders(
+    private func providers(for scope: AgentTaskRoutingScope, configuration: AgentTaskRouterConfiguration) -> Set<AgentProviderKind> {
+        AgentTaskRoutingCandidateBuilder.providers(
+            for: scope,
+            configuration: configuration,
             availability: modelRouterAvailabilityContext,
             surface: scope == .subagent ? .headless : .general
-        )
-        return AgentTaskRoutingCandidateBuilder.providers(
-            preferring: limit,
-            from: available
         )
     }
 
@@ -858,7 +1061,8 @@ extension AgentModeViewModel {
         guard let backendID = configuration.selectedBackendID,
               modelRouterRuntime?.isBackendReady(backendID) == true
         else { return false }
-        return AgentTaskRoutingCandidateBuilder().hasAvailableTarget(
+        let builder = modelRouterRuntime?.candidateBuilderFactory() ?? AgentTaskRoutingCandidateBuilder()
+        return builder.hasAvailableTarget(
             allowedProviders: providers(for: .primarySession, configuration: configuration),
             availability: modelRouterAvailabilityContext
         )
@@ -873,8 +1077,23 @@ extension AgentModeViewModel {
         )
     }
 
-    func applyRoutingTarget(_ target: AgentRoutingExecutableTarget, to session: TabSession) -> Bool {
-        guard let agent = AgentProviderKind(rawValue: target.agentRaw),
+    private func routingCandidateIsCurrent(_ candidate: AgentTaskRoutingCandidateBuilder.Candidate) -> Bool {
+        guard let scope = candidate.snapshotScope,
+              candidate.profileIdentity == RoutingModelProfileSnapshot.bundled.identity
+        else { return false }
+        let builder = modelRouterRuntime?.candidateBuilderFactory() ?? AgentTaskRoutingCandidateBuilder()
+        let current = builder.capture(
+            allowedProviders: scope.allowedProviders,
+            availability: modelRouterAvailabilityContext,
+            surface: scope.surface
+        )
+        return current.scope == scope && current.contains(candidate.target)
+    }
+
+    func applyRoutingTarget(_ candidate: AgentTaskRoutingCandidateBuilder.Candidate, to session: TabSession) -> Bool {
+        let target = candidate.target
+        guard routingCandidateIsCurrent(candidate),
+              let agent = AgentProviderKind(rawValue: target.agentRaw),
               AgentModelCatalog.isAgentAvailable(agent, availability: modelRouterAvailabilityContext)
         else { return false }
         session.selectedAgent = agent

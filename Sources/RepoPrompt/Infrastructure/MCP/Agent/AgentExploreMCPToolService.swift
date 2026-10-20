@@ -376,25 +376,6 @@ struct AgentExploreMCPToolService {
         message: String,
         context: ExploreStartContext
     ) async throws -> AgentExternalMCPRunStarter.StartOutcome {
-        try requireDiversityContextCurrent(context)
-        let routeLogContext = context.agentModeVM.makeRouteLogContext(scope: .headless)
-        do {
-            return try await startExploreRunBody(
-                target: target, message: message, context: context, routeLogContext: routeLogContext
-            )
-        } catch {
-            await routeLogContext?.finish(.rejected)
-            throw error
-        }
-    }
-
-    private func startExploreRunBody(
-        target: AgentModeViewModel.MCPSessionTarget,
-        message: String,
-        context: ExploreStartContext,
-        routeLogContext: AgentTaskRoutingRouteContext?
-    ) async throws -> AgentExternalMCPRunStarter.StartOutcome {
-        await routeLogContext?.attachSessionID(target.sessionID)
         try await AgentRunMCPToolService.requireWritableWorkspaceAuthority(
             context.targetWindow.workspaceManager.domainAuthorityAdmissionIssue(
                 for: context.expectedWorkspaceID
@@ -411,14 +392,19 @@ struct AgentExploreMCPToolService {
         var selection = context.selection
         var routedReasoningEffortRaw: String?
         var routerSelectedTarget = false
+        let routeLogContext = context.agentModeVM.makeRouteLogContext(scope: .headless)
+        if let targetSessionID = target.sessionID {
+            await routeLogContext?.attachSessionID(targetSessionID)
+        }
+        let finishRejected: () async -> Void = { await routeLogContext?.finish(.rejected) }
         do {
             if let routed = try await context.agentModeVM.routeSubagentTargetIfEnabled(
                 task: message,
                 surface: .headless,
                 baseline: baseline,
                 allowUsageBalance: context.selection.usageBalancingEligible,
-                logContext: routeLogContext,
-                diversity: context.diversityOptions ?? .none
+                diversity: context.diversityOptions ?? .none,
+                logContext: routeLogContext
             ) {
                 selection = AgentMCPSelectionResolver.ResolvedSelection(
                     agentRaw: routed.agentRaw,
@@ -441,46 +427,63 @@ struct AgentExploreMCPToolService {
                       diversity.exclusions[maker.rawValue] == nil
                 else { throw AgentModeViewModel.GlobalModelRoutingError.fallbackDiversityExcluded }
             }
+            try requireDiversityContextCurrent(context)
         } catch {
+            await finishRejected()
             throw MCPError.invalidParams(error.localizedDescription)
         }
-        try requireDiversityContextCurrent(context)
         // An `explore` role default may carry a stored model-parameter pin (e.g. an OpenCode
         // thinking level). Stage it onto the freshly created session so the run builder picks it
         // up from stored selections, exactly as `agent_run` start does. No rollback bookkeeping:
         // a failed explore start discards its target rather than restoring it. A role without a
         // pin resolves to an empty array, which stages nothing.
-        _ = try context.agentModeVM.mcpStageModelParameterSelections(
-            tabID: target.tabID,
-            agentRaw: selection.agentRaw,
-            modelRaw: selection.modelRaw,
-            selections: selection.modelParameterSelections
-        )
-        func performStart() async throws -> AgentExternalMCPRunStarter.StartOutcome {
-            try await startRun(
-                target,
-                message,
-                context.metadata,
-                context.agentModeVM,
-                selection.agentRaw,
-                selection.modelRaw,
-                routedReasoningEffortRaw,
-                .explore,
-                nil,
-                nil,
-                nil,
-                routerSelectedTarget
+        do {
+            _ = try context.agentModeVM.mcpStageModelParameterSelections(
+                tabID: target.tabID,
+                agentRaw: selection.agentRaw,
+                modelRaw: selection.modelRaw,
+                selections: selection.modelParameterSelections
             )
-        }
-        let outcome: AgentExternalMCPRunStarter.StartOutcome = if let routeLogContext {
-            try await routeLogContext.runStartScope(unarmedOnReturn: { _ in .notStarted }) {
-                try await performStart()
+            let run = { [startRun] in
+                try await startRun(
+                    target,
+                    message,
+                    context.metadata,
+                    context.agentModeVM,
+                    selection.agentRaw,
+                    selection.modelRaw,
+                    routedReasoningEffortRaw,
+                    .explore,
+                    nil,
+                    nil,
+                    nil,
+                    routerSelectedTarget
+                )
             }
-        } else {
-            try await performStart()
+            let outcome: AgentExternalMCPRunStarter.StartOutcome = if let routeLogContext {
+                try await routeLogContext.runStartScope { try await run() }
+            } else {
+                try await run()
+            }
+            if let routeLogContext, let agentRaw = selection.agentRaw, let modelRaw = selection.modelRaw {
+                let effectiveEffort = context.agentModeVM.session(for: target.tabID, createIfNeeded: false)?
+                    .selectedReasoningEffortRaw ?? routedReasoningEffortRaw
+                await routeLogContext.finish(.started(
+                    sessionID: outcome.snapshot.sessionID,
+                    applied: AgentRoutingExecutableTarget(
+                        agentRaw: agentRaw,
+                        modelRaw: modelRaw,
+                        reasoningEffortRaw: effectiveEffort,
+                        modelParameters: selection.modelParameterSelections
+                    )
+                ))
+            }
+            context.agentModeVM.mcpAcceptSessionTarget(target)
+            return outcome
+        } catch {
+            await finishRejected()
+            throw error
         }
-        context.agentModeVM.mcpAcceptSessionTarget(target)
-        return outcome
     }
 
     private func validateBatchWorktreeRequest(

@@ -3,8 +3,8 @@ import os
 
 private let explorationOSLog = Logger(subsystem: "com.repoprompt.ce", category: "ModelRouterExploration")
 
-struct AgentTaskRoutingExplorationRecord: Equatable, Encodable {
-    enum Kind: String, Encodable {
+struct AgentTaskRoutingExplorationRecord: Equatable, Codable {
+    enum Kind: String, Codable {
         case exploration, none, explorationUnavailable
     }
 
@@ -31,9 +31,6 @@ private struct ExplorationSchemaProbe: Decodable {
     let schema: Int
 }
 
-/// Fixed-position model exploration: a per-scope counter picks the cycle slots where Jev's runner-up replaces
-/// its pick. The counter file under a `flock` sidecar is the authority, so two advisors or processes sharing it
-/// never hand out the same durable value. Any storage failure degrades to a non-durable in-memory value.
 actor AgentTaskRoutingExplorationAdvisor {
     private static let cycleLength: UInt64 = 20
     private static let lockDeadlineNanoseconds: UInt64 = 250_000_000
@@ -73,8 +70,6 @@ actor AgentTaskRoutingExplorationAdvisor {
         }
     }
 
-    /// The highest-probability key other than `chosenKey` (ties go to the earliest ordered key), or nil unless
-    /// the evidence is complete, finite, within 0...1 and `chosenKey` is its unique maximum.
     nonisolated static func runnerUp(chosenKey: String, orderedKeys: [String], scores: [String: Double]?) -> String? {
         guard let scores, orderedKeys.count >= 2, Set(orderedKeys).count == orderedKeys.count,
               Set(scores.keys) == Set(orderedKeys),
@@ -136,9 +131,7 @@ actor AgentTaskRoutingExplorationAdvisor {
         }
     }
 
-    // ponytail: the whole transaction, including the flock poll, runs on this actor's executor without a
-    // suspension point; contention blocks one cooperative thread for at most the 250 ms deadline. Upgrade: an
-    // async lock acquisition if counter contention ever shows up in profiles.
+    // ponytail: flock contention blocks this actor's executor for at most 250 ms; use async acquisition if profiling warrants it.
     private func commit(_ scope: AgentTaskRoutingScope, floor: UInt64, to fileURL: URL) throws -> UInt64 {
         do {
             try FileManager.default.createDirectory(
@@ -161,8 +154,7 @@ actor AgentTaskRoutingExplorationAdvisor {
             encoder.outputFormatting = [.sortedKeys]
             try encoder.encode(ExplorationCounterDocument(schema: 1, counters: counters))
                 .write(to: fileURL, options: .atomic)
-            // ponytail: the atomic write lands with the umask mode before this chmod; the counters are not
-            // secret. Upgrade: write an O_EXCL 0600 temporary and rename it.
+            // ponytail: non-secret counters land with umask mode before chmod; use a 0600 temporary + rename if needed.
             try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: fileURL.path)
         } catch {
             throw ExplorationFailure(code: "write_failed")
@@ -189,8 +181,6 @@ actor AgentTaskRoutingExplorationAdvisor {
         return descriptor
     }
 
-    /// Latest on-disk counters (never cached). A malformed file is quarantined and counted from zero; a file
-    /// from a newer schema is left untouched.
     private func loadCounters(at url: URL) throws -> [String: UInt64] {
         guard FileManager.default.fileExists(atPath: url.path) else { return [:] }
         if let data = try? Data(contentsOf: url) {

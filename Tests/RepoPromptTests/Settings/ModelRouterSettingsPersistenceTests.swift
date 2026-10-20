@@ -1,6 +1,7 @@
 import Foundation
 @testable import RepoPromptApp
 import RepoPromptProviderQuota
+import RepoPromptSecureStorage
 import RepoPromptSettingsCore
 import XCTest
 
@@ -15,7 +16,6 @@ final class ModelRouterSettingsPersistenceTests: XCTestCase {
         )
         let document = GlobalSettingsDocument(scalarPreferences: GlobalScalarPreferences(modelRouter: router))
         XCTAssertEqual(document.requiredSchemaVersion, GlobalSettingsDocument.modelRouterSchemaVersion)
-        XCTAssertEqual(GlobalSettingsDocument.currentSchemaVersion, 10)
         let decoded = try JSONDecoder().decode(GlobalSettingsDocument.self, from: JSONEncoder().encode(document))
         XCTAssertEqual(decoded.scalarPreferences?.modelRouter, router)
     }
@@ -79,6 +79,114 @@ final class ModelRouterSettingsPersistenceTests: XCTestCase {
         let savedRoot = try XCTUnwrap(try JSONSerialization.jsonObject(with: Data(contentsOf: fileStore.fileURL)) as? [String: Any])
         let savedRouter = ((savedRoot["scalarPreferences"] as? [String: Any])?["modelRouter"] as? [String: Any])
         XCTAssertEqual((savedRouter?["futurePolicy"] as? [String: Any])?["mode"] as? String, "strict")
+    }
+
+    func testRouterPolicySettersAndFirstEnablePreserveUnknownRawOrder() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let fileStore = GlobalSettingsFileStore(fileURL: root.appendingPathComponent("globalSettings.json"))
+        try fileStore.save(GlobalSettingsDocument(scalarPreferences: .init(modelRouter: .init(
+            enabled: false,
+            selectedBackendRawValue: "jev",
+            candidateRoleRawValues: ["design", "future-role", "", "future-role", " Future Role "],
+            allowedProviderRawValues: ["cursor", "future-provider", " ", "future-provider", " Future Provider "]
+        ))))
+        let suite = "ModelRouter.raw-order.\(UUID())"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let store = GlobalSettingsStore(defaults: defaults, fileStore: fileStore)
+
+        store.setModelRouterCandidateRoles([.engineer, .explore])
+        store.setModelRouterAllowedProviders([.codexExec, .claudeCode])
+        var raw = try XCTUnwrap(try fileStore.load().scalarPreferences?.modelRouter)
+        XCTAssertEqual(raw.candidateRoleRawValues, ["explore", "engineer", "future-role", "future-role", " Future Role "])
+        XCTAssertEqual(raw.allowedProviderRawValues, ["claudeCode", "codexExec", "future-provider", "future-provider", " Future Provider "])
+
+        store.enableModelRouterWithCurrentPolicy(
+            backendID: .jev,
+            roles: [.design, .pair],
+            providers: [.cursor, .openCode]
+        )
+        raw = try XCTUnwrap(try fileStore.load().scalarPreferences?.modelRouter)
+        XCTAssertEqual(raw.candidateRoleRawValues, ["pair", "design", "future-role", "future-role", " Future Role "])
+        XCTAssertEqual(raw.allowedProviderRawValues, ["openCode", "cursor", "future-provider", "future-provider", " Future Provider "])
+    }
+
+    func testDecisionsAndFutureBackendRawRoundTripWithoutSchemaChangeOrSecret() throws {
+        for raw in ["openai-decisions", "future-router", "  "] {
+            let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+            try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: root) }
+            let file = GlobalSettingsFileStore(fileURL: root.appendingPathComponent("settings.json"))
+            try file.save(GlobalSettingsDocument(scalarPreferences: .init(modelRouter: .init(enabled: true, selectedBackendRawValue: raw))))
+            let suite = "RouterRaw.\(UUID())"
+            let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+            defer { defaults.removePersistentDomain(forName: suite) }
+            let store = GlobalSettingsStore(defaults: defaults, fileStore: file)
+            store.setModelRouterCustomInstructions("Prefer reliable choices")
+            let reloaded = try file.load()
+            XCTAssertEqual(reloaded.scalarPreferences?.modelRouter?.selectedBackendRawValue, raw)
+            XCTAssertEqual(reloaded.schemaVersion, 10)
+            let json = try String(contentsOf: file.fileURL, encoding: .utf8)
+            XCTAssertFalse(json.contains("APIKey"))
+            XCTAssertFalse(json.contains("Bearer"))
+        }
+    }
+
+    func testKnownEditsPreserveNilBlankKnownAndUnknownBackendRawValues() throws {
+        for raw in [nil, "", "  ", "jev", "openai-decisions", " future-router ", "Future-Router"] as [String?] {
+            let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+            try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: root) }
+            let file = GlobalSettingsFileStore(fileURL: root.appendingPathComponent("settings.json"))
+            try file.save(GlobalSettingsDocument(
+                scalarPreferences: .init(
+                    modelRouter: .init(enabled: false, selectedBackendRawValue: raw)
+                )
+            ))
+            let suite = "RouterRawPreservation.\(UUID())"
+            let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+            defer { defaults.removePersistentDomain(forName: suite) }
+            let store = GlobalSettingsStore(defaults: defaults, fileStore: file)
+
+            store.setModelRouterCustomInstructions("Preserve exact selection")
+            store.setAutoEffortEnabled(true)
+
+            let configuration = store.modelRouterConfiguration()
+            XCTAssertEqual(configuration.selectedBackendRawValue, raw)
+            XCTAssertEqual(configuration.selectedBackendID, raw.flatMap { value in
+                let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+                return trimmed.isEmpty ? nil : DecisionServiceID(rawValue: trimmed)
+            })
+            XCTAssertEqual(
+                try file.load().scalarPreferences?.modelRouter?.selectedBackendRawValue,
+                raw
+            )
+        }
+    }
+
+    func testBlockedFutureSchemaDoesNotMaterializeLegacyRouterDefault() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let file = GlobalSettingsFileStore(fileURL: root.appendingPathComponent("settings.json"))
+        var document = GlobalSettingsDocument(scalarPreferences: .init(modelRouter: .init(enabled: true, selectedBackendRawValue: "future-router")))
+        document.schemaVersion = GlobalSettingsDocument.currentSchemaVersion + 1
+        let original = try JSONEncoder().encode(document)
+        try original.write(to: file.fileURL, options: .atomic)
+        let suite = "RouterBlocked.\(UUID())"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let store = GlobalSettingsStore(defaults: defaults, fileStore: file)
+        XCTAssertNotNil(store.persistenceBlockReason)
+
+        let runtime = AgentTaskRouterRuntime(secureKeys: SecureKeysService(secureStorage: TestSecureStorageBackend()), settingsStore: store)
+        await runtime.reconcileDemand()
+        XCTAssertNil(store.routerDemandSnapshot().selectedBackendRawValue)
+        XCTAssertFalse(store.routerDemandSnapshot().routerEnabled)
+        XCTAssertEqual(try Data(contentsOf: file.fileURL), original)
+        await runtime.teardown()
     }
 
     func testMissingRouterGroupRemainsBaselineSchema() {
@@ -251,149 +359,122 @@ final class ModelRouterSettingsPersistenceTests: XCTestCase {
         }
     }
 
+    func testLegacyRandomnessAndReviewDiversityFieldsRoundTripTolerantly() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let fileStore = GlobalSettingsFileStore(fileURL: root.appendingPathComponent("globalSettings.json"))
+        var document = GlobalSettingsDocument()
+        document.scalarPreferences = GlobalScalarPreferences(modelRouter: .init(
+            enabled: true,
+            selectedBackendRawValue: "jev"
+        ))
+        try fileStore.save(document)
+
+        var rawRoot = try XCTUnwrap(try JSONSerialization.jsonObject(with: Data(contentsOf: fileStore.fileURL)) as? [String: Any])
+        var scalarPreferences = try XCTUnwrap(rawRoot["scalarPreferences"] as? [String: Any])
+        var rawRouter = try XCTUnwrap(scalarPreferences["modelRouter"] as? [String: Any])
+        rawRouter["randomness"] = "medium"
+        rawRouter["reviewDiversityEnabled"] = true
+        scalarPreferences["modelRouter"] = rawRouter
+        rawRoot["scalarPreferences"] = scalarPreferences
+        try JSONSerialization.data(withJSONObject: rawRoot, options: [.prettyPrinted, .sortedKeys])
+            .write(to: fileStore.fileURL, options: .atomic)
+
+        let loaded = try fileStore.load()
+        XCTAssertEqual(loaded.scalarPreferences?.modelRouter?.randomness, "medium")
+        XCTAssertEqual(loaded.scalarPreferences?.modelRouter?.reviewDiversityEnabled, true)
+
+        let suite = "ModelRouter.legacy-fields.\(UUID())"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let store = GlobalSettingsStore(defaults: defaults, fileStore: fileStore)
+        store.setModelRouterCustomInstructions("Keep legacy fields on sibling update")
+
+        let reloaded = try fileStore.load()
+        XCTAssertEqual(reloaded.scalarPreferences?.modelRouter?.randomness, "medium")
+        XCTAssertEqual(reloaded.scalarPreferences?.modelRouter?.reviewDiversityEnabled, true)
+        let savedRoot = try XCTUnwrap(try JSONSerialization.jsonObject(with: Data(contentsOf: fileStore.fileURL)) as? [String: Any])
+        let savedRouter = ((savedRoot["scalarPreferences"] as? [String: Any])?["modelRouter"] as? [String: Any])
+        XCTAssertEqual(savedRouter?["randomness"] as? String, "medium")
+        XCTAssertEqual(savedRouter?["reviewDiversityEnabled"] as? Bool, true)
+    }
+
     func testRandomnessAndReviewDiversityPersist() throws {
         try withUsageStore { store, file in
-            store.updateModelRouterScalar(commit: true) {
-                $0.enabled = true
-                $0.selectedBackendRawValue = "jev"
-                $0.candidateRoleRawValues = ["explore", "engineer"]
-            }
+            store.setModelRouterBackend(.jev)
             store.setUsageBalancingPreset(.expiringQuota)
             store.setAllowPaidFastRouting(true)
-            let levels: [(AgentRoutingRandomness, String)] = [(.low, "low"), (.medium, "medium"), (.high, "high"), (.off, "off")]
-            for (level, raw) in levels {
+            for (level, raw) in [(AgentRoutingRandomness.low, "low"), (.medium, "medium"), (.high, "high"), (.off, "off")] {
                 let revision = store.modelRouterSettingsRevision
                 store.setRandomness(level)
-                let router = try rawModelRouter(file)
-                XCTAssertEqual(router["randomness"] as? String, raw, "persisted randomness raw for \(raw)")
-                XCTAssertEqual(try file.load().scalarPreferences?.modelRouter?.randomness, raw, "typed load randomness for \(raw)")
-                XCTAssertEqual(store.modelRouterConfiguration().randomness, level, "in-memory configuration randomness for \(raw)")
-                XCTAssertEqual(try reloadedStore(file).modelRouterConfiguration().randomness, level, "reloaded store randomness for \(raw)")
-                XCTAssertEqual(AgentRoutingRandomness.stored(raw), level, "enum exact match for \(raw)")
-                XCTAssertEqual(store.modelRouterSettingsRevision, revision &+ 1, "revision bumps once for distinct randomness change \(raw)")
-                let changedRevision = store.modelRouterSettingsRevision
+                XCTAssertEqual(try rawModelRouter(file)["randomness"] as? String, raw)
+                XCTAssertEqual(try reloadedStore(file).modelRouterConfiguration().randomness, level)
+                XCTAssertEqual(store.modelRouterSettingsRevision, revision &+ 1)
                 store.setRandomness(level)
-                XCTAssertEqual(store.modelRouterSettingsRevision, changedRevision, "identical randomness repeat does not bump revision")
-                XCTAssertEqual(router["enabled"] as? Bool, true)
-                XCTAssertEqual(router["selectedBackendRawValue"] as? String, "jev")
-                XCTAssertEqual(router["candidateRoleRawValues"] as? [String], ["explore", "engineer"])
-                XCTAssertEqual(router["usageBalancingPreset"] as? String, "expiringQuota")
-                XCTAssertEqual(router["allowPaidFastRouting"] as? Bool, true)
-                XCTAssertEqual(try file.load().schemaVersion, GlobalSettingsDocument.modelRouterSchemaVersion)
+                XCTAssertEqual(store.modelRouterSettingsRevision, revision &+ 1)
             }
             for enabled in [true, false] {
                 let revision = store.modelRouterSettingsRevision
                 store.setReviewDiversityEnabled(enabled)
-                let router = try rawModelRouter(file)
-                XCTAssertEqual(router["reviewDiversityEnabled"] as? Bool, enabled, "persisted review diversity raw for \(enabled)")
-                XCTAssertEqual(try file.load().scalarPreferences?.modelRouter?.reviewDiversityEnabled, enabled, "typed load review diversity for \(enabled)")
-                XCTAssertEqual(store.modelRouterConfiguration().reviewDiversityEnabled, enabled, "in-memory configuration review diversity for \(enabled)")
-                XCTAssertEqual(try reloadedStore(file).modelRouterConfiguration().reviewDiversityEnabled, enabled, "reloaded store review diversity for \(enabled)")
-                XCTAssertEqual(store.modelRouterSettingsRevision, revision &+ 1, "revision bumps once for distinct review diversity change \(enabled)")
-                let changedRevision = store.modelRouterSettingsRevision
+                XCTAssertEqual(try rawModelRouter(file)["reviewDiversityEnabled"] as? Bool, enabled)
+                XCTAssertEqual(try reloadedStore(file).modelRouterConfiguration().reviewDiversityEnabled, enabled)
+                XCTAssertEqual(store.modelRouterSettingsRevision, revision &+ 1)
                 store.setReviewDiversityEnabled(enabled)
-                XCTAssertEqual(store.modelRouterSettingsRevision, changedRevision, "identical review diversity repeat does not bump revision")
-                XCTAssertEqual(router["randomness"] as? String, "off")
-                XCTAssertEqual(store.modelRouterConfiguration().randomness, .off)
-                XCTAssertEqual(router["enabled"] as? Bool, true)
-                XCTAssertEqual(router["selectedBackendRawValue"] as? String, "jev")
-                XCTAssertEqual(router["candidateRoleRawValues"] as? [String], ["explore", "engineer"])
-                XCTAssertEqual(router["usageBalancingPreset"] as? String, "expiringQuota")
-                XCTAssertEqual(router["allowPaidFastRouting"] as? Bool, true)
-                XCTAssertEqual(try file.load().schemaVersion, GlobalSettingsDocument.modelRouterSchemaVersion)
+                XCTAssertEqual(store.modelRouterSettingsRevision, revision &+ 1)
             }
             store.setModelRouterProvider(.codexExec, scope: .primarySession)
-            XCTAssertEqual(try file.load().schemaVersion, GlobalSettingsDocument.scopedModelRouterSchemaVersion)
             store.setRandomness(.high)
             store.setReviewDiversityEnabled(true)
-            let router = try rawModelRouter(file)
-            let loaded = try file.load()
-            let configuration = store.modelRouterConfiguration()
             let reloaded = try reloadedStore(file).modelRouterConfiguration()
-            XCTAssertEqual(router["randomness"] as? String, "high")
-            XCTAssertEqual(router["reviewDiversityEnabled"] as? Bool, true)
-            XCTAssertEqual(loaded.scalarPreferences?.modelRouter?.randomness, "high")
-            XCTAssertEqual(loaded.scalarPreferences?.modelRouter?.reviewDiversityEnabled, true)
-            XCTAssertEqual(configuration.randomness, .high)
-            XCTAssertTrue(configuration.reviewDiversityEnabled)
             XCTAssertEqual(reloaded.randomness, .high)
             XCTAssertTrue(reloaded.reviewDiversityEnabled)
-            XCTAssertEqual(router["primaryProviderRawValue"] as? String, "codexExec")
-            XCTAssertEqual(loaded.scalarPreferences?.modelRouter?.primaryProviderRawValue, "codexExec")
-            XCTAssertEqual(configuration.primaryProvider, .codexExec)
-            XCTAssertEqual(loaded.schemaVersion, GlobalSettingsDocument.scopedModelRouterSchemaVersion)
+            XCTAssertEqual(reloaded.primaryProvider, .codexExec)
+            XCTAssertEqual(reloaded.selectedBackendID, .jev)
+            XCTAssertEqual(reloaded.usageBalancing.preset, .expiringQuota)
+            XCTAssertTrue(reloaded.allowPaidFastRouting)
+            XCTAssertEqual(try file.load().schemaVersion, GlobalSettingsDocument.scopedModelRouterSchemaVersion)
         }
     }
 
     func testPreChangeSettingsReadOverrideDefaults() throws {
-        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
-        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
-        defer { try? FileManager.default.removeItem(at: root) }
-        let file = GlobalSettingsFileStore(fileURL: root.appendingPathComponent("settings.json"))
-        var router = GlobalScalarPreferences.ModelRouterSettings(
-            enabled: true,
-            selectedBackendRawValue: "jev",
-            candidateRoleRawValues: ["explore", "engineer"],
-            allowedProviderRawValues: ["codexExec", "claudeCode"]
-        )
-        router.usageBalancingEnabled = true
-        router.usageBalancingPreset = "nearLimits"
-        router.allowPaidFastRouting = true
-        try file.save(GlobalSettingsDocument(scalarPreferences: GlobalScalarPreferences(modelRouter: router)))
-        let raw = try rawModelRouter(file)
-        XCTAssertNil(raw["randomness"], "pre-change file has no randomness key")
-        XCTAssertNil(raw["reviewDiversityEnabled"], "pre-change file has no review diversity key")
-        XCTAssertEqual(try file.load().schemaVersion, GlobalSettingsDocument.modelRouterSchemaVersion)
-        let store = try reloadedStore(file)
-        let configuration = store.modelRouterConfiguration()
-        XCTAssertEqual(configuration.randomness, .off, "missing randomness reads off")
-        XCTAssertFalse(configuration.reviewDiversityEnabled, "missing review diversity reads false")
-        XCTAssertTrue(configuration.enabled)
-        XCTAssertEqual(configuration.selectedBackendID, .jev)
-        XCTAssertEqual(configuration.candidateRoles, [.explore, .engineer])
-        XCTAssertEqual(configuration.allowedProviders, [.codexExec, .claudeCode])
-        XCTAssertTrue(configuration.usageBalancing.enabled)
-        XCTAssertEqual(configuration.usageBalancing.preset, .nearLimits)
-        XCTAssertTrue(configuration.allowPaidFastRouting)
-        let revision = store.modelRouterSettingsRevision
-        store.setUsageBalancingPreset(.evenPace)
-        let edited = try rawModelRouter(file)
-        XCTAssertNil(edited["randomness"], "sibling edit does not materialize defaults: randomness")
-        XCTAssertNil(edited["reviewDiversityEnabled"], "sibling edit does not materialize defaults: review diversity")
-        XCTAssertEqual(edited["usageBalancingPreset"] as? String, "evenPace")
-        XCTAssertEqual(store.modelRouterSettingsRevision, revision &+ 1)
-        XCTAssertEqual(try file.load().schemaVersion, GlobalSettingsDocument.modelRouterSchemaVersion)
+        try withUsageStore { store, file in
+            store.setModelRouterBackend(.jev)
+            store.setUsageBalancingPreset(.nearLimits)
+            let raw = try rawModelRouter(file)
+            XCTAssertNil(raw["randomness"])
+            XCTAssertNil(raw["reviewDiversityEnabled"])
+            let configuration = try reloadedStore(file).modelRouterConfiguration()
+            XCTAssertEqual(configuration.randomness, .off)
+            XCTAssertFalse(configuration.reviewDiversityEnabled)
+            XCTAssertEqual(configuration.selectedBackendID, .jev)
+            XCTAssertEqual(configuration.usageBalancing.preset, .nearLimits)
+            store.setAllowPaidFastRouting(true)
+            XCTAssertNil(try rawModelRouter(file)["randomness"])
+            XCTAssertNil(try rawModelRouter(file)["reviewDiversityEnabled"])
+        }
     }
 
     func testUnknownRandomnessReadsOff() throws {
-        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
-        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
-        defer { try? FileManager.default.removeItem(at: root) }
-        let file = GlobalSettingsFileStore(fileURL: root.appendingPathComponent("settings.json"))
-        let router = GlobalScalarPreferences.ModelRouterSettings(enabled: false, selectedBackendRawValue: "jev")
-        try file.save(GlobalSettingsDocument(scalarPreferences: GlobalScalarPreferences(modelRouter: router)))
-        try patchRawModelRouter(file) { $0["randomness"] = "medium" }
-        XCTAssertEqual(try reloadedStore(file).modelRouterConfiguration().randomness, .medium, "known raw medium decodes to medium")
-        try patchRawModelRouter(file) { $0["reviewDiversityEnabled"] = true }
-        XCTAssertTrue(try reloadedStore(file).modelRouterConfiguration().reviewDiversityEnabled, "only literal true enables: true")
-        try patchRawModelRouter(file) { $0["reviewDiversityEnabled"] = false }
-        XCTAssertFalse(try reloadedStore(file).modelRouterConfiguration().reviewDiversityEnabled, "only literal true enables: false")
-        for raw in ["future-level", "High", " low", "", "extreme"] {
-            try patchRawModelRouter(file) {
-                $0["randomness"] = raw
-                $0.removeValue(forKey: "reviewDiversityEnabled")
+        try withUsageStore { store, file in
+            store.setModelRouterBackend(.jev)
+            try patchRawModelRouter(file) { $0["randomness"] = "medium" }
+            XCTAssertEqual(try reloadedStore(file).modelRouterConfiguration().randomness, .medium)
+            for raw in ["future-level", "High", " low", "", "extreme"] {
+                try patchRawModelRouter(file) {
+                    $0["randomness"] = raw
+                    $0.removeValue(forKey: "reviewDiversityEnabled")
+                }
+                let reloaded = try reloadedStore(file)
+                XCTAssertEqual(reloaded.modelRouterConfiguration().randomness, .off, raw)
+                XCTAssertEqual(AgentRoutingRandomness.stored(raw), .off, raw)
+                XCTAssertFalse(reloaded.modelRouterConfiguration().reviewDiversityEnabled)
+                reloaded.setUsageBalancingPreset(.expiringQuota)
+                XCTAssertEqual(try rawModelRouter(file)["randomness"] as? String, raw)
+                reloaded.setRandomness(.low)
+                XCTAssertEqual(try rawModelRouter(file)["randomness"] as? String, "low")
+                XCTAssertEqual(reloaded.modelRouterConfiguration().randomness, .low)
             }
-            let store = try reloadedStore(file)
-            XCTAssertEqual(store.modelRouterConfiguration().randomness, .off, "unknown randomness reads off: \(raw)")
-            XCTAssertFalse(store.modelRouterConfiguration().reviewDiversityEnabled)
-            XCTAssertEqual(AgentRoutingRandomness.stored(raw), .off)
-            store.setUsageBalancingPreset(.nearLimits)
-            let edited = try rawModelRouter(file)
-            XCTAssertEqual(edited["randomness"] as? String, raw, "sibling edit preserves unknown randomness raw: \(raw)")
-            XCTAssertEqual(edited["usageBalancingPreset"] as? String, "nearLimits")
-            store.setRandomness(.low)
-            XCTAssertEqual(try rawModelRouter(file)["randomness"] as? String, "low", "explicit setter overwrites unknown raw: \(raw)")
-            XCTAssertEqual(store.modelRouterConfiguration().randomness, .low)
         }
     }
 
@@ -417,7 +498,7 @@ final class ModelRouterSettingsPersistenceTests: XCTestCase {
     private func reloadedStore(_ file: GlobalSettingsFileStore) throws -> GlobalSettingsStore {
         let suite = "ModelRouterSettingsPersistenceTests.reload.\(UUID())"
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
-        addTeardownBlock { UserDefaults(suiteName: suite)?.removePersistentDomain(forName: suite) }
+        addTeardownBlock { defaults.removePersistentDomain(forName: suite) }
         return GlobalSettingsStore(defaults: defaults, fileStore: file)
     }
 

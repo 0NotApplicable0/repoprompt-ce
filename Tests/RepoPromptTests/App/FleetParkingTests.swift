@@ -1453,7 +1453,10 @@ final class FleetAgentWindowParkingTests: XCTestCase {
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         let defaults = UserDefaults.standard
         let previousStorage = defaults.string(forKey: "GlobalCustomStorageURL")
-        defaults.set(root.appendingPathComponent("storage").path, forKey: "GlobalCustomStorageURL")
+        // The shared domain runtime's metadata path policy is fixed at composition, so per-test storage must live under its owned root.
+        let ownedStorageParent = AppProfileLocations.current.applicationSupportRoot.appendingPathComponent("FleetAgentWindowParkingRoute-\(UUID().uuidString)", isDirectory: true)
+        addTeardownBlock { try? FileManager.default.removeItem(at: ownedStorageParent) }
+        UserDefaults.standard.set(AppProfileLocations.current.customWorkspaceDirectory(selectedDirectory: ownedStorageParent).path, forKey: "GlobalCustomStorageURL")
         let previousApproval = defaults.object(forKey: "workspace.approvalSettings")
         let store = GlobalSettingsStore.shared
         let previousAutoStart = store.mcpAutoStart()
@@ -2383,6 +2386,8 @@ final class FleetAgentWindowParkingTests: XCTestCase {
                 state.agentModeViewModel.test_installPersistentSessionBinding(sessionID: sessionID, on: session) != nil,
                 "session binding installed"
             )
+            // An installed binding admits operations only after restoration is authoritative.
+            session.recordRestorationAuthoritative(.persistedPayloadApplied)
 
             window.orderOut(nil)
             try self.requireSetup(!window.isVisible && !window.isKeyWindow, "fixture window starts hidden")
@@ -2864,7 +2869,7 @@ final class FleetAgentWindowParkingTests: XCTestCase {
                 // workspace error policy (MCPError.invalidRequest) wins over a CancellationError.
                 XCTAssertEqual(error.code, -32600)
                 guard case let .invalidRequest(detail) = error else { return XCTFail("wrong MCP error \(error)") }
-                XCTAssertTrue(detail?.contains("was cancelled before activation") ?? false, "\(error)")
+                XCTAssertTrue(detail?.contains("was cancelled before admission") ?? false, "\(error)")
             } catch {
                 XCTFail("unexpected error type \(error)")
             }

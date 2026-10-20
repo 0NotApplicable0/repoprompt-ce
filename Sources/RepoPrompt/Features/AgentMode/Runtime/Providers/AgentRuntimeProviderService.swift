@@ -300,8 +300,8 @@ final class AgentRuntimeProviderService {
     ///   - runType: The type of run — determines CLI tool config
     /// - Note: MCP tool restrictions are handled via ServerNetworkManager connection policies,
     ///   not via CLI flags. Use installClientConnectionPolicy before starting the agent run.
-    /// - Important: OpenCode and Cursor use their ACP runtimes for headless
-    ///   discovery while keeping broader chat-provider wiring separate.
+    /// - Important: ACP-backed providers use their shared one-shot bridge for
+    ///   headless discovery while keeping broader chat-provider wiring separate.
     func makeProvider(
         for agent: AgentProviderKind,
         modelString: String? = nil,

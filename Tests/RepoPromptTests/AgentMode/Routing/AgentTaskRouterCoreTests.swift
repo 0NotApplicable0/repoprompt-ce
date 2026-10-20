@@ -5,160 +5,28 @@ import RepoPromptSettingsCore
 import XCTest
 
 final class AgentTaskRouterCoreTests: XCTestCase {
-    func testRegistryRejectsDuplicatesAndNeverFallsBackUnknownID() async throws {
-        let backend = FakeBackend(id: .init(rawValue: "fake"), readiness: .ready(generation: 1, policyVersion: "v1"))
-        XCTAssertThrowsError(try AgentTaskRouterRegistry(registrations: [
-            .init(backend: backend), .init(backend: backend)
-        ])) { error in
-            XCTAssertEqual(error as? AgentTaskRouterRegistryError, .duplicateBackendID(.init(rawValue: "fake")))
-        }
-        let registry = try AgentTaskRouterRegistry(registrations: [.init(backend: backend)])
-        let missing = await registry.registration(for: .init(rawValue: "unknown"))
-        XCTAssertNil(missing)
-        let registrations = await registry.registrations()
-        XCTAssertEqual(registrations.map(\.id), [.init(rawValue: "fake")])
-    }
-
-    func testSecondBackendRegistrationOwnsSettingsWithoutGenericJevSwitches() async throws {
-        let fake = FakeBackend(id: .init(rawValue: "second"), readiness: .ready(generation: 1, policyVersion: "v1"))
-        let settings = FakeBackendSettingsController()
-        let runtime = try AgentTaskRouterRuntime(registrations: [
-            .init(
-                backend: fake,
-                settings: .init(
-                    presentation: .init(
-                        title: "Second backend",
-                        configurationDetail: "Fake settings",
-                        secretFieldLabel: nil,
-                        links: []
-                    ),
-                    controller: settings
-                )
-            )
-        ])
-        let registration = await runtime.registry.registration(for: fake.id)
-        XCTAssertEqual(registration?.settings?.presentation.title, "Second backend")
-        let readiness = await registration?.settings?.controller.readinessSnapshot()
-        XCTAssertEqual(readiness, .ready(generation: 1, policyVersion: "v1"))
-    }
-
-    func testRuntimeBootstrapsOnlyExplicitSelectedBackendAndNeverBootstrapsWhenDisabled() async throws {
-        let selectedID = AgentTaskRouterBackendID(rawValue: "selected")
-        let inactiveID = AgentTaskRouterBackendID(rawValue: "inactive")
-        let selectedSettings = BootstrapCountingSettingsController()
-        let inactiveSettings = BootstrapCountingSettingsController()
-        _ = try AgentTaskRouterRuntime(
-            registrations: [
-                .init(
-                    backend: FakeBackend(id: selectedID, readiness: .needsConfiguration(generation: 0, reason: "test")),
-                    settings: .init(presentation: testSettingsPresentation("Selected"), controller: selectedSettings)
-                ),
-                .init(
-                    backend: FakeBackend(id: inactiveID, readiness: .needsConfiguration(generation: 0, reason: "test")),
-                    settings: .init(presentation: testSettingsPresentation("Inactive"), controller: inactiveSettings)
-                )
-            ],
-            bootstrapBackendID: selectedID
-        )
-        await selectedSettings.waitUntilObserved()
-        await inactiveSettings.waitUntilObserved()
-        await selectedSettings.waitUntilBootstrapped()
-        let selectedBootstrapCount = await selectedSettings.bootstrapCount
-        let inactiveBootstrapCount = await inactiveSettings.bootstrapCount
-        XCTAssertEqual(selectedBootstrapCount, 1)
-        XCTAssertEqual(inactiveBootstrapCount, 0)
-
-        let disabledA = BootstrapCountingSettingsController()
-        let disabledB = BootstrapCountingSettingsController()
-        _ = try AgentTaskRouterRuntime(registrations: [
-            .init(
-                backend: FakeBackend(id: .init(rawValue: "disabled-a"), readiness: .needsConfiguration(generation: 0, reason: "test")),
-                settings: .init(presentation: testSettingsPresentation("A"), controller: disabledA)
-            ),
-            .init(
-                backend: FakeBackend(id: .init(rawValue: "disabled-b"), readiness: .needsConfiguration(generation: 0, reason: "test")),
-                settings: .init(presentation: testSettingsPresentation("B"), controller: disabledB)
-            )
-        ])
-        await disabledA.waitUntilObserved()
-        await disabledB.waitUntilObserved()
-        let disabledABootstrapCount = await disabledA.bootstrapCount
-        let disabledBBootstrapCount = await disabledB.bootstrapCount
-        XCTAssertEqual(disabledABootstrapCount, 0)
-        XCTAssertEqual(disabledBBootstrapCount, 0)
-    }
-
-    func testEnvelopeIsExactAndRejectsPrivacyExpansionsOrTruncation() throws {
-        let candidates = [descriptor("a"), descriptor("b")]
-        let request = try AgentTaskRoutingEnvelopeBuilder().build(
-            requestID: UUID(),
-            text: "  diagnose this  ",
-            scope: .subagent,
-            customInstructions: "  Prefer Claude for execution.  ",
-            candidates: candidates
-        )
-        XCTAssertEqual(request.task, "diagnose this")
-        XCTAssertEqual(request.contractVersion, AgentTaskRoutingRequest.currentContractVersion)
-        XCTAssertEqual(request.scope, .subagent)
-        XCTAssertEqual(request.decisionStage, .model)
-        XCTAssertEqual(request.customInstructions, "Prefer Claude for execution.")
-        let effortRequest = try AgentTaskRoutingEnvelopeBuilder().build(
-            requestID: UUID(),
-            text: "diagnose this",
-            decisionStage: .effort,
-            candidates: candidates
-        )
-        XCTAssertEqual(effortRequest.decisionStage, .effort)
-        XCTAssertThrowsError(try AgentTaskRoutingEnvelopeBuilder().build(
-            requestID: UUID(), text: String(repeating: "a", count: 4001), candidates: candidates
-        )) { XCTAssertEqual($0 as? AgentTaskRoutingEnvelopeBuilder.Rejection, .tooManyCharacters) }
-        XCTAssertThrowsError(try AgentTaskRoutingEnvelopeBuilder().build(
-            requestID: UUID(), text: "task", candidates: candidates, containsAttachments: true
-        )) { XCTAssertEqual($0 as? AgentTaskRoutingEnvelopeBuilder.Rejection, .unsupportedContent) }
-        XCTAssertThrowsError(try AgentTaskRoutingEnvelopeBuilder().build(
-            requestID: UUID(), text: "task", candidates: [descriptor("a")]
-        )) { XCTAssertEqual($0 as? AgentTaskRoutingEnvelopeBuilder.Rejection, .invalidCandidateCount) }
-        XCTAssertNoThrow(try AgentTaskRoutingEnvelopeBuilder().build(
-            requestID: UUID(),
-            text: "task",
-            candidates: (0 ..< 8).map { descriptor("candidate-\($0)") }
-        ))
-        XCTAssertThrowsError(try AgentTaskRoutingEnvelopeBuilder().build(
-            requestID: UUID(),
-            text: "task",
-            candidates: (0 ... AgentTaskRoutingEnvelopeBuilder.maximumCandidates).map { descriptor("candidate-\($0)") }
-        )) { XCTAssertEqual($0 as? AgentTaskRoutingEnvelopeBuilder.Rejection, .invalidCandidateCount) }
-    }
-
     func testLongRoutingExcerptIsDeterministicBoundedAndMasksBothEnds() {
         let task = "Investigate the parser. password=openingSecret "
             + String(repeating: "irrelevant middle ", count: 300)
             + " Finally, verify the fix. token=endingSecret"
-
         let excerpt = AgentTaskRoutingTaskExcerpt.make(from: task)
-
         XCTAssertEqual(excerpt, AgentTaskRoutingTaskExcerpt.make(from: task))
         XCTAssertTrue(excerpt.contains("Investigate the parser"))
         XCTAssertTrue(excerpt.contains("verify the fix"))
         XCTAssertTrue(excerpt.contains("middle omitted"))
         XCTAssertFalse(excerpt.contains("openingSecret"))
         XCTAssertFalse(excerpt.contains("endingSecret"))
-        XCTAssertLessThanOrEqual(excerpt.count, AgentTaskRoutingEnvelopeBuilder.maximumCharacters)
-        XCTAssertLessThanOrEqual(excerpt.utf8.count, AgentTaskRoutingEnvelopeBuilder.maximumUTF8Bytes)
+        XCTAssertLessThanOrEqual(excerpt.count, AgentTaskRoutingTaskExcerpt.maximumCharacters)
+        XCTAssertLessThanOrEqual(excerpt.utf8.count, AgentTaskRoutingTaskExcerpt.maximumUTF8Bytes)
     }
 
-    func testLongRoutingExcerptOmitsUnsafeCutSegmentsButStillProvidesJevInput() {
+    func testLongRoutingExcerptOmitsUnsafeCutSegments() {
         let task = "```\nprivate text\n" + String(repeating: "secret", count: 1000)
             + "\n```\nPlease inspect the result."
-
         let excerpt = AgentTaskRoutingTaskExcerpt.make(from: task)
-
         XCTAssertFalse(excerpt.contains("private text"))
         XCTAssertFalse(excerpt.contains("secret"))
         XCTAssertTrue(excerpt.contains("middle omitted"))
-        XCTAssertNoThrow(try AgentTaskRoutingEnvelopeBuilder().build(
-            requestID: UUID(), text: excerpt, candidates: [descriptor("a"), descriptor("b")]
-        ))
     }
 
     func testShortRoutingTaskRemainsExact() {
@@ -168,12 +36,10 @@ final class AgentTaskRouterCoreTests: XCTestCase {
     func testLongRoutingExcerptRespectsUTF8Limit() {
         let task = "Review Unicode handling. " + String(repeating: "✈️ ", count: 3000)
             + " Finally, add tests."
-
         let excerpt = AgentTaskRoutingTaskExcerpt.make(from: task)
-
         XCTAssertTrue(excerpt.contains("middle omitted"))
         XCTAssertTrue(excerpt.contains("add tests"))
-        XCTAssertLessThanOrEqual(excerpt.utf8.count, AgentTaskRoutingEnvelopeBuilder.maximumUTF8Bytes)
+        XCTAssertLessThanOrEqual(excerpt.utf8.count, AgentTaskRoutingTaskExcerpt.maximumUTF8Bytes)
     }
 
     func testExecutableIdentityIncludesEffortAndNormalizedACPParameters() {
@@ -199,413 +65,6 @@ final class AgentTaskRouterCoreTests: XCTestCase {
         )
         XCTAssertEqual(ordered, reversed)
     }
-
-    func testCoordinatorRejectsUnknownSelectionFromReadyBackend() async throws {
-        let backend = FakeBackend(
-            id: .init(rawValue: "fake"),
-            readiness: .ready(generation: 1, policyVersion: "v1"),
-            outcome: .selected(opaqueKey: "not-submitted", evidence: nil)
-        )
-        let registry = try AgentTaskRouterRegistry(registrations: [.init(backend: backend)])
-        let coordinator = AgentFreshTaskRoutingCoordinator(registry: registry)
-        let request = try AgentTaskRoutingEnvelopeBuilder().build(
-            requestID: UUID(), text: "task", candidates: [descriptor("a"), descriptor("b")]
-        )
-        let result = await coordinator.route(backendID: backend.id, request: request)
-        XCTAssertEqual(result, .failed(category: .invalidResponse, retryable: false, evidence: nil))
-    }
-
-    func testCoordinatorRejectsSelectionAfterReadinessGenerationChanges() async throws {
-        let backend = AdvancingReadinessBackend()
-        let registry = try AgentTaskRouterRegistry(registrations: [.init(backend: backend)])
-        let coordinator = AgentFreshTaskRoutingCoordinator(registry: registry)
-        let request = try AgentTaskRoutingEnvelopeBuilder().build(
-            requestID: UUID(), text: "task", candidates: [descriptor("a"), descriptor("b")]
-        )
-        let result = await coordinator.route(backendID: backend.id, request: request)
-        XCTAssertEqual(result, .failed(category: .policyUnavailable, retryable: false, evidence: nil))
-    }
-
-    func testCoordinatorCancellationRejectsLateBackendSelection() async throws {
-        let backend = LateCompletionBackend()
-        let registry = try AgentTaskRouterRegistry(registrations: [.init(backend: backend)])
-        let coordinator = AgentFreshTaskRoutingCoordinator(registry: registry)
-        let request = try AgentTaskRoutingEnvelopeBuilder().build(
-            requestID: UUID(), text: "task", candidates: [descriptor("a"), descriptor("b")]
-        )
-        let route = Task { await coordinator.route(backendID: backend.id, request: request) }
-        await backend.waitUntilStarted()
-        await coordinator.cancel(requestID: request.requestID)
-        await backend.completeWithSelection()
-        let outcome = await route.value
-        XCTAssertEqual(outcome, .cancelled)
-    }
-
-    func testCoordinatorReservesBeforeReadinessAndDuplicateCannotPass() async throws {
-        let backend = SuspendedReadinessBackend()
-        let registry = try AgentTaskRouterRegistry(registrations: [.init(backend: backend)])
-        let coordinator = AgentFreshTaskRoutingCoordinator(registry: registry)
-        let request = try AgentTaskRoutingEnvelopeBuilder().build(
-            requestID: UUID(), text: "task", candidates: [descriptor("a"), descriptor("b")]
-        )
-        let first = Task { await coordinator.route(backendID: backend.id, request: request) }
-        await backend.waitUntilReadinessStarted()
-        let duplicate = await coordinator.route(backendID: backend.id, request: request)
-        XCTAssertEqual(duplicate, .failed(category: .invalidRequest, retryable: false, evidence: nil))
-        await coordinator.cancel(requestID: request.requestID)
-        let firstOutcome = await first.value
-        XCTAssertEqual(firstOutcome, .cancelled)
-    }
-
-    func testCancelPromptlySettlesWhenBackendNeverCompletes() async throws {
-        let backend = NeverCompletingRouteBackend()
-        let registry = try AgentTaskRouterRegistry(registrations: [.init(backend: backend)])
-        let coordinator = AgentFreshTaskRoutingCoordinator(registry: registry)
-        let request = try AgentTaskRoutingEnvelopeBuilder().build(
-            requestID: UUID(), text: "task", candidates: [descriptor("a"), descriptor("b")]
-        )
-        let route = Task { await coordinator.route(backendID: backend.id, request: request) }
-        await backend.waitUntilStarted()
-        await coordinator.cancelAll()
-        let routeOutcome = await route.value
-        XCTAssertEqual(routeOutcome, .cancelled)
-    }
-
-    func testOptionalEvidenceIsValidatedUniformly() async throws {
-        let invalid = AgentTaskRoutingDecisionEvidence(
-            policyVersion: "wrong", confidence: .nan, scores: ["unknown": -1],
-            inputTokens: -1, outputTokens: -1, reasonCode: nil
-        )
-        for outcome in [
-            AgentTaskRoutingBackendOutcome.abstained(reason: "test", evidence: invalid),
-            .failed(category: .transport, retryable: true, evidence: invalid)
-        ] {
-            let backend = FakeBackend(
-                id: .init(rawValue: UUID().uuidString),
-                readiness: .ready(generation: 1, policyVersion: "v1"),
-                outcome: outcome
-            )
-            let registry = try AgentTaskRouterRegistry(registrations: [.init(backend: backend)])
-            let request = try AgentTaskRoutingEnvelopeBuilder().build(
-                requestID: UUID(), text: "task", candidates: [descriptor("a"), descriptor("b")]
-            )
-            let outcome = await AgentFreshTaskRoutingCoordinator(registry: registry)
-                .route(backendID: backend.id, request: request)
-            XCTAssertEqual(outcome, .failed(category: .invalidResponse, retryable: false, evidence: nil))
-        }
-        let nilEvidenceBackend = FakeBackend(
-            id: .init(rawValue: "nil-evidence"),
-            readiness: .ready(generation: 1, policyVersion: "v1"),
-            outcome: .selected(opaqueKey: "a", evidence: nil)
-        )
-        let registry = try AgentTaskRouterRegistry(registrations: [.init(backend: nilEvidenceBackend)])
-        let request = try AgentTaskRoutingEnvelopeBuilder().build(
-            requestID: UUID(), text: "task", candidates: [descriptor("a"), descriptor("b")]
-        )
-        let outcome = await AgentFreshTaskRoutingCoordinator(registry: registry)
-            .route(backendID: nilEvidenceBackend.id, request: request)
-        XCTAssertEqual(outcome, .selected(opaqueKey: "a", evidence: nil))
-    }
-
-    func testJevBackendRoutesToStrictlyValidatedOpaqueChoice() async {
-        let storage = TestSecureStorageBackend()
-        let client = SelectingJevClient()
-        let credentials = JevRouterCredentialService(
-            secureKeys: SecureKeysService(secureStorage: storage),
-            client: client
-        )
-        guard case .saved = await credentials.validateAndSave("secret", operationID: UUID()) else {
-            return XCTFail("Expected test credential to validate")
-        }
-        let backend = JevTaskRouterBackend(credentialService: credentials)
-        let outcome = await backend.route(.init(
-            requestID: UUID(), contractVersion: AgentTaskRoutingRequest.currentContractVersion,
-            task: "task", scope: .subagent, customInstructions: "Prefer b.",
-            candidates: [descriptor("a"), descriptor("b")]
-        ))
-        guard case let .selected(key, evidence) = outcome else {
-            return XCTFail("Expected Jev selection, got \(outcome)")
-        }
-        XCTAssertEqual(key, "b")
-        XCTAssertEqual(evidence?.policyVersion, JevRouterCredentialService.routingPolicyVersion)
-        XCTAssertEqual(evidence?.confidence, 0.8)
-        XCTAssertEqual(evidence?.scores, ["a": 0.2, "b": 0.8])
-        XCTAssertEqual(evidence?.reasonCode, "unique_argmax")
-
-        let request = await client.lastRequest
-        XCTAssertEqual(request?.model, JevRouterCredentialService.pinnedModel)
-        XCTAssertEqual(request?.state, "HIGHEST-PRIORITY USER ROUTING DIRECTIVE:\nPrefer b.\n\nTASK:\ntask")
-        // The shipped routing policy stays one choice question per decision.
-        XCTAssertEqual(request?.questions.count, 1)
-        XCTAssertEqual(request?.questions["route"]?.type, "choice")
-        XCTAssertEqual(request?.questions["route"]?.criteria, [
-            "a": "Provider: Test; model: a. Suitable work: rubric",
-            "b": "Provider: Test; model: b. Suitable work: rubric"
-        ])
-        XCTAssertTrue(request?.questions["route"]?.instructions.contains("delegated subagent session") == true)
-        XCTAssertTrue(request?.questions["route"]?.instructions.contains("Prefer b.") == true)
-        XCTAssertTrue(request?.questions["route"]?.instructions.hasPrefix("HIGHEST-PRIORITY USER ROUTING DIRECTIVE: Prefer b.") == true)
-        XCTAssertTrue(request?.questions["route"]?.instructions.contains("Choose the model first") == true)
-        XCTAssertTrue(request?.questions["route"]?.instructions.contains("No candidate is the ordinary default") == true)
-        XCTAssertTrue(request?.questions["route"]?.instructions.contains("Code and pull-request review") == true)
-    }
-
-    func testJevBackendRejectsStructurallyInvalidRequestsWithoutCallingService() async {
-        let invalidCandidateSets: [(String, [AgentTaskRoutingCandidateDescriptor])] = [
-            ("duplicate opaque keys", [descriptor("duplicate"), descriptor("duplicate")]),
-            ("fewer than two candidates", [descriptor("only")]),
-            ("empty opaque key", [descriptor(""), descriptor("b")]),
-            (
-                "more than the maximum candidates",
-                (0 ... AgentTaskRoutingEnvelopeBuilder.maximumCandidates).map { descriptor("key-\($0)") }
-            )
-        ]
-        for (name, candidates) in invalidCandidateSets {
-            let client = SelectingJevClient()
-            let credentials = JevRouterCredentialService(
-                secureKeys: SecureKeysService(secureStorage: TestSecureStorageBackend()),
-                client: client
-            )
-            let backend = JevTaskRouterBackend(credentialService: credentials)
-            let outcome = await backend.route(.init(
-                requestID: UUID(), contractVersion: AgentTaskRoutingRequest.currentContractVersion,
-                task: "task", scope: .primarySession, customInstructions: nil,
-                candidates: candidates
-            ))
-            XCTAssertEqual(outcome, .failed(category: .invalidRequest, retryable: false, evidence: nil), name)
-            let request = await client.lastRequest
-            XCTAssertNil(request, name)
-        }
-    }
-
-    private func descriptor(_ key: String) -> AgentTaskRoutingCandidateDescriptor {
-        .init(
-            opaqueKey: key,
-            roleLabels: [key],
-            targetDescription: "Provider: Test; model: \(key).",
-            rubricVersion: "v1",
-            rubric: "rubric"
-        )
-    }
-
-    private func testSettingsPresentation(_ title: String) -> AgentTaskRouterBackendSettingsPresentation {
-        .init(title: title, configurationDetail: "test", secretFieldLabel: nil, links: [])
-    }
-}
-
-private actor SelectingJevClient: JevRoutingClientProtocol {
-    private(set) var lastRequest: JevRoutingWireRequest?
-
-    func listModels(apiKey: String, timeout: Duration) -> JevModelList {
-        .init(models: [.init(name: "jev-latest")])
-    }
-
-    func judge(
-        request: JevRoutingWireRequest,
-        apiKey: String,
-        timeout: Duration
-    ) -> JevRoutingWireResponse {
-        lastRequest = request
-        return .init(
-            model: JevRouterCredentialService.pinnedModel,
-            answers: [
-                "route": .init(
-                    type: "choice",
-                    choice: "b",
-                    probabilities: ["a": 0.2, "b": 0.8],
-                    confidence: 0.8
-                )
-            ],
-            usage: .init(inputTokens: 12, outputTokens: 4)
-        )
-    }
-}
-
-private struct FakeBackend: AgentTaskRouterBackend {
-    let id: AgentTaskRouterBackendID
-    let displayName = "Fake"
-    let readiness: AgentTaskRouterBackendReadiness
-    var outcome: AgentTaskRoutingBackendOutcome = .abstained(reason: "test", evidence: nil)
-
-    func readinessSnapshot() async -> AgentTaskRouterBackendReadiness {
-        readiness
-    }
-
-    func route(_ request: AgentTaskRoutingRequest) async -> AgentTaskRoutingBackendOutcome {
-        outcome
-    }
-}
-
-private actor FakeBackendSettingsController: AgentTaskRouterBackendSettingsController {
-    func readinessSnapshot() -> AgentTaskRouterBackendReadiness {
-        .ready(generation: 1, policyVersion: "v1")
-    }
-
-    func readinessUpdates() -> AsyncStream<AgentTaskRouterBackendReadiness> {
-        AsyncStream { $0.yield(.ready(generation: 1, policyVersion: "v1"))
-            $0.finish()
-        }
-    }
-
-    func perform(_ action: AgentTaskRouterBackendSettingsAction) -> AgentTaskRouterBackendSettingsActionResult {
-        .succeeded("ok")
-    }
-
-    func bootstrapStoredConfigurationIfNeeded() {}
-    func cancelAndAdvanceGeneration() {}
-}
-
-private actor BootstrapCountingSettingsController: AgentTaskRouterBackendSettingsController {
-    private(set) var bootstrapCount = 0
-    private var observed = false
-    private var observationWaiters: [CheckedContinuation<Void, Never>] = []
-    private var bootstrapWaiters: [CheckedContinuation<Void, Never>] = []
-
-    func readinessSnapshot() -> AgentTaskRouterBackendReadiness {
-        .needsConfiguration(generation: 0, reason: "test")
-    }
-
-    func readinessUpdates() -> AsyncStream<AgentTaskRouterBackendReadiness> {
-        observed = true
-        observationWaiters.forEach { $0.resume() }
-        observationWaiters.removeAll()
-        return AsyncStream { continuation in
-            continuation.yield(.needsConfiguration(generation: 0, reason: "test"))
-            continuation.finish()
-        }
-    }
-
-    func perform(_ action: AgentTaskRouterBackendSettingsAction) -> AgentTaskRouterBackendSettingsActionResult {
-        .succeeded("test")
-    }
-
-    func bootstrapStoredConfigurationIfNeeded() {
-        bootstrapCount += 1
-        bootstrapWaiters.forEach { $0.resume() }
-        bootstrapWaiters.removeAll()
-    }
-
-    func cancelAndAdvanceGeneration() {}
-
-    func waitUntilObserved() async {
-        if observed {
-            return
-        }
-        await withCheckedContinuation { observationWaiters.append($0) }
-    }
-
-    func waitUntilBootstrapped() async {
-        if bootstrapCount > 0 {
-            return
-        }
-        await withCheckedContinuation { bootstrapWaiters.append($0) }
-    }
-}
-
-private actor AdvancingReadinessBackend: AgentTaskRouterBackend {
-    nonisolated let id = AgentTaskRouterBackendID(rawValue: "advancing")
-    nonisolated let displayName = "Advancing"
-    private var readinessCallCount = 0
-
-    func readinessSnapshot() -> AgentTaskRouterBackendReadiness {
-        readinessCallCount += 1
-        return .ready(generation: UInt64(readinessCallCount), policyVersion: "v1")
-    }
-
-    func route(_ request: AgentTaskRoutingRequest) -> AgentTaskRoutingBackendOutcome {
-        .selected(
-            opaqueKey: request.candidates[0].opaqueKey,
-            evidence: .init(
-                policyVersion: "v1", confidence: 0.8, scores: nil, inputTokens: 1, outputTokens: 1, reasonCode: nil
-            )
-        )
-    }
-}
-
-private actor LateCompletionBackend: AgentTaskRouterBackend {
-    nonisolated let id = AgentTaskRouterBackendID(rawValue: "late")
-    nonisolated let displayName = "Late"
-    private var started = false
-    private var startWaiters: [CheckedContinuation<Void, Never>] = []
-    private var completion: CheckedContinuation<AgentTaskRoutingBackendOutcome, Never>?
-
-    func readinessSnapshot() -> AgentTaskRouterBackendReadiness {
-        .ready(generation: 1, policyVersion: "v1")
-    }
-
-    func route(_ request: AgentTaskRoutingRequest) async -> AgentTaskRoutingBackendOutcome {
-        started = true
-        startWaiters.forEach { $0.resume() }
-        startWaiters.removeAll()
-        return await withCheckedContinuation { completion = $0 }
-    }
-
-    func waitUntilStarted() async {
-        if started {
-            return
-        }
-        await withCheckedContinuation { startWaiters.append($0) }
-    }
-
-    func completeWithSelection() {
-        completion?.resume(returning: .selected(
-            opaqueKey: "a",
-            evidence: .init(
-                policyVersion: "v1", confidence: 0.8, scores: nil, inputTokens: 1, outputTokens: 1, reasonCode: nil
-            )
-        ))
-        completion = nil
-    }
-}
-
-private actor SuspendedReadinessBackend: AgentTaskRouterBackend {
-    nonisolated let id = AgentTaskRouterBackendID(rawValue: "suspended-readiness")
-    nonisolated let displayName = "Suspended readiness"
-    private var started = false
-    private var waiters: [CheckedContinuation<Void, Never>] = []
-
-    func readinessSnapshot() async -> AgentTaskRouterBackendReadiness {
-        started = true
-        waiters.forEach { $0.resume() }
-        waiters.removeAll()
-        return await withUnsafeContinuation { (_: UnsafeContinuation<AgentTaskRouterBackendReadiness, Never>) in }
-    }
-
-    func route(_ request: AgentTaskRoutingRequest) -> AgentTaskRoutingBackendOutcome {
-        .cancelled
-    }
-
-    func waitUntilReadinessStarted() async {
-        if started {
-            return
-        }
-        await withCheckedContinuation { waiters.append($0) }
-    }
-}
-
-private actor NeverCompletingRouteBackend: AgentTaskRouterBackend {
-    nonisolated let id = AgentTaskRouterBackendID(rawValue: "never-completing")
-    nonisolated let displayName = "Never completing"
-    private var started = false
-    private var waiters: [CheckedContinuation<Void, Never>] = []
-
-    func readinessSnapshot() -> AgentTaskRouterBackendReadiness {
-        .ready(generation: 1, policyVersion: "v1")
-    }
-
-    func route(_ request: AgentTaskRoutingRequest) async -> AgentTaskRoutingBackendOutcome {
-        started = true
-        waiters.forEach { $0.resume() }
-        waiters.removeAll()
-        return await withUnsafeContinuation { (_: UnsafeContinuation<AgentTaskRoutingBackendOutcome, Never>) in }
-    }
-
-    func waitUntilStarted() async {
-        if started {
-            return
-        }
-        await withCheckedContinuation { waiters.append($0) }
-    }
 }
 
 @MainActor
@@ -616,7 +75,8 @@ final class AgentTaskRoutingCandidateBuilderPolicyTests: XCTestCase {
         modelOption("gpt-5.6-sol-high", "GPT-5.6 Sol High"),
         modelOption("gpt-6-luna-low", "GPT-6 Luna Low"),
         modelOption("gpt-6-sol-medium", "GPT-6 Sol Medium"),
-        modelOption("gpt-6-sol-high", "GPT-6 Sol High")
+        modelOption("gpt-6-sol-high", "GPT-6 Sol High"),
+        modelOption("gpt-6-astra", "GPT-6 Astra")
     ]
 
     private static let advertisedClaudeOptions = [
@@ -628,22 +88,33 @@ final class AgentTaskRoutingCandidateBuilderPolicyTests: XCTestCase {
     ]
 
     private static func modelOption(_ raw: String, _ name: String) -> AgentModelOption {
-        AgentModelOption(rawValue: raw, displayName: name, description: nil, isDefault: false)
+        let codex = raw.hasPrefix("gpt-") ? CodexModelSpecifier(raw: raw, discoveredRecords: []) : nil
+        let claude = raw.hasPrefix("claude-") ? ClaudeModelSpecifier(raw: raw) : nil
+        let effort = codex?.reasoningEffort ?? claude?.effortLevel.flatMap { CodexReasoningEffort.parse($0.rawValue) }
+        let base = codex.flatMap { specifier in
+            specifier.baseModel.map { $0 + (specifier.serviceTier == nil ? "" : "-fast") }
+        } ?? claude?.baseModel
+        return AgentModelOption(
+            rawValue: raw, displayName: name, description: nil, isDefault: false,
+            effortVariant: effort.flatMap { effort in base.map { AgentModelEffortVariant(baseModelRaw: $0, reasoningEffort: effort) } }
+        )
     }
 
     private func candidateBuilder(
         codexOptions: [AgentModelOption]? = nil,
-        claudeOptions: [AgentModelOption]? = nil
+        claudeOptions: [AgentModelOption]? = nil,
+        openCodeOptions: [AgentModelOption] = []
     ) -> AgentTaskRoutingCandidateBuilder {
         let codexOptions = codexOptions ?? Self.advertisedCodexOptions
         let claudeOptions = claudeOptions ?? Self.advertisedClaudeOptions
-        return AgentTaskRoutingCandidateBuilder { provider, _ in
+        return AgentTaskRoutingCandidateBuilder(modelOptions: { provider, _ in
             switch provider {
             case .codexExec: codexOptions
             case .claudeCode: claudeOptions
+            case .openCode: openCodeOptions
             default: []
             }
-        }
+        })
     }
 
     func testModelCandidatesIncludeAuditedCapabilityAndPricingWithoutPreselectedEffort() throws {
@@ -666,7 +137,7 @@ final class AgentTaskRoutingCandidateBuilderPolicyTests: XCTestCase {
         XCTAssertTrue(lunaCandidate.descriptor.targetDescription.contains("$0.10 input / $0.50 output"))
         XCTAssertNil(lunaCandidate.target.reasoningEffortRaw)
         XCTAssertFalse(lunaCandidate.descriptor.targetDescription.contains("Effort:"))
-        XCTAssertEqual(lunaCandidate.descriptor.rubricVersion, AgentTaskRoutingModelProfileCatalog.rubricVersion)
+        XCTAssertEqual(lunaCandidate.descriptor.rubricVersion, RoutingModelProfileResolver.bundled.rubricVersion)
 
         let fableCandidate = try XCTUnwrap(candidates.first(where: {
             ClaudeModelSpecifier(raw: $0.target.modelRaw).baseModel == AgentModel.claudeFable51.rawValue
@@ -682,6 +153,53 @@ final class AgentTaskRoutingCandidateBuilderPolicyTests: XCTestCase {
         XCTAssertEqual(opusCandidate.utilityTier, "claude-opus")
         XCTAssertTrue(opusCandidate.descriptor.targetDescription.contains("recommended starting point for most workloads"))
         XCTAssertTrue(opusCandidate.descriptor.targetDescription.contains("$4 input / $20 output"))
+    }
+
+    func testModelFamilyAvailabilityProjectsPartialNoAndFullCatalogsWithoutChangingCandidates() throws {
+        let fullAvailability = AgentModelCatalog.AvailabilityContext(
+            claudeCodeAvailable: true,
+            codexAvailable: true,
+            openCodeAvailable: false
+        )
+        let fullBuilder = candidateBuilder()
+        let candidatesBefore = try fullBuilder.build(
+            allowedProviders: [.claudeCode, .codexExec],
+            availability: fullAvailability
+        ).map(\.target)
+        let full = fullBuilder.modelFamilyAvailability(availability: fullAvailability)
+        let candidatesAfter = try fullBuilder.build(
+            allowedProviders: [.claudeCode, .codexExec],
+            availability: fullAvailability
+        ).map(\.target)
+
+        XCTAssertEqual(full.map(\.displayName), ["Luna", "Terra", "Sol", "Astra", "Haiku", "Sonnet", "Opus", "Fable"])
+        XCTAssertTrue(full.allSatisfy(\.isAvailable))
+        XCTAssertEqual(candidatesAfter, candidatesBefore)
+
+        let partial = candidateBuilder(codexOptions: [Self.modelOption("gpt-6-luna-low", "GPT-6 Luna Low")])
+            .modelFamilyAvailability(availability: .init(
+                claudeCodeAvailable: false,
+                codexAvailable: true,
+                openCodeAvailable: false
+            ))
+        XCTAssertEqual(partial.filter(\.isAvailable).map(\.displayName), ["Luna"])
+        XCTAssertEqual(
+            partial.first(where: { $0.displayName == "Terra" })?.unavailableReason,
+            "Codex CLI does not advertise a supported Terra model."
+        )
+        XCTAssertEqual(
+            partial.first(where: { $0.displayName == "Opus" })?.unavailableReason,
+            "Claude Code not connected."
+        )
+
+        let none = candidateBuilder().modelFamilyAvailability(availability: .init(
+            claudeCodeAvailable: false,
+            codexAvailable: false,
+            openCodeAvailable: false
+        ))
+        XCTAssertEqual(none.count, 8)
+        XCTAssertTrue(none.allSatisfy { !$0.isAvailable })
+        XCTAssertEqual(Set(none.compactMap(\.unavailableReason)), ["Codex CLI not connected.", "Claude Code not connected."])
     }
 
     func testClaudeOpusAliasIsFallbackWhenPinned55IsUnavailable() throws {
@@ -756,33 +274,125 @@ final class AgentTaskRoutingCandidateBuilderPolicyTests: XCTestCase {
         XCTAssertNil(AgentModelCatalog.preferredCodexFamilyOption("nova", from: Array(options.prefix(3))))
     }
 
-    func testAutomaticModelCandidatesCoverAvailableBaseModelsWithoutTierDefaults() throws {
+    func testAutomaticModelCandidatesPreserveCuratedFamiliesAndExcludeNoncuratedCatalogTargets() throws {
         let availability = AgentModelCatalog.AvailabilityContext(
             claudeCodeAvailable: true,
             codexAvailable: true,
-            openCodeAvailable: false
+            openCodeAvailable: true
         )
-
-        let candidates = try candidateBuilder().build(
-            allowedProviders: [.claudeCode, .codexExec],
+        let builder = candidateBuilder(
+            codexOptions: Self.advertisedCodexOptions + [Self.modelOption("gpt-99-nova", "Unknown Codex")],
+            openCodeOptions: [Self.modelOption("gpt-6-sol", "OpenCode Sol")]
+        )
+        let snapshot = builder.capture(
+            allowedProviders: [.claudeCode, .codexExec, .openCode],
             availability: availability
         )
+        XCTAssertTrue(snapshot.models.contains { $0.provider == .openCode && $0.baseModelRaw == "gpt-6-sol" })
 
-        XCTAssertTrue(Set(candidates.map(\.utilityTier)).isSuperset(of: [
-            "gpt-6-luna", "gpt-5.6-terra", "gpt-6-sol"
-        ]))
-        XCTAssertEqual(Set(candidates.map(\.target.agentRaw)), [
-            AgentProviderKind.claudeCode.rawValue,
-            AgentProviderKind.codexExec.rawValue
+        let candidates = try builder.build(snapshot: snapshot)
+
+        XCTAssertEqual(candidates.map(\.target.modelRaw), [
+            "gpt-6-luna", "gpt-5.6-terra", "gpt-6-sol", "gpt-6-astra",
+            "claude-haiku-4-5", "claude-sonnet-5", "claude-opus-5-5", "claude-fable-5-1"
         ])
-        XCTAssertFalse(candidates.contains { $0.descriptor.roleLabels.contains("explore") })
-        XCTAssertGreaterThan(candidates.count, 4)
-        XCTAssertLessThanOrEqual(candidates.count, AgentTaskRoutingEnvelopeBuilder.maximumCandidates)
+        XCTAssertEqual(candidates.map(\.utilityTier), [
+            "gpt-6-luna", "gpt-5.6-terra", "gpt-6-sol", "gpt-6-astra",
+            "claude-haiku", "claude-sonnet", "claude-opus", "claude-fable"
+        ])
+        XCTAssertFalse(candidates.contains { $0.target.agentRaw == AgentProviderKind.openCode.rawValue })
+        XCTAssertTrue(candidates.first { $0.utilityTier == "gpt-6-luna" }?.descriptor.rubric.contains("Do not choose it merely because the prompt is short") == true)
+        XCTAssertTrue(candidates.first { $0.utilityTier == "gpt-5.6-terra" }?.descriptor.rubric.contains("no preference from its market tier") == true)
+        XCTAssertTrue(candidates.first { $0.target.modelRaw == "gpt-6-sol" }?.descriptor.rubric.contains("missed findings or retries") == true)
+        XCTAssertTrue(candidates.first { $0.utilityTier == "gpt-6-astra" }?.descriptor.rubric.contains("premium price") == true)
+    }
+
+    func testUnknownFamiliesDoNotEnableAutomaticRouter() {
+        let builder = candidateBuilder(
+            codexOptions: [Self.modelOption("gpt-99-nova", "Nova"), Self.modelOption("future-codex", "Future")],
+            claudeOptions: []
+        )
+        XCTAssertThrowsError(try builder.build(
+            allowedProviders: [.codexExec],
+            availability: .init(claudeCodeAvailable: false, codexAvailable: true, openCodeAvailable: false)
+        )) { error in
+            XCTAssertEqual(error as? AgentTaskRoutingCandidateBuilder.BuildError, .noAvailableTargets)
+        }
+    }
+
+    func testTipModelEvidenceSurvivesBundledProfileMigration() throws {
+        let builder = candidateBuilder(
+            codexOptions: [Self.modelOption("gpt-6.1-sol-high", "GPT-6.1 Sol High")],
+            claudeOptions: [Self.modelOption("claude-sonnet-5-5", "Claude Sonnet 5.5")]
+        )
+        let models = try builder.build(
+            allowedProviders: [.codexExec, .claudeCode],
+            availability: .init(claudeCodeAvailable: true, codexAvailable: true, openCodeAvailable: false)
+        )
+        XCTAssertEqual(Set(models.map(\.target.modelRaw)), ["gpt-6.1-sol", "claude-sonnet-5-5"])
+        XCTAssertTrue(models.allSatisfy { $0.descriptor.targetDescription.contains("$2 input / $10 output") })
+        XCTAssertTrue(models.allSatisfy { $0.profileIdentity != nil })
+    }
+
+    func testPaidFastExpansionOmitsAllFastChoicesWhenItWouldExceedSharedCapacity() throws {
+        let efforts = ["minimal", "low", "medium", "high", "xhigh", "max"]
+        let options = efforts.flatMap { effort in
+            [
+                Self.modelOption("gpt-6-sol-\(effort)", "Sol \(effort)"),
+                Self.modelOption("gpt-6-sol-fast-\(effort)", "Sol Fast \(effort)")
+            ]
+        }
+        let availability = AgentModelCatalog.AvailabilityContext(
+            claudeCodeAvailable: false, codexAvailable: true, openCodeAvailable: false
+        )
+        let builder = candidateBuilder(codexOptions: options)
+        let model = try XCTUnwrap(
+            builder.build(allowedProviders: [.codexExec], availability: availability)
+                .first { $0.target.modelRaw == "gpt-6-sol" }
+        )
+        let candidates = try builder.buildEfforts(for: model, availability: availability, allowPaidFast: true)
+        XCTAssertEqual(candidates.count, 7, "The base and every ordinary effort must remain available")
+        XCTAssertFalse(candidates.contains { AgentTaskRoutingCandidateBuilder.isPaidFast($0.target) })
+        XCTAssertEqual(Set(candidates.compactMap(\.target.reasoningEffortRaw)), Set(efforts))
+    }
+
+    func testPaidFastExpansionRespectsServiceCapacityWithoutTruncatingOrdinaryChoices() throws {
+        let efforts = ["low", "medium", "high"]
+        let options = efforts.flatMap { effort in
+            [
+                Self.modelOption("gpt-6-sol-\(effort)", "Sol \(effort)"),
+                Self.modelOption("gpt-6-sol-fast-\(effort)", "Sol Fast \(effort)")
+            ]
+        }
+        let availability = AgentModelCatalog.AvailabilityContext(
+            claudeCodeAvailable: false, codexAvailable: true, openCodeAvailable: false
+        )
+        let builder = candidateBuilder(codexOptions: options)
+        let model = try XCTUnwrap(
+            builder.build(allowedProviders: [.codexExec], availability: availability)
+                .first { $0.target.modelRaw == "gpt-6-sol" }
+        )
+        let exactFit = try builder.buildEfforts(
+            for: model, availability: availability, allowPaidFast: true, maximumChoices: 8
+        )
+        XCTAssertEqual(exactFit.count, 8)
+        XCTAssertEqual(exactFit.count(where: { AgentTaskRoutingCandidateBuilder.isPaidFast($0.target) }), 4)
+        let limited = try builder.buildEfforts(
+            for: model, availability: availability, allowPaidFast: true, maximumChoices: 7
+        )
+        XCTAssertEqual(limited.count, 4)
+        XCTAssertFalse(limited.contains { AgentTaskRoutingCandidateBuilder.isPaidFast($0.target) })
+        XCTAssertEqual(Set(limited.compactMap(\.target.reasoningEffortRaw)), Set(efforts))
+        XCTAssertThrowsError(try builder.buildEfforts(
+            for: model, availability: availability, allowPaidFast: true, maximumChoices: 3
+        )) { error in
+            XCTAssertEqual(error as? AgentTaskRoutingCandidateBuilder.BuildError, .insufficientCapacity)
+        }
     }
 
     func testPaidFastNeverEntersAutomaticEffortsWithoutExplicitOptIn() throws {
         let options = ["gpt-6.1-sol-high", "gpt-6.1-sol-fast", "gpt-6.1-sol-fast-high"].map {
-            AgentModelOption(rawValue: $0, displayName: $0, description: nil, isDefault: false)
+            Self.modelOption($0, $0)
         }
         let availability = AgentModelCatalog.AvailabilityContext(claudeCodeAvailable: false, codexAvailable: true, openCodeAvailable: false)
         let builder = candidateBuilder(codexOptions: options)
@@ -807,6 +417,10 @@ final class AgentTaskRoutingCandidateBuilderPolicyTests: XCTestCase {
         XCTAssertEqual(input.selected.target.modelRaw, "gpt-6-sol-high")
         let peer = try XCTUnwrap(input.candidates.first { $0.target.agentRaw == AgentProviderKind.claudeCode.rawValue })
         XCTAssertEqual(peer.usagePeerClass, input.selected.usagePeerClass)
+        let captured = builder.capture(allowedProviders: [.claudeCode, .codexExec], availability: availability, surface: .headless)
+        XCTAssertEqual(peer.snapshotScope, captured.scope)
+        XCTAssertTrue(captured.contains(peer.target))
+        XCTAssertNotNil(peer.profileIdentity)
         XCTAssertEqual(ClaudeModelSpecifier(raw: peer.target.modelRaw).effortLevel?.rawValue, "high")
         XCTAssertFalse(AgentTaskRoutingCandidateBuilder.isPaidFast(peer.target))
         let reverse = try XCTUnwrap(builder.usageCandidates(basedOn: peer.target, allowedProviders: [.claudeCode, .codexExec], availability: availability, surface: .headless))
@@ -882,14 +496,14 @@ final class AgentTaskRoutingCandidateBuilderPolicyTests: XCTestCase {
     }
 
     func testUnknownModelEvidenceMakesCapabilityAndCostUncertaintyExplicit() {
-        let target = AgentRoutingExecutableTarget(
-            agentRaw: AgentProviderKind.openCode.rawValue,
-            modelRaw: "future-model",
-            reasoningEffortRaw: nil,
-            modelParameters: []
+        let metadata = RoutingExecutionModelMetadata(
+            provider: .openCode, baseModelRaw: "future-model", displayName: "future-model",
+            isProviderDefault: false, catalogOrder: 0, advertisedOptionRawValues: ["future-model"],
+            defaultEffortID: nil, efforts: []
         )
-
-        let description = AgentTaskRoutingModelProfileCatalog.description(for: target)
+        let resolver = RoutingModelProfileResolver.bundled
+        let description = resolver.resolve(metadata, catalogRevision: "unknown-model-test")
+            .description(snapshotDate: resolver.snapshotDate)
 
         XCTAssertTrue(description.contains("No audited benchmark or pricing profile"))
         XCTAssertTrue(description.contains("Treat capability and cost as uncertain"))
@@ -910,24 +524,37 @@ final class AgentTaskRoutingCandidateBuilderPolicyTests: XCTestCase {
         XCTAssertTrue(candidates.allSatisfy { $0.target.agentRaw == AgentProviderKind.claudeCode.rawValue })
     }
 
-    func testAvailableProviderPreferenceNarrowsFrontier() {
-        XCTAssertEqual(
-            AgentTaskRoutingCandidateBuilder.providers(
-                preferring: .claudeCode,
-                from: [.claudeCode, .codexExec]
-            ),
-            [.claudeCode]
+    func testAdvertisedModelsOutsideCuratedDefinitionsAreNotRouterCandidates() {
+        let excludedProviders: [AgentProviderKind] = [.openCode, .grokBuild, .devin]
+        let availability = AgentModelCatalog.AvailabilityContext(
+            claudeCodeAvailable: false, codexAvailable: false, openCodeAvailable: true,
+            cursorAvailable: true, grokBuildAvailable: true, devinAvailable: true
         )
-    }
+        let options: @MainActor (AgentProviderKind, AgentModelCatalog.AvailabilityContext) -> [AgentModelOption] = { provider, _ in
+            excludedProviders.contains(provider)
+                ? [Self.modelOption("advertised-\(provider.rawValue)", provider.displayName)]
+                : []
+        }
+        let builder = AgentTaskRoutingCandidateBuilder(modelOptions: options)
 
-    func testUnavailableProviderPreferenceFallsBackToAuthenticatedProviders() {
-        XCTAssertEqual(
-            AgentTaskRoutingCandidateBuilder.providers(
-                preferring: .claudeCode,
-                from: [.codexExec]
-            ),
-            [.codexExec]
-        )
+        XCTAssertTrue(AgentTaskRoutingCandidateBuilder.availableProviders(
+            availability: availability,
+            modelOptions: options
+        ).isEmpty)
+        XCTAssertThrowsError(try builder.build(
+            allowedProviders: Set(excludedProviders),
+            availability: availability
+        )) { error in
+            XCTAssertEqual(error as? AgentTaskRoutingCandidateBuilder.BuildError, .noAvailableTargets)
+        }
+
+        // Cursor is curated, but only its named families are candidates: an unlisted model is not.
+        let cursorBuilder = AgentTaskRoutingCandidateBuilder(cursorThinking: { _ in nil }, modelOptions: { provider, _ in
+            provider == .cursor ? [Self.modelOption("advertised-cursor", "Cursor")] : []
+        })
+        XCTAssertThrowsError(try cursorBuilder.build(allowedProviders: [.cursor], availability: availability)) { error in
+            XCTAssertEqual(error as? AgentTaskRoutingCandidateBuilder.BuildError, .noAvailableTargets)
+        }
     }
 
     func testUnavailableProviderPolicyFailsClosed() {
@@ -962,7 +589,16 @@ final class AgentTaskRoutingCandidateBuilderAvailabilityTests: XCTestCase {
     }
 
     private static func option(_ raw: String) -> AgentModelOption {
-        AgentModelOption(rawValue: raw, displayName: raw, description: nil, isDefault: false)
+        let specifier = raw.hasPrefix("gpt-") ? CodexModelSpecifier(raw: raw, discoveredRecords: []) : nil
+        return AgentModelOption(
+            rawValue: raw,
+            displayName: raw,
+            description: nil,
+            isDefault: false,
+            effortVariant: specifier?.reasoningEffort.flatMap { effort in
+                specifier?.baseModel.map { AgentModelEffortVariant(baseModelRaw: $0, reasoningEffort: effort) }
+            }
+        )
     }
 
     private static let fullCodex = [
@@ -1127,37 +763,1425 @@ final class AgentTaskRoutingCandidateBuilderAvailabilityTests: XCTestCase {
     }
 }
 
-final class AgentTaskRoutingModelProfileCatalogTests: XCTestCase {
-    private static let preamble = "Evidence snapshot 2026-10-10 (provider-published; API list price is a comparison proxy and CLI or subscription billing may differ): "
-    private static let profiles = [
-        "gemini-3.8-flash": "Gemini 3.8 Flash (published 2026-09-02) is Google's workhorse tier for long-horizon agentic workflows; Google reports 73.7% on DeepSWE v1.1, with a 1,048,576-token context window and 65,536-token maximum output. API list price: $0.75 input / $3.75 output per 1M tokens through December 31, 2026 ($1.50/$7.50 starting January 1, 2027), cached input $0.075 through December 31, 2026 ($0.15 from 2027-01-01).",
-        "gemini-3.1-pro": "Gemini 3.1 Pro (published 2026-02-19) is Google's flagship multimodal reasoning tier for complex coding tasks; Google reports 80.6% on SWE-Bench Verified (single attempt, Thinking (High)), with a 1,048,576-token context window and 65,536-token maximum output. API list price: $2.00 input / $12.00 output per 1M tokens (prompts <= 200k; $4.00 / $18.00 above), cached input $0.20 for prompts <= 200k ($0.40 above).",
-        "grok-4.7": "Grok 4.7 (released 2026-09-21) is xAI's flagship model for agentic coding and knowledge work, featuring 46.3% on CursorBench 4.0 at xHigh effort and a 500,000-token context window. API list price: $2.00 input / $0.50 cached / $6.00 output per 1M tokens for prompts < 200k; $4.00 / $1.00 / $12.00 at >= 200k.",
-        "composer-2.5": "Composer 2.5 (released 2026-05-18) is Cursor's proprietary agentic coding model optimized for edit-test-edit loops; Cursor reports 69.3% on Terminal-Bench 2.0 and 79.8% on SWE-Bench Multilingual (image, changelog benchmark table), with a 200K-token context window. API list price: Standard $0.50 input / $2.50 output per 1M tokens, Fast $3.00 / $15.00; cache read $0.2 Standard / $0.5 Fast."
-    ]
-
-    private func target(_ agent: String, _ model: String) -> AgentRoutingExecutableTarget {
-        AgentRoutingExecutableTarget(agentRaw: agent, modelRaw: model, reasoningEffortRaw: nil, modelParameters: [])
-    }
-
-    func testNewFamiliesHaveAuditedProfiles() throws {
-        let fixtures = [
-            ("antigravity", "gemini-3.8-flash-high", "gemini-3.8-flash"),
-            ("antigravity", "gemini-3.1-pro-high", "gemini-3.1-pro"),
-            ("grok", "grok-4.7", "grok-4.7"),
-            ("cursor", "grok-4.7", "grok-4.7"),
-            ("cursor", "composer-2.5", "composer-2.5")
+@MainActor
+final class AgentTaskRouterRuntimeTests: XCTestCase {
+    func testDemandMatrixWithoutSettingsWindowAndNoSelectionInvalidation() async throws {
+        let rows: [(Bool, String?, Bool, Set<DecisionServiceID>)] = [
+            (false, "openai-decisions", false, []),
+            (false, "unknown", true, [.jev]),
+            (true, "jev", false, [.jev]),
+            (true, "jev", true, [.jev]),
+            (true, "openai-decisions", false, [.openAIDecisions]),
+            (true, "openai-decisions", true, [.jev, .openAIDecisions]),
+            (true, nil, false, []), (true, "unknown", false, []),
+            (true, "  ", false, []), (true, "unknown", true, [.jev])
         ]
-        for (agent, model, family) in fixtures {
-            let expected = try XCTUnwrap(Self.profiles[family])
-            let actual = AgentTaskRoutingModelProfileCatalog.modelDescription(for: target(agent, model))
-            XCTAssertEqual(actual, Self.preamble + expected, "\(agent):\(model)")
-            XCTAssertTrue(actual.contains("API list price:"), "\(agent):\(model)")
-            XCTAssertFalse(actual.contains("No audited benchmark"), "\(agent):\(model)")
+        for (enabled, raw, auto, expected) in rows {
+            let source = RuntimeTestDemandSource(.init(routerEnabled: enabled, selectedBackendRawValue: raw, autoEffortEnabled: auto, routerRevision: 0))
+            let jev = RuntimeTestController()
+            let decisions = RuntimeTestController()
+            let runtime = try makeRuntime(source, jev, decisions)
+            await jev.waitUntilObserved()
+            await decisions.waitUntilObserved()
+            await runtime.reconcileDemand()
+            let jevCalls = await jev.calls
+            let decisionsCalls = await decisions.calls
+            XCTAssertEqual(jevCalls, expected.contains(.jev) ? 1 : 0, "\(enabled)/\(String(describing: raw))/\(auto)")
+            XCTAssertEqual(decisionsCalls, expected.contains(.openAIDecisions) ? 1 : 0)
+            let invalidations = await jev.invalidations + decisions.invalidations
+            XCTAssertEqual(invalidations, 0)
+            await runtime.teardown()
+            await jev.waitUntilTerminated()
+            await decisions.waitUntilTerminated()
         }
     }
 
-    func testAntigravityIdentityDropsEffortSuffix() throws {
+    func testIndependentAutoEffortServiceDemandCoversAllFourCombinationsAndUnknownIDs() async throws {
+        let rows: [(String, String, Set<DecisionServiceID>)] = [
+            ("jev", "jev", [.jev]),
+            ("openai-decisions", "jev", [.jev, .openAIDecisions]),
+            ("jev", "openai-decisions", [.jev, .openAIDecisions]),
+            ("openai-decisions", "openai-decisions", [.openAIDecisions]),
+            ("jev", "future-service", [.jev, .init(rawValue: "future-service")]),
+            ("", "  ", [])
+        ]
+        for (router, auto, expected) in rows {
+            let snapshot = AgentTaskRouterDemandSnapshot(
+                routerEnabled: true, selectedBackendRawValue: router,
+                autoEffortEnabled: true, routerRevision: 0,
+                autoEffortBackendRawValue: auto, autoEffortRevision: 0
+            )
+            XCTAssertEqual(snapshot.requiredBackendIDs, expected)
+            let source = RuntimeTestDemandSource(snapshot)
+            let jev = RuntimeTestController()
+            let decisions = RuntimeTestController()
+            let runtime = try makeRuntime(source, jev, decisions)
+            await jev.waitUntilObserved()
+            await decisions.waitUntilObserved()
+            await runtime.reconcileDemand()
+            let counts = await (jev.calls, decisions.calls)
+            XCTAssertEqual(counts.0, expected.contains(.jev) ? 1 : 0)
+            XCTAssertEqual(counts.1, expected.contains(.openAIDecisions) ? 1 : 0)
+            await runtime.teardown()
+        }
+    }
+
+    func testRapidTransitionsAndGuidanceRevisionDoNotRebillFailedGeneration() async throws {
+        let source = RuntimeTestDemandSource(.init(routerEnabled: true, selectedBackendRawValue: "openai-decisions", autoEffortEnabled: true, routerRevision: 0))
+        let jev = RuntimeTestController()
+        let decisions = RuntimeTestController()
+        let runtime = try makeRuntime(source, jev, decisions)
+        await jev.waitUntilObserved()
+        await decisions.waitUntilObserved()
+        await runtime.reconcileDemand()
+        source.set(.init(routerEnabled: true, selectedBackendRawValue: "jev", autoEffortEnabled: true, routerRevision: 1))
+        source.set(.init(routerEnabled: true, selectedBackendRawValue: "openai-decisions", autoEffortEnabled: true, routerRevision: 2))
+        source.set(.init(routerEnabled: true, selectedBackendRawValue: "openai-decisions", autoEffortEnabled: true, routerRevision: 3))
+        await runtime.reconcileDemand()
+        let counts = await (jev.calls, decisions.calls)
+        XCTAssertEqual(counts.0, 1)
+        XCTAssertEqual(counts.1, 1)
+        let invalidations = await (jev.invalidations, decisions.invalidations)
+        XCTAssertEqual(invalidations.0, 0)
+        XCTAssertEqual(invalidations.1, 0)
+        await runtime.teardown()
+    }
+
+    func testValidatingControllerIsNotBootstrappedAndCachesStayPerID() async throws {
+        let source = RuntimeTestDemandSource(.init(routerEnabled: true, selectedBackendRawValue: "openai-decisions", autoEffortEnabled: true, routerRevision: 0))
+        let jev = RuntimeTestController()
+        let decisions = RuntimeTestController(state: .validating(generation: 7))
+        let runtime = try makeRuntime(source, jev, decisions)
+        await jev.waitUntilObserved()
+        await decisions.waitUntilObserved()
+        await runtime.reconcileDemand()
+        let calls = await decisions.calls
+        XCTAssertEqual(calls, 0)
+        await decisions.set(.ready(generation: 8, policyVersion: "decisions-test"))
+        await runtime.reconcileDemand()
+        let ready = await decisions.readinessSnapshot()
+        XCTAssertEqual(ready, .ready(generation: 8, policyVersion: "decisions-test"))
+        XCTAssertFalse(runtime.isBackendReady(.jev))
+        await runtime.teardown()
+    }
+
+    func testRapidABARechecksLatestDemandImmediatelyBeforeAdmission() async throws {
+        let source = RuntimeTestDemandSource(.init(routerEnabled: true, selectedBackendRawValue: "openai-decisions", autoEffortEnabled: false, routerRevision: 0))
+        let jev = RuntimeTestController(gateAdmission: true)
+        let decisions = RuntimeTestController(gateAdmission: true)
+        let runtime = try makeRuntime(source, jev, decisions)
+        await decisions.waitUntilAdmission()
+        source.set(.init(routerEnabled: true, selectedBackendRawValue: "jev", autoEffortEnabled: false, routerRevision: 1))
+        await runtime.reconcileDemand(waitForBootstrap: false)
+        await jev.waitUntilAdmission()
+        source.set(.init(routerEnabled: true, selectedBackendRawValue: "openai-decisions", autoEffortEnabled: false, routerRevision: 2))
+        await runtime.reconcileDemand(waitForBootstrap: false)
+        await jev.releaseAdmission()
+        await decisions.releaseAdmission()
+        await runtime.reconcileDemand()
+        let counts = await (jev.calls, decisions.calls)
+        XCTAssertEqual(counts.0, 0)
+        XCTAssertEqual(counts.1, 1)
+        await runtime.teardown()
+    }
+
+    func testExplicitValidationStreamWinsOverPendingBootstrapSnapshot() async throws {
+        let source = RuntimeTestDemandSource(.init(routerEnabled: true, selectedBackendRawValue: "openai-decisions", autoEffortEnabled: false, routerRevision: 0))
+        let jev = RuntimeTestController()
+        let decisions = RuntimeTestController(gateAdmission: true)
+        let runtime = try makeRuntime(source, jev, decisions)
+        await decisions.waitUntilAdmission()
+        await decisions.set(.validating(generation: 0))
+        try await waitForReadiness(.validating(generation: 0), id: .openAIDecisions, runtime: runtime)
+        await decisions.releaseAdmission()
+        await runtime.reconcileDemand()
+        let calls = await decisions.calls
+        XCTAssertEqual(calls, 0)
+        await runtime.teardown()
+    }
+
+    func testOlderReadinessGenerationCannotReplaceCurrentProjection() async throws {
+        let source = RuntimeTestDemandSource(.init(routerEnabled: false, selectedBackendRawValue: "openai-decisions", autoEffortEnabled: false, routerRevision: 0))
+        let jev = RuntimeTestController()
+        let decisions = RuntimeTestController(state: .ready(generation: 5, policyVersion: "test"))
+        let runtime = try makeRuntime(source, jev, decisions)
+        await runtime.reconcileDemand()
+        await decisions.set(.ready(generation: 6, policyVersion: "test"))
+        try await waitForReadiness(.ready(generation: 6, policyVersion: "test"), id: .openAIDecisions, runtime: runtime)
+        await decisions.set(.needsConfiguration(generation: 5, reason: "stale"))
+        try await Task.sleep(for: .milliseconds(30))
+        XCTAssertEqual(runtime.backendReadiness(.openAIDecisions), .ready(generation: 6, policyVersion: "test"))
+        await runtime.teardown()
+    }
+
+    func testTeardownDoesNotAwaitCancellationIgnoringBootstrapRead() async throws {
+        let source = RuntimeTestDemandSource(.init(routerEnabled: true, selectedBackendRawValue: "openai-decisions", autoEffortEnabled: false, routerRevision: 0))
+        let jev = RuntimeTestController()
+        let decisions = RuntimeTestController(gateAdmission: true)
+        let runtime = try makeRuntime(source, jev, decisions)
+        await decisions.waitUntilAdmission()
+        let finished = expectation(description: "Runtime teardown finishes before bootstrap read resumes")
+        let teardown = Task {
+            await runtime.teardown()
+            finished.fulfill()
+        }
+        await fulfillment(of: [finished], timeout: 1)
+        await decisions.releaseAdmission()
+        await teardown.value
+    }
+
+    func testRevisionCancelsRoutesWithoutInvalidatingCredentialsOrRebootstrapping() async throws {
+        let source = RuntimeTestDemandSource(.init(routerEnabled: true, selectedBackendRawValue: "openai-decisions", autoEffortEnabled: false, routerRevision: 0))
+        let controller = RuntimeTestController(state: .ready(generation: 4, policyVersion: "test"))
+        let backend = RuntimeSuspendedBackend()
+        let runtime = try AgentTaskRouterRuntime(registrations: [
+            .init(
+                service: backend,
+                configuration: .init(presentation: testPresentation("test"), controller: controller)
+            )
+        ], demandSource: source)
+        await runtime.reconcileDemand()
+        let request = FiniteChoiceDecisionRequest(
+            requestID: UUID(), consumerID: .modelRouter,
+            contractVersion: FiniteChoiceDecisionRequest.currentContractVersion,
+            policy: ModelRouterDecisionPolicy.identity, textContext: "TASK:\ntask",
+            question: .init(name: "model_route", instructions: "Choose one.", choices: ["a", "b"].map {
+                .init(opaqueKey: $0, description: "test")
+            })
+        )
+        let route = Task { await runtime.coordinator.decide(serviceID: .openAIDecisions, request: request, consumerRevision: 0) }
+        await backend.waitUntilStarted()
+        source.set(.init(routerEnabled: true, selectedBackendRawValue: "openai-decisions", autoEffortEnabled: false, routerRevision: 1))
+        await runtime.reconcileDemand()
+        let outcome = await route.value
+        XCTAssertEqual(outcome, .cancelled)
+        await backend.complete()
+        let counts = await (controller.calls, controller.invalidations)
+        XCTAssertEqual(counts.0, 0)
+        XCTAssertEqual(counts.1, 0)
+        await runtime.teardown()
+    }
+
+    func testAutoEffortRevisionCancelsOnlyAutoEffortWithoutBackendFallback() async throws {
+        let source = RuntimeTestDemandSource(.init(
+            routerEnabled: true, selectedBackendRawValue: "openai-decisions",
+            autoEffortEnabled: true, routerRevision: 0,
+            autoEffortBackendRawValue: "openai-decisions", autoEffortRevision: 0
+        ))
+        let controller = RuntimeTestController(state: .ready(generation: 4, policyVersion: "test"))
+        let backend = RuntimeSuspendedBackend()
+        let runtime = try AgentTaskRouterRuntime(registrations: [
+            .init(service: backend, configuration: .init(presentation: testPresentation("test"), controller: controller))
+        ], demandSource: source)
+        await runtime.reconcileDemand()
+        func request(_ consumer: DecisionConsumerID) -> FiniteChoiceDecisionRequest {
+            .init(
+                requestID: UUID(), consumerID: consumer,
+                contractVersion: FiniteChoiceDecisionRequest.currentContractVersion,
+                policy: .init(id: "test", version: "1"), textContext: "masked turn",
+                question: .init(name: "effort", instructions: "Choose one.", choices: ["a", "b"].map {
+                    .init(opaqueKey: $0, description: "test")
+                })
+            )
+        }
+        let autoRequest = request(.autoEffort)
+        let task = Task { await runtime.coordinator.decide(serviceID: .openAIDecisions, request: autoRequest, consumerRevision: 0) }
+        await backend.waitUntilStarted()
+        source.set(.init(
+            routerEnabled: true, selectedBackendRawValue: "openai-decisions",
+            autoEffortEnabled: true, routerRevision: 1,
+            autoEffortBackendRawValue: "openai-decisions", autoEffortRevision: 0
+        ))
+        await runtime.reconcileDemand()
+        await backend.complete()
+        let selectedOutcome = await task.value
+        XCTAssertEqual(selectedOutcome, .selected(opaqueKey: "a", evidence: nil))
+
+        let nextRequest = request(.autoEffort)
+        let next = Task { await runtime.coordinator.decide(serviceID: .openAIDecisions, request: nextRequest, consumerRevision: 0) }
+        await backend.waitUntilStarted()
+        source.set(.init(
+            routerEnabled: true, selectedBackendRawValue: "openai-decisions",
+            autoEffortEnabled: true, routerRevision: 1,
+            autoEffortBackendRawValue: "jev", autoEffortRevision: 1
+        ))
+        await runtime.reconcileDemand()
+        let outcome = await next.value
+        XCTAssertEqual(outcome, .cancelled)
+        await backend.complete()
+        await runtime.teardown()
+    }
+
+    func testExplicitInvalidationDoesNotImmediatelyBootstrapSameDemand() async throws {
+        let source = RuntimeTestDemandSource(.init(routerEnabled: true, selectedBackendRawValue: "openai-decisions", autoEffortEnabled: false, routerRevision: 0))
+        let jev = RuntimeTestController()
+        let decisions = RuntimeTestController()
+        let runtime = try makeRuntime(source, jev, decisions)
+        await runtime.reconcileDemand()
+        await decisions.set(.needsConfiguration(generation: 1, reason: "removed"))
+        source.set(.init(routerEnabled: true, selectedBackendRawValue: "openai-decisions", autoEffortEnabled: false, routerRevision: 1))
+        await runtime.reconcileDemand()
+        let calls = await decisions.calls
+        XCTAssertEqual(calls, 1)
+        await runtime.teardown()
+    }
+
+    func testProductionDefaultIsNilOnlyBeforeFirstSnapshotAndRegistersBoth() async throws {
+        for raw in [nil, "", "  ", "openai-decisions", "future"] as [String?] {
+            let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+            try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: root) }
+            let file = GlobalSettingsFileStore(fileURL: root.appendingPathComponent("settings.json"))
+            try file.save(GlobalSettingsDocument(scalarPreferences: .init(modelRouter: .init(enabled: false, selectedBackendRawValue: raw))))
+            let suite = "RuntimeDefault.\(UUID())"
+            let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+            defer { defaults.removePersistentDomain(forName: suite) }
+            let store = GlobalSettingsStore(defaults: defaults, fileStore: file)
+            let runtime = AgentTaskRouterRuntime(secureKeys: SecureKeysService(secureStorage: TestSecureStorageBackend()), settingsStore: store)
+            XCTAssertEqual(store.routerDemandSnapshot().selectedBackendRawValue, raw ?? "jev")
+            XCTAssertEqual(runtime.defaultBackendID, .jev)
+            let ids = await runtime.registry.registrations().map(\.id)
+            XCTAssertEqual(Set(ids), [.jev, .openAIDecisions])
+            await runtime.teardown()
+        }
+    }
+
+    func testEnabledLegacyProductionIntentBootstrapsJevWithoutSettingsVM() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let file = GlobalSettingsFileStore(fileURL: root.appendingPathComponent("settings.json"))
+        try file.save(GlobalSettingsDocument(scalarPreferences: .init(modelRouter: .init(enabled: true, selectedBackendRawValue: nil))))
+        let suite = "LegacyDemand.\(UUID())"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let store = GlobalSettingsStore(defaults: defaults, fileStore: file)
+        let keys = SecureKeysService(secureStorage: TestSecureStorageBackend())
+        try keys.saveAPIKey("synthetic-test-key", for: .jevRouterAPIKey)
+        let client = RuntimeJevClient()
+        let runtime = AgentTaskRouterRuntime(secureKeys: keys, jevClient: client, settingsStore: store)
+        await runtime.reconcileDemand()
+        // Bootstrap completion and the readiness stream's UI projection are separate
+        // owners. Await the existing bounded observation barrier, not scheduler order.
+        try await waitForReadiness(
+            .ready(generation: 1, policyVersion: JevRouterCredentialService.routingPolicyVersion),
+            id: .jev, runtime: runtime
+        )
+        let calls = await client.calls
+        XCTAssertEqual(calls, 1)
+        XCTAssertTrue(runtime.isBackendReady(.jev))
+        XCTAssertFalse(runtime.isBackendReady(.openAIDecisions))
+        XCTAssertEqual(store.routerDemandSnapshot().selectedBackendRawValue, "jev")
+        await runtime.teardown()
+    }
+
+    func testSettingsPublishesPostMutationSnapshotsAndRevisionOnlyChanges() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let suite = "RuntimeDemand.\(UUID())"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let store = GlobalSettingsStore(defaults: defaults, fileStore: GlobalSettingsFileStore(fileURL: root.appendingPathComponent("settings.json")))
+        var iterator = store.routerDemandUpdates().makeAsyncIterator()
+        let initial = await iterator.next()
+        XCTAssertNil(initial?.selectedBackendRawValue)
+        store.setModelRouterBackend(.openAIDecisions, commit: false)
+        let selected = await iterator.next()
+        XCTAssertEqual(selected, store.routerDemandSnapshot())
+        store.setModelRouterEnabled(true, commit: false)
+        let enabled = await iterator.next()
+        XCTAssertEqual(enabled?.routerEnabled, true)
+        store.setAutoEffortEnabled(true, commit: false)
+        let auto = await iterator.next()
+        XCTAssertEqual(auto?.autoEffortEnabled, true)
+        store.setModelRouterCustomInstructions("Prefer reliable choices", commit: false)
+        let guidance = await iterator.next()
+        XCTAssertEqual(guidance?.key, auto?.key)
+        XCTAssertGreaterThan(try XCTUnwrap(guidance?.routerRevision), try XCTUnwrap(auto?.routerRevision))
+    }
+
+    func testReloadImportAndRecoveryPublishInstalledDemand() async throws {
+        for operation in ["reload", "import", "recover"] {
+            let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+            try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: root) }
+            let url = root.appendingPathComponent("settings.json")
+            var document = GlobalSettingsDocument(scalarPreferences: .init(modelRouter: .init(enabled: true, selectedBackendRawValue: "openai-decisions")))
+            let encoder = JSONEncoder()
+            encoder.dateEncodingStrategy = .iso8601
+            document.schemaVersion = document.requiredSchemaVersion
+            if operation == "import" { document.schemaLineage = "foreign.fixture" }
+            if operation == "recover" { try Data("invalid json".utf8).write(to: url) }
+            else { try encoder.encode(document).write(to: url) }
+            let suite = "DemandInstall.\(UUID())"
+            let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+            defer { defaults.removePersistentDomain(forName: suite) }
+            let store = GlobalSettingsStore(defaults: defaults, fileStore: GlobalSettingsFileStore(fileURL: url))
+            var iterator = store.routerDemandUpdates().makeAsyncIterator()
+            let initial = await iterator.next()
+            if operation == "reload" {
+                document.scalarPreferences?.modelRouter?.selectedBackendRawValue = "jev"
+                try encoder.encode(document).write(to: url)
+                guard store.reloadFromDisk() else { return XCTFail("Reload failed") }
+            } else if operation == "import" {
+                guard store.importBlockedPersistenceAfterBackup() else { return XCTFail("Import failed") }
+            } else {
+                guard store.recoverBlockedPersistenceAfterBackup() else { return XCTFail("Recovery failed") }
+            }
+            let installed = await iterator.next()
+            XCTAssertEqual(installed, store.routerDemandSnapshot())
+            if operation == "reload" || operation == "import" {
+                XCTAssertTrue(try XCTUnwrap(installed?.routerEnabled))
+                XCTAssertEqual(installed?.selectedBackendRawValue, operation == "reload" ? "jev" : "openai-decisions")
+                XCTAssertGreaterThan(try XCTUnwrap(installed?.routerRevision), try XCTUnwrap(initial?.routerRevision))
+            }
+        }
+    }
+
+    private func waitForReadiness(
+        _ expected: DecisionReadiness,
+        id: DecisionServiceID,
+        runtime: AgentTaskRouterRuntime
+    ) async throws {
+        for _ in 0 ..< 100 {
+            if runtime.backendReadiness(id) == expected { return }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        XCTFail("Timed out waiting for backend readiness \(expected)")
+    }
+
+    private func makeRuntime(_ source: RuntimeTestDemandSource, _ jev: RuntimeTestController, _ decisions: RuntimeTestController) throws -> AgentTaskRouterRuntime {
+        try AgentTaskRouterRuntime(registrations: [
+            registration(.jev, jev), registration(.openAIDecisions, decisions)
+        ], demandSource: source)
+    }
+
+    private func registration(_ id: DecisionServiceID, _ controller: RuntimeTestController) -> DecisionServiceRegistration {
+        .init(
+            service: RuntimeTestBackend(id: id, controller: controller),
+            configuration: .init(presentation: testPresentation(id.rawValue), controller: controller)
+        )
+    }
+
+    private func testPresentation(_ title: String) -> DecisionServiceSettingsPresentation {
+        .init(
+            title: title,
+            summary: "test",
+            notices: [],
+            disclosures: [],
+            productStatus: nil,
+            capabilities: [],
+            secretFieldLabel: nil,
+            supportedCredentialActions: [],
+            links: []
+        )
+    }
+}
+
+@MainActor
+final class RuntimeTestDemandSource: AgentTaskRouterDemandSource {
+    private var snapshot: AgentTaskRouterDemandSnapshot
+    private var continuation: AsyncStream<AgentTaskRouterDemandSnapshot>.Continuation?
+    init(_ snapshot: AgentTaskRouterDemandSnapshot) {
+        self.snapshot = snapshot
+    }
+
+    func routerDemandSnapshot() -> AgentTaskRouterDemandSnapshot {
+        snapshot
+    }
+
+    func routerDemandUpdates() -> AsyncStream<AgentTaskRouterDemandSnapshot> {
+        AsyncStream { continuation = $0
+            $0.yield(snapshot)
+        }
+    }
+
+    func set(_ snapshot: AgentTaskRouterDemandSnapshot) {
+        self.snapshot = snapshot
+        continuation?.yield(snapshot)
+    }
+}
+
+private actor RuntimeJevClient: JevRoutingClientProtocol {
+    private(set) var calls = 0
+    func listModels(apiKey: String, timeout: Duration) -> JevModelList {
+        calls += 1
+        return .init(models: [.init(name: "jev-latest")])
+    }
+
+    func judge(request: JevRoutingWireRequest, apiKey: String, timeout: Duration) throws -> JevRoutingWireResponse {
+        throw JevRoutingClientError.invalidRequest
+    }
+}
+
+private actor RuntimeSuspendedBackend: DecisionService {
+    nonisolated let id = DecisionServiceID.openAIDecisions
+    nonisolated let displayName = "test"
+    nonisolated let capabilities = DecisionServiceCapabilities.runtimeTest
+    private var completion: CheckedContinuation<DecisionOutcome, Never>?
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+    func readinessSnapshot() -> DecisionReadiness {
+        .ready(generation: 4, policyVersion: "test")
+    }
+
+    func decide(_ request: FiniteChoiceDecisionRequest) async -> DecisionOutcome {
+        waiters.forEach { $0.resume() }
+        waiters.removeAll()
+        return await withCheckedContinuation { completion = $0 }
+    }
+
+    func waitUntilStarted() async {
+        if completion == nil { await withCheckedContinuation { waiters.append($0) } }
+    }
+
+    func complete() {
+        completion?.resume(returning: .selected(opaqueKey: "a", evidence: nil))
+        completion = nil
+    }
+}
+
+private struct RuntimeTestBackend: DecisionService {
+    let id: DecisionServiceID
+    let controller: RuntimeTestController
+    let capabilities = DecisionServiceCapabilities.runtimeTest
+    var displayName: String {
+        id.rawValue
+    }
+
+    func readinessSnapshot() async -> DecisionReadiness {
+        await controller.readinessSnapshot()
+    }
+
+    func decide(_ request: FiniteChoiceDecisionRequest) async -> DecisionOutcome {
+        .cancelled
+    }
+}
+
+private actor RuntimeTestController: DecisionServiceConfigurationController {
+    private var state: DecisionReadiness
+    private(set) var calls = 0
+    private(set) var invalidations = 0
+    private var observed = false
+    private var terminated = false
+    private var observationWaiters: [CheckedContinuation<Void, Never>] = []
+    private var terminationWaiters: [CheckedContinuation<Void, Never>] = []
+    private var continuation: AsyncStream<DecisionReadiness>.Continuation?
+    private var snapshotCalls = 0
+    private var gateAdmission: Bool
+    private var admissionWaiters: [CheckedContinuation<Void, Never>] = []
+    private var releases: [CheckedContinuation<Void, Never>] = []
+    init(state: DecisionReadiness = .needsConfiguration(generation: 0, reason: "test"), gateAdmission: Bool = false) {
+        self.state = state
+        self.gateAdmission = gateAdmission
+    }
+
+    func readinessSnapshot() async -> DecisionReadiness {
+        snapshotCalls += 1
+        if gateAdmission, snapshotCalls > 1 {
+            admissionWaiters.forEach { $0.resume() }
+            admissionWaiters.removeAll()
+            await withCheckedContinuation { releases.append($0) }
+        }
+        return state
+    }
+
+    func waitUntilAdmission() async {
+        if releases.isEmpty { await withCheckedContinuation { admissionWaiters.append($0) } }
+    }
+
+    func releaseAdmission() {
+        gateAdmission = false
+        releases.forEach { $0.resume() }
+        releases.removeAll()
+    }
+
+    func readinessUpdates() -> AsyncStream<DecisionReadiness> {
+        observed = true
+        observationWaiters.forEach { $0.resume() }
+        observationWaiters.removeAll()
+        return AsyncStream {
+            continuation = $0
+            $0.yield(state)
+            $0.onTermination = { [weak self] _ in Task { await self?.didTerminate() } }
+        }
+    }
+
+    func set(_ state: DecisionReadiness) {
+        self.state = state
+        continuation?.yield(state)
+    }
+
+    func perform(_ action: DecisionServiceSettingsAction) -> DecisionServiceSettingsActionResult {
+        .succeeded("test")
+    }
+
+    func bootstrapStoredConfigurationIfNeeded() {
+        calls += 1
+    }
+
+    func cancelAndAdvanceGeneration() {
+        invalidations += 1
+    }
+
+    func waitUntilObserved() async {
+        if !observed { await withCheckedContinuation { observationWaiters.append($0) } }
+    }
+
+    func waitUntilTerminated() async {
+        if !terminated { await withCheckedContinuation { terminationWaiters.append($0) } }
+    }
+
+    private func didTerminate() {
+        terminated = true
+        terminationWaiters.forEach { $0.resume() }
+        terminationWaiters.removeAll()
+    }
+}
+
+private extension DecisionServiceCapabilities {
+    static let runtimeTest = Self(
+        contextKinds: [.text],
+        finiteChoice: .init(
+            minimumChoices: 2, maximumChoices: 12, maximumContextBytes: 24 * 1024,
+            maximumInstructionsBytes: 16 * 1024, maximumChoiceDescriptionBytes: 8 * 1024,
+            maximumAggregateBytes: 128 * 1024
+        ),
+        evidence: .init(confidence: true, probabilityDistribution: true, usage: true)
+    )
+}
+
+@MainActor
+final class RoutingModelProfileResolverTests: XCTestCase {
+    private let date = ISO8601DateFormatter().date(from: "2026-10-07T00:00:00Z")!
+
+    private func family(
+        _ id: String,
+        provider: String = AgentProviderKind.codexExec.rawValue,
+        aliases: [String] = [],
+        prefixes: [String] = []
+    ) -> [String: Any] {
+        [
+            "providerID": provider,
+            "id": id,
+            "utilityTier": "tier-\(id)",
+            "summary": "Family \(id) annotation.",
+            "rubric": "Family \(id) rubric.",
+            "aliases": aliases,
+            "matchers": prefixes.map { ["kind": "versionedPrefix", "prefix": $0] }
+        ]
+    }
+
+    private func exact(
+        _ id: String,
+        familyID: String = "family",
+        aliases: [String] = [],
+        summary: String? = "Exact audited annotation."
+    ) -> [String: Any] {
+        var item: [String: Any] = [
+            "providerID": AgentProviderKind.codexExec.rawValue,
+            "id": id, "familyID": familyID, "aliases": aliases,
+            "utilityTier": NSNull(), "rubric": NSNull(), "price": NSNull(),
+            "evidenceIDs": []
+        ]
+        if let summary { item["summary"] = summary }
+        else { item["summary"] = NSNull() }
+        return item
+    }
+
+    private func data(
+        families: [[String: Any]] = [],
+        models: [[String: Any]] = [],
+        efforts: [[String: Any]] = [],
+        extra: [String: Any] = [:]
+    ) throws -> Data {
+        var document: [String: Any] = [
+            "schemaVersion": 1,
+            "profileVersion": "fixture-profile-v1",
+            "evidenceVersion": "fixture-evidence-v1",
+            "rubricVersion": "fixture-rubric-v1",
+            "issuedAt": "2026-09-23T00:00:00Z",
+            "expiresAt": "2027-09-23T00:00:00Z",
+            "families": families, "models": models, "evidence": [], "efforts": efforts
+        ]
+        document.merge(extra) { _, new in new }
+        return try JSONSerialization.data(withJSONObject: document, options: [.sortedKeys])
+    }
+
+    private func resolver(families: [[String: Any]], models: [[String: Any]] = []) throws -> RoutingModelProfileResolver {
+        try .init(document: RoutingProfileDocumentDecoder.decode(data(families: families, models: models)))
+    }
+
+    private func model(
+        _ id: String,
+        provider: AgentProviderKind = .codexExec,
+        efforts: [RoutingExecutionEffort] = []
+    ) -> RoutingExecutionModelMetadata {
+        .init(
+            provider: provider,
+            baseModelRaw: id,
+            displayName: "Provider display \(id)",
+            isProviderDefault: false,
+            catalogOrder: 0,
+            advertisedOptionRawValues: [id],
+            defaultEffortID: .init(rawValue: "future-depth"),
+            efforts: efforts
+        )
+    }
+
+    func testBundledDataStrictlyDecodesAndPreservesKnownEvidence() throws {
+        let resolver = RoutingModelProfileResolver.bundled
+        let document = try XCTUnwrap(resolver.document)
+        XCTAssertEqual(document.schemaVersion, 1)
+        XCTAssertEqual(document.models.count, 17)
+        let luna = resolver.resolve(model("gpt-6-luna"), catalogRevision: "catalog-1", now: date)
+        XCTAssertEqual(luna.match, .exact)
+        XCTAssertTrue(luna.description(snapshotDate: resolver.snapshotDate).contains("$0.10 input / $0.50 output"))
+        XCTAssertEqual(luna.price.version, document.evidenceVersion)
+        XCTAssertEqual(luna.price.freshness, .current)
+        XCTAssertNotNil(luna.price.checkedAt)
+        let priorLuna = resolver.resolve(model("gpt-5.6-luna"), catalogRevision: "catalog-1", now: date)
+        XCTAssertEqual(priorLuna.evidence.source, .exactProfile)
+        XCTAssertEqual(priorLuna.evidence.version, document.evidenceVersion)
+        XCTAssertNotNil(priorLuna.evidence.checkedAt)
+        XCTAssertTrue(priorLuna.evidence.value.joined().contains("Terminal-Bench 2.1"))
+    }
+
+    func testStrictSchemaRejectsDuplicateJSONKeysUnknownFieldsAndUnknownMatchers() throws {
+        let duplicate = Data("{\"schemaVersion\":1,\"schemaVersion\":2}".utf8)
+        XCTAssertThrowsError(try RoutingProfileDocumentDecoder.decode(duplicate)) { error in
+            XCTAssertEqual(error as? RoutingProfileDecodeError, .duplicateJSONKey("schemaVersion"))
+        }
+        XCTAssertThrowsError(try RoutingProfileDocumentDecoder.decode(data(extra: ["endpoint": "https://example.test"]))) { error in
+            XCTAssertEqual(error as? RoutingProfileDecodeError, .unknownField("root.endpoint"))
+        }
+        var invalid = family("family", prefixes: ["model-"])
+        invalid["matchers"] = [["kind": "regex", "prefix": "model-"]]
+        XCTAssertThrowsError(try RoutingProfileDocumentDecoder.decode(data(families: [invalid])))
+        var oversized = family("family")
+        oversized["summary"] = String(repeating: "x", count: 8193)
+        XCTAssertThrowsError(try RoutingProfileDocumentDecoder.decode(data(families: [oversized])))
+    }
+
+    func testDuplicateLogicalAliasesAndMatchersAreRejected() throws {
+        let one = family("one", aliases: ["shared"])
+        let two = family("two", aliases: ["shared"])
+        XCTAssertThrowsError(try RoutingProfileDocumentDecoder.decode(data(families: [one, two])))
+        let repeated = family("one", prefixes: ["model-", "model-"])
+        XCTAssertThrowsError(try RoutingProfileDocumentDecoder.decode(data(families: [repeated])))
+    }
+
+    func testExactOverrideInheritsOnlySafeFamilyAnnotationsWithFieldProvenance() throws {
+        var entry = exact("known")
+        entry["price"] = [
+            "text": "API list price: $2 input / $10 output per 1M tokens.",
+            "checkedAt": "2026-09-23T00:00:00Z",
+            "expiresAt": "2026-12-31T00:00:00Z"
+        ]
+        let resolver = try resolver(families: [family("family")], models: [entry])
+        let advertised = RoutingExecutionEffort(id: .init(rawValue: "future-depth"), executableTarget: nil)
+        let resolved = resolver.resolve(model("known", efforts: [advertised]), catalogRevision: "catalog-42", now: date)
+        XCTAssertEqual(resolved.match, .exact)
+        XCTAssertEqual(resolved.executionProviderID.source, .providerCatalog)
+        XCTAssertEqual(resolved.executionProviderID.value, AgentProviderKind.codexExec.rawValue)
+        XCTAssertEqual(resolved.familyID.source, .exactProfile)
+        XCTAssertEqual(resolved.familyID.value, "family")
+        XCTAssertEqual(resolved.modelID.source, .providerCatalog)
+        XCTAssertEqual(resolved.modelID.version, "catalog-42")
+        XCTAssertEqual(resolved.displayName.value, "Provider display known")
+        XCTAssertEqual(resolved.advertisedEffortIDs.value, ["future-depth"])
+        XCTAssertTrue(resolved.executableEffortIDs.value.isEmpty)
+        XCTAssertEqual(resolved.summary.source, .exactProfile)
+        XCTAssertEqual(resolved.summary.version, "fixture-profile-v1")
+        XCTAssertEqual(resolved.rubric.source, .familyProfile)
+        XCTAssertEqual(resolved.rubric.value, "Family family rubric.")
+        XCTAssertEqual(resolved.price.source, .exactProfile)
+        XCTAssertEqual(resolved.price.version, "fixture-evidence-v1")
+        XCTAssertEqual(resolved.price.freshness, .current)
+    }
+
+    func testExactAliasFamilyAliasProviderFamilyAndVersionedMatcherPrecedence() throws {
+        let resolver = try resolver(
+            families: [family("family", aliases: ["family-alias"], prefixes: ["future-v-"])],
+            models: [exact("known", aliases: ["known-alias"])]
+        )
+        XCTAssertEqual(resolver.resolve(model("known-alias"), catalogRevision: "1", now: date).match, .exactAlias)
+        XCTAssertEqual(resolver.resolve(model("family-alias"), catalogRevision: "1", now: date).match, .family)
+        XCTAssertEqual(resolver.resolve(model("future-v-2.1"), catalogRevision: "1", now: date).match, .family)
+        XCTAssertEqual(resolver.resolve(model("unexpected"), catalogRevision: "1", providerFamilyID: "family", now: date).match, .family)
+        XCTAssertEqual(resolver.resolve(model("future-v-beta"), catalogRevision: "1", now: date).match, .unknown)
+        XCTAssertEqual(resolver.resolve(model("future-v-2.1"), catalogRevision: "1", providerFamilyID: "conflict", now: date).match, .unknown)
+        XCTAssertEqual(resolver.resolve(model("future-v-2.1", provider: .openCode), catalogRevision: "1", now: date).match, .unknown)
+    }
+
+    func testAmbiguousFamilyMatchersResolveUnknownWithoutBlockingProviderModel() throws {
+        let resolver = try resolver(families: [
+            family("broad", prefixes: ["future-"]),
+            family("narrow", prefixes: ["future-2-"])
+        ])
+        let resolved = resolver.resolve(model("future-2-1"), catalogRevision: "1", now: date)
+        XCTAssertEqual(resolved.match, .unknown)
+        XCTAssertNil(resolved.familyID.value)
+        XCTAssertEqual(resolved.familyID.source, .genericFallback)
+        XCTAssertEqual(resolved.modelID.value, "future-2-1")
+        XCTAssertEqual(resolved.summary.source, .genericFallback)
+    }
+
+    func testStaleAndUnknownPriceNeverRenderAsCurrent() throws {
+        var entry = exact("known")
+        entry["price"] = [
+            "text": "API list price: $2 input / $10 output per 1M tokens.",
+            "checkedAt": "2026-09-23T00:00:00Z",
+            "expiresAt": "2026-09-30T00:00:00Z"
+        ]
+        let resolver = try resolver(families: [family("family")], models: [entry])
+        let stale = resolver.resolve(model("known"), catalogRevision: "1", now: date)
+        XCTAssertEqual(stale.price.freshness, .stale)
+        XCTAssertTrue(stale.description(snapshotDate: "2026-09-23").contains("Stale historical price (not current)"))
+        let familyOnly = resolver.resolve(model("new-family-model"), catalogRevision: "1", providerFamilyID: "family", now: date)
+        XCTAssertNil(familyOnly.price.value)
+        XCTAssertEqual(familyOnly.price.freshness, .unknown)
+        XCTAssertTrue(familyOnly.description(snapshotDate: "2026-09-23").contains("Price is unknown"))
+    }
+
+    func testCandidateBuilderUsesProfilesOnlyForAdvertisedShortlistedModels() throws {
+        let resolver = try resolver(families: [family("family")], models: [exact("gpt-6-sol"), exact("known")])
+        let options = [
+            AgentModelOption(rawValue: "gpt-6-sol", displayName: "Sol", description: nil, isPlaceholderDefault: false, isProviderDefault: false),
+            AgentModelOption(rawValue: "gpt-6-luna", displayName: "Luna", description: nil, isPlaceholderDefault: false, isProviderDefault: false),
+            AgentModelOption(rawValue: "new-model", displayName: "New", description: nil, isPlaceholderDefault: false, isProviderDefault: false)
+        ]
+        let builder = AgentTaskRoutingCandidateBuilder(profileResolver: resolver) { provider, _ in
+            provider == .codexExec ? options : []
+        }
+        let availability = AgentModelCatalog.AvailabilityContext(
+            claudeCodeAvailable: false, codexAvailable: true, openCodeAvailable: false
+        )
+        let candidates = try builder.build(allowedProviders: [.codexExec], availability: availability)
+        XCTAssertEqual(candidates.map(\.target.modelRaw), ["gpt-6-luna", "gpt-6-sol"])
+        XCTAssertTrue(candidates[0].descriptor.targetDescription.contains("No audited benchmark or pricing profile"))
+        XCTAssertTrue(candidates[1].descriptor.targetDescription.contains("Exact audited annotation"))
+        XCTAssertFalse(candidates.contains { $0.target.modelRaw == "known" || $0.target.modelRaw == "new-model" })
+    }
+
+    func testUnknownNewModelAndEffortDoNotGuessFromNamesOrAdmitTargets() throws {
+        let resolver = try resolver(families: [family("family")], models: [exact("known")])
+        let unknown = resolver.resolve(model("known-high"), catalogRevision: "1", now: date)
+        XCTAssertEqual(unknown.match, .unknown)
+        XCTAssertTrue(unknown.summary.value.contains("No audited benchmark or pricing profile"))
+        XCTAssertFalse(unknown.description(snapshotDate: "2026-09-23").contains("Exact audited annotation"))
+        let effort = resolver.effortDescription(raw: "future-depth", now: date)
+        XCTAssertEqual(effort.source, .genericFallback)
+        XCTAssertTrue(effort.value.contains("Provider-advertised effort future-depth"))
+        XCTAssertNil(resolver.document?.efforts.first { $0.id == "future-depth" })
+    }
+}
+
+@MainActor
+final class RoutingModelProfileSnapshotTests: XCTestCase {
+    func testBundledSnapshotUsesStrictlyDecodedResolverAndContentDigest() {
+        let snapshot = RoutingModelProfileSnapshot.bundled
+        let resolver = RoutingModelProfileResolver.bundled
+
+        XCTAssertEqual(snapshot.resolver.profileVersion, resolver.profileVersion)
+        XCTAssertEqual(snapshot.digest.count, 64)
+        XCTAssertEqual(snapshot.digest, RoutingModelProfileSnapshot.digest(BundledRoutingProfiles.data))
+        XCTAssertNotNil(resolver.document)
+        XCTAssertEqual(RoutingModelProfileSnapshot.digest(Data("bundled".utf8)).count, 64)
+        XCTAssertNotEqual(
+            RoutingModelProfileSnapshot.digest(Data("bundled".utf8)),
+            RoutingModelProfileSnapshot.digest(Data("changed".utf8))
+        )
+        XCTAssertEqual(snapshot.identity, "bundled:\(snapshot.digest):\(resolver.profileVersion)")
+    }
+
+    func testBundledStoreReturnsStableContentDerivedSnapshot() {
+        let store = RoutingProfileStore()
+        let first = store.snapshot()
+        let second = store.snapshot()
+
+        XCTAssertEqual(first.identity, second.identity)
+        XCTAssertEqual(first.digest, RoutingModelProfileSnapshot.bundled.digest)
+        XCTAssertTrue(first.identity.hasPrefix("bundled:"))
+    }
+
+    func testSnapshotIdentityChangesWhenBundledContentDigestChanges() {
+        let resolver = RoutingModelProfileResolver.bundled
+        let first = RoutingModelProfileSnapshot(resolver: resolver, digest: "first")
+        let second = RoutingModelProfileSnapshot(resolver: resolver, digest: "second")
+
+        XCTAssertNotEqual(first.identity, second.identity)
+    }
+}
+
+private extension DecisionServiceCapabilities {
+    /// Same finite-choice limits Jev and OpenAI Decisions register (12 choices).
+    static let routerFrontier = Self(
+        contextKinds: [.text],
+        finiteChoice: .init(
+            minimumChoices: 2, maximumChoices: 12, maximumContextBytes: 24 * 1024,
+            maximumInstructionsBytes: 16 * 1024, maximumChoiceDescriptionBytes: 8 * 1024,
+            maximumAggregateBytes: 128 * 1024
+        ),
+        evidence: .init(confidence: true, probabilityDistribution: true, usage: true)
+    )
+}
+
+@MainActor
+final class AgentTaskRoutingCandidateBuilderProviderTests: XCTestCase {
+    override func setUp() {
+        super.setUp()
+        GlobalSettingsStore.installApplicationModelIdentityPolicy()
+    }
+
+    private static let providers: Set<AgentProviderKind> = [.codexExec, .claudeCode, .antigravity, .grok, .cursor]
+    private static let catalogs: [AgentProviderKind: [String]] = [
+        .codexExec: ["gpt-6-luna", "gpt-5.6-terra", "gpt-6.1-sol", "gpt-6-astra"],
+        .claudeCode: ["claude-haiku-4-5", "claude-sonnet-5-5", "claude-opus-5-5", "claude-fable-5-1"],
+        .antigravity: [
+            "gemini-3.8-flash-high", "gemini-3.8-flash-medium", "gemini-3.8-flash-low", "gemini-3.7-flash-high",
+            "gemini-3.1-pro-high", "gemini-3.1-pro-low", "claude-opus-5-5-high", "gpt-oss-120b-medium"
+        ],
+        .grok: ["grok-4.7", "grok-4.6"],
+        .cursor: ["composer-2.5", "grok-4.7", "claude-opus-5-5", "gemini-3.8-flash", "kimi-k3"]
+    ]
+    private static let expectedIdentities = [
+        "codexExec:gpt-6-luna", "codexExec:gpt-5.6-terra", "codexExec:gpt-6.1-sol", "codexExec:gpt-6-astra",
+        "claudeCode:claude-haiku-4-5", "claudeCode:claude-sonnet-5-5", "claudeCode:claude-opus-5-5", "claudeCode:claude-fable-5-1",
+        "antigravity:gemini-3.8-flash", "antigravity:gemini-3.1-pro", "grok:grok-4.7", "cursor:composer-2.5"
+    ]
+
+    private func availability(grok: Bool = true) -> AgentModelCatalog.AvailabilityContext {
+        .init(
+            claudeCodeAvailable: true, codexAvailable: true, openCodeAvailable: true,
+            cursorAvailable: true, antigravityAvailable: true, grokAvailable: grok,
+            grokBuildAvailable: true, devinAvailable: true,
+            zaiConfigured: true, kimiConfigured: true, customClaudeCompatibleConfigured: true
+        )
+    }
+
+    private static func options(
+        _ extra: [AgentProviderKind: [String]] = [:]
+    ) -> @MainActor (AgentProviderKind, AgentModelCatalog.AvailabilityContext) -> [AgentModelOption] {
+        { provider, _ in
+            ((Self.catalogs[provider] ?? []) + (extra[provider] ?? [])).map {
+                AgentModelOption(rawValue: $0, displayName: $0, description: nil, isDefault: false)
+            }
+        }
+    }
+
+    private func builder() -> AgentTaskRoutingCandidateBuilder {
+        AgentTaskRoutingCandidateBuilder(cursorThinking: { _ in nil }, modelOptions: Self.options())
+    }
+
+    private func availableProviders(
+        _ availability: AgentModelCatalog.AvailabilityContext,
+        surface: AgentModelCatalog.AgentSelectionSurface = .general
+    ) -> Set<AgentProviderKind> {
+        AgentTaskRoutingCandidateBuilder.availableProviders(
+            availability: availability, surface: surface, modelOptions: Self.options()
+        )
+    }
+
+    private func models(
+        _ builder: AgentTaskRoutingCandidateBuilder,
+        availability: AgentModelCatalog.AvailabilityContext
+    ) throws -> [AgentTaskRoutingCandidateBuilder.Candidate] {
+        try builder.build(allowedProviders: availableProviders(availability), availability: availability)
+    }
+
+    private func identity(_ candidate: AgentTaskRoutingCandidateBuilder.Candidate) -> String {
+        "\(candidate.target.agentRaw):\(candidate.target.modelRaw)"
+    }
+
+    private func configuration(
+        primary: AgentProviderKind?,
+        subagent: AgentProviderKind?
+    ) -> AgentTaskRouterConfiguration {
+        AgentTaskRouterConfiguration(
+            enabled: true, selectedBackendID: .jev, selectedBackendRawValue: "jev",
+            candidateRoles: [], allowedProviders: [], candidateRolesMaterialized: false,
+            allowedProvidersMaterialized: false, unknownRoleRawValues: [], unknownProviderRawValues: [],
+            primaryProvider: primary, subagentProvider: subagent, customInstructions: "",
+            validity: .valid, revision: 1
+        )
+    }
+
+    func testAllFiveProvidersContributeTheirFamilies() throws {
+        let availability = availability()
+        XCTAssertEqual(availableProviders(availability), Self.providers)
+        let candidates = try models(builder(), availability: availability)
+        XCTAssertEqual(candidates.map(identity), Self.expectedIdentities)
+        XCTAssertTrue(candidates.allSatisfy { $0.target.reasoningEffortRaw == nil && $0.target.modelParameters.isEmpty })
+        let newFamilies = candidates.filter { ["antigravity", "grok", "cursor"].contains($0.target.agentRaw) }
+        XCTAssertEqual(newFamilies.map(\.utilityTier), ["gemini-flash", "gemini-pro", "grok", "composer"])
+        for candidate in newFamilies {
+            XCTAssertNil(candidate.usagePeerClass)
+            XCTAssertEqual(candidate.usageModelAliases, [candidate.target.modelRaw])
+            XCTAssertFalse(AgentTaskRoutingCandidateBuilder.isPaidFast(candidate.target))
+        }
+        // Invert: nothing outside the named families, and no older Gemini while the newer is advertised.
+        let antigravity = candidates.filter { $0.target.agentRaw == "antigravity" }
+        XCTAssertFalse(antigravity.contains { $0.target.modelRaw.hasPrefix("claude-") || $0.target.modelRaw.hasPrefix("gpt-") })
+        XCTAssertFalse(antigravity.contains { $0.target.modelRaw.hasPrefix("gemini-3.7-flash") })
+        XCTAssertEqual(candidates.filter { $0.target.agentRaw == "cursor" }.map(\.target.modelRaw), ["composer-2.5"])
+        XCTAssertEqual(candidates.filter { $0.target.agentRaw == "grok" }.map(\.target.modelRaw), ["grok-4.7"])
+        // Providers the context does not mark available stay out.
+        let partial = AgentModelCatalog.AvailabilityContext(claudeCodeAvailable: true, codexAvailable: true, openCodeAvailable: true)
+        XCTAssertEqual(availableProviders(partial), [.codexExec, .claudeCode])
+    }
+
+    func testFrontierWithAllClassesStaysWithinTwelveCandidates() throws {
+        // The decision path caps a question at FiniteChoiceDecisionValidator.maximumChoices (12);
+        // Jev and OpenAI Decisions register the same limit.
+        XCTAssertEqual(FiniteChoiceDecisionValidator.maximumChoices, 12)
+        XCTAssertEqual(DecisionServiceCapabilities.routerFrontier.finiteChoice.maximumChoices, 12)
+        XCTAssertTrue(ModelRouterDecisionPolicy.supports(.routerFrontier))
+        let candidates = try models(builder(), availability: availability())
+        XCTAssertEqual(candidates.count, 12)
+        XCTAssertLessThanOrEqual(candidates.count, FiniteChoiceDecisionValidator.maximumChoices)
+        XCTAssertEqual(Set(candidates.map(identity)), Set(Self.expectedIdentities))
+        let request = try ModelRouterDecisionPolicy().build(
+            requestID: UUID(), task: "Review this change", scope: .primarySession, stage: .model,
+            directive: "", candidates: candidates, capabilities: .routerFrontier
+        )
+        XCTAssertEqual(request.question.choices.count, 12)
+    }
+
+    func testCursorGrokIsFallbackOnlyWhenGrokCLIUnavailable() throws {
+        let builder = builder()
+        let fallback = try models(builder, availability: availability(grok: false)).filter { $0.target.modelRaw == "grok-4.7" }
+        XCTAssertEqual(fallback.map(identity), ["cursor:grok-4.7"])
+        let both = try models(builder, availability: availability()).filter { $0.target.modelRaw == "grok-4.7" }
+        XCTAssertEqual(both.map(identity), ["grok:grok-4.7"])
+    }
+
+    func testProviderLimitSelectsOnlyThatNewProvider() throws {
+        let availability = availability()
+        for provider in [AgentProviderKind.cursor, .antigravity, .grok] {
+            for surface in [AgentModelCatalog.AgentSelectionSurface.general, .headless] {
+                for scope in [AgentTaskRoutingScope.primarySession, .subagent] {
+                    let allowed = AgentTaskRoutingCandidateBuilder.providers(
+                        for: scope,
+                        configuration: configuration(primary: provider, subagent: provider),
+                        availability: availability,
+                        surface: surface,
+                        modelOptions: Self.options()
+                    )
+                    XCTAssertEqual(allowed, [provider])
+                    let candidates = try builder().build(allowedProviders: allowed, availability: availability, surface: surface)
+                    XCTAssertEqual(Set(candidates.map(\.target.agentRaw)), [provider.rawValue])
+                }
+            }
+        }
+        // A saved limit never gates availability: an unavailable provider falls back to the rest.
+        let unavailable = AgentModelCatalog.AvailabilityContext(claudeCodeAvailable: true, codexAvailable: true, openCodeAvailable: true)
+        XCTAssertEqual(
+            AgentTaskRoutingCandidateBuilder.providers(
+                for: .primarySession, configuration: configuration(primary: .cursor, subagent: nil),
+                availability: unavailable, modelOptions: Self.options()
+            ),
+            [.codexExec, .claudeCode]
+        )
+    }
+
+    func testAntigravityEffortStageUsesAdvertisedSuffixes() throws {
+        let builder = builder()
+        let availability = availability()
+        let candidates = try models(builder, availability: availability)
+        for (base, expected) in [
+            ("gemini-3.8-flash", ["gemini-3.8-flash-high", "gemini-3.8-flash-medium", "gemini-3.8-flash-low"]),
+            ("gemini-3.1-pro", ["gemini-3.1-pro-high", "gemini-3.1-pro-low"])
+        ] {
+            let selected = try XCTUnwrap(candidates.first { $0.target.agentRaw == "antigravity" && $0.target.modelRaw == base })
+            let efforts = try builder.buildEfforts(for: selected, availability: availability)
+            XCTAssertEqual(efforts.map(\.target.modelRaw), expected)
+            XCTAssertEqual(efforts.map(\.descriptor.roleLabels), expected.map { ["effort:\($0.split(separator: "-").last!)"] })
+            XCTAssertTrue(efforts.allSatisfy { $0.target.agentRaw == "antigravity" && $0.target.reasoningEffortRaw == nil && $0.target.modelParameters.isEmpty })
+            // Invert: no target names an effort the catalog does not advertise, and the bare base is not offered.
+            XCTAssertFalse(efforts.map(\.target.modelRaw).contains(base))
+            XCTAssertTrue(efforts.allSatisfy { Self.catalogs[.antigravity]?.contains($0.target.modelRaw) == true })
+        }
+    }
+
+    func testCursorEffortStageUsesAdvertisedModelParameter() throws {
+        let definitions: [String: ACPModelParameterDefinition] = [
+            "grok-4.7": .init(
+                kind: .thinking, configID: "reasoning_effort", displayName: "Reasoning effort",
+                choices: ["low", "medium", "high", "xhigh"].map { .init(rawValue: $0, displayName: $0) },
+                currentValueRaw: "medium"
+            ),
+            "grok-4.6": .init(
+                kind: .thinking, configID: "effort", displayName: "Effort",
+                choices: ["low", "high"].map { .init(rawValue: $0, displayName: $0) },
+                currentValueRaw: "low"
+            )
+        ]
+        let builder = AgentTaskRoutingCandidateBuilder(
+            cursorThinking: { definitions[$0] },
+            modelOptions: Self.options([.cursor: ["grok-4.6"]])
+        )
+        let availability = availability(grok: false)
+        let fallback = try XCTUnwrap(models(builder, availability: availability).first { identity($0) == "cursor:grok-4.7" })
+        for (raw, configID, values) in [
+            ("grok-4.7", "reasoning_effort", ["low", "medium", "high", "xhigh"]),
+            ("grok-4.6", "effort", ["low", "high"])
+        ] {
+            let selected = AgentTaskRoutingCandidateBuilder.Candidate(
+                opaqueKey: fallback.opaqueKey, utilityTier: fallback.utilityTier,
+                target: .init(agentRaw: "cursor", modelRaw: raw, reasoningEffortRaw: nil, modelParameters: []),
+                descriptor: fallback.descriptor, snapshotScope: fallback.snapshotScope,
+                profileIdentity: fallback.profileIdentity
+            )
+            let efforts = try builder.buildEfforts(for: selected, availability: availability)
+            XCTAssertEqual(efforts.map(\.target.modelRaw), Array(repeating: raw, count: values.count))
+            XCTAssertEqual(efforts.map(\.descriptor.roleLabels), values.map { ["effort:\($0)"] })
+            XCTAssertEqual(efforts.map(\.target.modelParameters), values.map { value in
+                [ACPModelParameterSelection(providerID: .cursor, baseModelRaw: raw, kind: .thinking, configID: configID, valueRaw: value)]
+            })
+            // Invert: effort lives in modelParameters, never in reasoningEffortRaw.
+            XCTAssertTrue(efforts.allSatisfy { $0.target.reasoningEffortRaw == nil })
+            XCTAssertFalse(efforts.contains { AgentTaskRoutingCandidateBuilder.isPaidFast($0.target) })
+            // The selected candidate's effort targets stay current against a fresh provider snapshot.
+            let scope = try XCTUnwrap(fallback.snapshotScope)
+            let current = builder.capture(
+                allowedProviders: scope.allowedProviders,
+                availability: availability,
+                surface: .general
+            )
+            XCTAssertTrue(efforts.allSatisfy { current.contains($0.target) })
+        }
+    }
+
+    func testModelWithoutEffortControlHasOneProviderDefaultTarget() throws {
+        let builder = builder()
+        let availability = availability()
+        let candidates = try models(builder, availability: availability)
+        for expected in ["grok:grok-4.7", "cursor:composer-2.5"] {
+            let selected = try XCTUnwrap(candidates.first { identity($0) == expected })
+            let efforts = try builder.buildEfforts(for: selected, availability: availability)
+            XCTAssertEqual(efforts.count, 1)
+            XCTAssertEqual(efforts.map(identity), [expected])
+            XCTAssertEqual(efforts.map(\.descriptor.roleLabels), [["effort:provider-default"]])
+            XCTAssertTrue(efforts.allSatisfy { $0.target.reasoningEffortRaw == nil && $0.target.modelParameters.isEmpty })
+            // Invert: a single target never produces an effort-stage decision request.
+            XCTAssertThrowsError(try ModelRouterDecisionPolicy().build(
+                requestID: UUID(), task: "Review this change", scope: .primarySession, stage: .effort,
+                directive: "", candidates: efforts, capabilities: .routerFrontier
+            )) { error in
+                XCTAssertEqual(error as? ModelRouterDecisionPolicy.BuildError, .invalidRequest)
+            }
+        }
+    }
+}
+
+@MainActor
+final class AgentTaskRoutingProviderAvailabilityTests: XCTestCase {
+    override func setUp() {
+        super.setUp()
+        GlobalSettingsStore.installApplicationModelIdentityPolicy()
+    }
+
+    private enum Subject: CaseIterable {
+        case cursor
+        case antigravity
+        case grok
+
+        var expectedIdentities: [String] {
+            switch self {
+            case .cursor: ["cursor:composer-2.5", "cursor:grok-4.7"]
+            case .antigravity: ["antigravity:gemini-3.8-flash", "antigravity:gemini-3.1-pro"]
+            case .grok: ["grok:grok-4.7"]
+            }
+        }
+    }
+
+    private struct Fixture {
+        let suiteName: String
+        let defaults: UserDefaults
+        let coordinator: AntigravityConnectionCoordinator
+        let viewModel: APISettingsViewModel
+
+        func cleanup() {
+            defaults.removePersistentDomain(forName: suiteName)
+        }
+    }
+
+    private static let connectionHintKey = "AntigravityCLIConnected"
+    private static let catalogs: [AgentProviderKind: [String]] = [
+        .antigravity: [
+            "gemini-3.8-flash-high", "gemini-3.8-flash-medium", "gemini-3.8-flash-low", "gemini-3.7-flash-high",
+            "gemini-3.1-pro-high", "gemini-3.1-pro-low", "claude-opus-5-5-high", "gpt-oss-120b-medium"
+        ],
+        .grok: ["grok-4.7", "grok-4.6"],
+        .cursor: ["composer-2.5", "grok-4.7", "claude-opus-5-5", "gemini-3.8-flash", "kimi-k3"]
+    ]
+
+    private static let modelOptions: @MainActor (AgentProviderKind, AgentModelCatalog.AvailabilityContext) -> [AgentModelOption] = { provider, _ in
+        (catalogs[provider] ?? []).map {
+            AgentModelOption(rawValue: $0, displayName: $0, description: nil, isDefault: false)
+        }
+    }
+
+    private func makeFixture() throws -> Fixture {
+        let suiteName = "AgentTaskRoutingProviderAvailabilityTests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defaults.removePersistentDomain(forName: suiteName)
+        let notificationCenter = NotificationCenter()
+        let coordinator = AntigravityConnectionCoordinator(notificationCenter: notificationCenter, userDefaults: defaults)
+        let keyManager = KeyManager(secureService: SecureKeysService(secureStorage: TestSecureStorageBackend()))
+        let viewModel = APISettingsViewModel(
+            aiQueriesService: AIQueriesService(keyManager: keyManager),
+            keyManager: keyManager,
+            loadStoredDataOnInit: false,
+            antigravityConnectionCoordinator: coordinator,
+            notificationCenter: notificationCenter
+        )
+        viewModel.isClaudeCodeConnected = false
+        viewModel.isCodexConnected = false
+        viewModel.isOpenCodeConnected = false
+        viewModel.isCursorConnected = false
+        viewModel.isGrokConnected = false
+        viewModel.test_resetContextBuilderProviderValidation()
+        return Fixture(suiteName: suiteName, defaults: defaults, coordinator: coordinator, viewModel: viewModel)
+    }
+
+    private func markConnectedWithoutVerification(_ subject: Subject, in fixture: Fixture) {
+        switch subject {
+        case .cursor: fixture.viewModel.isCursorConnected = true
+        case .grok: fixture.viewModel.isGrokConnected = true
+        case .antigravity: fixture.defaults.set(true, forKey: Self.connectionHintKey)
+        }
+    }
+
+    private func verifyAndConnect(_ subject: Subject, in fixture: Fixture) async throws {
+        switch subject {
+        case .cursor:
+            fixture.viewModel.isCursorConnected = true
+            fixture.viewModel.test_completeContextBuilderProviderValidation(verifiedProviders: [.cursor])
+        case .grok:
+            fixture.viewModel.isGrokConnected = true
+            fixture.viewModel.test_completeContextBuilderProviderValidation(verifiedProviders: [.grok])
+        case .antigravity:
+            try await publishAntigravity(isConnected: true, in: fixture)
+        }
+    }
+
+    private func disconnect(_ subject: Subject, in fixture: Fixture) async throws {
+        switch subject {
+        case .cursor:
+            fixture.viewModel.isCursorConnected = false
+            fixture.viewModel.test_completeContextBuilderProviderValidation(verifiedProviders: [])
+        case .grok:
+            fixture.viewModel.isGrokConnected = false
+            fixture.viewModel.test_completeContextBuilderProviderValidation(verifiedProviders: [])
+        case .antigravity:
+            try await publishAntigravity(isConnected: false, in: fixture)
+        }
+    }
+
+    private func publishAntigravity(isConnected: Bool, in fixture: Fixture) async throws {
+        let generation = await fixture.coordinator.beginManualMutation()
+        _ = await fixture.coordinator.publishIfCurrent(
+            generation: generation,
+            isConnected: isConnected,
+            errorMessage: nil,
+            hasOwnedMCPEntry: isConnected
+        )
+        let viewModel = fixture.viewModel
+        try await AsyncTestWait.waitUntil("Antigravity routing availability is \(isConnected)") {
+            viewModel.isAntigravityConnected == isConnected
+                && viewModel.modelRouterAvailabilityContext.antigravityAvailable == isConnected
+        }
+    }
+
+    /// Reads the production owner (`APISettingsViewModel.modelRouterAvailabilityContext`) exactly
+    /// as the Router does, then builds the model-stage frontier from it.
+    private func routedIdentities(_ viewModel: APISettingsViewModel) throws -> [String] {
+        let availability = viewModel.modelRouterAvailabilityContext
+        let builder = AgentTaskRoutingCandidateBuilder(cursorThinking: { _ in nil }, modelOptions: Self.modelOptions)
+        let candidates = try builder.build(
+            allowedProviders: AgentTaskRoutingCandidateBuilder.availableProviders(
+                availability: availability, modelOptions: Self.modelOptions
+            ),
+            availability: availability
+        )
+        return candidates.map { "\($0.target.agentRaw):\($0.target.modelRaw)" }
+    }
+
+    private func assertExcluded(_ viewModel: APISettingsViewModel, file: StaticString = #filePath, line: UInt = #line) {
+        XCTAssertThrowsError(try routedIdentities(viewModel), file: file, line: line) { error in
+            XCTAssertEqual(error as? AgentTaskRoutingCandidateBuilder.BuildError, .noAvailableTargets, file: file, line: line)
+        }
+    }
+
+    /// With no settings owner wired, the router fallback must not claim providers this process
+    /// never verified (`AvailabilityContext.current` marks Antigravity and Grok available).
+    func testRouterFallbackWithoutSettingsOwnerAdmitsOnlyClaudeAndCodex() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let viewModel = AgentModeViewModel(
+            testWorkspacePath: root.path,
+            codexControllerFactory: { _, _, _, _, _, _ in
+                preconditionFailure("Availability fallback test must not start Codex")
+            },
+            headlessProviderFactory: { _, _, _, _, _ in UnsupportedHeadlessAgentProvider(reason: "test terminal") }
+        )
+        let availability = viewModel.modelRouterAvailabilityContext
+        for provider in [AgentProviderKind.cursor, .antigravity, .grok] {
+            XCTAssertFalse(AgentModelCatalog.isAgentAvailable(provider, availability: availability), provider.rawValue)
+        }
+        for provider in [AgentProviderKind.claudeCode, .codexExec] {
+            XCTAssertTrue(AgentModelCatalog.isAgentAvailable(provider, availability: availability), provider.rawValue)
+        }
+    }
+
+    func testConnectedButUnverifiedProviderIsExcluded() throws {
+        for subject in Subject.allCases {
+            let fixture = try makeFixture()
+            defer { fixture.cleanup() }
+            markConnectedWithoutVerification(subject, in: fixture)
+            XCTAssertFalse(fixture.viewModel.isAntigravityConnected)
+            assertExcluded(fixture.viewModel)
+        }
+    }
+
+    func testVerifiedProviderIsIncluded() async throws {
+        for subject in Subject.allCases {
+            let fixture = try makeFixture()
+            defer { fixture.cleanup() }
+            try await verifyAndConnect(subject, in: fixture)
+            XCTAssertEqual(try routedIdentities(fixture.viewModel), subject.expectedIdentities)
+        }
+    }
+
+    func testDisconnectRemovesProvider() async throws {
+        for subject in Subject.allCases {
+            let fixture = try makeFixture()
+            defer { fixture.cleanup() }
+            try await verifyAndConnect(subject, in: fixture)
+            XCTAssertEqual(try routedIdentities(fixture.viewModel), subject.expectedIdentities)
+            try await disconnect(subject, in: fixture)
+            assertExcluded(fixture.viewModel)
+        }
+    }
+
+    func testReconnectRestoresProvider() async throws {
+        for subject in Subject.allCases {
+            let fixture = try makeFixture()
+            defer { fixture.cleanup() }
+            try await verifyAndConnect(subject, in: fixture)
+            try await disconnect(subject, in: fixture)
+            assertExcluded(fixture.viewModel)
+            try await verifyAndConnect(subject, in: fixture)
+            XCTAssertEqual(try routedIdentities(fixture.viewModel), subject.expectedIdentities)
+        }
+    }
+}
+
+@MainActor
+final class RoutingModelProfileNewFamilyTests: XCTestCase {
+    private static let snapshotDate = "2026-10-10"
+
+    /// Provider-published facts per profile id, as observed on the evidence date.
+    private static let facts: [String: [String]] = [
+        "gemini-3.8-flash": [
+            "Gemini 3.8 Flash (published 2026-09-02) is Google's workhorse tier for long-horizon agentic workflows",
+            "1,048,576-token context window and 65,536-token maximum output",
+            "Google reports 73.7% on DeepSWE v1.1.",
+            "API list price: $0.75 input / $3.75 output per 1M tokens through December 31, 2026"
+        ],
+        "gemini-3.1-pro": [
+            "Gemini 3.1 Pro (published 2026-02-19) is Google's flagship multimodal reasoning tier for complex coding tasks",
+            "1,048,576-token context window and 65,536-token maximum output",
+            "Google reports 80.6% on SWE-Bench Verified (single attempt, Thinking (High)).",
+            "API list price: $2.00 input / $12.00 output per 1M tokens (prompts <= 200k; $4.00 / $18.00 above)"
+        ],
+        "grok-4.7": [
+            "Grok 4.7 (released 2026-09-21) is xAI's flagship model for agentic coding and knowledge work",
+            "500,000-token context window",
+            "xAI reports 46.3% on CursorBench 4.0 at xHigh effort.",
+            "API list price: $2.00 input / $0.50 cached / $6.00 output per 1M tokens for prompts < 200k"
+        ],
+        "composer-2.5": [
+            "Composer 2.5 (released 2026-05-18) is Cursor's proprietary agentic coding model optimized for edit-test-edit loops",
+            "200K-token context window",
+            "Cursor reports 69.3% on Terminal-Bench 2.0 and 79.8% on SWE-Bench Multilingual",
+            "API list price: Standard $0.50 input / $2.50 output per 1M tokens, Fast $3.00 / $15.00"
+        ]
+    ]
+
+    private func metadata(_ provider: AgentProviderKind, _ raw: String) -> RoutingExecutionModelMetadata {
+        .init(
+            provider: provider, baseModelRaw: raw, displayName: raw, isProviderDefault: false,
+            catalogOrder: 0, advertisedOptionRawValues: [raw], defaultEffortID: nil, efforts: []
+        )
+    }
+
+    private func resolve(_ provider: AgentProviderKind, _ raw: String) -> ResolvedRoutingProfile {
+        RoutingModelProfileResolver.bundled.resolve(metadata(provider, raw), catalogRevision: "new-family-fixture")
+    }
+
+    private func description(_ profile: ResolvedRoutingProfile) -> String {
+        profile.description(snapshotDate: RoutingModelProfileResolver.bundled.snapshotDate)
+    }
+
+    func testNewFamiliesHaveAuditedProfiles() throws {
+        let fixtures: [(AgentProviderKind, String, String)] = [
+            (.antigravity, "gemini-3.8-flash-high", "gemini-3.8-flash"),
+            (.antigravity, "gemini-3.1-pro-high", "gemini-3.1-pro"),
+            (.grok, "grok-4.7", "grok-4.7"),
+            (.cursor, "grok-4.7", "grok-4.7"),
+            (.cursor, "composer-2.5", "composer-2.5")
+        ]
+        for (provider, raw, profileID) in fixtures {
+            let label = "\(provider.rawValue):\(raw)"
+            let profile = resolve(provider, raw)
+            let text = description(profile)
+            XCTAssertEqual(profile.match, .exact, label)
+            XCTAssertEqual(profile.summary.source, .exactProfile, label)
+            XCTAssertEqual(profile.price.source, .exactProfile, label)
+            XCTAssertEqual(profile.evidence.source, .exactProfile, label)
+            XCTAssertEqual(profile.summary.sourceID, "\(provider.rawValue):\(profileID)", label)
+            XCTAssertEqual(profile.price.freshness, .current, label)
+            XCTAssertTrue(text.hasPrefix("Evidence snapshot \(Self.snapshotDate) (provider-published;"), label)
+            for fact in try XCTUnwrap(Self.facts[profileID]) {
+                XCTAssertTrue(text.contains(fact), "\(label): \(fact)")
+            }
+            XCTAssertFalse(text.contains("No audited benchmark"), label)
+            XCTAssertFalse(text.contains("Price is unknown"), label)
+            // Invert: the provider catalog stays authoritative for identity.
+            XCTAssertEqual(profile.modelID.source, .providerCatalog, label)
+            XCTAssertEqual(profile.modelID.value, raw, label)
+        }
+    }
+
+    func testNewFamiliesReachCandidateDescriptions() throws {
+        GlobalSettingsStore.installApplicationModelIdentityPolicy()
+        let catalogs: [AgentProviderKind: [String]] = [
+            .antigravity: ["gemini-3.8-flash-high", "gemini-3.8-flash-low", "gemini-3.1-pro-high"],
+            .grok: ["grok-4.7"],
+            .cursor: ["composer-2.5"]
+        ]
+        let availability = AgentModelCatalog.AvailabilityContext(
+            claudeCodeAvailable: false, codexAvailable: false, openCodeAvailable: false,
+            cursorAvailable: true, antigravityAvailable: true, grokAvailable: true
+        )
+        let candidates = try AgentTaskRoutingCandidateBuilder(cursorThinking: { _ in nil }, modelOptions: { provider, _ in
+            (catalogs[provider] ?? []).map {
+                AgentModelOption(rawValue: $0, displayName: $0, description: nil, isDefault: false)
+            }
+        }).build(allowedProviders: [.antigravity, .grok, .cursor], availability: availability)
+        XCTAssertEqual(candidates.map(\.target.modelRaw), ["gemini-3.8-flash", "gemini-3.1-pro", "grok-4.7", "composer-2.5"])
+        for candidate in candidates {
+            XCTAssertTrue(candidate.descriptor.targetDescription.contains("API list price:"), candidate.target.modelRaw)
+            XCTAssertFalse(candidate.descriptor.targetDescription.contains("No audited benchmark"), candidate.target.modelRaw)
+            XCTAssertEqual(candidate.descriptor.rubricVersion, RoutingModelProfileResolver.bundled.rubricVersion)
+        }
+    }
+
+    func testAntigravityIdentityDropsEffortSuffix() {
         let fixtures = [
             ("gemini-3.8-flash-high", "gemini-3.8-flash"),
             ("gemini-3.8-flash-medium", "gemini-3.8-flash"),
@@ -1165,30 +2189,47 @@ final class AgentTaskRoutingModelProfileCatalogTests: XCTestCase {
             ("gemini-3.1-pro-high", "gemini-3.1-pro"),
             ("gemini-3.1-pro-low", "gemini-3.1-pro")
         ]
-        for (model, family) in fixtures {
-            let expected = try XCTUnwrap(Self.profiles[family])
-            let actual = AgentTaskRoutingModelProfileCatalog.modelDescription(for: target("antigravity", model))
-            XCTAssertEqual(actual, Self.preamble + expected, model)
-            XCTAssertFalse(actual.contains("No audited benchmark"), model)
+        for (raw, base) in fixtures {
+            let suffixed = resolve(.antigravity, raw)
+            let plain = resolve(.antigravity, base)
+            XCTAssertEqual(suffixed.match, .exact, raw)
+            XCTAssertEqual(suffixed.summary, plain.summary, raw)
+            XCTAssertEqual(suffixed.price, plain.price, raw)
+            XCTAssertEqual(description(suffixed), description(plain), raw)
+            XCTAssertFalse(description(suffixed).contains("No audited benchmark"), raw)
         }
+        XCTAssertEqual(RoutingModelIdentity.antigravityEffortSplit("gemini-3.8-flash-x-high")?.base, "gemini-3.8-flash")
+        XCTAssertNil(RoutingModelIdentity.antigravityEffortSplit("gemini-3.8-flash"))
     }
 
     func testUnknownIdentityKeepsUncertainProfile() {
-        let fixtures = [
-            ("antigravity", "gemini-3.7-flash-high"),
-            ("antigravity", "claude-opus-5-5-high"),
-            ("cursor", "gemini-3.8-flash-high"),
-            ("grok", "gemini-3.1-pro-high")
+        let fixtures: [(AgentProviderKind, String)] = [
+            (.antigravity, "gemini-3.7-flash-high"),
+            (.antigravity, "claude-opus-5-5-high"),
+            (.antigravity, "gpt-oss-120b-medium"),
+            (.cursor, "gemini-3.8-flash-high"),
+            (.grok, "gemini-3.1-pro-high"),
+            (.grok, "grok-4.6"),
+            (.cursor, "kimi-k3")
         ]
-        for (agent, model) in fixtures {
-            let actual = AgentTaskRoutingModelProfileCatalog.modelDescription(for: target(agent, model))
-            XCTAssertTrue(actual.contains("No audited benchmark or pricing profile"), "\(agent):\(model)")
-            XCTAssertTrue(actual.contains("Treat capability and cost as uncertain"), "\(agent):\(model)")
+        for (provider, raw) in fixtures {
+            let profile = resolve(provider, raw)
+            let text = description(profile)
+            XCTAssertEqual(profile.match, .unknown, "\(provider.rawValue):\(raw)")
+            XCTAssertEqual(profile.summary.source, .genericFallback, "\(provider.rawValue):\(raw)")
+            XCTAssertTrue(text.contains("No audited benchmark or pricing profile"), "\(provider.rawValue):\(raw)")
+            XCTAssertTrue(text.contains("Treat capability and cost as uncertain"), "\(provider.rawValue):\(raw)")
         }
     }
 
     func testEvidenceVersionAdvanced() {
-        XCTAssertEqual(AgentTaskRoutingModelProfileCatalog.evidenceVersion, "rpce.model-routing-evidence.2026-10-10.1")
-        XCTAssertEqual(AgentTaskRoutingModelProfileCatalog.rubricVersion, "rpce.automatic-utility-frontier.v2-evidence-2026-10-10.1")
+        let resolver = RoutingModelProfileResolver.bundled
+        XCTAssertEqual(resolver.evidenceVersion, "rpce.model-routing-evidence.2026-10-10.1")
+        XCTAssertEqual(resolver.rubricVersion, "rpce.automatic-utility-frontier.v2-evidence-2026-10-10.1")
+        XCTAssertEqual(resolver.profileVersion, "rpce.bundled-routing-profiles.2026-10-10.1")
+        XCTAssertEqual(resolver.snapshotDate, Self.snapshotDate)
+        XCTAssertNotEqual(resolver.evidenceVersion, "rpce.model-routing-evidence.2026-09-30.2")
+        XCTAssertNotEqual(resolver.rubricVersion, "rpce.automatic-utility-frontier.v2-evidence-2026-09-30.2")
+        XCTAssertNotEqual(resolver.profileVersion, "rpce.bundled-routing-profiles.2026-09-30.2")
     }
 }

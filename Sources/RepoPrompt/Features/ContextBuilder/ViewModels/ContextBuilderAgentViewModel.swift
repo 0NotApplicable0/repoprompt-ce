@@ -1503,7 +1503,8 @@ final class ContextBuilderAgentViewModel: ObservableObject {
 
     private func loadConfigForSession(_ session: TabSession) {
         guard let manager = workspaceManager,
-              let tabState = manager.composeTab(with: session.tabID) else { return }
+              let workspaceID = manager.activeWorkspaceID,
+              let tabState = manager.modelRoutingTab(workspaceID: workspaceID, tabID: session.tabID) else { return }
 
         isRestoringState = true
 
@@ -1921,6 +1922,9 @@ final class ContextBuilderAgentViewModel: ObservableObject {
                 userInfo: [NSLocalizedDescriptionKey: "Context Builder provider validation is not ready. Retry after Models settings finish loading."]
             )
         }
+        // Freeze only caller-facing policy here. Keep discovery model/effort and
+        // Oracle roster resolution at their existing post-validation boundary.
+        let reconciliationGuidance = settingsManager.effectiveAgentModelsProfile(workspaceID: identity.workspaceID).oracleReconciliationGuidance
         #if DEBUG
             if let validationOverride = runTestHooks?.validateContextBuilderProviders {
                 await validationOverride()
@@ -1976,7 +1980,9 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         }
         let generatedResponseAuthority: ContextBuilderGeneratedResponseAuthority
         if let mode = parsedResponseType?.headlessMode {
-            let snapshot = OracleSelectionSnapshot.mcp(profile: profile)
+            var oracleProfile = profile
+            oracleProfile.oracleReconciliationGuidance = reconciliationGuidance
+            let snapshot = OracleSelectionSnapshot.mcp(profile: oracleProfile)
             let resolver = OracleExecutionResolver(promptViewModel: promptManager)
             let execution = try resolver.resolve(
                 choice: oraclePreset.map(OracleStartChoice.contextBuilderPreset) ?? .automatic,
@@ -2020,15 +2026,25 @@ final class ContextBuilderAgentViewModel: ObservableObject {
     private func persistSessionConfig(_ session: TabSession, markWorkspaceDirty: Bool = true) {
         guard !isRestoringState,
               let manager = workspaceManager,
-              var tab = manager.composeTab(with: session.tabID) else { return }
+              let workspaceID = manager.activeWorkspaceID,
+              var tab = manager.modelRoutingTab(workspaceID: workspaceID, tabID: session.tabID) else { return }
 
-        // Persist only tab-specific Context Builder state
-        tab.contextBuilder = ContextBuilderTabConfig(
+        // Loading treats an absent/invalid follow-up as plan and prompt IDs as a set.
+        // Compare the same effective values so an unchanged save does not republish the tab.
+        let selectedPromptIDs = session.selectedContextBuilderPromptIDs.sorted { $0.uuidString < $1.uuidString }
+        let proposed = ContextBuilderTabConfig(
             instructions: session.contextBuilderInstructions,
             followUpTypeRaw: session.selectedFollowUpType.rawValue,
-            selectedContextBuilderPromptIDs: Array(session.selectedContextBuilderPromptIDs)
+            selectedContextBuilderPromptIDs: selectedPromptIDs
         )
-        manager.updateComposeTab(tab, markDirty: markWorkspaceDirty)
+        var current = tab.contextBuilder
+        current.followUpTypeRaw = current.followUpTypeRaw.flatMap(ContextBuilderFollowUpType.init(rawValue:))?.rawValue
+            ?? ContextBuilderFollowUpType.plan.rawValue
+        current.selectedContextBuilderPromptIDs = Set(current.selectedContextBuilderPromptIDs).sorted { $0.uuidString < $1.uuidString }
+        guard current != proposed else { return }
+
+        tab.contextBuilder = proposed
+        manager.updateComposeTab(tab, workspaceID: workspaceID, markDirty: markWorkspaceDirty)
     }
 
     private func persistCurrentSession() {
@@ -5034,7 +5050,9 @@ final class ContextBuilderAgentViewModel: ObservableObject {
                 task.cancel()
             }
             try requireCurrentOracleRun(session: session, generation: generation)
-            let groupReply = ContextBuilderOracleGroupReply(result: completion.result)
+            let groupReply = ContextBuilderOracleGroupReply(
+                result: completion.result, reconciliationGuidance: execution.reconciliationGuidance
+            )
             guard session.followUpOracleGroupState.matchesFinalResult(
                 groupReply.result,
                 generation: generation
@@ -5617,7 +5635,6 @@ final class ContextBuilderAgentViewModel: ObservableObject {
             mode: mode.mcpModeName,
             snapshot: snapshot
         )
-
         return try await runFollowUpOracleStream(
             for: tabID,
             originWorkspaceID: originWorkspaceID,

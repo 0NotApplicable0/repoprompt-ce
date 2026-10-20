@@ -1,116 +1,110 @@
-# Model Router decision log
+# Model Routing Decision Log
 
-The Model Router keeps a local, default-on JSONL record of what it decided and what was then applied.
-It is a diagnostic record: it never changes which target is chosen, never blocks a start, and has no
-setting to disable it.
-
-## Location and retention
+RepoPrompt CE appends JSON Lines records for routed task starts and Auto Effort judgments to a local diagnostics file:
 
 ```text
 ~/Library/Application Support/RepoPrompt CE/Diagnostics/ModelRouter/jev-decisions.jsonl
-~/Library/Application Support/RepoPrompt CE/Diagnostics/ModelRouter/jev-decisions.jsonl.1
 ```
 
-Each line is one JSON object with an `event` field. At most two files exist: the active file and one
-rotated file (`.1`).
+When the active file would exceed `5 MiB` (`5_242_880` bytes), the logger rotates `jev-decisions.jsonl` to `jev-decisions.jsonl.1` (replacing any prior `.1` file) before writing the new line. At most two files exist on disk.
 
-Rotation is a fixed size threshold (default 5 MiB, never below 64 KiB). Before a row is appended, the
-active file is rotated when it is non-empty and the row would push it past the threshold: the old `.1` is
-deleted, the active file becomes `.1`, and a fresh active file starts. A single row larger than the
-threshold is still written whole, alone, to a fresh active file; the next row rotates it. Rows are never
-truncated, split or intentionally dropped while the log is writable.
+The log is enabled by default. It never records task text, prompt excerpts, file paths, or API keys.
 
-## Admission
+## Event Kinds
 
-Writes are serialized through one actor. A 1 MiB budget counts queued plus in-flight bytes and is
-backpressure, not a cap: when the budget is full, callers wait in FIFO order, and a waiter's bytes are
-reserved and queued before the waiter resumes, so a later small row cannot overtake an older large one.
-A cancelled route still waits and its row is still written once.
-A caller waits only until its decision row is admitted to the queue, which fixes its order, while the physical append and the route's applied row follow asynchronously.
+Every line is a single JSON object with `"schema": 1`, an ISO-8601 `"timestamp"`, and an `"event"` discriminator (`"decision"` or `"applied"`). All events emitted for a single routed turn share the same `"requestID"`.
 
-If a physical open, append or rotate fails, only that row is discarded, a drop counter is incremented
-and one `os_log` error is written. Routing and run start never fail, block or change because of the log.
+### `decision`
 
-## Privacy
+Written once per `(requestID, stage)` for:
 
-Rows are built from an explicit allowlist. They never contain the task, the task excerpt, custom routing
-instructions, rubrics, API keys or file system paths. `rationale` is always `null` because the decoded
-Jev response contract exposes none. Candidates are the executable targets (provider, model, effort and
-model parameters) with their opaque per-request keys.
+- `stage = "model"` — global model router stage-1 model pick (`outcome` in `selected`, `abstained`, `failed`, `cancelled`, `localSingleCandidate`).
+- `stage = "effort"` — global model router stage-2 effort pick (`outcome` in `selected`, `abstained`, `failed`, `cancelled`, `localSingleCandidate`).
+- `stage = "autoEffort"` — Auto Effort judgment (`outcome` in `selected`, `abstained`, `failed`, `cancelled`).
 
-## `decision` events
+Fields:
 
-Written exactly once per `(requestID, stage)` for a Jev model-stage pick, a Jev effort-stage pick, an
-Auto Effort judgment, an abstention, a failure, a cancellation, and a local single-candidate application
-made without a Jev request.
+| Field | Type | Notes |
+| --- | --- | --- |
+| `schema` | `Int` | Currently `1`. |
+| `event` | `String` | `"decision"`. |
+| `timestamp` | `String` | ISO-8601 UTC timestamp with fractional seconds. |
+| `requestID` | `String` | UUID shared across stages and the terminal `applied` event for a route. |
+| `sessionID` | `String?` | Session UUID when known at decision time, otherwise `null`. |
+| `scope` | `String` | `"primarySession"`, `"subagent"`, or `"headless"`. |
+| `stage` | `String` | `"model"`, `"effort"`, or `"autoEffort"`. |
+| `outcome` | `String` | `"selected"`, `"abstained"`, `"failed"`, `"cancelled"`, or `"localSingleCandidate"`. |
+| `backend` | `String?` | `"jev"`, `"openai-decisions"`, `"local"`, or `null`. |
+| `jevModel` | `String?` | Decision service model identifier when a remote backend answered, otherwise `null`. |
+| `policyVersion` | `String?` | Acceptance policy version from the decision evidence when present. |
+| `candidates` | `[Candidate]` | Full candidate list (each object has `key`, `provider`, `model`, `effort`, `modelParameters`). |
+| `chosenKey` | `String?` | Decision service's original selected opaque key (`"c0"`, `"effort-1"`, etc.), or `null`; exploration does not rewrite it. |
+| `chosenTarget` | `Target?` | Decision service's original selected provider/model/effort/parameters target, or `null`; exploration does not rewrite it. |
+| `probabilities` | `[String: Double]?` | Per-candidate probabilities keyed by opaque key when decoded from the backend response (`null` otherwise; never invented). |
+| `confidence` | `Double?` | Backend confidence when decoded (`null` otherwise; never invented). |
+| `reasonCode` | `String?` | Backend abstention code, or `router_disabled` / `backend_not_ready` for a pre-route diversity fallback; otherwise `null`. |
+| `inputTokens` | `Int?` | Decision request input tokens when reported, otherwise `null`. |
+| `outputTokens` | `Int?` | Decision response output tokens when reported, otherwise `null`. |
+| `latencyMs` | `Double?` | Monotonic service-call latency through readiness recheck, or `null` when no service call settled (including local picks and early cancellation). |
+| `failure` | `String?` | Failure category raw value when `outcome == "failed"`, otherwise `null`. |
+| `rationale` | `String?` | Always `null` (reserved; task/rationale prose is never persisted). |
+| `makerExclusions` | `[String: [String]]?` | Model-stage map from excluded maker (`anthropic`, `openai`, `google`, `xai`, `cursor`) to sources in canonical order: `exclude_makers`, `diverse_from_sessions`, `review_diversity`. `null` without exclusions and on effort / Auto Effort rows. |
 
-| Field | Meaning |
-| --- | --- |
-| `event` | `"decision"` |
-| `schema`, `timestamp` | Schema version (`1`) and ISO-8601 time. |
-| `requestID` | The route's id; every `applied` row for the route carries the same id. |
-| `sessionID` | Session id, `null` before a session is allocated. |
-| `scope` | `primarySession`, `subagent` or `headless`. |
-| `stage` | `model`, `effort` or `autoEffort`. |
-| `outcome` | `selected`, `abstained`, `failed`, `cancelled` or `localSingleCandidate`. |
-| `backend` | Router backend id (`jev`), or `local`. |
-| `jevModel`, `policyVersion` | Pinned Jev model and policy version when Jev answered. |
-| `candidates` | Every candidate: `key`, `provider`, `model`, `effort`, `modelParameters`. |
-| `chosenKey`, `chosenTarget` | The chosen opaque key and its executable target. |
-| `probabilities`, `confidence` | Jev's per-candidate probabilities and confidence. |
-| `reasonCode` | Reason reported with the decision. |
-| `inputTokens`, `outputTokens` | Jev usage. |
-| `latencyMs` | Monotonic milliseconds around the backend call. |
-| `failure` | Failure category when one exists. |
-| `rationale` | Always `null`. |
-| `makerExclusions` | Model stage only; `null` on `effort`, `autoEffort` and when nothing was excluded. Maps each excluded maker to the sources that excluded it, always in the order `exclude_makers`, `diverse_from_sessions`, `review_diversity`. `exclude_makers` is an explicit exclusion, `diverse_from_sessions` excludes makers by session diversity, and `review_diversity` is Review diversity. |
-| `override` | Model stage only; always present. `null` unless Jev selected among at least two surviving models and the decision was counted, then an object (see below). `chosenKey`, `chosenTarget` and `probabilities` stay Jev's own choice; an `applied` row reports the final executable target. |
+The `override` field is an object for every counted Jev model-stage selection (including Randomness Off), otherwise `null`. Old rows without this field remain decodable. It contains:
 
-### `override` object
+| Field | Type | Notes |
+| --- | --- | --- |
+| `kind` | `String` | `exploration`, `none`, or `explorationUnavailable`. |
+| `randomness` | `String` | `off`, `low`, `medium`, or `high` captured for this decision. |
+| `counter` | `UInt64` | One-based per-scope model-stage selection count. |
+| `position` | `Int` | One-based position in the 20-decision cycle. |
+| `originalKey` | `String` | Jev's original selected key, matching `chosenKey`. |
+| `appliedKey` | `String` | Runner-up key when exploring; otherwise `originalKey`. |
+| `durable` | `Bool` | Whether this count was persisted successfully. |
 
-| Field | Meaning |
-| --- | --- |
-| `kind` | `none` (counted, not exploring), `exploration` (Jev's runner-up replaced the pick) or `explorationUnavailable` (exploring position, no valid runner-up, Jev's pick kept). |
-| `randomness` | Raw level at the decision: `off`, `low`, `medium` or `high`. |
-| `counter` | Unsigned 64-bit count issued for the routing scope: primary session or subagent (a `headless` subagent uses the subagent counter). |
-| `position` | Cycle position, `1...20`. |
-| `originalKey` | Jev's chosen key. |
-| `appliedKey` | Key output by the exploration step; it is not the later usage-balancing or effort result. |
-| `durable` | `true` when committed under the counter-file lock; `false` for a degraded in-memory value. |
+`explorationUnavailable` means the position called for exploration but no valid runner-up could be established from `DecisionEvidence.probabilities`. Missing probabilities are never inferred from scores. The original pick and probability evidence retain their Jev meaning; `appliedKey` records the post-exploration model before effort routing. An explored pick skips usage balancing. `none` and `explorationUnavailable` retain ordinary usage-balancing behavior, so `appliedKey` is not a final start target. The terminal `applied` event records the actual selection. Effort and Auto Effort rows always have `override: null`.
 
-The schema stays `1`; `override` is additive.
+Maker exclusions filter the model candidates before the decision request. A single allowed model is applied locally; its effort stage proceeds normally. An empty allowed set emits a failed model event with `failure = "allCandidatesExcluded"` and rejects the start without a decision request. With exclusions, a disabled or unavailable router emits a failed model event before fallback. An excluded, unknown, or missing baseline rejects the start (`fallbackDiversityExcluded`); usage balancing cannot rescue that baseline or replace an allowed one with an excluded maker. These host policy failures do not add categories to the generic decision-service protocol. Old log rows without `makerExclusions` remain decodable.
 
-## `applied` events
+### `applied`
 
-Written exactly once per routed start or composer submission that produced a decision, after the run
-reached its provider pipeline or the start was rejected. A router-off or explicitly pinned start writes
-none.
+Written once per routed composer submission, `agent_run` start, or `agent_explore` start after the session starts or the start is rejected. Joins to the route's `decision` events by `requestID`.
 
-| Field | Meaning |
-| --- | --- |
-| `event`, `schema`, `timestamp`, `requestID`, `scope` | As above, with `event` = `"applied"`. |
-| `sessionID` | `null` when the start is rejected. |
-| `outcome` | `applied` (the picked target ran), `fallback` (a different target replaced the pick), `rejected`, or `notStarted` (the message steered or queued into a live run). |
-| `provider`, `model`, `effort`, `modelParameters` | The target that was actually applied. |
-| `picked` | The target the router picked, or `null` when it picked none. |
+Fields:
 
-"Applied" means the run reached its provider pipeline (or was rejected before it). A provider that fails
-later is an ordinary run failure and is not reinterpreted here. Decision rows are always written before
-the application row of the same route.
+| Field | Type | Notes |
+| --- | --- | --- |
+| `schema` | `Int` | Currently `1`. |
+| `event` | `String` | `"applied"`. |
+| `timestamp` | `String` | ISO-8601 UTC timestamp with fractional seconds. |
+| `requestID` | `String` | Matches the route's `decision` events. |
+| `sessionID` | `String?` | Started session UUID, or `null` when `outcome == "rejected"`. |
+| `scope` | `String` | `"primarySession"`, `"subagent"`, or `"headless"`. |
+| `outcome` | `String` | `"applied"` (router pick used), `"fallback"` (baseline/default used instead of router pick), `"rejected"` (start failed or was blocked), or `"notStarted"` (submission did not start an inactive session). |
+| `provider`, `model`, `effort` | `String?` | Applied selection, or `null` when rejected/not started. An explicit effort encoded in a Claude/Codex model identifier is projected into `effort`. |
+| `modelParameters` | `[Parameter]` | Applied provider parameter selections; empty when rejected/not started. |
+| `picked` | `Target?` | Router-selected target before any fallback (`null` when no pick was made). |
 
-## Example
+## Upstream evidence mapping
 
-Count exploring model decisions by scope:
+`DecisionEvidence` supplies `policyVersion` (`acceptancePolicyVersion`), `confidence`, per-key `probabilities`, and usage counts. Missing evidence remains JSON `null`; scores are not converted into probabilities. `jevModel` retains the legacy field name and identifies the pinned evaluator only when evidence matches the backend's validated acceptance policy. Upstream adapters validate that model before exposing evidence. `latencyMs` is measured by `DecisionCoordinator`; it is not a backend-reported duration. Auto Effort uses the service's acceptance policy version, not the consumer's prompt-policy version. Rationale is always `null`.
 
-```bash
-jq -s 'map(select(.event=="decision" and .stage=="model" and .override.kind=="exploration")) | group_by(.scope) | map({scope:.[0].scope,exploring:length})' jev-decisions.jsonl
-```
+## Inspecting with `jq`
 
 Count `decision` events by chosen provider:
 
 ```bash
-jq -s '[.[] | select(.event == "decision" and .chosenTarget != null)]
-  | group_by(.chosenTarget.provider)
-  | map({provider: .[0].chosenTarget.provider, count: length})' \
-  "$HOME/Library/Application Support/RepoPrompt CE/Diagnostics/ModelRouter/jev-decisions.jsonl"
+jq -r 'select(.event == "decision" and .chosenTarget.provider != null) | .chosenTarget.provider' \
+  "$HOME/Library/Application Support/RepoPrompt CE/Diagnostics/ModelRouter/jev-decisions.jsonl" \
+  | sort | uniq -c | sort -nr
+```
+
+Join each `applied` event with its stage decisions by `requestID`:
+
+```bash
+jq -s 'group_by(.requestID) | map({
+  requestID: .[0].requestID,
+  decisions: map(select(.event == "decision") | {stage, outcome, chosenTarget}),
+  applied: (map(select(.event == "applied")) | .[0] | {outcome, sessionID, provider, model, effort, modelParameters, picked})
+})' "$HOME/Library/Application Support/RepoPrompt CE/Diagnostics/ModelRouter/jev-decisions.jsonl"
 ```

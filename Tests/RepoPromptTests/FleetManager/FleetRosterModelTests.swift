@@ -2,6 +2,7 @@ import Combine
 import Foundation
 @_spi(TestSupport) @testable import RepoPromptApp
 import RepoPromptSettingsCore
+import RepoPromptShared
 import XCTest
 
 final class FleetRosterModelTests: XCTestCase {
@@ -379,7 +380,10 @@ final class FleetRosterModelTests: XCTestCase {
         let repository = FileManager.default.temporaryDirectory.appendingPathComponent("fleet-roster-\(UUID())")
         try FileManager.default.createDirectory(at: repository, withIntermediateDirectories: true)
         let previousStoragePath = UserDefaults.standard.string(forKey: "GlobalCustomStorageURL")
-        UserDefaults.standard.set(repository.appendingPathComponent("storage").path, forKey: "GlobalCustomStorageURL")
+        // The shared domain runtime's metadata path policy is fixed at composition, so per-test storage must live under its owned root.
+        let ownedStorageParent = AppProfileLocations.current.applicationSupportRoot.appendingPathComponent("FleetRosterStorage-\(UUID().uuidString)", isDirectory: true)
+        addTeardownBlock { try? FileManager.default.removeItem(at: ownedStorageParent) }
+        UserDefaults.standard.set(AppProfileLocations.current.customWorkspaceDirectory(selectedDirectory: ownedStorageParent).path, forKey: "GlobalCustomStorageURL")
         do {
             await window.workspaceManager.awaitInitialized()
             let workspace = window.workspaceManager.createWorkspace(name: "Fleet roster \(UUID())", repoPaths: [repository.path], ephemeral: false)
@@ -1332,6 +1336,8 @@ final class FleetManagerWindowTests: XCTestCase {
         state.agentModeViewModel.test_installLiveSession(session)
         let sessionID = UUID()
         XCTAssertNotNil(state.agentModeViewModel.test_installPersistentSessionBinding(sessionID: sessionID, on: session))
+        // An installed binding admits operations only after restoration is authoritative.
+        session.recordRestorationAuthoritative(.persistedPayloadApplied)
         var changes = 0
         let sink = manager.$activeWorkspaceID.dropFirst().sink { _ in changes += 1 }
         var reveals = 0
@@ -1524,7 +1530,10 @@ final class FleetManagerActionTests: XCTestCase {
         previousApproval = defaults.object(forKey: "workspace.approvalSettings")
         previousAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
         settingsCaptured = true
-        defaults.set(directory.appendingPathComponent("storage").path, forKey: "GlobalCustomStorageURL")
+        // The shared domain runtime's metadata path policy is fixed at composition, so per-test storage must live under its owned root.
+        let ownedStorageParent = AppProfileLocations.current.applicationSupportRoot.appendingPathComponent("FleetRosterStorage-\(UUID().uuidString)", isDirectory: true)
+        addTeardownBlock { try? FileManager.default.removeItem(at: ownedStorageParent) }
+        UserDefaults.standard.set(AppProfileLocations.current.customWorkspaceDirectory(selectedDirectory: ownedStorageParent).path, forKey: "GlobalCustomStorageURL")
         GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)
         FleetParkingCoordinator.shared.resetForTesting()
         FleetParkingCoordinator.shared.setAutomaticBackstopDeliveryEnabledForTesting(false)
@@ -1687,6 +1696,8 @@ final class FleetManagerActionTests: XCTestCase {
         actions.requestDeleteChat(rowID: chat.targetID, windowID: chat.state.windowID, workspaceID: chat.workspace.id, sessionID: chat.targetID)
         let replacementID = UUID()
         _ = try XCTUnwrap(chat.state.agentModeViewModel.test_installPersistentSessionBinding(sessionID: replacementID, on: chat.target))
+        // An installed binding admits operations only after restoration is authoritative.
+        chat.target.recordRestorationAuthoritative(.persistedPayloadApplied)
 
         await actions.confirmDeletion()
 
@@ -2349,6 +2360,8 @@ final class FleetManagerActionTests: XCTestCase {
         for (session, id) in [(target, targetID), (peer, peerID)] {
             session.hasLoadedPersistedState = true
             _ = try XCTUnwrap(vm.test_installPersistentSessionBinding(sessionID: id, on: session))
+            // An installed binding admits operations only after restoration is authoritative.
+            session.recordRestorationAuthoritative(.persistedPayloadApplied)
         }
         target.runState = .idle
         peer.runState = .completed

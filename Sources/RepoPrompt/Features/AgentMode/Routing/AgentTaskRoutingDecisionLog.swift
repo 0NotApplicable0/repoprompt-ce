@@ -2,21 +2,19 @@ import Foundation
 import os
 import RepoPromptShared
 
-// MARK: - Schema
-
-enum AgentTaskRoutingLogScope: String, Equatable {
+enum AgentTaskRoutingLogScope: String, Codable, Equatable {
     case primarySession
     case subagent
     case headless
 }
 
-enum AgentTaskRoutingLogStage: String, Equatable {
+enum AgentTaskRoutingLogStage: String, Codable, Equatable {
     case model
     case effort
     case autoEffort
 }
 
-enum AgentTaskRoutingLogOutcome: String, Equatable {
+enum AgentTaskRoutingLogOutcome: String, Codable, Equatable {
     case selected
     case abstained
     case failed
@@ -24,7 +22,7 @@ enum AgentTaskRoutingLogOutcome: String, Equatable {
     case localSingleCandidate
 }
 
-enum AgentTaskRoutingAppliedOutcome: String, Equatable {
+enum AgentTaskRoutingAppliedOutcome: String, Codable, Equatable {
     case applied
     case fallback
     case rejected
@@ -32,7 +30,6 @@ enum AgentTaskRoutingAppliedOutcome: String, Equatable {
 }
 
 private extension KeyedEncodingContainer {
-    /// Optional fields are always present so the schema is stable; absent values are JSON null.
     mutating func encodeOrNull(_ value: (some Encodable)?, forKey key: Key) throws {
         if let value {
             try encode(value, forKey: key)
@@ -42,9 +39,8 @@ private extension KeyedEncodingContainer {
     }
 }
 
-/// Executable target projection. Only opaque identifiers and catalog values; never task text or paths.
-struct AgentTaskRoutingLogTarget: Encodable, Equatable {
-    struct Parameter: Encodable, Equatable {
+struct AgentTaskRoutingLogTarget: Codable, Equatable {
+    struct Parameter: Codable, Equatable {
         let providerID: String
         let baseModel: String
         let kind: String
@@ -60,7 +56,13 @@ struct AgentTaskRoutingLogTarget: Encodable, Equatable {
     init(_ target: AgentRoutingExecutableTarget) {
         provider = target.agentRaw
         model = target.modelRaw
-        effort = target.reasoningEffortRaw
+        effort = target.reasoningEffortRaw ?? {
+            switch AgentProviderKind(rawValue: target.agentRaw) {
+            case .claudeCode: ClaudeModelSpecifier(raw: target.modelRaw).explicitEffortLevel?.rawValue
+            case .codexExec: CodexModelSpecifier(raw: target.modelRaw).reasoningEffort?.rawValue
+            default: nil
+            }
+        }()
         modelParameters = target.modelParameters.map {
             Parameter(
                 providerID: $0.providerID.rawValue,
@@ -81,6 +83,14 @@ struct AgentTaskRoutingLogTarget: Encodable, Equatable {
 
     private enum CodingKeys: String, CodingKey { case provider, model, effort, modelParameters }
 
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        provider = try container.decodeIfPresent(String.self, forKey: .provider)
+        model = try container.decode(String.self, forKey: .model)
+        effort = try container.decodeIfPresent(String.self, forKey: .effort)
+        modelParameters = try container.decodeIfPresent([Parameter].self, forKey: .modelParameters) ?? []
+    }
+
     func encode(to encoder: Encoder) throws {
         var container = encoder.container(keyedBy: CodingKeys.self)
         try container.encodeOrNull(provider, forKey: .provider)
@@ -90,23 +100,42 @@ struct AgentTaskRoutingLogTarget: Encodable, Equatable {
     }
 }
 
-struct AgentTaskRoutingLogCandidate: Encodable, Equatable {
+struct AgentTaskRoutingLogCandidate: Codable, Equatable {
     let key: String
-    let target: AgentTaskRoutingLogTarget
+    let provider: String?
+    let model: String
+    let effort: String?
+    let modelParameters: [AgentTaskRoutingLogTarget.Parameter]
+
+    init(key: String, target: AgentTaskRoutingLogTarget) {
+        self.key = key
+        provider = target.provider
+        model = target.model
+        effort = target.effort
+        modelParameters = target.modelParameters
+    }
 
     private enum CodingKeys: String, CodingKey { case key, provider, model, effort, modelParameters }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        key = try container.decode(String.self, forKey: .key)
+        provider = try container.decodeIfPresent(String.self, forKey: .provider)
+        model = try container.decode(String.self, forKey: .model)
+        effort = try container.decodeIfPresent(String.self, forKey: .effort)
+        modelParameters = try container.decodeIfPresent([AgentTaskRoutingLogTarget.Parameter].self, forKey: .modelParameters) ?? []
+    }
 
     func encode(to encoder: Encoder) throws {
         var container = encoder.container(keyedBy: CodingKeys.self)
         try container.encode(key, forKey: .key)
-        try container.encodeOrNull(target.provider, forKey: .provider)
-        try container.encode(target.model, forKey: .model)
-        try container.encodeOrNull(target.effort, forKey: .effort)
-        try container.encode(target.modelParameters, forKey: .modelParameters)
+        try container.encodeOrNull(provider, forKey: .provider)
+        try container.encode(model, forKey: .model)
+        try container.encodeOrNull(effort, forKey: .effort)
+        try container.encode(modelParameters, forKey: .modelParameters)
     }
 }
 
-/// Everything a decision row carries that the route knows; identity and time are added by the context.
 struct AgentTaskRoutingDecisionDraft {
     var stage: AgentTaskRoutingLogStage
     var outcome: AgentTaskRoutingLogOutcome
@@ -132,12 +161,62 @@ struct AgentTaskRoutingDecisionDraft {
     }
 }
 
-struct AgentTaskRoutingDecisionEvent: Encodable {
-    let requestID: UUID
-    let sessionID: UUID?
+struct AgentTaskRoutingDecisionEvent: Codable, Equatable {
+    let schema: Int
+    let timestamp: String
+    let requestID: String
+    let sessionID: String?
     let scope: AgentTaskRoutingLogScope
-    let draft: AgentTaskRoutingDecisionDraft
-    let timestamp: Date
+    let stage: AgentTaskRoutingLogStage
+    let outcome: AgentTaskRoutingLogOutcome
+    let backend: String?
+    let jevModel: String?
+    let policyVersion: String?
+    let candidates: [AgentTaskRoutingLogCandidate]
+    let chosenKey: String?
+    let chosenTarget: AgentTaskRoutingLogTarget?
+    let probabilities: [String: Double]?
+    let confidence: Double?
+    let reasonCode: String?
+    let inputTokens: Int?
+    let outputTokens: Int?
+    let latencyMs: Double?
+    let failure: String?
+    let rationale: String?
+    let makerExclusions: [String: [String]]?
+    let routingOverride: AgentTaskRoutingExplorationRecord?
+
+    init(
+        requestID: UUID,
+        sessionID: UUID?,
+        scope: AgentTaskRoutingLogScope,
+        draft: AgentTaskRoutingDecisionDraft,
+        timestamp: Date
+    ) {
+        schema = AgentTaskRoutingDecisionLog.schemaVersion
+        self.timestamp = AgentTaskRoutingDecisionLog.format(timestamp)
+        self.requestID = requestID.uuidString
+        self.sessionID = sessionID?.uuidString
+        self.scope = scope
+        stage = draft.stage
+        outcome = draft.outcome
+        backend = draft.backend
+        jevModel = draft.jevModel
+        policyVersion = draft.policyVersion
+        candidates = draft.candidates
+        chosenKey = draft.chosenKey
+        chosenTarget = draft.chosenTarget
+        probabilities = draft.probabilities
+        confidence = draft.confidence
+        reasonCode = draft.reasonCode
+        inputTokens = draft.inputTokens
+        outputTokens = draft.outputTokens
+        latencyMs = draft.latencyMs
+        failure = draft.failure
+        makerExclusions = draft.makerExclusions
+        routingOverride = draft.routingOverride
+        rationale = nil
+    }
 
     private enum CodingKeys: String, CodingKey {
         case event, schema, timestamp, requestID, sessionID, scope, stage, outcome, backend, jevModel
@@ -146,70 +225,169 @@ struct AgentTaskRoutingDecisionEvent: Encodable {
         case routingOverride = "override"
     }
 
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        schema = try container.decode(Int.self, forKey: .schema)
+        timestamp = try container.decode(String.self, forKey: .timestamp)
+        requestID = try container.decode(String.self, forKey: .requestID)
+        sessionID = try container.decodeIfPresent(String.self, forKey: .sessionID)
+        scope = try container.decode(AgentTaskRoutingLogScope.self, forKey: .scope)
+        stage = try container.decode(AgentTaskRoutingLogStage.self, forKey: .stage)
+        outcome = try container.decode(AgentTaskRoutingLogOutcome.self, forKey: .outcome)
+        backend = try container.decodeIfPresent(String.self, forKey: .backend)
+        jevModel = try container.decodeIfPresent(String.self, forKey: .jevModel)
+        policyVersion = try container.decodeIfPresent(String.self, forKey: .policyVersion)
+        candidates = try container.decode([AgentTaskRoutingLogCandidate].self, forKey: .candidates)
+        chosenKey = try container.decodeIfPresent(String.self, forKey: .chosenKey)
+        chosenTarget = try container.decodeIfPresent(AgentTaskRoutingLogTarget.self, forKey: .chosenTarget)
+        probabilities = try container.decodeIfPresent([String: Double].self, forKey: .probabilities)
+        confidence = try container.decodeIfPresent(Double.self, forKey: .confidence)
+        reasonCode = try container.decodeIfPresent(String.self, forKey: .reasonCode)
+        inputTokens = try container.decodeIfPresent(Int.self, forKey: .inputTokens)
+        outputTokens = try container.decodeIfPresent(Int.self, forKey: .outputTokens)
+        latencyMs = try container.decodeIfPresent(Double.self, forKey: .latencyMs)
+        failure = try container.decodeIfPresent(String.self, forKey: .failure)
+        rationale = try container.decodeIfPresent(String.self, forKey: .rationale)
+        makerExclusions = try container.decodeIfPresent([String: [String]].self, forKey: .makerExclusions)
+        routingOverride = try container.decodeIfPresent(AgentTaskRoutingExplorationRecord.self, forKey: .routingOverride)
+    }
+
     func encode(to encoder: Encoder) throws {
         var container = encoder.container(keyedBy: CodingKeys.self)
         try container.encode("decision", forKey: .event)
-        try container.encode(AgentTaskRoutingDecisionLog.schemaVersion, forKey: .schema)
-        try container.encode(AgentTaskRoutingDecisionLog.format(timestamp), forKey: .timestamp)
-        try container.encode(requestID.uuidString, forKey: .requestID)
-        try container.encodeOrNull(sessionID?.uuidString, forKey: .sessionID)
+        try container.encode(schema, forKey: .schema)
+        try container.encode(timestamp, forKey: .timestamp)
+        try container.encode(requestID, forKey: .requestID)
+        try container.encodeOrNull(sessionID, forKey: .sessionID)
         try container.encode(scope.rawValue, forKey: .scope)
-        try container.encode(draft.stage.rawValue, forKey: .stage)
-        try container.encode(draft.outcome.rawValue, forKey: .outcome)
-        try container.encodeOrNull(draft.backend, forKey: .backend)
-        try container.encodeOrNull(draft.jevModel, forKey: .jevModel)
-        try container.encodeOrNull(draft.policyVersion, forKey: .policyVersion)
-        try container.encode(draft.candidates, forKey: .candidates)
-        try container.encodeOrNull(draft.chosenKey, forKey: .chosenKey)
-        try container.encodeOrNull(draft.chosenTarget, forKey: .chosenTarget)
-        try container.encodeOrNull(draft.probabilities, forKey: .probabilities)
-        try container.encodeOrNull(draft.confidence, forKey: .confidence)
-        try container.encodeOrNull(draft.reasonCode, forKey: .reasonCode)
-        try container.encodeOrNull(draft.inputTokens, forKey: .inputTokens)
-        try container.encodeOrNull(draft.outputTokens, forKey: .outputTokens)
-        try container.encodeOrNull(draft.latencyMs, forKey: .latencyMs)
-        try container.encodeOrNull(draft.failure, forKey: .failure)
-        try container.encodeOrNull(draft.makerExclusions, forKey: .makerExclusions)
-        // The decoded Jev response contract exposes no rationale.
+        try container.encode(stage.rawValue, forKey: .stage)
+        try container.encode(outcome.rawValue, forKey: .outcome)
+        try container.encodeOrNull(backend, forKey: .backend)
+        try container.encodeOrNull(jevModel, forKey: .jevModel)
+        try container.encodeOrNull(policyVersion, forKey: .policyVersion)
+        try container.encode(candidates, forKey: .candidates)
+        try container.encodeOrNull(chosenKey, forKey: .chosenKey)
+        try container.encodeOrNull(chosenTarget, forKey: .chosenTarget)
+        try container.encodeOrNull(probabilities, forKey: .probabilities)
+        try container.encodeOrNull(confidence, forKey: .confidence)
+        try container.encodeOrNull(reasonCode, forKey: .reasonCode)
+        try container.encodeOrNull(inputTokens, forKey: .inputTokens)
+        try container.encodeOrNull(outputTokens, forKey: .outputTokens)
+        try container.encodeOrNull(latencyMs, forKey: .latencyMs)
+        try container.encodeOrNull(failure, forKey: .failure)
+        try container.encodeOrNull(makerExclusions, forKey: .makerExclusions)
+        try container.encodeOrNull(routingOverride, forKey: .routingOverride)
         try container.encodeNil(forKey: .rationale)
-        try container.encodeOrNull(draft.routingOverride, forKey: .routingOverride)
     }
 }
 
-struct AgentTaskRoutingAppliedEvent: Encodable {
-    let requestID: UUID
-    let sessionID: UUID?
+struct AgentTaskRoutingAppliedEvent: Codable, Equatable {
+    let schema: Int
+    let timestamp: String
+    let requestID: String
+    let sessionID: String?
     let scope: AgentTaskRoutingLogScope
     let outcome: AgentTaskRoutingAppliedOutcome
-    let applied: AgentTaskRoutingLogTarget?
+    let provider: String?
+    let model: String?
+    let effort: String?
+    let modelParameters: [AgentTaskRoutingLogTarget.Parameter]
     let picked: AgentTaskRoutingLogTarget?
-    let timestamp: Date
+
+    init(
+        requestID: UUID,
+        sessionID: UUID?,
+        scope: AgentTaskRoutingLogScope,
+        outcome: AgentTaskRoutingAppliedOutcome,
+        applied: AgentTaskRoutingLogTarget?,
+        picked: AgentTaskRoutingLogTarget?,
+        timestamp: Date
+    ) {
+        schema = AgentTaskRoutingDecisionLog.schemaVersion
+        self.timestamp = AgentTaskRoutingDecisionLog.format(timestamp)
+        self.requestID = requestID.uuidString
+        self.sessionID = sessionID?.uuidString
+        self.scope = scope
+        self.outcome = outcome
+        provider = applied?.provider
+        model = applied?.model
+        effort = applied?.effort
+        modelParameters = applied?.modelParameters ?? []
+        self.picked = picked
+    }
 
     private enum CodingKeys: String, CodingKey {
         case event, schema, timestamp, requestID, sessionID, scope, outcome
         case provider, model, effort, modelParameters, picked
     }
 
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        schema = try container.decode(Int.self, forKey: .schema)
+        timestamp = try container.decode(String.self, forKey: .timestamp)
+        requestID = try container.decode(String.self, forKey: .requestID)
+        sessionID = try container.decodeIfPresent(String.self, forKey: .sessionID)
+        scope = try container.decode(AgentTaskRoutingLogScope.self, forKey: .scope)
+        outcome = try container.decode(AgentTaskRoutingAppliedOutcome.self, forKey: .outcome)
+        provider = try container.decodeIfPresent(String.self, forKey: .provider)
+        model = try container.decodeIfPresent(String.self, forKey: .model)
+        effort = try container.decodeIfPresent(String.self, forKey: .effort)
+        modelParameters = try container.decodeIfPresent([AgentTaskRoutingLogTarget.Parameter].self, forKey: .modelParameters) ?? []
+        picked = try container.decodeIfPresent(AgentTaskRoutingLogTarget.self, forKey: .picked)
+    }
+
     func encode(to encoder: Encoder) throws {
         var container = encoder.container(keyedBy: CodingKeys.self)
         try container.encode("applied", forKey: .event)
-        try container.encode(AgentTaskRoutingDecisionLog.schemaVersion, forKey: .schema)
-        try container.encode(AgentTaskRoutingDecisionLog.format(timestamp), forKey: .timestamp)
-        try container.encode(requestID.uuidString, forKey: .requestID)
-        try container.encodeOrNull(sessionID?.uuidString, forKey: .sessionID)
+        try container.encode(schema, forKey: .schema)
+        try container.encode(timestamp, forKey: .timestamp)
+        try container.encode(requestID, forKey: .requestID)
+        try container.encodeOrNull(sessionID, forKey: .sessionID)
         try container.encode(scope.rawValue, forKey: .scope)
         try container.encode(outcome.rawValue, forKey: .outcome)
-        try container.encodeOrNull(applied?.provider, forKey: .provider)
-        try container.encodeOrNull(applied?.model, forKey: .model)
-        try container.encodeOrNull(applied?.effort, forKey: .effort)
-        try container.encode(applied?.modelParameters ?? [], forKey: .modelParameters)
+        try container.encodeOrNull(provider, forKey: .provider)
+        try container.encodeOrNull(model, forKey: .model)
+        try container.encodeOrNull(effort, forKey: .effort)
+        try container.encode(modelParameters, forKey: .modelParameters)
         try container.encodeOrNull(picked, forKey: .picked)
     }
 }
 
-// MARK: - Storage
+enum AgentTaskRoutingLogLine: Codable, Equatable {
+    case decision(AgentTaskRoutingDecisionEvent)
+    case applied(AgentTaskRoutingAppliedEvent)
 
-/// Physical file operations. Injected so tests can fail or gate I/O without production-only behavior.
+    private enum CodingKeys: String, CodingKey {
+        case event
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        let kind = try container.decode(String.self, forKey: .event)
+        switch kind {
+        case "decision":
+            self = try .decision(AgentTaskRoutingDecisionEvent(from: decoder))
+        case "applied":
+            self = try .applied(AgentTaskRoutingAppliedEvent(from: decoder))
+        default:
+            throw DecodingError.dataCorruptedError(
+                forKey: .event,
+                in: container,
+                debugDescription: "Unknown routing decision log event: \(kind)"
+            )
+        }
+    }
+
+    func encode(to encoder: Encoder) throws {
+        switch self {
+        case let .decision(event):
+            try event.encode(to: encoder)
+        case let .applied(event):
+            try event.encode(to: encoder)
+        }
+    }
+}
+
 protocol AgentTaskRoutingDecisionLogStorage: Sendable {
     func activeFileSize() async throws -> Int
     func append(_ data: Data) async throws
@@ -253,14 +431,6 @@ struct AgentTaskRoutingDecisionLogFileStorage: AgentTaskRoutingDecisionLogStorag
     }
 }
 
-// MARK: - Log actor
-
-/// Default-on local JSONL record of router decisions and their application.
-///
-/// Admission is soft backpressure, not a cap: queued plus in-flight bytes count against `admissionBudget`,
-/// waiters are served FIFO ahead of newcomers, and a promoted waiter's bytes are reserved and enqueued
-/// before its caller resumes. Rotation is a threshold: a row is never split, truncated or dropped while
-/// the log is writable. A physical I/O failure drops only that row, counts it, and never affects routing.
 actor AgentTaskRoutingDecisionLog {
     static let schemaVersion = 1
     static let defaultMaxBytes = 5 * 1024 * 1024
@@ -350,7 +520,6 @@ actor AgentTaskRoutingDecisionLog {
         )
     }
 
-    /// Encodes an allowlisted event and appends it. Never throws and never fails the caller.
     func record(_ event: some Encodable) async {
         guard let line = try? encoder.encode(event) else {
             droppedCount += 1
@@ -360,7 +529,6 @@ actor AgentTaskRoutingDecisionLog {
         await append(line + Data([0x0A]))
     }
 
-    /// Non-throwing and deliberately not cancellation-aware: a cancelled route is still logged once.
     func append(_ row: Data) async {
         let size = row.count
         // ponytail: waiters hold precedence; an empty-queue oversized row never bypasses an older waiter.
@@ -375,12 +543,16 @@ actor AgentTaskRoutingDecisionLog {
         }
     }
 
-    /// Resolves once every admitted and waiting row has been written or discarded.
     func flush() async {
-        if isIdle { return }
-        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
-            idleWaiters.append(continuation)
+        while !isIdle {
+            await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+                idleWaiters.append(continuation)
+            }
         }
+    }
+
+    func flushForTesting() async {
+        await flush()
     }
 
     private var isIdle: Bool {
@@ -435,7 +607,6 @@ actor AgentTaskRoutingDecisionLog {
         idle.forEach { $0.resume() }
     }
 
-    /// Reserve and enqueue the head waiter's bytes before resuming it, with no suspension point.
     private func promote() {
         while let head = waiters.first, admittedBytes + head.line.count <= admissionBudget || admittedBytes == 0 {
             waiters.removeFirst()
@@ -468,10 +639,9 @@ actor AgentTaskRoutingDecisionLog {
     }
 }
 
-// MARK: - Route context
-
 enum AgentTaskRoutingStartSettlement {
     case accepted(actual: AgentRoutingExecutableTarget?, sessionID: UUID?)
+    case started(sessionID: UUID?, applied: AgentRoutingExecutableTarget)
     case rejected
     case notStarted
 
@@ -481,8 +651,6 @@ enum AgentTaskRoutingStartSettlement {
     }
 }
 
-/// Route-owned lifetime: stages written, decision presence and first-writer-wins finalization live here,
-/// not in the log, so a delayed application finalizes regardless of how many other routes completed.
 actor AgentTaskRoutingRouteContext {
     nonisolated let requestID: UUID
     nonisolated let scope: AgentTaskRoutingLogScope
@@ -506,7 +674,6 @@ actor AgentTaskRoutingRouteContext {
         sessionID = id
     }
 
-    /// First nonempty map wins; an empty map leaves the slot open.
     func attachMakerExclusions(_ map: [String: [String]]) {
         guard makerExclusions == nil, !map.isEmpty else { return }
         makerExclusions = map
@@ -516,7 +683,6 @@ actor AgentTaskRoutingRouteContext {
         picked = target
     }
 
-    /// Writes at most one decision per stage.
     func emitDecision(_ draft: AgentTaskRoutingDecisionDraft) async {
         guard !finished, stagesWritten.insert(draft.stage).inserted else { return }
         hasDecision = true
@@ -528,7 +694,6 @@ actor AgentTaskRoutingRouteContext {
         pendingEmits -= 1
     }
 
-    /// First writer wins. No applied row exists without an emitted decision.
     func finish(_ settlement: AgentTaskRoutingStartSettlement) async {
         guard !finished else { return }
         finished = true
@@ -548,7 +713,11 @@ actor AgentTaskRoutingRouteContext {
         case let .accepted(actual, acceptedSessionID):
             appliedTarget = actual
             eventSessionID = acceptedSessionID ?? sessionID
-            outcome = (picked != nil && picked == actual) ? .applied : .fallback
+            outcome = (picked != nil && picked.map(AgentTaskRoutingLogTarget.init) == actual.map(AgentTaskRoutingLogTarget.init)) ? .applied : .fallback
+        case let .started(startedSessionID, applied):
+            appliedTarget = applied
+            eventSessionID = startedSessionID ?? sessionID
+            outcome = (picked.map(AgentTaskRoutingLogTarget.init) == AgentTaskRoutingLogTarget(applied)) ? .applied : .fallback
         }
         let event = await log.makeAppliedEvent(
             requestID: requestID,
@@ -561,8 +730,14 @@ actor AgentTaskRoutingRouteContext {
         await log.record(event)
     }
 
-    /// Runs `body` with this route's start sink in scope. The completion task awaits the sink and
-    /// finishes the application; `body` returning or throwing without arming settles it too.
+    nonisolated func runStartScope<T>(
+        _ body: () async throws -> T
+    ) async rethrows -> T {
+        try await AgentTaskRoutingJudgeLogging.currentTaskLocal.withValue(self) {
+            try await body()
+        }
+    }
+
     nonisolated func runStartScope<T>(
         unarmedOnReturn: (T) -> AgentTaskRoutingStartSettlement,
         _ body: () async throws -> T
@@ -585,15 +760,12 @@ actor AgentTaskRoutingRouteContext {
     }
 }
 
-/// Lets a long start method that mints its context mid-way finish it from one outer catch.
 @MainActor
 final class AgentTaskRoutingRouteContextHolder {
     var context: AgentTaskRoutingRouteContext?
 }
 
-/// Synchronous arm/settle handshake between the composer/MCP start sites and the route context.
 final class AgentTaskRoutingStartSink: @unchecked Sendable {
-    /// Token returned to exactly one start site.
     struct Armed {
         fileprivate let sink: AgentTaskRoutingStartSink
 
@@ -602,7 +774,6 @@ final class AgentTaskRoutingStartSink: @unchecked Sendable {
             sink.settle(AgentTaskRoutingStartSettlement(recorder: recorder, actual: actual, sessionID: sessionID))
         }
 
-        /// Early exits that never reached the provider pipeline.
         func settleRejected() {
             sink.settle(.rejected)
         }
@@ -613,7 +784,6 @@ final class AgentTaskRoutingStartSink: @unchecked Sendable {
     private var settled: AgentTaskRoutingStartSettlement?
     private var waiter: CheckedContinuation<AgentTaskRoutingStartSettlement, Never>?
 
-    /// Arms the live sink in scope, once. Nil when there is no routed start in scope.
     static func armCurrent() -> Armed? {
         guard let scope = AgentTaskRoutingRouteScope.live, scope.sink.arm() else { return nil }
         return Armed(sink: scope.sink)
@@ -680,14 +850,12 @@ struct AgentTaskRoutingRouteScope {
         currentTaskLocal.get()
     }
 
-    /// A scope whose start already settled is stale (inherited by a later task) and is ignored.
     static var live: AgentTaskRoutingRouteScope? {
         guard let scope = current, !scope.sink.isSettled else { return nil }
         return scope
     }
 }
 
-/// Carries the context the Auto Effort judge writes its decision through.
 enum AgentTaskRoutingJudgeLogging {
     static let currentTaskLocal = BoxedTaskLocal<AgentTaskRoutingRouteContext?>(nil)
     static var current: AgentTaskRoutingRouteContext? {

@@ -213,6 +213,7 @@ struct APISettingsView: View {
                     deleteAction: deleteGrokKey,
                     isLoading: isLoadingGrok,
                     infoURL: "https://console.x.ai/",
+                    caption: "Also passed to Grok Build for Oracle, Chat, and model discovery, even when you're signed in with grok login. Grok chooses which credential each request uses; requests to the xAI API that use the key are billed to the xAI API account.",
                     availableModels: viewModel.availableGrokModels,
                     selectedModel: $viewModel.grokCustomModel
                 )
