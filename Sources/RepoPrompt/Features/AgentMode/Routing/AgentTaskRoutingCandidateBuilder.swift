@@ -606,7 +606,7 @@ struct AgentTaskRoutingCandidateBuilder {
                 guard versionedBase.hasSuffix(suffix), versionedBase.count > suffix.count else { continue }
                 versionText = versionedBase.dropLast(suffix.count)
             } else {
-                guard !versionedBase.hasSuffix("-flash") else { continue }
+                guard !versionedBase.split(separator: "-").contains("flash") else { continue }
                 versionText = versionedBase.prefix { $0 != "-" }
             }
             let components = versionText.split(separator: ".", omittingEmptySubsequences: false)

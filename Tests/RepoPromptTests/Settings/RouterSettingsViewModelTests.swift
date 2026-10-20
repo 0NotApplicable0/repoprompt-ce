@@ -1287,6 +1287,22 @@ final class RouterSettingsViewModelTests: XCTestCase {
         }
     }
 
+    func testGeminiProIgnoresNewerFlashVariants() throws {
+        let availability = fiveProviderAvailability(claudeAndCodex: false, antigravity: true)
+        let advertised = ["gemini-2.5-pro", "gemini-3-flash-preview", "gemini-3.1-flash-lite", "gemini-3.8-flash"]
+        for (models, expectedPro) in [
+            (advertised, "gemini-2.5-pro"),
+            (advertised + ["gemini-4-argon"], "gemini-4-argon")
+        ] {
+            let options: @MainActor (AgentProviderKind, AgentModelCatalog.AvailabilityContext) -> [AgentModelOption] = { provider, _ in
+                provider == .antigravity ? Self.frontierCatalogOptions(models) : []
+            }
+            let previews = try RouterSettingsViewModel.buildTargetPreviews(availability: availability, catalogOptions: options)
+            XCTAssertEqual(previews.first { $0.familyDisplayName == "Gemini Pro" }?.target.modelRaw, expectedPro)
+            XCTAssertEqual(previews.first { $0.familyDisplayName == "Gemini Flash" }?.target.modelRaw, "gemini-3.8-flash")
+        }
+    }
+
     func testRouterFamilyStaysUnavailableWithoutMatchingModel() {
         let availability = fiveProviderAvailability(claudeAndCodex: false, antigravity: true, grok: true)
         let options: @MainActor (AgentProviderKind, AgentModelCatalog.AvailabilityContext) -> [AgentModelOption] = { provider, _ in
