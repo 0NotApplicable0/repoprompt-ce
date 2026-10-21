@@ -64,6 +64,30 @@ final class AntigravityStreamParserTests: XCTestCase {
         XCTAssertEqual(results.first?.type, "content")
         XCTAssertEqual(results.first?.text, mixed)
     }
+
+    func testStreamJSONAssistantDeltaUsesNestedStepUpdate() {
+        let event = AntigravityStreamJSONLineParser.parse(#"{"event":"step_update","step_update":{"step_type":"agent_response","text_delta":"pong"}}"#)
+        XCTAssertEqual(event, .assistantDelta("pong"))
+    }
+
+    func testStreamJSONResultUsesNestedResultEnvelope() {
+        let event = AntigravityStreamJSONLineParser.parse(#"{"event":"result","result":{"response":"pong\n","status":"completed"}}"#)
+        XCTAssertEqual(event, .result(response: "pong\n", status: "completed"))
+    }
+
+    func testStreamJSONIgnoresMalformedAndUnknownEvents() {
+        XCTAssertEqual(AntigravityStreamJSONLineParser.parse("{not json"), .ignored)
+        XCTAssertEqual(AntigravityStreamJSONLineParser.parse(#"{"event":"tool_update"}"#), .ignored)
+    }
+
+    func testStreamJSONPreservesPlainText() {
+        XCTAssertEqual(AntigravityStreamJSONLineParser.parse("pong"), .plain("pong"))
+    }
+
+    func testStreamJSONRequiresAgentResponseTextDelta() {
+        let event = AntigravityStreamJSONLineParser.parse(#"{"event":"step_update","step_update":{"step_type":"tool","text_delta":"ignore"}}"#)
+        XCTAssertEqual(event, .ignored)
+    }
 }
 
 final class AntigravityToolStepParserTests: XCTestCase {

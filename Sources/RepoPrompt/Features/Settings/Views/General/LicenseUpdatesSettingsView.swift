@@ -1,13 +1,11 @@
 import SwiftUI
 
 struct LicenseUpdatesSettingsView: View {
-    @ObservedObject var windowState: WindowState
     @ObservedObject private var sparkleManager: SparkleUpdaterManager
 
     var closeAction: (() -> Void)?
 
-    init(windowState: WindowState, closeAction: (() -> Void)? = nil) {
-        self.windowState = windowState
+    init(closeAction: (() -> Void)? = nil) {
         _sparkleManager = ObservedObject(wrappedValue: SparkleUpdaterManager.shared)
         self.closeAction = closeAction
     }

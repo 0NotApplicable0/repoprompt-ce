@@ -67,6 +67,11 @@ final class FleetManagerWorkspaceCatalog: WorkspaceChooserSource {
     private var lastSequence: UInt64 = 0
     private var projectionGeneration: UInt64 = 0
     private var cachedModels: [UUID: (digest: String, model: WorkspaceModel)] = [:]
+    private var missingDocumentWorkspaceIDs: [UUID] = []
+
+    var canRemoveMissingWorkspaceEntries: Bool {
+        !missingDocumentWorkspaceIDs.isEmpty
+    }
 
     init(store: DomainWorkspaceStore = AppDomainRuntimeComposition.shared.runtime.workspaceStore) {
         self.store = store
@@ -122,9 +127,25 @@ final class FleetManagerWorkspaceCatalog: WorkspaceChooserSource {
         }
     }
 
+    func requestRemoveMissingWorkspaceEntries() {
+        guard retryTask == nil, let runID, canRemoveMissingWorkspaceEntries else { return }
+        let workspaceIDs = missingDocumentWorkspaceIDs
+        retryTask = Task { [weak self, store] in
+            _ = await store.execute(.init(
+                operationID: UUID(), origin: .appPresentation(windowID: 0),
+                command: .removeMissingWorkspaceCatalogEntries(workspaceIDs: workspaceIDs)
+            ))
+            let snapshot = await store.snapshot()
+            guard !Task.isCancelled, self?.runID == runID else { return }
+            self?.apply(snapshot)
+            self?.retryTask = nil
+        }
+    }
+
     private func apply(_ snapshot: DomainWorkspaceCatalogSnapshot) {
         guard snapshot.publicationSequence >= lastSequence else { return }
         lastSequence = snapshot.publicationSequence
+        missingDocumentWorkspaceIDs = snapshot.unavailableWorkspaces.filter(\.isAbsentENOENT).map(\.workspaceID)
         guard snapshot.isBootstrapped else {
             reportFailure(.notBootstrapped, snapshot: snapshot)
             return

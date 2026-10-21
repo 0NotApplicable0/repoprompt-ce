@@ -5,7 +5,6 @@ import SwiftUI
 @MainActor
 enum AppSettingsCommand {
     private static var notificationSubscriptions: Set<AnyCancellable> = []
-    private static var openingWindow: Task<WindowState, Error>?
     private static let menuTarget = AppSettingsMenuTarget()
 
     static func installNativeMenuAction(in menu: NSMenu? = nil, target: AppSettingsMenuTarget? = nil) {
@@ -29,29 +28,13 @@ enum AppSettingsCommand {
     static func open(
         selectedTab: SettingsTab? = nil,
         requestedWindow: WindowState? = nil,
-        present: @MainActor (WindowState, SettingsTab?) -> Void = {
+        present: @MainActor (WindowState?, SettingsTab?) -> Void = {
             SettingsWindowCoordinator.shared.open(windowState: $0, selectedTab: $1)
         }
     ) async throws {
-        let target: WindowState = if let existing = requestedWindow ?? targetWindow() {
-            existing
-        } else {
-            try await openSettingsTargetWindow()
-        }
-        guard !target.isClosing else { throw CancellationError() }
+        let target = requestedWindow ?? targetWindow()
+        guard target?.isClosing != true else { throw CancellationError() }
         present(target, selectedTab)
-    }
-
-    private static func openSettingsTargetWindow() async throws -> WindowState {
-        if let openingWindow { return try await openingWindow.value }
-        let task = Task { @MainActor in
-            let result = try await WindowStatesManager.shared.openNewMainWindow()
-            await result.window.workspaceManager.awaitInitialized()
-            return result.window
-        }
-        openingWindow = task
-        defer { openingWindow = nil }
-        return try await task.value
     }
 
     static func openFromMenu() {
@@ -67,7 +50,7 @@ enum AppSettingsCommand {
     static func open(
         notification: Notification,
         selectedTab: SettingsTab?,
-        present: @MainActor (WindowState, SettingsTab?) -> Void = {
+        present: @MainActor (WindowState?, SettingsTab?) -> Void = {
             SettingsWindowCoordinator.shared.open(windowState: $0, selectedTab: $1)
         }
     ) async throws {
@@ -76,8 +59,14 @@ enum AppSettingsCommand {
             guard WindowStatesManager.shared.allWindows.contains(where: { $0 === state }), !state.isClosing else { return }
             requested = state
         } else if let id = notification.userInfo?["windowID"] as? Int {
-            guard let state = WindowStatesManager.shared.window(withID: id), !state.isClosing else { return }
-            requested = state
+            if let state = WindowStatesManager.shared.window(withID: id) {
+                guard !state.isClosing else { return }
+                requested = state
+            } else if WindowStatesManager.shared.allWindows.isEmpty {
+                requested = nil
+            } else {
+                return
+            }
         } else {
             requested = nil
         }

@@ -380,6 +380,145 @@ final class AntigravityRunDiagnosticsTests: XCTestCase {
         XCTAssertFalse(captured.events.contains { $0.type == "message_stop" })
     }
 
+    func testStreamJSONFirstTurnFixturePublishesAssistantTextBeforeProcessExit() async throws {
+        let fixture = try makeControlledStreamJSONFixture()
+        let stream = try await fixture.provider.streamAgentMessage(AgentMessage(userMessage: "diagnostics test"))
+        let receivedPong = expectation(description: "decoded pong before process termination")
+        let events = EventRecorder()
+        let consumer = Task {
+            do {
+                for try await event in stream {
+                    events.append(event)
+                    if event.type == "content", event.text == "pong" {
+                        receivedPong.fulfill()
+                    }
+                }
+                return nil as String?
+            } catch {
+                return error.localizedDescription
+            }
+        }
+        let lines = try String(decoding: fixtureData(named: "agy-stream-json-first-turn.ndjson"), as: UTF8.self)
+            .split(separator: "\n", omittingEmptySubsequences: true)
+        XCTAssertEqual(lines.count, 5)
+        for line in lines.prefix(3) {
+            fixture.process.yield(.stdout(Data((line + "\n").utf8)))
+        }
+        await fulfillment(of: [receivedPong], timeout: 10)
+        XCTAssertFalse(fixture.process.terminationSent)
+
+        for line in lines.dropFirst(3) {
+            fixture.process.yield(.stdout(Data((line + "\n").utf8)))
+        }
+        fixture.process.finish()
+        let failure = await consumer.value
+        await fixture.provider.dispose()
+        try? FileManager.default.removeItem(at: fixture.root)
+
+        XCTAssertNil(failure)
+        XCTAssertTrue(consecutive(fixture.arguments.arguments, [
+            "--print",
+            AntigravityAgentProvider.combinedPrompt(system: "", user: "diagnostics test")
+        ]))
+        XCTAssertTrue(consecutive(fixture.arguments.arguments, ["--output-format", "stream-json"]))
+        XCTAssertEqual(content(in: events.events), "pong\n")
+        XCTAssertEqual(events.events.count(where: { $0.type == "message_stop" }), 1)
+        XCTAssertFalse(content(in: events.events).contains("{\"event\""))
+    }
+
+    func testStreamJSONResumeFixtureReplaysNoHistoryAndMatchesResult() async throws {
+        let captured = try await captureStreamJSONFixture(named: "agy-stream-json-resume.ndjson")
+        XCTAssertTrue(consecutive(captured.arguments, ["--output-format", "stream-json"]))
+        XCTAssertEqual(content(in: captured.events), "pong2\n")
+        XCTAssertFalse(content(in: captured.events).contains("system_message"))
+    }
+
+    func testStreamJSONResultExtendsPartialDeltasEmitsSuffixOnly() async throws {
+        let captured = try await captureStreamJSON(
+            "{\"event\":\"step_update\",\"step_update\":{\"step_type\":\"agent_response\",\"text_delta\":\"po\"}}\n"
+                + "{\"event\":\"result\",\"result\":{\"response\":\"pong\\n\",\"status\":\"SUCCESS\"}}\n"
+        )
+        XCTAssertTrue(consecutive(captured.arguments, ["--output-format", "stream-json"]))
+        XCTAssertEqual(content(in: captured.events), "pong\n")
+    }
+
+    func testStreamJSONDivergedResultDoesNotDuplicate() async throws {
+        let captured = try await captureStreamJSON(
+            "{\"event\":\"step_update\",\"step_update\":{\"step_type\":\"agent_response\",\"text_delta\":\"po\"}}\n"
+                + "{\"event\":\"result\",\"result\":{\"response\":\"different\\n\",\"status\":\"SUCCESS\"}}\n"
+        )
+        XCTAssertTrue(consecutive(captured.arguments, ["--output-format", "stream-json"]))
+        XCTAssertEqual(content(in: captured.events), "po")
+    }
+
+    func testStreamJSONResultOnlyFallbackEmitsResponseOnce() async throws {
+        let captured = try await captureStreamJSON(
+            "{\"event\":\"result\",\"result\":{\"response\":\"pong\\n\",\"status\":\"SUCCESS\"}}\n"
+        )
+        XCTAssertTrue(consecutive(captured.arguments, ["--output-format", "stream-json"]))
+        XCTAssertEqual(content(in: captured.events), "pong\n")
+    }
+
+    func testStreamJSONPollCapResultClassifiedCappedAndMarkerNotInContent() async throws {
+        let captured = try await captureStreamJSON(
+            "{\"event\":\"result\",\"result\":{\"response\":\"Error: timed out waiting for response\",\"status\":\"SUCCESS\"}}\n"
+        )
+        XCTAssertTrue(consecutive(captured.arguments, ["--output-format", "stream-json"]))
+        XCTAssertTrue(captured.failure?.contains("headless print mode stopped") == true)
+        XCTAssertFalse(content(in: captured.events).contains("Error: timed out waiting for response"))
+    }
+
+    func testStreamJSONInitOnlyFirstTurnIsNoMeaningfulOutput() async throws {
+        let captured = try await captureStreamJSON("{\"event\":\"init\",\"conversation_id\":\"fixture\"}\n")
+        XCTAssertTrue(consecutive(captured.arguments, ["--output-format", "stream-json"]))
+        XCTAssertTrue(captured.failure?.localizedCaseInsensitiveContains("no meaningful output") == true)
+        XCTAssertTrue(content(in: captured.events).isEmpty)
+    }
+
+    func testStreamJSONPartialDeltasThenExit3SurfacesFailure() async throws {
+        let captured = try await captureStreamJSON(
+            "{\"event\":\"step_update\",\"step_update\":{\"step_type\":\"agent_response\",\"text_delta\":\"pong\"}}\n",
+            exitStatus: 3
+        )
+        XCTAssertTrue(consecutive(captured.arguments, ["--output-format", "stream-json"]))
+        XCTAssertEqual(content(in: captured.events), "pong")
+        XCTAssertNotNil(captured.failure)
+        XCTAssertFalse(captured.events.contains { $0.type == "message_stop" })
+    }
+
+    func testStreamJSONMalformedEventLineDoesNotLeakRawJSON() async throws {
+        let captured = try await captureStreamJSON("{\"event\":\"step_update\"\nplain output\n")
+        XCTAssertTrue(consecutive(captured.arguments, ["--output-format", "stream-json"]))
+        XCTAssertEqual(content(in: captured.events), "plain output\n")
+        XCTAssertFalse(content(in: captured.events).contains("{\"event\""))
+    }
+
+    func testStreamJSONUnterminatedResultLineDoesNotLeakRawJSON() async throws {
+        let captured = try await captureStreamJSON(
+            "{\"event\":\"result\",\"result\":{\"response\":\"pong\\n\",\"status\":\"SUCCESS\"}}"
+        )
+        XCTAssertTrue(consecutive(captured.arguments, ["--output-format", "stream-json"]))
+        XCTAssertEqual(content(in: captured.events), "pong\n")
+        XCTAssertFalse(content(in: captured.events).contains("{\"event\""))
+    }
+
+    func testStreamJSONFixtureFilesMatchCapturedBytes() throws {
+        let first = try fixtureData(named: "agy-stream-json-first-turn.ndjson")
+        let resume = try fixtureData(named: "agy-stream-json-resume.ndjson")
+        XCTAssertEqual(first.count, 2308)
+        XCTAssertEqual(resume.count, 2503)
+        XCTAssertEqual(String(decoding: first, as: UTF8.self).split(whereSeparator: \.isNewline).count, 5)
+        XCTAssertEqual(String(decoding: resume, as: UTF8.self).split(whereSeparator: \.isNewline).count, 6)
+    }
+
+    func testOversizedPromptUsesTextOutputAndPlainStdout() async throws {
+        let prompt = String(repeating: "x", count: AntigravityAgentProvider.maxInlinePromptBytes + 1)
+        let captured = try await captureStreamJSON("plain stdout\n", prompt: prompt)
+        XCTAssertFalse(captured.arguments.contains("--output-format"))
+        XCTAssertEqual(content(in: captured.events), "plain stdout\n")
+        XCTAssertNil(captured.failure)
+    }
+
     private func makeRoot() throws -> URL {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("AntigravityRunDiagnosticsTests-\(UUID().uuidString)", isDirectory: true)
@@ -448,6 +587,149 @@ final class AntigravityRunDiagnosticsTests: XCTestCase {
             runner: runner, config: AntigravityAgentConfig(maxPrintResumes: 0), runtimeOverrides: runtime
         )
         return Fixture(root: root, diagnostics: diagnostics, activeLogs: activeLogs, provider: provider)
+    }
+
+    private final class EventRecorder: @unchecked Sendable {
+        private let lock = NSLock()
+        private var value: [AIStreamResult] = []
+
+        func append(_ event: AIStreamResult) {
+            lock.withLock { value.append(event) }
+        }
+
+        var events: [AIStreamResult] {
+            lock.withLock { value }
+        }
+    }
+
+    private final class ControlledProcess: @unchecked Sendable {
+        let stream: AsyncThrowingStream<CLIProcessRunner.StreamEvent, Error>
+        private let continuation: AsyncThrowingStream<CLIProcessRunner.StreamEvent, Error>.Continuation
+        private let lock = NSLock()
+        private var didSendTermination = false
+
+        init() {
+            let pair = AsyncThrowingStream<CLIProcessRunner.StreamEvent, Error>.makeStream()
+            stream = pair.stream
+            continuation = pair.continuation
+        }
+
+        func yield(_ event: CLIProcessRunner.StreamEvent) {
+            continuation.yield(event)
+        }
+
+        func finish() {
+            lock.withLock { didSendTermination = true }
+            continuation.yield(.terminated(status: 0, timedOut: false))
+            continuation.finish()
+        }
+
+        var terminationSent: Bool {
+            lock.withLock { didSendTermination }
+        }
+    }
+
+    private final class ArgumentCapture: @unchecked Sendable {
+        private let lock = NSLock()
+        private var value: [String] = []
+
+        func record(_ arguments: [String]) {
+            lock.withLock { value = arguments }
+        }
+
+        var arguments: [String] {
+            lock.withLock { value }
+        }
+    }
+
+    private struct StreamJSONCapture {
+        let arguments: [String]
+        let events: [AIStreamResult]
+        let failure: String?
+    }
+
+    private struct ControlledStreamJSONFixture {
+        let root: URL
+        let arguments: ArgumentCapture
+        let process: ControlledProcess
+        let provider: AntigravityAgentProvider
+    }
+
+    private func makeControlledStreamJSONFixture() throws -> ControlledStreamJSONFixture {
+        let root = try makeRoot()
+        let arguments = ArgumentCapture()
+        let process = ControlledProcess()
+        let runtime = AntigravityAgentProvider.RuntimeOverrides(
+            prepareContext: { runID in
+                HeadlessAgentContext(runID: runID ?? UUID(), configURL: nil, environment: ["HOME": root.path])
+            },
+            processEvents: { args, _ in
+                arguments.record(args)
+                return process.stream
+            },
+            logDirectory: root.appendingPathComponent("active", isDirectory: true),
+            diagnosticsDirectory: root.appendingPathComponent("diagnostics", isDirectory: true),
+            now: { 0 }
+        )
+        let provider = AntigravityAgentProvider(
+            runner: CLIProcessRunner(config: CLIProcessConfiguration(command: "/never-launch-agy", additionalPaths: [])),
+            config: AntigravityAgentConfig(maxPrintResumes: 0),
+            runtimeOverrides: runtime
+        )
+        return ControlledStreamJSONFixture(root: root, arguments: arguments, process: process, provider: provider)
+    }
+
+    private func captureStreamJSONFixture(named name: String) async throws -> StreamJSONCapture {
+        try await captureStreamJSON(String(decoding: fixtureData(named: name), as: UTF8.self))
+    }
+
+    private func captureStreamJSON(
+        _ stdout: String,
+        exitStatus: Int32 = 0,
+        prompt: String = "diagnostics test"
+    ) async throws -> StreamJSONCapture {
+        let root = try makeRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let arguments = ArgumentCapture()
+        let events: [CLIProcessRunner.StreamEvent] = [
+            .stdout(Data(stdout.utf8)),
+            .terminated(status: exitStatus, timedOut: false)
+        ]
+        let clock = Clock()
+        let script = EventScript(clock: clock, events: events.map { (0, $0) }, terminalError: nil)
+        let runtime = AntigravityAgentProvider.RuntimeOverrides(
+            prepareContext: { runID in
+                HeadlessAgentContext(runID: runID ?? UUID(), configURL: nil, environment: ["HOME": root.path])
+            },
+            processEvents: { args, _ in
+                arguments.record(args)
+                return AsyncThrowingStream(unfolding: { try script.next() })
+            },
+            logDirectory: root.appendingPathComponent("active", isDirectory: true),
+            diagnosticsDirectory: root.appendingPathComponent("diagnostics", isDirectory: true),
+            now: { clock.now }
+        )
+        let provider = AntigravityAgentProvider(
+            runner: CLIProcessRunner(config: CLIProcessConfiguration(command: "/never-launch-agy", additionalPaths: [])),
+            config: AntigravityAgentConfig(maxPrintResumes: 0),
+            runtimeOverrides: runtime
+        )
+        let captured = await capture(provider, prompt: prompt)
+        return StreamJSONCapture(arguments: arguments.arguments, events: captured.events, failure: captured.failure)
+    }
+
+    private func fixtureData(named name: String) throws -> Data {
+        let directory = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
+        return try Data(contentsOf: directory.appendingPathComponent("Fixtures/\(name)"))
+    }
+
+    private func content(in events: [AIStreamResult]) -> String {
+        events.filter { $0.type == "content" }.compactMap(\.text).joined()
+    }
+
+    private func consecutive(_ array: [String], _ pair: [String]) -> Bool {
+        guard pair.count == 2 else { return false }
+        return array.indices.dropLast().contains { array[$0] == pair[0] && array[$0 + 1] == pair[1] }
     }
 
     private func capture(_ provider: AntigravityAgentProvider, prompt: String = "diagnostics test") async -> Capture {
@@ -690,6 +972,36 @@ final class AntigravityArgumentBuilderTests: XCTestCase {
             resumeConversationID: "abc-123"
         )
         XCTAssertTrue(consecutive(args, ["--conversation", "abc-123"]))
+    }
+
+    func testBuildArgumentsInlineAddsStreamJSONOutputFormat() {
+        let args = AntigravityAgentProvider.buildArguments(
+            config: AntigravityAgentConfig(
+                modelString: "gemini-3.1-pro-preview", useSandbox: true, dangerouslySkipPermissions: true
+            ),
+            workspacePath: nil,
+            logFilePath: "/tmp/agy.log",
+            resumeConversationID: "abc-123",
+            inlinePrompt: "stream this"
+        )
+        XCTAssertTrue(consecutive(args, ["--print", "stream this"]))
+        XCTAssertTrue(consecutive(args, ["--output-format", "stream-json"]))
+        XCTAssertTrue(consecutive(args, ["--model", "gemini-3.1-pro-preview"]))
+        XCTAssertTrue(consecutive(args, ["--conversation", "abc-123"]))
+        XCTAssertTrue(args.contains("--sandbox"))
+        XCTAssertTrue(args.contains("--dangerously-skip-permissions"))
+        XCTAssertTrue(consecutive(args, ["--print-timeout", "3600s"]))
+        XCTAssertTrue(consecutive(args, ["--log-file", "/tmp/agy.log"]))
+    }
+
+    func testBuildArgumentsStdinPathOmitsOutputFormat() {
+        let args = AntigravityAgentProvider.buildArguments(
+            config: AntigravityAgentConfig(),
+            workspacePath: nil,
+            logFilePath: nil,
+            inlinePrompt: nil
+        )
+        XCTAssertFalse(args.contains("--output-format"))
     }
 
     func testConfigDefaultMaxPrintResumesIsBounded() {

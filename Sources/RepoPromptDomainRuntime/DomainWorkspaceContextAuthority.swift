@@ -342,7 +342,10 @@ actor DomainWorkspaceContextAuthority {
     }
 
     func snapshot() -> DomainWorkspaceCatalogSnapshot {
-        DomainWorkspaceCatalogSnapshot(
+        let unavailableIDs = Set(unavailableWorkspaces.keys)
+            .subtracting(records.keys)
+            .subtracting(deletedWorkspaceIDs)
+        return DomainWorkspaceCatalogSnapshot(
             runtimeIdentity: identity,
             isBootstrapped: didBootstrap,
             publicationSequence: publicationSequence,
@@ -354,9 +357,15 @@ actor DomainWorkspaceContextAuthority {
                 return $0.document.workspaceID.uuidString < $1.document.workspaceID.uuidString
             },
             // A stale unavailable entry must not declare a recovered or deleted member missing.
-            unavailableWorkspaceIDs: Set(unavailableWorkspaces.keys)
-                .subtracting(records.keys)
-                .subtracting(deletedWorkspaceIDs)
+            unavailableWorkspaceIDs: unavailableIDs,
+            unavailableWorkspaces: unavailableIDs.sorted { $0.uuidString < $1.uuidString }.compactMap { id in
+                unavailableWorkspaces[id].map {
+                    DomainUnavailableWorkspaceSummary(
+                        workspaceID: id, fileURL: $0.fileURL, name: $0.name,
+                        repoPaths: $0.repoPaths, isAbsentENOENT: $0.isAbsentENOENT
+                    )
+                }
+            }
         )
     }
 
@@ -775,6 +784,8 @@ actor DomainWorkspaceContextAuthority {
             )
         case let .deleteWorkspace(workspaceID):
             await deleteWorkspace(workspaceID, envelope: envelope, fingerprint: fingerprint)
+        case let .removeMissingWorkspaceCatalogEntries(workspaceIDs):
+            await removeMissingWorkspaceCatalogEntries(workspaceIDs, envelope: envelope, fingerprint: fingerprint)
         }
         invalidateReadRegistrationIfSuperseded(
             workspaceID: workspaceID,
@@ -816,7 +827,7 @@ actor DomainWorkspaceContextAuthority {
         case let .saveWorkspaceDocument(workspaceID),
              let .resolveExternalConflict(workspaceID, _, _):
             records[workspaceID]?.document.metadata.isEphemeral == true
-        case .deleteWorkspace:
+        case .deleteWorkspace, .removeMissingWorkspaceCatalogEntries:
             false
         }
     }
@@ -827,7 +838,7 @@ actor DomainWorkspaceContextAuthority {
              let .resolveOrCreateWorkspaceForExactRoot(document, _),
              let .replaceWorkingDocument(document):
             document
-        case .saveWorkspaceDocument, .deleteWorkspace, .resolveExternalConflict:
+        case .saveWorkspaceDocument, .deleteWorkspace, .removeMissingWorkspaceCatalogEntries, .resolveExternalConflict:
             nil
         }
     }
@@ -1091,6 +1102,7 @@ actor DomainWorkspaceContextAuthority {
                   recovered.health.acceptsMutations
             else {
                 recoveryPending = true
+                await refreshUnavailableObservation(unavailable)
                 continue
             }
             installRecordPreservingDiagnostics(makeRecord(from: recovered))
@@ -1253,6 +1265,31 @@ actor DomainWorkspaceContextAuthority {
 
         if changed { return .changed }
         return recoveryPending ? .recoveryPending : .unchanged
+    }
+
+    private func refreshUnavailableObservation(_ stale: DomainPersistenceBootstrap.UnavailableWorkspace) async {
+        guard let observed = await persistence.observeUnavailableWorkspace(
+            workspaceID: stale.workspaceID,
+            fileURL: stale.fileURL,
+            reason: stale.reason
+        ),
+            !Task.isCancelled,
+            let current = unavailableWorkspaces[stale.workspaceID],
+            current.fileMetadata == stale.fileMetadata
+        else { return }
+        unavailableWorkspaces[stale.workspaceID] = observed
+        guard observed.name != current.name
+            || observed.repoPaths != current.repoPaths
+            || observed.isAbsentENOENT != current.isAbsentENOENT
+        else { return }
+        publish(
+            kind: .externalReloaded,
+            workspaceID: stale.workspaceID,
+            contextID: nil,
+            operationID: nil,
+            revisions: nil,
+            diagnostic: "workspace_unavailable_observation_changed"
+        )
     }
 
     #if DEBUG
@@ -1961,6 +1998,70 @@ actor DomainWorkspaceContextAuthority {
                 )
             }
             return persistenceFailureOutcome(envelope, record: nil, error: error)
+        } catch {
+            return persistenceFailureOutcome(envelope, record: nil, error: error)
+        }
+    }
+
+    private func removeMissingWorkspaceCatalogEntries(
+        _ workspaceIDs: [UUID],
+        envelope: DomainWorkspaceCommandEnvelope,
+        fingerprint: String
+    ) async -> DomainCommandOutcome {
+        await acquireCatalogMutation()
+        defer { releaseCatalogMutation() }
+        if let recorded = await recordedOutcome(for: envelope, fingerprint: fingerprint) {
+            return recorded
+        }
+        let ids = Set(workspaceIDs).sorted { $0.uuidString < $1.uuidString }
+        let workspaces = ids.compactMap { unavailableWorkspaces[$0] }
+        guard !ids.isEmpty, workspaces.count == ids.count,
+              ids.allSatisfy({ records[$0] == nil && !deletedWorkspaceIDs.contains($0) })
+        else {
+            return recordTransientOutcome(
+                envelope: envelope, fingerprint: fingerprint, disposition: .conflict,
+                errorCode: .workspaceExternalConflict, diagnostic: "missing_workspace_entry_not_removable"
+            )
+        }
+        do {
+            let removed = try await persistence.persistRemovedMissingCatalogEntries(
+                workspaces: workspaces,
+                expectedCatalogRevision: envelope.expectedCatalogRevision ?? catalogRevision,
+                operationID: envelope.operationID,
+                fingerprint: fingerprint,
+                now: Date()
+            )
+            catalogRevision = max(catalogRevision, removed.catalogRevision)
+            for tombstone in removed.tombstones {
+                let workspaceID = tombstone.workspaceID
+                unavailableWorkspaces.removeValue(forKey: workspaceID)
+                readRegistrations.removeValue(forKey: workspaceID)
+                removeCanonicalRecord(workspaceID)
+                deletedWorkspaceIDs.insert(workspaceID)
+                globalOperations.insert(tombstone.operation)
+            }
+            let outcome = DomainCommandOutcome(
+                operationID: envelope.operationID, disposition: .applied, before: nil, after: nil,
+                catalogRevision: catalogRevision, resultingDigest: nil
+            )
+            for workspaceID in ids {
+                publish(
+                    kind: .workspaceDeleted, workspaceID: workspaceID, contextID: nil,
+                    operationID: envelope.operationID, origin: envelope.origin, revisions: nil, diagnostic: nil
+                )
+            }
+            recordMetric(envelope: envelope, outcome: outcome, byteCount: 0)
+            return outcome
+        } catch DomainPersistenceError.externalDocumentConflict {
+            return recordTransientOutcome(
+                envelope: envelope, fingerprint: fingerprint, disposition: .conflict,
+                errorCode: .workspaceExternalConflict, diagnostic: "missing_workspace_entry_not_removable"
+            )
+        } catch DomainPersistenceError.stateConflict {
+            return recordTransientOutcome(
+                envelope: envelope, fingerprint: fingerprint, disposition: .conflict,
+                errorCode: .stateConflict, diagnostic: "durable_remove_missing_catalog_conflict"
+            )
         } catch {
             return persistenceFailureOutcome(envelope, record: nil, error: error)
         }
@@ -3149,6 +3250,7 @@ private extension DomainWorkspaceCommandEnvelope {
         case let .replaceWorkingDocument(document): document.workspaceID
         case let .saveWorkspaceDocument(workspaceID): workspaceID
         case let .deleteWorkspace(workspaceID): workspaceID
+        case .removeMissingWorkspaceCatalogEntries: nil
         case let .resolveExternalConflict(workspaceID, _, _): workspaceID
         }
     }

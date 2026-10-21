@@ -2,6 +2,7 @@ import Combine
 import Foundation
 import MCP
 @_spi(TestSupport) @testable import RepoPromptApp
+import RepoPromptDomainRuntime
 import RepoPromptSettingsCore
 import RepoPromptShared
 import SwiftUI
@@ -798,6 +799,147 @@ final class FleetManagerWorkspacesTests: XCTestCase {
         }
         storageRoot = nil
         try await super.tearDown()
+    }
+
+    func testRemoveMissingWorkspaceEntriesClearsFleetWarningPreservesUnreadableAndRestoresExactNameLookup() async throws {
+        for includeUnreadable in [true, false] {
+            let root = try XCTUnwrap(storageRoot).appendingPathComponent("Removal-\(UUID())", isDirectory: true)
+            let storage = root.appendingPathComponent("Workspaces", isDirectory: true)
+            try FileManager.default.createDirectory(at: storage, withIntermediateDirectories: true)
+            let available = WorkspaceModel(name: "AvailableRepo", repoPaths: [], isSavedWorkspace: true)
+            let absent = WorkspaceModel(name: "AbsentRepo", repoPaths: [], isSavedWorkspace: true)
+            let unreadable = WorkspaceModel(name: "UnreadableRepo", repoPaths: [], isSavedWorkspace: true)
+            let members = includeUnreadable ? [available, absent, unreadable] : [available, absent]
+            func fileURL(_ workspace: WorkspaceModel) -> URL {
+                storage.appendingPathComponent(DomainWorkspaceStoragePath.directoryName(name: workspace.name, id: workspace.id))
+                    .appendingPathComponent("workspace.json")
+            }
+            let availableBytes = try JSONEncoder().encode(available)
+            let unreadableBytes = Data("not JSON".utf8)
+            for workspace in members where workspace.id != absent.id {
+                let url = fileURL(workspace)
+                try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+                try (workspace.id == available.id ? availableBytes : unreadableBytes).write(to: url)
+            }
+            try JSONEncoder().encode(members.map {
+                WorkspaceIndexEntry(id: $0.id, name: $0.name, customStoragePath: nil, isSystemWorkspace: false, isHiddenInMenus: false)
+            }).write(to: storage.appendingPathComponent("workspacesIndex.json"))
+            let runtime = MCPDomainRuntime(configuration: .init(
+                mode: .app, profileIdentifier: "fleet-removal", storageDirectory: root.appendingPathComponent("runtime"),
+                workspaceStorageDirectory: storage, eventDirectory: root.appendingPathComponent("events"),
+                temporaryDirectory: root.appendingPathComponent("tmp"), externalReloadInterval: nil
+            ))
+            let store = runtime.workspaceStore
+            let initial = await store.snapshot()
+            XCTAssertEqual(initial.unavailableWorkspaceIDs, Set(includeUnreadable ? [absent.id, unreadable.id] : [absent.id]))
+            let beforeLookup = await store.readLocation(matching: .exactName("AvailableRepo"))
+            XCTAssertEqual(beforeLookup, .unavailable)
+            let catalog = FleetManagerWorkspaceCatalog(store: store)
+            defer { catalog.stop() }
+            let loaded = expectation(description: "Fleet unavailable warning loaded")
+            let loadObservation = catalog.$workspaceChooserPresentation.filter { $0.failure != nil }.prefix(1).sink { _ in loaded.fulfill() }
+            catalog.start()
+            await fulfillment(of: [loaded], timeout: 5)
+            loadObservation.cancel()
+            XCTAssertTrue(catalog.canRemoveMissingWorkspaceEntries)
+
+            let subscription = await store.subscribe()
+            let deleted = expectation(description: "Absent entry deletion published")
+            let eventTask = Task {
+                for await event in subscription.events {
+                    if event.kind == .workspaceDeleted, event.workspaceID == absent.id {
+                        deleted.fulfill()
+                        return
+                    }
+                }
+            }
+            defer { eventTask.cancel() }
+            let refreshed = expectation(description: "Fleet removal reflected in presentation")
+            let refreshObservation = catalog.$workspaceChooserPresentation.filter {
+                guard case let .ready(value, _) = $0, case let .authority(stamp) = value.source else { return false }
+                return stamp.catalogRevision > initial.catalogRevision
+            }.prefix(1).sink { _ in refreshed.fulfill() }
+            catalog.requestRemoveMissingWorkspaceEntries()
+            await fulfillment(of: [deleted, refreshed], timeout: 5)
+            refreshObservation.cancel()
+
+            let after = await store.snapshot()
+            XCTAssertEqual(after.catalogRevision, initial.catalogRevision + 1)
+            XCTAssertEqual(after.unavailableWorkspaceIDs, Set(includeUnreadable ? [unreadable.id] : []))
+            XCTAssertEqual(after.workspaces.map(\.document.workspaceID), [available.id])
+            XCTAssertFalse(FileManager.default.fileExists(atPath: fileURL(absent).path))
+            XCTAssertEqual(try Data(contentsOf: fileURL(available)), availableBytes)
+            XCTAssertFalse(catalog.canRemoveMissingWorkspaceEntries)
+            let removedByID = await store.readLocation(matching: .id(absent.id))
+            XCTAssertEqual(removedByID, .notRegistered)
+            guard case let .ready(value, _) = catalog.workspaceChooserPresentation,
+                  case let .authority(stamp) = value.source
+            else { return XCTFail("Expected an authority-backed Fleet catalog") }
+            XCTAssertEqual(value.workspaces.map(\.id), [available.id])
+            XCTAssertEqual(stamp.isComplete, !includeUnreadable)
+            if includeUnreadable {
+                XCTAssertNotNil(catalog.workspaceChooserPresentation.failure)
+                XCTAssertEqual(try Data(contentsOf: fileURL(unreadable)), unreadableBytes)
+            } else {
+                XCTAssertNil(catalog.workspaceChooserPresentation.failure)
+                let lookup = await store.readLocation(matching: .exactName("AvailableRepo"))
+                guard case let .matched(location) = lookup else { return XCTFail("Expected exact-name lookup after removal") }
+                XCTAssertEqual(location.workspaceID, available.id)
+            }
+        }
+    }
+
+    func testFleetRemovabilityFollowsUnavailableDocumentChangesWithoutCatalogRevisionChange() async throws {
+        let root = try XCTUnwrap(storageRoot).appendingPathComponent("Observation-\(UUID())", isDirectory: true)
+        let storage = root.appendingPathComponent("Workspaces", isDirectory: true)
+        try FileManager.default.createDirectory(at: storage, withIntermediateDirectories: true)
+        let available = WorkspaceModel(name: "AvailableRepo", repoPaths: [], isSavedWorkspace: true)
+        let changing = WorkspaceModel(name: "ChangingRepo", repoPaths: [], isSavedWorkspace: true)
+        func fileURL(_ workspace: WorkspaceModel) -> URL {
+            storage.appendingPathComponent(DomainWorkspaceStoragePath.directoryName(name: workspace.name, id: workspace.id))
+                .appendingPathComponent("workspace.json")
+        }
+        for workspace in [available, changing] {
+            let url = fileURL(workspace)
+            try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try (workspace.id == available.id ? JSONEncoder().encode(available) : Data("not JSON".utf8)).write(to: url)
+        }
+        try JSONEncoder().encode([available, changing].map {
+            WorkspaceIndexEntry(id: $0.id, name: $0.name, customStoragePath: nil, isSystemWorkspace: false, isHiddenInMenus: false)
+        }).write(to: storage.appendingPathComponent("workspacesIndex.json"))
+        let runtime = MCPDomainRuntime(configuration: .init(
+            mode: .app, profileIdentifier: "fleet-observation", storageDirectory: root.appendingPathComponent("runtime"),
+            workspaceStorageDirectory: storage, eventDirectory: root.appendingPathComponent("events"),
+            temporaryDirectory: root.appendingPathComponent("tmp"), externalReloadInterval: nil
+        ))
+        let store = runtime.workspaceStore
+        let initial = await store.snapshot()
+        let catalog = FleetManagerWorkspaceCatalog(store: store)
+        defer { catalog.stop() }
+        let loaded = expectation(description: "Fleet unavailable warning loaded")
+        let loadObservation = catalog.$workspaceChooserPresentation.filter { $0.failure != nil }.prefix(1).sink { _ in loaded.fulfill() }
+        catalog.start()
+        await fulfillment(of: [loaded], timeout: 5)
+        loadObservation.cancel()
+        XCTAssertFalse(catalog.canRemoveMissingWorkspaceEntries)
+
+        func waitForRemovable(_ expected: Bool) async {
+            for _ in 0 ..< 100 where catalog.canRemoveMissingWorkspaceEntries != expected {
+                try? await Task.sleep(nanoseconds: 50_000_000)
+            }
+        }
+        try FileManager.default.removeItem(at: fileURL(changing))
+        await store.reloadExternalChanges()
+        await waitForRemovable(true)
+        XCTAssertTrue(catalog.canRemoveMissingWorkspaceEntries)
+
+        try Data("not JSON".utf8).write(to: fileURL(changing))
+        await store.reloadExternalChanges()
+        await waitForRemovable(false)
+        XCTAssertFalse(catalog.canRemoveMissingWorkspaceEntries)
+        let after = await store.snapshot()
+        XCTAssertEqual(after.catalogRevision, initial.catalogRevision)
+        XCTAssertEqual(after.unavailableWorkspaceIDs, [changing.id])
     }
 
     func testFleetShowsDebugBadgeInDebugBuilds() throws {
@@ -1680,32 +1822,58 @@ final class FleetManagerWindowTests: XCTestCase {
         first.isCurrentlyFocused = true
         XCTAssertTrue(FleetParkingCoordinator.shared.park(windowID: first.windowID, reason: .operator))
         first.isCurrentlyFocused = true
-        var targets: [Int] = []
-        try await AppSettingsCommand.open(present: { targets.append($0.windowID)
+        var targets: [Int?] = []
+        try await AppSettingsCommand.open(present: { targets.append($0?.windowID)
             XCTAssertNil($1)
         })
         XCTAssertEqual(targets, [second.windowID])
         first.isCurrentlyFocused = false
         second.isCurrentlyFocused = true
-        try await AppSettingsCommand.open(selectedTab: .mcp, present: { targets.append($0.windowID)
+        try await AppSettingsCommand.open(selectedTab: .mcp, present: { targets.append($0?.windowID)
             XCTAssertEqual($1, .mcp)
         })
         XCTAssertEqual(targets, [second.windowID, second.windowID])
     }
 
-    func testSettingsCommandWithNoWorkspaceWindowsOpensSettings() async throws {
+    private func assertWindowlessSettingsOpen(notification: Foundation.Notification? = nil, selectedTab: SettingsTab? = nil) async throws {
         XCTAssertTrue(WindowStatesManager.shared.allWindows.isEmpty)
+        GlobalSettingsStore.shared.setMCPAutoStart(true, commit: false)
+        WindowlessSettingsDependencies.loadStoredAPIDataOnWindowlessInit = false
+        defer {
+            WindowlessSettingsDependencies.loadStoredAPIDataOnWindowlessInit = true
+            SettingsWindowCoordinator.shared.close()
+        }
         makeCoordinator().open()
         AppWindowOpener.shared.installRequestAware { [unowned self] requestID in
             registerProgrammaticWindow(requestID: requestID)
         }
         defer { AppWindowOpener.shared.resetForTesting() }
-        var targets: [Int] = []
-        try await AppSettingsCommand.open(present: { targets.append($0.windowID)
-            XCTAssertNil($1)
-        })
-        XCTAssertEqual(targets.count, 1)
-        XCTAssertEqual(targets.first, WindowStatesManager.shared.latestWindowState?.windowID)
+        let counter = WindowState.windowCounter
+        var targets: [Int?] = []
+        let present: @MainActor (WindowState?, SettingsTab?) -> Void = {
+            targets.append($0?.windowID)
+            XCTAssertEqual($1, selectedTab)
+            SettingsWindowCoordinator.shared.open(windowState: $0, selectedTab: $1)
+        }
+        if let notification {
+            try await AppSettingsCommand.open(notification: notification, selectedTab: selectedTab, present: present)
+        } else {
+            try await AppSettingsCommand.open(selectedTab: selectedTab, present: present)
+        }
+        XCTAssertEqual(targets, [nil])
+        XCTAssertEqual(SettingsWindowCoordinator.shared.windowForTesting?.isVisible, true)
+        XCTAssertTrue(WindowStatesManager.shared.allWindows.isEmpty)
+        XCTAssertEqual(WindowState.windowCounter, counter)
+        let snapshot = await AppDomainRuntimeComposition.shared.catalogSnapshot()
+        let windowScopes = snapshot.activeScopesByToolName.values.joined().filter {
+            if case .window = $0 { return true }
+            return false
+        }
+        XCTAssertTrue(windowScopes.isEmpty)
+    }
+
+    func testSettingsCommandWithNoWorkspaceWindowsOpensSettings() async throws {
+        try await assertWindowlessSettingsOpen()
     }
 
     func testMCPBindContextCreateIfMissingWithOnlyFleetOpen() async throws {
@@ -1722,20 +1890,437 @@ final class FleetManagerWindowTests: XCTestCase {
         }
     }
 
-    func testSettingsDeepLinkWithNoWorkspaceWindowsUsesCommandTarget() async throws {
-        XCTAssertTrue(WindowStatesManager.shared.allWindows.isEmpty)
-        makeCoordinator().open()
-        AppWindowOpener.shared.installRequestAware { [unowned self] requestID in
-            registerProgrammaticWindow(requestID: requestID)
+    private struct WindowlessWorkspaceSeed {
+        enum Document { case valid, futureSchema, absent, garbage }
+
+        var id = UUID()
+        let name: String
+        let repoPaths: [String]
+        let document: Document
+    }
+
+    private func closeRegisteredWindows() async {
+        for state in windows {
+            if state.mcpServer.windowToolsEnabled { await state.mcpServer.stopServer() }
+            state.attachWindow(nil)
+            state.beginClose()
+            await state.tearDown()
+            WindowStatesManager.shared.unregisterWindowState(state)
         }
-        defer { AppWindowOpener.shared.resetForTesting() }
-        var targets: [Int] = []
-        try await AppSettingsCommand.open(notification: Notification(name: .showMCPSettingsTab), selectedTab: .mcp, present: {
-            targets.append($0.windowID)
-            XCTAssertEqual($1, .mcp)
-        })
-        XCTAssertEqual(targets.count, 1)
-        XCTAssertEqual(targets.first, WindowStatesManager.shared.latestWindowState?.windowID)
+        for window in nsWindows {
+            window.orderOut(nil)
+        }
+        windows.removeAll()
+        nsWindows.removeAll()
+    }
+
+    private func seedDocumentURL(_ seed: WindowlessWorkspaceSeed, in storage: URL) -> URL {
+        storage
+            .appendingPathComponent(DomainWorkspaceStoragePath.directoryName(name: seed.name, id: seed.id))
+            .appendingPathComponent("workspace.json")
+    }
+
+    private func writeSeedDocument(_ seed: WindowlessWorkspaceSeed, in storage: URL) throws {
+        let date = Date(timeIntervalSince1970: 1_780_000_000)
+        let tabID = UUID()
+        let model = WorkspaceModel(
+            id: seed.id, dateModified: date, name: seed.name, repoPaths: seed.repoPaths, lastUsed: date,
+            isSystemWorkspace: false, composeTabs: [ComposeTabState(id: tabID, name: "Fixture")], activeComposeTabID: tabID
+        )
+        var data = try JSONEncoder().encode(model)
+        if seed.document == .futureSchema {
+            var object = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+            object["schemaVersion"] = 999
+            data = try JSONSerialization.data(withJSONObject: object)
+        } else if seed.document == .garbage {
+            data = Data("not json".utf8)
+        }
+        let url = seedDocumentURL(seed, in: storage)
+        try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try data.write(to: url, options: .atomic)
+    }
+
+    private func withSeededWorkspaceRuntime(
+        _ seeds: [WindowlessWorkspaceSeed],
+        _ body: (MCPDomainRuntime, URL) async throws -> Void
+    ) async throws {
+        let sandbox = try WorkspaceTestProcessSandbox.validate()
+        let base = sandbox.appendingPathComponent("windowless-\(UUID().uuidString)", isDirectory: true)
+        let storage = AppProfileLocations.current.customWorkspaceDirectory(
+            selectedDirectory: base.appendingPathComponent("Workspaces", isDirectory: true)
+        )
+        try FileManager.default.createDirectory(at: storage, withIntermediateDirectories: true)
+        let previousStorage = UserDefaults.standard.object(forKey: "GlobalCustomStorageURL")
+        UserDefaults.standard.set(storage.path, forKey: "GlobalCustomStorageURL")
+        defer {
+            if let previousStorage {
+                UserDefaults.standard.set(previousStorage, forKey: "GlobalCustomStorageURL")
+            } else {
+                UserDefaults.standard.removeObject(forKey: "GlobalCustomStorageURL")
+            }
+            try? FileManager.default.removeItem(at: base)
+        }
+        for seed in seeds where seed.document != .absent {
+            try writeSeedDocument(seed, in: storage)
+        }
+        try JSONEncoder().encode(seeds.map {
+            WorkspaceIndexEntry(id: $0.id, name: $0.name, customStoragePath: nil, isSystemWorkspace: false, isHiddenInMenus: false)
+        }).write(to: storage.appendingPathComponent("workspacesIndex.json"), options: .atomic)
+        let runtime = MCPDomainRuntime(configuration: .init(
+            mode: .app, profileIdentifier: "windowless-\(UUID().uuidString)",
+            storageDirectory: base.appendingPathComponent("runtime"), workspaceStorageDirectory: storage,
+            eventDirectory: base.appendingPathComponent("events"), temporaryDirectory: base.appendingPathComponent("tmp"),
+            externalReloadInterval: nil
+        ))
+        try await runtime.start()
+        await closeRegisteredWindows()
+        if await ServerNetworkManager.shared.isRunning() { await ServerNetworkManager.shared.stop() }
+        try await AppDomainRuntimeComposition.shared.withRuntimeForTesting(runtime) { try await body(runtime, storage) }
+    }
+
+    private func fleetRoutingFailure(
+        _ service: WindowRoutingService, connectionID: UUID, client: String, toolName: String = "manage_workspaces", args: [String: Value]
+    ) async -> String? {
+        do {
+            _ = try await callFleetRouting(service, connectionID: connectionID, client: client, toolName: toolName, args: args)
+            return nil
+        } catch {
+            return String(describing: error)
+        }
+    }
+
+    func testWindowlessMCPWorkspaceOperationsSkipUnavailableAndRejectUnavailableTarget() async throws {
+        let sandbox = try WorkspaceTestProcessSandbox.validate()
+        let roots = sandbox.appendingPathComponent("windowless-roots-\(UUID().uuidString)", isDirectory: true)
+        let availableRoot = roots.appendingPathComponent("available", isDirectory: true)
+        let unavailableRoot = roots.appendingPathComponent("unavailable", isDirectory: true)
+        let garbageFreshRoot = roots.appendingPathComponent("garbage-fresh", isDirectory: true)
+        for url in [availableRoot, unavailableRoot, garbageFreshRoot] {
+            try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+        }
+        defer { try? FileManager.default.removeItem(at: roots) }
+        let available = WindowlessWorkspaceSeed(name: "SharedName", repoPaths: [availableRoot.path], document: .valid)
+        let futureSchema = WindowlessWorkspaceSeed(name: "UnavailableRepo", repoPaths: [unavailableRoot.path], document: .futureSchema)
+        let absent = WindowlessWorkspaceSeed(name: "SharedName", repoPaths: [], document: .absent)
+
+        try await withSeededWorkspaceRuntime([available, futureSchema, absent]) { runtime, _ in
+            try await self.withFleetOnlyRouting { service, connectionID, client in
+                let listed = try await self.callFleetRouting(service, connectionID: connectionID, client: client, args: ["action": .string("list")])
+                XCTAssertEqual(listed.objectValue?["workspaces"]?.arrayValue?.compactMap { $0.objectValue?["name"]?.stringValue }, ["SharedName"])
+                XCTAssertTrue(WindowStatesManager.shared.allWindows.isEmpty)
+
+                let bound = try await self.callFleetRouting(service, connectionID: connectionID, client: client, toolName: "bind_context", args: [
+                    "op": .string("bind"), "working_dirs": .array([.string(availableRoot.path)])
+                ])
+                XCTAssertNotNil(bound.objectValue?["binding"])
+                XCTAssertEqual(WindowStatesManager.shared.allWindows.count, 1)
+                await self.closeRegisteredWindows()
+                XCTAssertTrue(WindowStatesManager.shared.allWindows.isEmpty)
+
+                let switched = try await self.callFleetRouting(service, connectionID: connectionID, client: client, args: [
+                    "action": .string("switch"), "workspace": .string("SharedName"), "open_in_new_window": .bool(true)
+                ])
+                XCTAssertEqual(switched.objectValue?["status"]?.stringValue, "ok")
+                XCTAssertEqual(WindowStatesManager.shared.allWindows.count, 1)
+                XCTAssertEqual(WindowStatesManager.shared.latestWindowState?.workspaceManager.activeWorkspaceID, available.id)
+                await self.closeRegisteredWindows()
+
+                let before = await self.workspaceFingerprint(runtime)
+                let switchUnavailable = await self.fleetRoutingFailure(service, connectionID: connectionID, client: client, args: [
+                    "action": .string("switch"), "workspace": .string("UnavailableRepo"), "open_in_new_window": .bool(true)
+                ])
+                XCTAssertTrue(try XCTUnwrap(switchUnavailable).contains("UnavailableRepo"))
+                XCTAssertTrue(try XCTUnwrap(switchUnavailable).contains("unavailable"))
+                XCTAssertTrue(WindowStatesManager.shared.allWindows.isEmpty)
+
+                let bindUnavailable = await self.fleetRoutingFailure(service, connectionID: connectionID, client: client, toolName: "bind_context", args: [
+                    "op": .string("bind"), "working_dirs": .array([.string(unavailableRoot.path)]), "create_if_missing": .bool(true)
+                ])
+                XCTAssertTrue(try XCTUnwrap(bindUnavailable).contains("UnavailableRepo"))
+                XCTAssertTrue(try XCTUnwrap(bindUnavailable).contains("unavailable"))
+                XCTAssertTrue(WindowStatesManager.shared.allWindows.isEmpty)
+                let after = await self.workspaceFingerprint(runtime)
+                XCTAssertEqual(after.ids, before.ids)
+                XCTAssertEqual(after.revision, before.revision)
+            }
+        }
+
+        let garbage = WindowlessWorkspaceSeed(name: "UnavailableRepo", repoPaths: [], document: .garbage)
+        try await withSeededWorkspaceRuntime([available, garbage]) { runtime, _ in
+            try await self.withFleetOnlyRouting { service, connectionID, client in
+                let before = await self.workspaceFingerprint(runtime)
+                let failure = await self.fleetRoutingFailure(service, connectionID: connectionID, client: client, toolName: "bind_context", args: [
+                    "op": .string("bind"), "working_dirs": .array([.string(garbageFreshRoot.path)]), "create_if_missing": .bool(true)
+                ])
+                XCTAssertTrue(try XCTUnwrap(failure).contains("Remove Missing Entries"))
+                XCTAssertTrue(WindowStatesManager.shared.allWindows.isEmpty)
+
+                let byName = await self.fleetRoutingFailure(service, connectionID: connectionID, client: client, args: [
+                    "action": .string("switch"), "workspace": .string("UnavailableRepo"), "open_in_new_window": .bool(true)
+                ])
+                XCTAssertTrue(try XCTUnwrap(byName).contains("UnavailableRepo"))
+                XCTAssertTrue(try XCTUnwrap(byName).contains("unavailable"))
+                XCTAssertTrue(WindowStatesManager.shared.allWindows.isEmpty)
+                let after = await self.workspaceFingerprint(runtime)
+                XCTAssertEqual(after.ids, before.ids)
+                XCTAssertEqual(after.revision, before.revision)
+            }
+        }
+    }
+
+    private func workspaceFingerprint(_ runtime: MCPDomainRuntime) async -> (ids: Set<UUID>, revision: UInt64) {
+        let snapshot = await runtime.workspaceStore.snapshot()
+        return (Set(snapshot.workspaces.map(\.document.workspaceID)).union(snapshot.unavailableWorkspaceIDs), snapshot.catalogRevision)
+    }
+
+    func testWindowlessMCPBindCreateIfMissingCreatesWorkspaceBesideUnavailableMember() async throws {
+        let sandbox = try WorkspaceTestProcessSandbox.validate()
+        let roots = sandbox.appendingPathComponent("windowless-fresh-\(UUID().uuidString)", isDirectory: true)
+        let unavailableRoot = roots.appendingPathComponent("unavailable", isDirectory: true)
+        let freshRoot = roots.appendingPathComponent("fresh", isDirectory: true)
+        for url in [unavailableRoot, freshRoot] {
+            try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+        }
+        defer { try? FileManager.default.removeItem(at: roots) }
+        let futureSchema = WindowlessWorkspaceSeed(name: "UnavailableRepo", repoPaths: [unavailableRoot.path], document: .futureSchema)
+        try await withSeededWorkspaceRuntime([futureSchema]) { _, _ in
+            try await self.withFleetOnlyRouting { service, connectionID, client in
+                let created = try await self.callFleetRouting(service, connectionID: connectionID, client: client, toolName: "bind_context", args: [
+                    "op": .string("bind"), "working_dirs": .array([.string(freshRoot.path)]), "create_if_missing": .bool(true)
+                ])
+                XCTAssertNotNil(created.objectValue?["binding"])
+                XCTAssertEqual(WindowStatesManager.shared.allWindows.count, 1)
+                await self.closeRegisteredWindows()
+            }
+        }
+    }
+
+    func testWindowlessMCPBindCreateTracksUnavailableObservationChangesAfterReload() async throws {
+        let sandbox = try WorkspaceTestProcessSandbox.validate()
+        let roots = sandbox.appendingPathComponent("windowless-observe-\(UUID().uuidString)", isDirectory: true)
+        let firstRoot = roots.appendingPathComponent("first", isDirectory: true)
+        let secondRoot = roots.appendingPathComponent("second", isDirectory: true)
+        for url in [firstRoot, secondRoot] {
+            try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+        }
+        defer { try? FileManager.default.removeItem(at: roots) }
+        let changing = WindowlessWorkspaceSeed(name: "ChangingRepo", repoPaths: [], document: .absent)
+        try await withSeededWorkspaceRuntime([changing]) { runtime, storage in
+            try await self.withFleetOnlyRouting { service, connectionID, client in
+                func bind(_ root: URL) async -> String? {
+                    await self.fleetRoutingFailure(service, connectionID: connectionID, client: client, toolName: "bind_context", args: [
+                        "op": .string("bind"), "working_dirs": .array([.string(root.path)]), "create_if_missing": .bool(true)
+                    ])
+                }
+                let before = await self.workspaceFingerprint(runtime)
+                let documentURL = self.seedDocumentURL(changing, in: storage)
+                try FileManager.default.createDirectory(at: documentURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+                try Data("not json".utf8).write(to: documentURL)
+                await runtime.workspaceStore.reloadExternalChanges()
+                let afterCorruption = await bind(firstRoot)
+                XCTAssertTrue(try XCTUnwrap(afterCorruption).contains("Remove Missing Entries"))
+                XCTAssertTrue(WindowStatesManager.shared.allWindows.isEmpty)
+                let corrupted = await self.workspaceFingerprint(runtime)
+                XCTAssertEqual(corrupted.ids, before.ids)
+                XCTAssertEqual(corrupted.revision, before.revision)
+
+                try FileManager.default.removeItem(at: documentURL)
+                await runtime.workspaceStore.reloadExternalChanges()
+                let afterDeletion = await bind(secondRoot)
+                XCTAssertNil(afterDeletion)
+                XCTAssertEqual(WindowStatesManager.shared.allWindows.count, 1)
+                await self.closeRegisteredWindows()
+            }
+        }
+    }
+
+    func testWindowlessMCPBindCreateRechecksUnavailableMembersAfterApproval() async throws {
+        let sandbox = try WorkspaceTestProcessSandbox.validate()
+        let roots = sandbox.appendingPathComponent("windowless-approval-\(UUID().uuidString)", isDirectory: true)
+        let lateRoot = roots.appendingPathComponent("late", isDirectory: true)
+        try FileManager.default.createDirectory(at: lateRoot, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: roots) }
+        let late = WindowlessWorkspaceSeed(name: "LateRepo", repoPaths: [lateRoot.path], document: .absent)
+        let lateFuture = WindowlessWorkspaceSeed(id: late.id, name: late.name, repoPaths: late.repoPaths, document: .futureSchema)
+        try await withSeededWorkspaceRuntime([late]) { runtime, storage in
+            try await self.withFleetOnlyRouting { service, connectionID, client in
+                let before = await self.workspaceFingerprint(runtime)
+                var boundaryReached = false
+                service.test_afterCreateApproval = {
+                    boundaryReached = true
+                    do {
+                        try self.writeSeedDocument(lateFuture, in: storage)
+                    } catch {
+                        XCTFail("Could not write the late unavailable document: \(error)")
+                    }
+                    await runtime.workspaceStore.reloadExternalChanges()
+                }
+                let failure = await self.fleetRoutingFailure(service, connectionID: connectionID, client: client, toolName: "bind_context", args: [
+                    "op": .string("bind"), "working_dirs": .array([.string(lateRoot.path)]), "create_if_missing": .bool(true)
+                ])
+                XCTAssertTrue(boundaryReached)
+                XCTAssertTrue(try XCTUnwrap(failure).contains("LateRepo"))
+                XCTAssertTrue(try XCTUnwrap(failure).contains("unavailable"))
+                XCTAssertTrue(WindowStatesManager.shared.allWindows.isEmpty)
+                let after = await self.workspaceFingerprint(runtime)
+                XCTAssertEqual(after.ids, before.ids)
+                XCTAssertEqual(after.revision, before.revision)
+            }
+        }
+    }
+
+    func testWindowlessMCPBindCreateRechecksUnavailableMembersAfterWindowOpen() async throws {
+        let sandbox = try WorkspaceTestProcessSandbox.validate()
+        let roots = sandbox.appendingPathComponent("windowless-open-\(UUID().uuidString)", isDirectory: true)
+        let lateRoot = roots.appendingPathComponent("late", isDirectory: true)
+        try FileManager.default.createDirectory(at: lateRoot, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: roots) }
+        let late = WindowlessWorkspaceSeed(name: "LateOpenRepo", repoPaths: [lateRoot.path], document: .absent)
+        let lateFuture = WindowlessWorkspaceSeed(id: late.id, name: late.name, repoPaths: late.repoPaths, document: .futureSchema)
+        try await withSeededWorkspaceRuntime([late]) { runtime, storage in
+            try await self.withFleetOnlyRouting { service, connectionID, client in
+                let manager = WindowStatesManager.shared
+                var boundaryReached = false
+                manager.afterOpenResultGateForTesting = {
+                    boundaryReached = true
+                    do {
+                        try self.writeSeedDocument(lateFuture, in: storage)
+                    } catch {
+                        XCTFail("Could not write the late unavailable document: \(error)")
+                    }
+                    await runtime.workspaceStore.reloadExternalChanges()
+                }
+                defer { manager.afterOpenResultGateForTesting = nil }
+                let failure = await self.fleetRoutingFailure(service, connectionID: connectionID, client: client, toolName: "bind_context", args: [
+                    "op": .string("bind"), "working_dirs": .array([.string(lateRoot.path)]), "create_if_missing": .bool(true)
+                ])
+                XCTAssertTrue(boundaryReached)
+                let message = try XCTUnwrap(failure)
+                XCTAssertTrue(message.contains("LateOpenRepo"))
+                XCTAssertTrue(message.contains("unavailable"))
+                XCTAssertTrue(message.contains("stays open"))
+                XCTAssertEqual(WindowStatesManager.shared.allWindows.count, 1)
+                let snapshot = await runtime.workspaceStore.snapshot()
+                XCTAssertTrue(snapshot.unavailableWorkspaceIDs.contains(late.id))
+                let requested = Set(WorkspaceManagerViewModel.normalizedExactWorkspaceDirectorySet([lateRoot.path]))
+                let committed = try snapshot.workspaces.map { try WorkspaceManagerViewModel.decodeDomainWorkspaceCatalogRecordBytes($0) }
+                XCTAssertFalse(committed.contains { Set(WorkspaceManagerViewModel.normalizedExactWorkspaceDirectorySet($0.repoPaths)) == requested })
+                await self.closeRegisteredWindows()
+            }
+        }
+    }
+
+    func testWindowlessMCPBindCreateBindsOpenedWindowToWorkspaceRecoveredDuringWindowOpen() async throws {
+        let sandbox = try WorkspaceTestProcessSandbox.validate()
+        let roots = sandbox.appendingPathComponent("windowless-recover-\(UUID().uuidString)", isDirectory: true)
+        let lateRoot = roots.appendingPathComponent("late", isDirectory: true)
+        try FileManager.default.createDirectory(at: lateRoot, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: roots) }
+        let late = WindowlessWorkspaceSeed(name: "RecoveredOpenRepo", repoPaths: [lateRoot.path], document: .absent)
+        let lateValid = WindowlessWorkspaceSeed(id: late.id, name: late.name, repoPaths: late.repoPaths, document: .valid)
+        try await withSeededWorkspaceRuntime([late]) { runtime, storage in
+            try await self.withFleetOnlyRouting { service, connectionID, client in
+                let manager = WindowStatesManager.shared
+                var injections = 0
+                manager.afterOpenResultGateForTesting = {
+                    injections += 1
+                    manager.afterOpenResultGateForTesting = nil
+                    do {
+                        try self.writeSeedDocument(lateValid, in: storage)
+                    } catch {
+                        XCTFail("Could not write the recovered document: \(error)")
+                    }
+                    await runtime.workspaceStore.reloadExternalChanges()
+                }
+                defer { manager.afterOpenResultGateForTesting = nil }
+                let bound = try await self.callFleetRouting(service, connectionID: connectionID, client: client, toolName: "bind_context", args: [
+                    "op": .string("bind"), "working_dirs": .array([.string(lateRoot.path)]), "create_if_missing": .bool(true)
+                ])
+                XCTAssertEqual(injections, 1)
+                XCTAssertNotNil(bound.objectValue?["binding"])
+                XCTAssertEqual(WindowStatesManager.shared.allWindows.count, 1)
+                XCTAssertEqual(WindowStatesManager.shared.allWindows.first?.workspaceManager.activeWorkspaceID, late.id)
+                let snapshot = await runtime.workspaceStore.snapshot()
+                XCTAssertFalse(snapshot.unavailableWorkspaceIDs.contains(late.id))
+                let requested = Set(WorkspaceManagerViewModel.normalizedExactWorkspaceDirectorySet([lateRoot.path]))
+                let committed = try snapshot.workspaces.map { try WorkspaceManagerViewModel.decodeDomainWorkspaceCatalogRecordBytes($0) }
+                let requestedRootWorkspaces = committed.filter {
+                    Set(WorkspaceManagerViewModel.normalizedExactWorkspaceDirectorySet($0.repoPaths)) == requested
+                }
+                XCTAssertEqual(requestedRootWorkspaces.map(\.id), [late.id])
+                await self.closeRegisteredWindows()
+            }
+        }
+    }
+
+    func testWindowlessMCPSwitchByNameReportsUniqueAbsentEntryAsUnavailable() async throws {
+        let absent = WindowlessWorkspaceSeed(name: "UniqueAbsentRepo", repoPaths: [], document: .absent)
+        try await withSeededWorkspaceRuntime([absent]) { runtime, _ in
+            try await self.withFleetOnlyRouting { service, connectionID, client in
+                let before = await self.workspaceFingerprint(runtime)
+                let failure = await self.fleetRoutingFailure(service, connectionID: connectionID, client: client, args: [
+                    "action": .string("switch"), "workspace": .string("UniqueAbsentRepo"), "open_in_new_window": .bool(true)
+                ])
+                let message = try XCTUnwrap(failure)
+                XCTAssertTrue(message.contains("UniqueAbsentRepo"))
+                XCTAssertTrue(message.contains("unavailable"))
+                XCTAssertTrue(WindowStatesManager.shared.allWindows.isEmpty)
+                let after = await self.workspaceFingerprint(runtime)
+                XCTAssertEqual(after.ids, before.ids)
+                XCTAssertEqual(after.revision, before.revision)
+            }
+        }
+    }
+
+    private func listedToolNames(_ endpoint: PersistentMCPTestEndpoint) async throws -> [String] {
+        let response = try await endpoint.client.request(method: "tools/list", params: [:], timeoutSeconds: 5)
+        let object = try MCPExportWatchdogIntegrationTests.responseObject(from: response)
+        let tools = try XCTUnwrap((object["result"] as? [String: Any])?["tools"] as? [[String: Any]])
+        return tools.compactMap { $0["name"] as? String }.sorted()
+    }
+
+    private func closeEndpoint(_ endpoint: PersistentMCPTestEndpoint) async {
+        endpoint.client.close()
+        await endpoint.connectionManager.stop()
+        await ServerNetworkManager.shared.debugRemoveConnection(endpoint.connectionID)
+        await ServerNetworkManager.shared.debugClearPersistedRoutingState(for: endpoint.clientName)
+    }
+
+    func testWindowlessMCPToolsListMatchesSingleWindowAndUnboundCallFailsWithBindGuidance() async throws {
+        XCTAssertTrue(WindowStatesManager.shared.allWindows.isEmpty)
+        let state = try await makeLiveWindow()
+        let enabled = await state.mcpServer.setWindowToolsEnabled(true)
+        XCTAssertTrue(enabled)
+        let network = ServerNetworkManager.shared
+        let single = try await PersistentMCPTestEndpoint.make(label: "fleet-single", networkManager: network)
+        let singleWindowNames = try await listedToolNames(single)
+        await closeEndpoint(single)
+        await closeRegisteredWindows()
+        XCTAssertTrue(WindowStatesManager.shared.allWindows.isEmpty)
+
+        let windowless = try await PersistentMCPTestEndpoint.make(
+            label: "fleet-windowless", networkManager: network, requiredToolNames: ["bind_context", "manage_workspaces"]
+        )
+        let windowlessNames = try await listedToolNames(windowless)
+        XCTAssertEqual(windowlessNames, singleWindowNames)
+        for toolName in ["get_file_tree", "manage_selection"] {
+            let response = try await windowless.callTool(name: toolName, arguments: [:])
+            XCTAssertTrue(response.rawJSON.contains("\"isError\":true"), response.rawJSON)
+            XCTAssertTrue(response.rawJSON.contains("bind_context"), response.rawJSON)
+            XCTAssertTrue(response.rawJSON.contains("manage_workspaces"), response.rawJSON)
+        }
+        await closeEndpoint(windowless)
+    }
+
+    func testSettingsDeepLinkWithNoWorkspaceWindowsUsesCommandTarget() async throws {
+        try await assertWindowlessSettingsOpen(notification: Notification(name: .showMCPSettingsTab), selectedTab: .mcp)
+    }
+
+    func testSettingsDeepLinkWithPlaceholderWindowIDAndNoWorkspaceWindowsOpensTab() async throws {
+        try await assertWindowlessSettingsOpen(
+            notification: Notification(name: .showModelPresetsTab, object: nil, userInfo: ["windowID": 0]),
+            selectedTab: .modelPresets
+        )
     }
 
     func testFleetSettingsMenuDispatchesToApplicationCommandWithoutSceneTarget() throws {

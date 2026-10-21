@@ -195,10 +195,20 @@ struct WorkspaceLandingView: View {
 @MainActor
 protocol WorkspaceChooserSource: ObservableObject {
     var workspaceChooserPresentation: WorkspaceChooserPresentation { get }
+    var canRemoveMissingWorkspaceEntries: Bool { get }
     func retryWorkspaceChooser()
+    func requestRemoveMissingWorkspaceEntries()
     #if DEBUG
         func didConsumeWorkspaceChooserForTesting(_ value: WorkspaceChooserConsumption)
     #endif
+}
+
+extension WorkspaceChooserSource {
+    var canRemoveMissingWorkspaceEntries: Bool {
+        false
+    }
+
+    func requestRemoveMissingWorkspaceEntries() {}
 }
 
 extension WorkspaceManagerViewModel: WorkspaceChooserSource {}
@@ -242,6 +252,10 @@ struct WorkspaceChooserResultsView<Source: WorkspaceChooserSource>: View {
                     HStack {
                         Text(warning(for: catalog.source)).font(.callout).foregroundStyle(.secondary)
                         retryButton(failure)
+                        if workspaceManager.canRemoveMissingWorkspaceEntries {
+                            Button("Remove Missing Entries", action: workspaceManager.requestRemoveMissingWorkspaceEntries)
+                                .disabled(failure.recovery.isRetrying)
+                        }
                     }
                 }
                 if catalog.workspaces.isEmpty {

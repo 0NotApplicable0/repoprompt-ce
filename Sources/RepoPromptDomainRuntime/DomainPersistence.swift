@@ -148,6 +148,9 @@ struct DomainPersistenceBootstrap {
         let fileURL: URL
         let reason: String
         let fileMetadata: DomainFileMetadata
+        var name: String?
+        var repoPaths: [String]?
+        var isAbsentENOENT = false
     }
 
     let workspaces: [Workspace]
@@ -826,6 +829,77 @@ package struct DomainPersistenceCoordinator {
         }
     }
 
+    func persistRemovedMissingCatalogEntries(
+        workspaces: [DomainPersistenceBootstrap.UnavailableWorkspace],
+        expectedCatalogRevision: UInt64?,
+        operationID: UUID,
+        fingerprint: String,
+        now: Date
+    ) async throws -> (catalogRevision: UInt64, tombstones: [DomainDeletionTombstone]) {
+        try await DomainBlockingIO.run { cancellation in
+            let worker = blockingWorker(cancellation)
+            try cancellation.check()
+            try worker.ensureLazyMigration(now: now)
+            return try worker.withLock(at: worker.lockDirectory.appendingPathComponent("workspace-catalog.lock")) {
+                let catalog = try worker.loadCurrentCatalog(now: now)
+                if let expectedCatalogRevision, expectedCatalogRevision != catalog.revision {
+                    throw DomainPersistenceError.stateConflict(expected: expectedCatalogRevision, actual: catalog.revision)
+                }
+                let sorted = workspaces.sorted { $0.workspaceID.uuidString < $1.workspaceID.uuidString }
+                func commitAfterLockingWorkspace(at index: Int) throws -> (catalogRevision: UInt64, tombstones: [DomainDeletionTombstone]) {
+                    try cancellation.check()
+                    if index < sorted.count {
+                        return try worker.withLock(at: worker.lockURL(sorted[index].workspaceID)) {
+                            try commitAfterLockingWorkspace(at: index + 1)
+                        }
+                    }
+                    for workspace in sorted {
+                        let entries = catalog.entries.filter { $0.workspaceID == workspace.workspaceID }
+                        guard entries.count == 1,
+                              entries[0].fileURL.standardizedFileURL == workspace.fileURL.standardizedFileURL,
+                              !(catalog.deletions ?? []).contains(where: { $0.workspaceID == workspace.workspaceID }),
+                              worker.isDocumentConfirmedAbsentENOENT(at: entries[0].fileURL)
+                        else { throw DomainPersistenceError.externalDocumentConflict }
+                    }
+                    let outcome = DomainCommandOutcome(
+                        operationID: operationID, disposition: .applied, before: nil, after: nil,
+                        catalogRevision: catalog.revision &+ 1, resultingDigest: nil
+                    )
+                    let tombstones = sorted.map { workspace in
+                        let retainedOperations: [DomainRecordedOperation]
+                        if case let .success(journal?) = worker.loadJournal(workspaceID: workspace.workspaceID) {
+                            retainedOperations = journal.operations
+                        } else {
+                            retainedOperations = []
+                        }
+                        return DomainDeletionTombstone(
+                            workspaceID: workspace.workspaceID,
+                            fileURL: workspace.fileURL,
+                            retainedOperations: retainedOperations,
+                            operation: DomainRecordedOperation(
+                                fingerprint: fingerprint, recordedAt: now, outcome: outcome,
+                                resultingWorkspaceID: workspace.workspaceID
+                            ),
+                            deletedAt: now
+                        )
+                    }
+                    let removedIDs = Set(sorted.map(\.workspaceID))
+                    let next = RuntimeWorkspaceCatalog(
+                        version: RuntimeWorkspaceCatalog.schemaVersion,
+                        revision: outcome.catalogRevision,
+                        entries: catalog.entries.filter { !removedIDs.contains($0.workspaceID) },
+                        deletions: (catalog.deletions ?? []) + tombstones,
+                        updatedAt: now
+                    )
+                    try cancellation.check()
+                    try worker.atomicWrite(worker.encoder.encode(next), to: worker.catalogURL)
+                    return (next.revision, tombstones)
+                }
+                return try commitAfterLockingWorkspace(at: 0)
+            }
+        }
+    }
+
     func currentCatalogRevision() async throws -> UInt64? {
         try await DomainBlockingIO.run { cancellation in
             try cancellation.check()
@@ -877,6 +951,21 @@ package struct DomainPersistenceCoordinator {
             }
         } catch {
             return nil
+        }
+    }
+
+    func observeUnavailableWorkspace(
+        workspaceID: UUID,
+        fileURL: URL,
+        reason: String
+    ) async -> DomainPersistenceBootstrap.UnavailableWorkspace? {
+        try? await DomainBlockingIO.run { cancellation in
+            try cancellation.check()
+            return blockingWorker(cancellation).salvagedUnavailable(
+                workspaceID: workspaceID,
+                fileURL: fileURL,
+                reason: reason
+            )
         }
     }
 
@@ -1036,20 +1125,18 @@ package struct DomainPersistenceCoordinator {
         for entry in entries {
             guard loadedIDs.insert(entry.workspaceID).inserted else { continue }
             if duplicateWorkspaceIDs.contains(entry.workspaceID) {
-                unavailable.append(.init(
+                unavailable.append(salvagedUnavailable(
                     workspaceID: entry.workspaceID,
                     fileURL: entry.fileURL,
-                    reason: "duplicate_workspace_catalog_id",
-                    fileMetadata: fileMetadata(at: entry.fileURL)
+                    reason: "duplicate_workspace_catalog_id"
                 ))
             } else if let result = loadWorkspace(workspaceID: entry.workspaceID, fileURL: entry.fileURL) {
                 loaded.append(result.workspace)
             } else {
-                unavailable.append(.init(
+                unavailable.append(salvagedUnavailable(
                     workspaceID: entry.workspaceID,
                     fileURL: entry.fileURL,
-                    reason: "workspace_document_unavailable",
-                    fileMetadata: fileMetadata(at: entry.fileURL)
+                    reason: "workspace_document_unavailable"
                 ))
             }
         }
@@ -1881,6 +1968,40 @@ package struct DomainPersistenceCoordinator {
         } catch {
             return .invalid(observedMetadata)
         }
+    }
+
+    private func isDocumentConfirmedAbsentENOENT(at url: URL) -> Bool {
+        var status = stat()
+        return Darwin.lstat(url.path, &status) != 0 && errno == ENOENT
+    }
+
+    private func salvagedUnavailable(
+        workspaceID: UUID,
+        fileURL: URL,
+        reason: String
+    ) -> DomainPersistenceBootstrap.UnavailableWorkspace {
+        let isAbsent = isDocumentConfirmedAbsentENOENT(at: fileURL)
+        let identity = isAbsent
+            ? nil
+            : DomainWorkspaceDocument.salvageIdentity(from: fileURL, expectedWorkspaceID: workspaceID)
+        return .init(
+            workspaceID: workspaceID,
+            fileURL: fileURL,
+            reason: reason,
+            fileMetadata: fileMetadata(at: fileURL),
+            name: identity?.name ?? legacyIndexName(for: workspaceID),
+            repoPaths: identity?.repoPaths,
+            isAbsentENOENT: isAbsent
+        )
+    }
+
+    private func legacyIndexName(for workspaceID: UUID) -> String? {
+        guard let size = (try? fileManager.attributesOfItem(atPath: indexURL.path)[.size] as? NSNumber)?.uint64Value,
+              size <= DomainWorkspaceDocument.maximumSalvageByteCount,
+              let data = try? Data(contentsOf: indexURL),
+              let entries = try? decoder.decode([LegacyWorkspaceIndexEntry].self, from: data)
+        else { return nil }
+        return entries.first { $0.id == workspaceID }?.name
     }
 
     private func fileMetadata(at url: URL) -> DomainFileMetadata {

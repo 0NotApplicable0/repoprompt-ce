@@ -68,17 +68,32 @@ final class SettingsWindowCoordinator: NSObject, ObservableObject, NSWindowDeleg
     private var hostingController: NSHostingController<SettingsWindowRootView>?
     private var model: SettingsWindowModel?
     private weak var targetedWindowState: WindowState?
+    private var windowlessDependencies: WindowlessSettingsDependencies?
     private var cancellables: Set<AnyCancellable> = []
 
     override private init() {}
 
-    func open(windowState: WindowState, selectedTab: SettingsTab? = nil) {
+    #if DEBUG
+        var windowForTesting: NSWindow? {
+            windowController?.window
+        }
+    #endif
+
+    func open(windowState: WindowState?, selectedTab: SettingsTab? = nil) {
         let model = ensureModel(selectedTab: selectedTab)
         targetedWindowState = windowState
+        if windowState == nil {
+            if windowlessDependencies == nil {
+                windowlessDependencies = WindowlessSettingsDependencies()
+            }
+        } else {
+            tearDownWindowlessDependencies()
+        }
 
         let rootView = SettingsWindowRootView(
             model: model,
-            windowState: windowState
+            windowState: windowState,
+            windowless: windowlessDependencies
         )
 
         if let hostingController, let windowController {
@@ -148,7 +163,7 @@ final class SettingsWindowCoordinator: NSObject, ObservableObject, NSWindowDeleg
     /// Opens or retargets the Settings window before publishing section intent.
     /// An already-mounted router view observes the token change; a cold-mounted
     /// view reads the retained request when it enters the hierarchy.
-    func openAgentDecisions(windowState: WindowState, section: AgentDecisionsSection) {
+    func openAgentDecisions(windowState: WindowState?, section: AgentDecisionsSection) {
         open(windowState: windowState, selectedTab: .modelRouter)
         publishAgentDecisionsSectionRequest(section)
     }
@@ -213,7 +228,13 @@ final class SettingsWindowCoordinator: NSObject, ObservableObject, NSWindowDeleg
         return tabTitle.isEmpty ? "Settings" : "Settings — \(tabTitle)"
     }
 
+    private func tearDownWindowlessDependencies() {
+        windowlessDependencies?.tearDown()
+        windowlessDependencies = nil
+    }
+
     private func clearWindowReferences() {
+        tearDownWindowlessDependencies()
         windowController?.window?.delegate = nil
         windowController = nil
         hostingController = nil

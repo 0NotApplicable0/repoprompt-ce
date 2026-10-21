@@ -394,6 +394,7 @@ let package = Package(
             name: "RepoPromptTests",
             dependencies: repoPromptTestDependencies,
             path: "Tests/RepoPromptTests",
+            exclude: ["AgentMode/Antigravity/Fixtures"],
             swiftSettings: repoPromptTestSwiftSettings
         )
     ],

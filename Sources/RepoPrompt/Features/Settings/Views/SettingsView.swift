@@ -20,7 +20,8 @@ struct SettingsView: View {
     let fileManager: WorkspaceFilesViewModel
     let promptViewModel: PromptViewModel
     let apiSettingsViewModel: APISettingsViewModel
-    let windowState: WindowState
+    let windowState: WindowState?
+    let windowless: WindowlessSettingsDependencies?
     var onAPIKeyUpdated: (() -> Void)?
 
     @Binding var selectedTab: SettingsTab
@@ -69,7 +70,8 @@ struct SettingsView: View {
         fileManager: WorkspaceFilesViewModel,
         promptViewModel: PromptViewModel,
         apiSettingsViewModel: APISettingsViewModel,
-        windowState: WindowState,
+        windowState: WindowState?,
+        windowless: WindowlessSettingsDependencies? = nil,
         onAPIKeyUpdated: (() -> Void)?,
         selectedTab: Binding<SettingsTab>,
         closeAction: (() -> Void)? = nil
@@ -78,6 +80,7 @@ struct SettingsView: View {
         self.promptViewModel = promptViewModel
         self.apiSettingsViewModel = apiSettingsViewModel
         self.windowState = windowState
+        self.windowless = windowless
         self.onAPIKeyUpdated = onAPIKeyUpdated
         _selectedTab = selectedTab
         self.closeAction = closeAction
@@ -282,9 +285,26 @@ struct SettingsView: View {
         contentView
     }
 
+    private var settingsWindowID: Int {
+        windowState?.windowID ?? 0
+    }
+
+    @ViewBuilder
     private var routerSettingsContent: some View {
-        RouterSettingsView(viewModel: windowState.routerSettingsViewModel, onNavigate: { selectedTab = $0 })
-            .transition(.opacity.animation(.easeInOut(duration: 0.15)))
+        if let viewModel = windowState?.routerSettingsViewModel ?? windowless?.routerSettingsViewModel {
+            RouterSettingsView(viewModel: viewModel, onNavigate: { selectedTab = $0 })
+                .transition(.opacity.animation(.easeInOut(duration: 0.15)))
+        }
+    }
+
+    private func noActiveWorkspacePlaceholder(message: String) -> some View {
+        VStack {
+            Text("No Active Workspace")
+                .font(.headline)
+            Text(message)
+                .foregroundColor(.secondary)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
     @ViewBuilder
@@ -294,23 +314,28 @@ struct SettingsView: View {
             AppearanceSettingsView(promptViewModel: promptViewModel)
                 .transition(.opacity.animation(.easeInOut(duration: 0.15)))
         case .licenseUpdates:
-            LicenseUpdatesSettingsView(
-                windowState: windowState,
-                closeAction: closeAction
-            )
-            .transition(.opacity.animation(.easeInOut(duration: 0.15)))
-        case .mcp:
-            MCPSettingsView(
-                vm: windowState.mcpServer,
-                promptVM: promptViewModel,
-                windowID: windowState.windowID,
-                onNavigate: { tab in selectedTab = tab },
-                closeAction: closeAction
-            )
-            .transition(.opacity.animation(.easeInOut(duration: 0.15)))
-        case .mcpTools:
-            MCPToolsSettingsView(server: windowState.mcpServer)
+            LicenseUpdatesSettingsView(closeAction: closeAction)
                 .transition(.opacity.animation(.easeInOut(duration: 0.15)))
+        case .mcp:
+            if let windowState {
+                MCPSettingsView(
+                    vm: windowState.mcpServer,
+                    promptVM: promptViewModel,
+                    windowID: windowState.windowID,
+                    onNavigate: { tab in selectedTab = tab },
+                    closeAction: closeAction
+                )
+                .transition(.opacity.animation(.easeInOut(duration: 0.15)))
+            } else {
+                noActiveWorkspacePlaceholder(message: "Please open or create a workspace to manage MCP.")
+            }
+        case .mcpTools:
+            if let windowState {
+                MCPToolsSettingsView(server: windowState.mcpServer)
+                    .transition(.opacity.animation(.easeInOut(duration: 0.15)))
+            } else {
+                noActiveWorkspacePlaceholder(message: "Please open or create a workspace to manage MCP tools.")
+            }
         case .permissions:
             PermissionsSettingsView()
                 .transition(.opacity.animation(.easeInOut(duration: 0.15)))
@@ -321,7 +346,7 @@ struct SettingsView: View {
             AdvancedSettingsView(
                 fileManager: fileManager,
                 promptViewModel: promptViewModel,
-                windowState: windowState
+                windowID: windowState?.windowID
             )
             .transition(.opacity.animation(.easeInOut(duration: 0.15)))
         case .telemetry:
@@ -331,12 +356,12 @@ struct SettingsView: View {
             NotificationSettingsView()
                 .transition(.opacity.animation(.easeInOut(duration: 0.15)))
         case .chatSettings:
-            ChatSettingsView(promptViewModel: promptViewModel, windowID: windowState.windowID, closeAction: closeAction)
+            ChatSettingsView(promptViewModel: promptViewModel, windowID: settingsWindowID, closeAction: closeAction)
                 .transition(.opacity.animation(.easeInOut(duration: 0.15)))
         case .apiGeneral:
             APISettingsView(
                 viewModel: apiSettingsViewModel,
-                windowID: windowState.windowID,
+                windowID: settingsWindowID,
                 onAPIKeyUpdated: onAPIKeyUpdated,
                 closeAction: closeAction
             )
@@ -356,7 +381,7 @@ struct SettingsView: View {
             CLIProvidersSettingsView(
                 viewModel: apiSettingsViewModel,
                 promptViewModel: promptViewModel,
-                windowID: windowState.windowID,
+                windowID: settingsWindowID,
                 providerPermissionsViewModel: { makeAgentProviderPermissionsSettingsViewModel() },
                 onAPIKeyUpdated: onAPIKeyUpdated,
                 closeAction: closeAction,
@@ -367,12 +392,16 @@ struct SettingsView: View {
             PromptOrderSettingsView(promptViewModel: promptViewModel)
                 .transition(.opacity.animation(.easeInOut(duration: 0.15)))
         case .manageWorkspaces:
-            ManageWorkspacesView(isPresented: .constant(true), showCloseButton: false)
-                .environmentObject(windowState.workspaceManager)
-                .environmentObject(WindowStatesManager.shared)
-                .transition(.opacity.animation(.easeInOut(duration: 0.15)))
+            if let windowState {
+                ManageWorkspacesView(isPresented: .constant(true), showCloseButton: false)
+                    .environmentObject(windowState.workspaceManager)
+                    .environmentObject(WindowStatesManager.shared)
+                    .transition(.opacity.animation(.easeInOut(duration: 0.15)))
+            } else {
+                noActiveWorkspacePlaceholder(message: "Please open or create a workspace to manage workspaces.")
+            }
         case .managePresets:
-            if let activeWorkspace = windowState.workspaceManager.activeWorkspace {
+            if let windowState, let activeWorkspace = windowState.workspaceManager.activeWorkspace {
                 ManagePresetsView(
                     isPresented: .constant(true),
                     showCloseButton: false,
@@ -381,13 +410,7 @@ struct SettingsView: View {
                 .environmentObject(windowState.workspaceManager)
                 .transition(.opacity.animation(.easeInOut(duration: 0.15)))
             } else {
-                VStack {
-                    Text("No Active Workspace")
-                        .font(.headline)
-                    Text("Please open or create a workspace to manage its presets.")
-                        .foregroundColor(.secondary)
-                }
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                noActiveWorkspacePlaceholder(message: "Please open or create a workspace to manage its presets.")
             }
         case .modelPresets:
             ModelPresetsSettingsView(promptViewModel: promptViewModel)
@@ -406,19 +429,23 @@ struct SettingsView: View {
             WorkflowPresetsSettingsView(promptViewModel: promptViewModel, initialScope: .chat)
                 .transition(.opacity.animation(.easeInOut(duration: 0.15)))
         case .contextBuilder:
-            ContextBuilderSettingsView(
-                contextBuilderVM: windowState.contextBuilderAgentViewModel,
-                promptVM: promptViewModel,
-                apiSettingsVM: apiSettingsViewModel,
-                windowID: windowState.windowID,
-                onNavigate: { tab in selectedTab = tab }
-            )
-            .transition(.opacity.animation(.easeInOut(duration: 0.15)))
+            if let windowState {
+                ContextBuilderSettingsView(
+                    contextBuilderVM: windowState.contextBuilderAgentViewModel,
+                    promptVM: promptViewModel,
+                    apiSettingsVM: apiSettingsViewModel,
+                    windowID: windowState.windowID,
+                    onNavigate: { tab in selectedTab = tab }
+                )
+                .transition(.opacity.animation(.easeInOut(duration: 0.15)))
+            } else {
+                noActiveWorkspacePlaceholder(message: "Please open or create a workspace to configure Context Builder.")
+            }
         case .agentMode:
             AgentModeGeneralSettingsView(
                 promptVM: promptViewModel,
                 apiSettingsVM: apiSettingsViewModel,
-                workspaceID: windowState.workspaceManager.activeWorkspace?.id,
+                workspaceID: windowState?.workspaceManager.activeWorkspace?.id,
                 onNavigate: { tab in selectedTab = tab }
             )
             .transition(.opacity.animation(.easeInOut(duration: 0.15)))
@@ -428,10 +455,10 @@ struct SettingsView: View {
             AgentModelsSettingsView(
                 promptVM: promptViewModel,
                 apiSettingsVM: apiSettingsViewModel,
-                windowID: windowState.windowID,
-                workspaceID: windowState.workspaceManager.activeWorkspace?.id,
-                workspaceName: windowState.workspaceManager.activeWorkspace?.name,
-                settingsManager: windowState.settingsManager,
+                windowID: settingsWindowID,
+                workspaceID: windowState?.workspaceManager.activeWorkspace?.id,
+                workspaceName: windowState?.workspaceManager.activeWorkspace?.name,
+                settingsManager: windowState?.settingsManager ?? windowless?.settingsManager ?? WindowSettingsManager(windowID: 0),
                 onNavigate: { tab in selectedTab = tab }
             )
             .transition(.opacity.animation(.easeInOut(duration: 0.15)))
@@ -462,8 +489,10 @@ struct SettingsView: View {
     /// Direct Agents scope VM, shared storage diagnostics
     @MainActor
     private func makeAgentProviderPermissionsSettingsViewModel() -> AgentProviderPermissionsSettingsViewModel {
-        let agentModeVM = windowState.agentModeViewModel
-        let bindingService = agentModeVM.providerBindingService
+        let agentModeVM = windowState?.agentModeViewModel
+        let bindingService = agentModeVM?.providerBindingService
+            ?? windowless?.providerBindingService
+            ?? AgentModeProviderBindingService()
         let securePermissions = bindingService.preferences.securePermissions
             ?? AgentPermissionSecureStore.shared
         let diagnostics = AgentPermissionStorageDiagnosticsViewModel(

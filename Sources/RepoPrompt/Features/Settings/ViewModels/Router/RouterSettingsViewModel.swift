@@ -128,7 +128,7 @@ final class RouterSettingsViewModel: ObservableObject {
         settingsStore: GlobalSettingsStore,
         runtime: AgentTaskRouterRuntime,
         apiSettingsViewModel: APISettingsViewModel,
-        workspaceManager: WorkspaceManagerViewModel,
+        workspaceManager: WorkspaceManagerViewModel?,
         availabilityProvider: (@MainActor () -> AgentModelCatalog.AvailabilityContext)? = nil,
         targetPreviewBuilder: (@MainActor (AgentModelCatalog.AvailabilityContext) throws -> [TargetPreview])? = nil,
         unavailableTargetPreviewBuilder: (@MainActor (AgentModelCatalog.AvailabilityContext) -> [UnavailableTargetPreview])? = nil,
@@ -192,12 +192,18 @@ final class RouterSettingsViewModel: ObservableObject {
         .receive(on: RunLoop.main)
         .sink { [weak self] _ in self?.scheduleRefresh() }
         .store(in: &cancellables)
-        workspaceManager.$activeWorkspaceID
+        workspaceManager?.$activeWorkspaceID
             .removeDuplicates()
             .receive(on: RunLoop.main)
             .sink { [weak self] _ in self?.scheduleRefresh() }
             .store(in: &cancellables)
         scheduleRefresh()
+    }
+
+    func tearDown() {
+        refreshTask?.cancel()
+        refreshTask = nil
+        cancellables.removeAll()
     }
 
     var backendOptions: [BackendOption] {

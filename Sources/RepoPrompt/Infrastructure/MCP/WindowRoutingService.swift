@@ -163,6 +163,10 @@ final class WindowRoutingService: Service {
     private let setActiveWindowForCurrentConnection: (@Sendable (Int) async throws -> Void)?
     private let deletionExecutor: @MainActor (WindowState, WorkspaceModel) async -> WorkspaceWindowDeletion.Result
 
+    #if DEBUG
+        var test_afterCreateApproval: (@MainActor () async -> Void)?
+    #endif
+
     /// Thread-safe tools storage. Routing definitions are static in M1; disabled-tool
     /// filtering and window selection are applied from live state outside this cache.
     private let toolsCache = ToolsCache()
@@ -257,13 +261,47 @@ final class WindowRoutingService: Service {
         let runtime = AppDomainRuntimeComposition.shared.runtime
         try await runtime.start()
         let snapshot = await runtime.workspaceStore.snapshot()
-        guard snapshot.isBootstrapped, snapshot.unavailableWorkspaceIDs.isEmpty else {
+        guard snapshot.isBootstrapped else {
             throw MCPError.internalError("Workspace inventory is unavailable. Retry after workspace recovery completes.")
         }
         let workspaces = try snapshot.workspaces.map {
             try WorkspaceManagerViewModel.decodeDomainWorkspaceCatalogRecordBytes($0)
         }
         return Self.workspaceInventoryModels(workspaces, authorityIncompleteWorkspaceIDs: [], includeHidden: includeHidden)
+    }
+
+    private func throwIfTargetMatchesUnavailableWorkspace(
+        workspaceReference: String? = nil,
+        workingDirs: [String]? = nil,
+        failClosedOnUnreadable: Bool = false,
+        openedWindowID: Int? = nil
+    ) async throws {
+        let runtime = AppDomainRuntimeComposition.shared.runtime
+        try await runtime.start()
+        let unavailable = await runtime.workspaceStore.snapshot().unavailableWorkspaces
+        let openedWindowNote = openedWindowID.map { " Window \($0) was already opened for this request and stays open." } ?? ""
+        func describe(_ entry: DomainUnavailableWorkspaceSummary) -> String {
+            "'\(entry.name ?? entry.workspaceID.uuidString)' (\(entry.workspaceID.uuidString), \(entry.fileURL.path))"
+        }
+        for entry in unavailable {
+            var matches = false
+            if let workspaceReference {
+                matches = workspaceReference == entry.workspaceID.uuidString
+                    || workspaceReference == (entry.name ?? entry.workspaceID.uuidString)
+            }
+            if let workingDirs, let repoPaths = entry.repoPaths {
+                let roots = Set(WorkspaceManagerViewModel.normalizedExactWorkspaceDirectorySet(repoPaths))
+                matches = matches || Set(workingDirs).isSubset(of: roots)
+            }
+            if matches {
+                throw MCPError.invalidParams("Workspace \(describe(entry)) is unavailable: its document cannot be read, so it cannot be used. Remove or repair the entry in Fleet Manager (\"Remove Missing Entries\") and retry.\(openedWindowNote)")
+            }
+        }
+        guard failClosedOnUnreadable else { return }
+        let blocking = unavailable.filter { !$0.isAbsentENOENT && $0.repoPaths == nil }
+        guard !blocking.isEmpty else { return }
+        let ids = blocking.prefix(5).map(\.workspaceID.uuidString).joined(separator: ", ")
+        throw MCPError.invalidParams("\(blocking.count) workspace catalog entries are unreadable (\(ids)), so creating a workspace could duplicate one. Resolve them with \"Remove Missing Entries\" in Fleet Manager and retry.\(openedWindowNote)")
     }
 
     private func loadWorkspaceDiskSnapshot(allowWindowless: Bool = false) async throws -> [WorkspaceModel] {
@@ -360,11 +398,16 @@ final class WindowRoutingService: Service {
 
     private func resolveWorkspaceForSwitch(rawWorkspaceParam: String, includeHidden: Bool) async throws -> WorkspaceModel {
         let diskWorkspaces = try await loadWorkspaceDiskSnapshot(allowWindowless: true)
-        return try Self.resolveWorkspaceReference(
-            rawWorkspaceParam,
-            in: diskWorkspaces,
-            mode: .visibleNameByDefault(action: "switch", includeHidden: includeHidden)
-        )
+        do {
+            return try Self.resolveWorkspaceReference(
+                rawWorkspaceParam,
+                in: diskWorkspaces,
+                mode: .visibleNameByDefault(action: "switch", includeHidden: includeHidden)
+            )
+        } catch {
+            try await throwIfTargetMatchesUnavailableWorkspace(workspaceReference: rawWorkspaceParam)
+            throw error
+        }
     }
 
     private func resolveWorkspaceForDelete(rawWorkspaceParam: String, includeHidden: Bool) async throws -> WorkspaceModel {
@@ -1614,11 +1657,15 @@ final class WindowRoutingService: Service {
             return resolution
         }
 
+        try await throwIfTargetMatchesUnavailableWorkspace(workingDirs: normalizedWorkingDirs)
+
         guard createIfMissing else {
             throw MCPError.invalidParams(
                 "No existing workspace exactly matches working_dirs [\(normalizedWorkingDirs.joined(separator: ", "))] and no workspace repo_paths superset contains those roots. Exact matching uses the full workspace repo_paths set (order-insensitive); superset fallback uses root-set membership only, not descendant paths. Retry with create_if_missing=true to create one."
             )
         }
+
+        try await throwIfTargetMatchesUnavailableWorkspace(failClosedOnUnreadable: true)
 
         let approvalWindow = try await resolveWorkspaceApprovalWindow(requestedWindowID: windowID, openInNewWindow: true)
         let existingWorkspaces: [WorkspaceModel] = if let approvalWindow {
@@ -1641,6 +1688,10 @@ final class WindowRoutingService: Service {
             throw MCPError.invalidRequest("Workspace creation was denied by the user.")
         }
 
+        #if DEBUG
+            if let test_afterCreateApproval { await test_afterCreateApproval() }
+        #endif
+
         if let resolution = try await resolveExistingWorkingDirsBindResolution(
             normalizedWorkingDirs: normalizedWorkingDirs,
             windowID: windowID,
@@ -1650,9 +1701,36 @@ final class WindowRoutingService: Service {
             return resolution
         }
 
+        try await throwIfTargetMatchesUnavailableWorkspace(
+            workingDirs: normalizedWorkingDirs,
+            failClosedOnUnreadable: true
+        )
+
         let newWindow = try await openRoutingWindow(deferringInitialAgentSystemWorkspaceRefresh: true)
         defer { newWindow.agentModeViewModel.finishInitialSystemWorkspaceSessionListRefreshDeferral() }
         await newWindow.workspaceManager.awaitInitialized()
+
+        do {
+            if let resolution = try await resolveExistingWorkingDirsBindResolution(
+                normalizedWorkingDirs: normalizedWorkingDirs,
+                windowID: newWindow.windowID,
+                connectionID: connectionID,
+                afterApproval: true
+            ) {
+                return resolution
+            }
+        } catch let error as MCPError {
+            throw MCPError.invalidRequest(
+                "\(error.localizedDescription) Window \(newWindow.windowID) was already opened for this request and stays open."
+            )
+        }
+
+        try await throwIfTargetMatchesUnavailableWorkspace(
+            workingDirs: normalizedWorkingDirs,
+            failClosedOnUnreadable: true,
+            openedWindowID: newWindow.windowID
+        )
+
         let newWorkspace = try await createWorkspace(
             in: newWindow,
             name: workspaceName,
@@ -2273,18 +2351,20 @@ final class WindowRoutingService: Service {
                     // Then overlay window visibility information from in-memory state
 
                     // Get a workspace manager to load disk snapshot
-                    guard let referenceManager = await MainActor.run(body: {
+                    let referenceManager = await MainActor.run(body: {
                         routingService.windowStates.allWindows.first?.workspaceManager
-                    }) else {
-                        return ManageWorkspacesResponse(action: "list", workspaces: [], status: "ok")
-                    }
+                    })
 
                     // Load authoritative workspace data and overlay incomplete two-phase restores
                     // as hidden recovery records.
-                    let diskWorkspaces = await routingService.loadWorkspaceInventorySnapshot(
-                        from: referenceManager,
-                        includeHidden: includeHidden
-                    )
+                    let diskWorkspaces: [WorkspaceModel] = if let referenceManager {
+                        await routingService.loadWorkspaceInventorySnapshot(
+                            from: referenceManager,
+                            includeHidden: includeHidden
+                        )
+                    } else {
+                        try await routingService.loadWindowlessWorkspaceInventory(includeHidden: includeHidden)
+                    }
 
                     // Build map of which windows are showing each workspace
                     let windowsByWorkspaceID: [UUID: Set<Int>] = await MainActor.run {

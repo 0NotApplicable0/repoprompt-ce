@@ -259,6 +259,7 @@ final class AntigravityAgentProvider: HeadlessAgentProvider {
         var args = ["--print"]
         if let inlinePrompt {
             args.append(inlinePrompt)
+            args += ["--output-format", "stream-json"]
         }
         if let rawModel = config.modelString?.trimmingCharacters(in: .whitespacesAndNewlines) {
             let model = Self.normalizedModelID(rawModel)
@@ -498,6 +499,7 @@ final class AntigravityAgentProvider: HeadlessAgentProvider {
                                 toolLog: activeToolLog,
                                 expectedPIDRunID: context.runID,
                                 isFirstTurn: turn == 0,
+                                streamJSON: inlinePrompt,
                                 continuation: continuation
                             )
 
@@ -739,11 +741,33 @@ final class AntigravityAgentProvider: HeadlessAgentProvider {
         toolLog: AntigravityTrajectoryToolLog,
         expectedPIDRunID: UUID,
         isFirstTurn: Bool,
+        streamJSON: Bool,
         continuation: AsyncThrowingStream<AIStreamResult, Error>.Continuation
     ) async throws -> TurnOutcome {
         var framer = LineFramer()
         var stdoutData = Data()
+        var decodedData = Data()
+        var streamedText = ""
         var stderrTail = Data()
+
+        func decodedOutput(for text: String, appendNewline: Bool) -> String? {
+            guard streamJSON else { return text + (appendNewline ? "\n" : "") }
+            switch AntigravityStreamJSONLineParser.parse(text) {
+            case let .assistantDelta(delta):
+                streamedText += delta
+                return delta
+            case let .result(response, _):
+                let containsCapMarker = response
+                    .split(separator: "\n", omittingEmptySubsequences: false)
+                    .contains { AntigravityStreamParser.isPollCapMarkerLine(String($0)) }
+                guard !containsCapMarker, response.hasPrefix(streamedText) else { return nil }
+                return String(response.dropFirst(streamedText.count))
+            case let .plain(plain):
+                return plain + (appendNewline ? "\n" : "")
+            case .ignored:
+                return nil
+            }
+        }
         var exitStatus: Int32?
         var timedOut = false
         var watchdog: Task<Void, Never>?
@@ -782,10 +806,11 @@ final class AntigravityAgentProvider: HeadlessAgentProvider {
                     stdoutData.append(chunk)
                     framer.feed(chunk) { line in
                         if let text = String(data: line, encoding: .utf8) {
-                            // Withhold the poll-cap marker line from streamed content; the turn is
-                            // still classified as capped below via the accumulated stdoutData.
-                            guard !AntigravityStreamParser.isPollCapMarkerLine(text) else { return }
-                            continuation.yield(AntigravityStreamParser.contentResult(text + "\n"))
+                            let output = decodedOutput(for: text, appendNewline: true)
+                            if let output, !output.isEmpty, !AntigravityStreamParser.isPollCapMarkerLine(output) {
+                                decodedData.append(contentsOf: output.utf8)
+                                continuation.yield(AntigravityStreamParser.contentResult(output))
+                            }
                         }
                     }
                 case let .stderr(chunk):
@@ -810,8 +835,11 @@ final class AntigravityAgentProvider: HeadlessAgentProvider {
             try Task.checkCancellation()
             framer.flush { line in
                 if let text = String(data: line, encoding: .utf8), !text.isEmpty {
-                    guard !AntigravityStreamParser.isPollCapMarkerLine(text) else { return }
-                    continuation.yield(AntigravityStreamParser.contentResult(text))
+                    let output = decodedOutput(for: text, appendNewline: false)
+                    if let output, !output.isEmpty, !AntigravityStreamParser.isPollCapMarkerLine(output) {
+                        decodedData.append(contentsOf: output.utf8)
+                        continuation.yield(AntigravityStreamParser.contentResult(output))
+                    }
                 }
             }
         } catch {
@@ -839,6 +867,7 @@ final class AntigravityAgentProvider: HeadlessAgentProvider {
             stderr: stderrString,
             logTail: logTail,
             isFirstTurn: isFirstTurn,
+            decodedText: streamJSON ? decodedData : nil,
             trajectoryFailureKind: trajectoryFailureKind
         )
         diagnostics.completed = outcome == .completed
@@ -852,6 +881,7 @@ final class AntigravityAgentProvider: HeadlessAgentProvider {
         stderr: String,
         logTail: String?,
         isFirstTurn: Bool,
+        decodedText: Data? = nil,
         trajectoryFailureKind: AntigravityTrajectoryStore.FailureKind? = nil
     ) throws -> TurnOutcome {
         if let processFailure = processFailure(
@@ -867,7 +897,8 @@ final class AntigravityAgentProvider: HeadlessAgentProvider {
             stdoutData: stdoutData,
             stderr: stderr,
             logTail: logTail,
-            isFirstTurn: isFirstTurn
+            isFirstTurn: isFirstTurn,
+            decodedText: decodedText
         )
     }
 
@@ -875,7 +906,8 @@ final class AntigravityAgentProvider: HeadlessAgentProvider {
         stdoutData: Data,
         stderr: String? = nil,
         logTail: String?,
-        isFirstTurn: Bool
+        isFirstTurn: Bool,
+        decodedText: Data? = nil
     ) throws -> TurnOutcome {
         if isHeadlessPermissionDenial(stderr: stderr, logTail: logTail) {
             throw headlessPermissionDenialError
@@ -885,7 +917,7 @@ final class AntigravityAgentProvider: HeadlessAgentProvider {
         if AntigravityStreamParser.isPrintModePollCapTimeout(stdout: stdoutString, logTail: logTail) {
             return .capped
         }
-        let hasMeaningfulOutput = String(data: stdoutData, encoding: .utf8)?
+        let hasMeaningfulOutput = String(data: decodedText ?? stdoutData, encoding: .utf8)?
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .isEmpty == false
         if !hasMeaningfulOutput {

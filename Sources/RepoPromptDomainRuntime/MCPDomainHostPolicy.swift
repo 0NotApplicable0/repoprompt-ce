@@ -38,14 +38,17 @@ package struct MCPDomainCatalogAdvertisementRequest: Sendable {
     package let disabledToolNames: Set<String>
     package let policy: MCPDomainClientPolicySnapshot
     package let agentSessionLinkSurface: AgentSessionLinkToolSurface
+    package let includeCanonicalWindowToolsWhenWindowless: Bool
 
     package init(
         isGloballyEnabled: Bool,
         disabledToolNames: Set<String>,
         policy: MCPDomainClientPolicySnapshot,
-        agentSessionLinkSurface: AgentSessionLinkToolSurface = .full
+        agentSessionLinkSurface: AgentSessionLinkToolSurface = .full,
+        includeCanonicalWindowToolsWhenWindowless: Bool = false
     ) {
         self.agentSessionLinkSurface = agentSessionLinkSurface
+        self.includeCanonicalWindowToolsWhenWindowless = includeCanonicalWindowToolsWhenWindowless
         self.isGloballyEnabled = isGloballyEnabled
         self.disabledToolNames = disabledToolNames
         self.policy = policy
@@ -125,11 +128,21 @@ package extension MCPDomainHost {
         }
 
         let catalog = await registry.snapshot()
+        var definitions = catalog.definitions
+        if request.includeCanonicalWindowToolsWhenWindowless {
+            let registered = Dictionary(uniqueKeysWithValues: definitions.map { ($0.name, $0) })
+            let windowNames = Set(MCPDomainToolCatalog.windowToolNames)
+            definitions = MCPDomainToolCatalog.orderedToolNames.compactMap { name in
+                if let definition = registered[name] { return definition }
+                guard windowNames.contains(name) else { return nil }
+                return MCPDomainCanonicalToolDefinitions.definition(named: name)
+            }
+        }
         var visible: [MCPDomainToolDefinition] = []
         var hidden: [String: MCPDomainCatalogHiddenReason] = [:]
-        visible.reserveCapacity(catalog.definitions.count)
+        visible.reserveCapacity(definitions.count)
 
-        for definition in catalog.definitions {
+        for definition in definitions {
             let toolName = definition.name
             if toolName == MCPWindowToolName.becomeOverseer, !request.policy.canBecomeOverseer {
                 hidden[toolName] = .missingAdditionalToolGrant
