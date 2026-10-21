@@ -136,7 +136,7 @@ final class WindowRoutingService: Service {
             creationCommitted = true
             try Task.checkCancellation()
             if switchToCreated {
-                let switchResult = await workspaceManager.requestWorkspaceSwitch(to: workspace, saveState: true)
+                let switchResult = await workspaceManager.requestWorkspaceSwitch(to: workspace, saveState: true, origin: .programmatic)
                 guard switchResult.didSwitch else {
                     throw MCPError.invalidRequest(switchResult.message ?? "Workspace switch was cancelled.")
                 }
@@ -194,7 +194,8 @@ final class WindowRoutingService: Service {
                     windowStates.allWindows.filter { $0.workspaceManager.activeWorkspaceID == workspaceID }.map(\.windowID)
                 },
                 requestClose: { try windowStates.requestCloseWindow(windowID: $0, authorization: $1) },
-                authorization: Self.workspaceDeleteCloseAuthorization()
+                authorization: Self.workspaceDeleteCloseAuthorization(),
+                origin: .programmatic
             ).execute()
         }
     }
@@ -1185,6 +1186,7 @@ final class WindowRoutingService: Service {
             let result = try await windowStates.openNewMainWindow(
                 deferringInitialAgentSystemWorkspaceRefresh: deferringInitialAgentSystemWorkspaceRefresh,
                 parkOnOpen: scope != nil,
+                consumesRestoreEntry: false,
                 requestID: scope?.requestID ?? UUID()
             )
             guard let scope else { return result.window }
@@ -1212,7 +1214,7 @@ final class WindowRoutingService: Service {
         let newWindow = try await openRoutingWindow(deferringInitialAgentSystemWorkspaceRefresh: true)
         defer { newWindow.agentModeViewModel.finishInitialSystemWorkspaceSessionListRefreshDeferral() }
         await newWindow.workspaceManager.awaitInitialized()
-        let switchResult = await newWindow.workspaceManager.requestWorkspaceSwitch(to: workspace, saveState: true)
+        let switchResult = await newWindow.workspaceManager.requestWorkspaceSwitch(to: workspace, saveState: true, origin: .programmatic)
         if !switchResult.didSwitch {
             throw MCPError.invalidRequest(switchResult.message ?? "Workspace switch was cancelled.")
         }
@@ -1258,7 +1260,7 @@ final class WindowRoutingService: Service {
     ) async throws -> WorkspaceModel {
         let newWorkspace = window.workspaceManager.createWorkspace(name: name, repoPaths: repoPaths, savedInLibrary: false)
         if switchToCreated {
-            let switchResult = await window.workspaceManager.requestWorkspaceSwitch(to: newWorkspace, saveState: true)
+            let switchResult = await window.workspaceManager.requestWorkspaceSwitch(to: newWorkspace, saveState: true, origin: .programmatic)
             if !switchResult.didSwitch {
                 throw MCPError.invalidRequest(switchResult.message ?? "Workspace switch was cancelled.")
             }
@@ -1342,19 +1344,33 @@ final class WindowRoutingService: Service {
         workingDirsMatchedBy(matchKind: .superset, candidateCount: candidateCount, disambiguatedByWindowID: disambiguatedByWindowID)
     }
 
+    nonisolated static func workingDirsMatchedByNote(matchedBy: String, equivalentCount: Int, workspaceName: String) -> String {
+        guard equivalentCount > 1 else { return matchedBy }
+        return "\(matchedBy); \(equivalentCount) workspaces share these roots, resolved to \"\(workspaceName)\" by the deterministic bind rule"
+    }
+
+    nonisolated static func test_workingDirsMatchedByNote(matchedBy: String, equivalentCount: Int, workspaceName: String) -> String {
+        workingDirsMatchedByNote(matchedBy: matchedBy, equivalentCount: equivalentCount, workspaceName: workspaceName)
+    }
+
     private func workingDirsResolution(
         windowID: Int,
         workspace: WorkspaceModel,
         normalizedWorkingDirs: [String],
         matchedBy: String,
-        createdWorkspace: Bool
+        createdWorkspace: Bool,
+        equivalentCount: Int = 1
     ) -> WorkingDirsBindResolution {
         WorkingDirsBindResolution(
             windowID: windowID,
             workspaceID: workspace.id,
             workspaceName: workspace.name,
             repoPaths: workspace.repoPaths,
-            matchedBy: matchedBy,
+            matchedBy: Self.workingDirsMatchedByNote(
+                matchedBy: matchedBy,
+                equivalentCount: equivalentCount,
+                workspaceName: workspace.name
+            ),
             createdWorkspace: createdWorkspace,
             normalizedWorkingDirs: normalizedWorkingDirs
         )
@@ -1384,13 +1400,14 @@ final class WindowRoutingService: Service {
                     workspace: activeEquivalentWorkspace,
                     normalizedWorkingDirs: normalizedWorkingDirs,
                     matchedBy: matchedBy,
-                    createdWorkspace: createdWorkspace
+                    createdWorkspace: createdWorkspace,
+                    equivalentCount: match.equivalentWorkspaceIDs.count
                 )
             }
 
             if let targetWindow = windowStates.allWindows.first(where: { $0.windowID == preferredWindowID }) {
                 if targetWindow.workspaceManager.activeWorkspace?.id != match.workspace.id {
-                    let switchResult = await targetWindow.workspaceManager.requestWorkspaceSwitch(to: match.workspace, saveState: true)
+                    let switchResult = await targetWindow.workspaceManager.requestWorkspaceSwitch(to: match.workspace, saveState: true, origin: .programmatic)
                     if !switchResult.didSwitch {
                         throw MCPError.invalidRequest(switchResult.message ?? "Workspace switch was cancelled.")
                     }
@@ -1400,7 +1417,8 @@ final class WindowRoutingService: Service {
                     workspace: match.workspace,
                     normalizedWorkingDirs: normalizedWorkingDirs,
                     matchedBy: matchedBy,
-                    createdWorkspace: createdWorkspace
+                    createdWorkspace: createdWorkspace,
+                    equivalentCount: match.equivalentWorkspaceIDs.count
                 )
             }
         }
@@ -1411,7 +1429,8 @@ final class WindowRoutingService: Service {
             workspace: match.workspace,
             normalizedWorkingDirs: normalizedWorkingDirs,
             matchedBy: matchedBy,
-            createdWorkspace: createdWorkspace
+            createdWorkspace: createdWorkspace,
+            equivalentCount: match.equivalentWorkspaceIDs.count
         )
     }
 
@@ -1435,11 +1454,12 @@ final class WindowRoutingService: Service {
                     workspace: activeEquivalentWorkspace,
                     normalizedWorkingDirs: normalizedWorkingDirs,
                     matchedBy: matchedBy,
-                    createdWorkspace: createdWorkspace
+                    createdWorkspace: createdWorkspace,
+                    equivalentCount: match.equivalentWorkspaceIDs.count
                 )
             }
             if requestedWindow.workspaceManager.activeWorkspace?.id != match.workspace.id {
-                let switchResult = await requestedWindow.workspaceManager.requestWorkspaceSwitch(to: match.workspace, saveState: true)
+                let switchResult = await requestedWindow.workspaceManager.requestWorkspaceSwitch(to: match.workspace, saveState: true, origin: .programmatic)
                 if !switchResult.didSwitch {
                     throw MCPError.invalidRequest(switchResult.message ?? "Workspace switch was cancelled.")
                 }
@@ -1449,7 +1469,8 @@ final class WindowRoutingService: Service {
                 workspace: match.workspace,
                 normalizedWorkingDirs: normalizedWorkingDirs,
                 matchedBy: matchedBy,
-                createdWorkspace: createdWorkspace
+                createdWorkspace: createdWorkspace,
+                equivalentCount: match.equivalentWorkspaceIDs.count
             )
         }
 
@@ -2444,7 +2465,7 @@ final class WindowRoutingService: Service {
                             await newWindow.workspaceManager.awaitInitialized()
 
                             // Switch the new window to the target workspace
-                            let switchResult = await newWindow.workspaceManager.requestWorkspaceSwitch(to: targetWorkspace, saveState: true)
+                            let switchResult = await newWindow.workspaceManager.requestWorkspaceSwitch(to: targetWorkspace, saveState: true, origin: .programmatic)
                             if !switchResult.didSwitch {
                                 throw MCPError.invalidRequest(switchResult.message ?? "Workspace switch was cancelled.")
                             }
@@ -2493,7 +2514,7 @@ final class WindowRoutingService: Service {
                     let targetModel = try await routingService.resolveWorkspaceForSwitch(rawWorkspaceParam: rawWorkspaceParam, includeHidden: includeHidden)
 
                     // Perform the switch on the target window
-                    let switchResult = await targetWindow.workspaceManager.requestWorkspaceSwitch(to: targetModel, saveState: true)
+                    let switchResult = await targetWindow.workspaceManager.requestWorkspaceSwitch(to: targetModel, saveState: true, origin: .programmatic)
                     if !switchResult.didSwitch {
                         throw MCPError.invalidRequest(switchResult.message ?? "Workspace switch was cancelled.")
                     }
@@ -2972,7 +2993,10 @@ final class WindowRoutingService: Service {
                     }
 
                     // Remove the folder from the workspace
-                    await targetWindow.workspaceManager.removeFolder(folderPath, from: workspace)
+                    let removal = await targetWindow.workspaceManager.removeFolder(folderPath, from: workspace, origin: .programmatic)
+                    if let removal, !removal.didSwitch {
+                        throw MCPError.invalidRequest(removal.message ?? "Workspace switch was cancelled.")
+                    }
 
                     // Return updated workspace info
                     let updatedWorkspace = await MainActor.run {

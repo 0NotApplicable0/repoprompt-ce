@@ -3570,7 +3570,8 @@ class WorkspaceManagerViewModel: ObservableObject {
             saveState: false,
             reason: "internal",
             deletionToken: nil,
-            initialDefaultAttempt: attempt
+            initialDefaultAttempt: attempt,
+            origin: .person
         )
     }
 
@@ -3858,6 +3859,8 @@ class WorkspaceManagerViewModel: ObservableObject {
     private let switchTimingPolicy: WorkspaceSwitchTimingPolicy
     #if DEBUG
         private var workspaceSwitchPhaseDidChangeHandlerForTesting: ((WorkspaceSwitchPhase) -> Void)?
+        private var workspaceSwitchRequestedHandlerForTesting: (@MainActor (UUID, String, WorkspaceSwitchOrigin) -> Void)?
+        private var workspaceSwitchDidBeginHandlerForTesting: (@MainActor (UUID) async -> Void)?
         private var workspaceSwitchRecoveryWillBeginHandlerForTesting: (@MainActor () async -> Void)?
         private var workspaceSwitchReadinessDidInvalidateHandlerForTesting: (@MainActor () async -> Void)?
         private var workspaceHydrationGenerationDidAdvanceHandlerForTesting: (@MainActor () -> Void)?
@@ -6100,7 +6103,8 @@ class WorkspaceManagerViewModel: ObservableObject {
 
     private func completeWorkspaceSwitchOperation(
         _ operationID: UUID,
-        originalResult: WorkspaceSwitchResult
+        originalResult: WorkspaceSwitchResult,
+        origin: WorkspaceSwitchOrigin
     ) async -> WorkspaceSwitchResult {
         let originalActivity = activeWorkspaceSwitch
         // Startup-specific disposition, before generic recovery: a newer synchronous selection
@@ -6164,7 +6168,7 @@ class WorkspaceManagerViewModel: ObservableObject {
             if !recoveryResult.didSwitch, !isClosingStartup {
                 let detail = recoveryResult.message ?? "Unknown recovery failure."
                 let message = "Workspace switch recovery could not restore a usable workspace: \(detail)"
-                pendingWorkspaceSwitchBlockedNotice = WorkspaceSwitchBlockedNotice(message: message)
+                publishBlockedNotice(message: message, blockingOperationID: nil, origin: origin)
                 finalResult = .blocked(message)
             }
         }
@@ -6393,14 +6397,22 @@ class WorkspaceManagerViewModel: ObservableObject {
     }
 
     @MainActor
-    func requestWorkspaceSwitch(to newWorkspace: WorkspaceModel, saveState: Bool = true, reason: String = "userOrInternal") async -> WorkspaceSwitchResult {
+    func requestWorkspaceSwitch(
+        to newWorkspace: WorkspaceModel,
+        saveState: Bool = true,
+        reason: String = "userOrInternal",
+        origin: WorkspaceSwitchOrigin = .person
+    ) async -> WorkspaceSwitchResult {
+        #if DEBUG
+            workspaceSwitchRequestedHandlerForTesting?(newWorkspace.id, reason, origin)
+        #endif
         noteNonStartupWorkspaceActivationRequested()
         await joinAdmittedInitialDefaultActivationIfNeeded()
         if let cancellation = explicitActivationCancellation(for: newWorkspace) {
             return cancellation
         }
         if let creationResult = await workspaceCreationBarrierResult(workspaceID: newWorkspace.id) {
-            return userVisibleWorkspaceSwitchResult(creationResult)
+            return userVisibleWorkspaceSwitchResult(creationResult, origin: origin)
         }
         if let cancellation = explicitActivationCancellation(for: newWorkspace) {
             return cancellation
@@ -6410,12 +6422,14 @@ class WorkspaceManagerViewModel: ObservableObject {
             || currentBeforeAdmission?.consolidatedIntoWorkspaceID != nil
         {
             return userVisibleWorkspaceSwitchResult(
-                .blocked("Workspace \"\(newWorkspace.name)\" is a consolidated recovery copy. Restore it before opening it.")
+                .blocked("Workspace \"\(newWorkspace.name)\" is a consolidated recovery copy. Restore it before opening it."),
+                origin: origin
             )
         }
         if activeConsolidatedRestoreIDs.contains(newWorkspace.id) {
             return userVisibleWorkspaceSwitchResult(
-                .blocked("Workspace \"\(newWorkspace.name)\" is still being restored and cannot be opened yet.")
+                .blocked("Workspace \"\(newWorkspace.name)\" is still being restored and cannot be opened yet."),
+                origin: origin
             )
         }
 
@@ -6441,14 +6455,16 @@ class WorkspaceManagerViewModel: ObservableObject {
                 || classificationBlocksSwitch
             {
                 return userVisibleWorkspaceSwitchResult(
-                    .blocked("Workspace \"\(newWorkspace.name)\" has not finished restoration and cannot be opened yet.")
+                    .blocked("Workspace \"\(newWorkspace.name)\" has not finished restoration and cannot be opened yet."),
+                    origin: origin
                 )
             }
         }
         if let concurrentResult = concurrentWorkspaceSwitchResult(requestedWorkspace: newWorkspace) {
             return userVisibleWorkspaceSwitchResult(
                 concurrentResult,
-                blockingOperationID: activeWorkspaceSwitch?.operationID
+                blockingOperationID: activeWorkspaceSwitch?.operationID,
+                origin: origin
             )
         }
         if newWorkspace.id == activeWorkspaceID {
@@ -6459,12 +6475,14 @@ class WorkspaceManagerViewModel: ObservableObject {
         }
         if isRefreshing {
             return userVisibleWorkspaceSwitchResult(
-                .blocked("Cannot switch workspaces while refresh is in progress.")
+                .blocked("Cannot switch workspaces while refresh is in progress."),
+                origin: origin
             )
         }
         guard let activationLease = workspaceActivityCoordinator.beginActivation(workspaceID: newWorkspace.id) else {
             return userVisibleWorkspaceSwitchResult(
-                .blocked("Workspace \"\(newWorkspace.name)\" is being deleted and cannot be activated.")
+                .blocked("Workspace \"\(newWorkspace.name)\" is being deleted and cannot be activated."),
+                origin: origin
             )
         }
         defer { workspaceActivityCoordinator.endActivation(activationLease) }
@@ -6479,10 +6497,14 @@ class WorkspaceManagerViewModel: ObservableObject {
                 ?? .blocked("Workspace switch already in progress.")
             return userVisibleWorkspaceSwitchResult(
                 result,
-                blockingOperationID: activeWorkspaceSwitch?.operationID
+                blockingOperationID: activeWorkspaceSwitch?.operationID,
+                origin: origin
             )
         }
 
+        #if DEBUG
+            await workspaceSwitchDidBeginHandlerForTesting?(newWorkspace.id)
+        #endif
         let operationResult = await performRequestedWorkspaceSwitch(
             to: newWorkspace,
             saveState: saveState,
@@ -6491,22 +6513,33 @@ class WorkspaceManagerViewModel: ObservableObject {
         )
         let finalResult = await completeWorkspaceSwitchOperation(
             operationID,
-            originalResult: operationResult
+            originalResult: operationResult,
+            origin: origin
         )
-        return userVisibleWorkspaceSwitchResult(finalResult)
+        return userVisibleWorkspaceSwitchResult(finalResult, origin: origin)
     }
 
     private func userVisibleWorkspaceSwitchResult(
         _ result: WorkspaceSwitchResult,
-        blockingOperationID: UUID? = nil
+        blockingOperationID: UUID? = nil,
+        origin: WorkspaceSwitchOrigin
     ) -> WorkspaceSwitchResult {
         if case let .blocked(message) = result {
-            pendingWorkspaceSwitchBlockedNotice = WorkspaceSwitchBlockedNotice(
-                message: message,
-                blockingOperationID: blockingOperationID
-            )
+            publishBlockedNotice(message: message, blockingOperationID: blockingOperationID, origin: origin)
         }
         return result
+    }
+
+    private func publishBlockedNotice(
+        message: String,
+        blockingOperationID: UUID?,
+        origin: WorkspaceSwitchOrigin
+    ) {
+        guard origin == .person else { return }
+        pendingWorkspaceSwitchBlockedNotice = WorkspaceSwitchBlockedNotice(
+            message: message,
+            blockingOperationID: blockingOperationID
+        )
     }
 
     private func performRequestedWorkspaceSwitch(
@@ -6650,6 +6683,18 @@ class WorkspaceManagerViewModel: ObservableObject {
             _ handler: ((WorkspaceSwitchPhase) -> Void)?
         ) {
             workspaceSwitchPhaseDidChangeHandlerForTesting = handler
+        }
+
+        func setWorkspaceSwitchRequestedHandlerForTesting(
+            _ handler: (@MainActor (UUID, String, WorkspaceSwitchOrigin) -> Void)?
+        ) {
+            workspaceSwitchRequestedHandlerForTesting = handler
+        }
+
+        func setWorkspaceSwitchDidBeginHandlerForTesting(
+            _ handler: (@MainActor (UUID) async -> Void)?
+        ) {
+            workspaceSwitchDidBeginHandlerForTesting = handler
         }
 
         func setWorkspaceDeleteWillExecuteHandlerForTesting(
@@ -7009,7 +7054,8 @@ class WorkspaceManagerViewModel: ObservableObject {
                 saveState: false,
                 reason: reason,
                 deletionToken: nil,
-                initialDefaultAttempt: nil
+                initialDefaultAttempt: nil,
+                origin: .person
             )
         }
         if let concurrentResult = concurrentWorkspaceSwitchResult(requestedWorkspace: workspace) {
@@ -7040,7 +7086,8 @@ class WorkspaceManagerViewModel: ObservableObject {
         )
         return await completeWorkspaceSwitchOperation(
             operationID,
-            originalResult: operationResult
+            originalResult: operationResult,
+            origin: .person
         )
     }
 
@@ -7049,7 +7096,8 @@ class WorkspaceManagerViewModel: ObservableObject {
         to newWorkspace: WorkspaceModel,
         saveState: Bool = true,
         reason: String = "internal",
-        deletionToken: WorkspaceDeletionCancellationToken? = nil
+        deletionToken: WorkspaceDeletionCancellationToken? = nil,
+        origin: WorkspaceSwitchOrigin = .person
     ) async -> WorkspaceSwitchResult {
         noteNonStartupWorkspaceActivationRequested()
         return await performDirectWorkspaceSwitch(
@@ -7057,7 +7105,8 @@ class WorkspaceManagerViewModel: ObservableObject {
             saveState: saveState,
             reason: reason,
             deletionToken: deletionToken,
-            initialDefaultAttempt: nil
+            initialDefaultAttempt: nil,
+            origin: origin
         )
     }
 
@@ -7068,7 +7117,8 @@ class WorkspaceManagerViewModel: ObservableObject {
         saveState: Bool,
         reason: String,
         deletionToken: WorkspaceDeletionCancellationToken?,
-        initialDefaultAttempt: InitialDefaultActivationAttempt?
+        initialDefaultAttempt: InitialDefaultActivationAttempt?,
+        origin: WorkspaceSwitchOrigin
     ) async -> WorkspaceSwitchResult {
         if initialDefaultAttempt == nil {
             await joinAdmittedInitialDefaultActivationIfNeeded()
@@ -7126,7 +7176,8 @@ class WorkspaceManagerViewModel: ObservableObject {
         )
         return await completeWorkspaceSwitchOperation(
             operationID,
-            originalResult: operationResult
+            originalResult: operationResult,
+            origin: origin
         )
     }
 
@@ -17621,14 +17672,18 @@ class WorkspaceManagerViewModel: ObservableObject {
         await removeFolder(folderPath, from: activeWS)
     }
 
-    func removeFolder(_ folderPath: String, from workspace: WorkspaceModel) async {
+    @discardableResult
+    func removeFolder(
+        _ folderPath: String,
+        from workspace: WorkspaceModel,
+        origin: WorkspaceSwitchOrigin = .person
+    ) async -> WorkspaceSwitchResult? {
         guard !Task.isCancelled, let target = fileManager.workspaceRootIdentity(for: folderPath),
-              let current = self.workspace(withID: workspace.id) else { return }
+              let current = self.workspace(withID: workspace.id) else { return nil }
         let remainingPaths = current.repoPaths.filter { fileManager.workspaceRootIdentity(for: $0) != target }
-        guard remainingPaths.count != current.repoPaths.count else { return }
+        guard remainingPaths.count != current.repoPaths.count else { return nil }
         if remainingPaths.isEmpty {
-            await removeFinalFolder(folderPath, from: workspace)
-            return
+            return await removeFinalFolder(folderPath, from: workspace, origin: origin)
         }
 
         if activeWorkspaceID == workspace.id {
@@ -17637,12 +17692,11 @@ class WorkspaceManagerViewModel: ObservableObject {
             _ = captureActiveWorkspaceForSave(source: .rootRemove)
         }
         // Capture/listeners can update the manager. Never apply the caller's stale value.
-        guard let index = workspaceIndex(for: workspace.id) else { return }
+        guard let index = workspaceIndex(for: workspace.id) else { return nil }
         let newPaths = workspaces[index].repoPaths.filter { fileManager.workspaceRootIdentity(for: $0) != target }
-        guard newPaths.count != workspaces[index].repoPaths.count else { return }
+        guard newPaths.count != workspaces[index].repoPaths.count else { return nil }
         if newPaths.isEmpty {
-            await removeFinalFolder(folderPath, from: workspace)
-            return
+            return await removeFinalFolder(folderPath, from: workspace, origin: origin)
         }
         do {
             try await performExplicitRootEdit(
@@ -17653,24 +17707,30 @@ class WorkspaceManagerViewModel: ObservableObject {
         } catch {
             reportRootEditFailure(error, workspaceID: workspace.id, source: .rootRemove)
         }
+        return nil
     }
 
-    private func removeFinalFolder(_ folderPath: String, from workspace: WorkspaceModel) async {
-        guard activeWorkspaceID == workspace.id else { return }
+    @discardableResult
+    private func removeFinalFolder(
+        _ folderPath: String,
+        from workspace: WorkspaceModel,
+        origin: WorkspaceSwitchOrigin
+    ) async -> WorkspaceSwitchResult? {
+        guard activeWorkspaceID == workspace.id else { return nil }
         let activationGeneration = rootActivationGeneration
         guard let fallback = await findOrCreatePublishedDefaultWorkspace(),
               !Task.isCancelled, activeWorkspaceID == workspace.id,
               rootActivationGeneration == activationGeneration,
               let current = self.workspace(withID: workspace.id),
-              let target = fileManager.workspaceRootIdentity(for: folderPath) else { return }
+              let target = fileManager.workspaceRootIdentity(for: folderPath) else { return nil }
         let remainingPaths = current.repoPaths.filter { fileManager.workspaceRootIdentity(for: $0) != target }
-        guard remainingPaths.count != current.repoPaths.count else { return }
+        guard remainingPaths.count != current.repoPaths.count else { return nil }
         if remainingPaths.isEmpty {
-            await switchWorkspace(to: fallback)
+            return await switchWorkspace(to: fallback, origin: origin)
         } else {
             // Publishing Default can suspend while a root edit changes this workspace.
             // Re-enter the normal removal path so capture and persistence use that new state.
-            await removeFolder(folderPath, from: current)
+            return await removeFolder(folderPath, from: current, origin: origin)
         }
     }
 

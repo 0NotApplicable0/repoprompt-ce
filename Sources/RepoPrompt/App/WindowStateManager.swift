@@ -39,6 +39,7 @@ struct WindowOpenRequest: Equatable {
     let id: UUID
     let refreshDeferralID: UUID?
     let parkOnOpen: Bool
+    var consumesRestoreEntry = true
 }
 
 struct ClaimedWindowOpenRequest {
@@ -1042,20 +1043,7 @@ class WindowStatesManager: ObservableObject {
                     let applyStartMS = WorkspaceRestorePerfLog.timestampMSIfEnabled()
                 #endif
 
-                // Seed instance-number state from snapshot for deterministic restore
-                self.preseedInstanceNumberState(from: snapshot)
-
-                self.restoreQueue = entries
-                // Count every restore entry as in-progress before handing any out, so
-                // entries destined for windows that have not registered yet keep the
-                // persistence gate held (multi-window crash restore).
-                self.restorePersistenceGate.finishRestoreSessionLoad(pendingEntryCount: entries.count)
-                if !entries.isEmpty {
-                    self.applyRestoreEntriesIfPossible()
-                }
-                self.flushDeferredWindowSessionPersistIfRestoreIdle()
-                self.scheduleLeftoverRestoreEntryGraceReleaseIfNeeded()
-                self.updateAgentSessionOversightTopologyState()
+                self.installRestoreEntries(entries, snapshot: snapshot)
                 #if DEBUG
                     if let applyStartMS {
                         WorkspaceRestorePerfLog.log(
@@ -1065,6 +1053,23 @@ class WindowStatesManager: ObservableObject {
                 #endif
             }
         }
+    }
+
+    private func installRestoreEntries(_ entries: [WindowSessionEntry], snapshot: WindowSessionSnapshot?) {
+        // Seed instance-number state from snapshot for deterministic restore
+        preseedInstanceNumberState(from: snapshot)
+
+        restoreQueue = entries
+        // Count every restore entry as in-progress before handing any out, so
+        // entries destined for windows that have not registered yet keep the
+        // persistence gate held (multi-window crash restore).
+        restorePersistenceGate.finishRestoreSessionLoad(pendingEntryCount: entries.count)
+        if !entries.isEmpty {
+            applyRestoreEntriesIfPossible()
+        }
+        flushDeferredWindowSessionPersistIfRestoreIdle()
+        scheduleLeftoverRestoreEntryGraceReleaseIfNeeded()
+        updateAgentSessionOversightTopologyState()
     }
 
     /// Pre-seeds instance number state from a loaded session snapshot.
@@ -1100,16 +1105,11 @@ class WindowStatesManager: ObservableObject {
 
     // MARK: - Programmatic Window Creation
 
-    /// Opens a new main window and waits for it to be registered.
-    ///
-    /// This method uses `AppWindowOpener` to trigger SwiftUI's `openWindow(id: "main")`,
-    /// then waits for the new window to appear in `allWindows`.
-    ///
-    /// - Returns: The newly created `WindowState`
-    /// - Throws: `WindowOpenError.openerUnavailable` if no opener is installed
+    /// Opens a new main window, waits for registration, and returns it; throws `WindowOpenError.openerUnavailable` without an opener.
     func openNewMainWindow(
         deferringInitialAgentSystemWorkspaceRefresh: Bool = false,
         parkOnOpen: Bool = false,
+        consumesRestoreEntry: Bool = true,
         requestID: UUID = UUID()
     ) async throws -> WindowOpenResult {
         if parkOnOpen { try Task.checkCancellation() }
@@ -1118,7 +1118,8 @@ class WindowStatesManager: ObservableObject {
         let request = WindowOpenRequest(
             id: requestID,
             refreshDeferralID: deferringInitialAgentSystemWorkspaceRefresh ? UUID() : nil,
-            parkOnOpen: parkOnOpen
+            parkOnOpen: parkOnOpen,
+            consumesRestoreEntry: consumesRestoreEntry
         )
         let handle = parkOnOpen ? WindowParkOnOpenHandle(clock: parkOnOpenClock) : nil
 
@@ -1235,6 +1236,7 @@ class WindowStatesManager: ObservableObject {
         else { return }
 
         let operation = openOperations[index]
+        if !operation.request.consumesRestoreEntry { newState.declineLaunchRestoreEntries() }
         if operation.request.refreshDeferralID != nil {
             verifyInitialRefreshDeferralClaim(request: operation.request, newState: newState)
         }
@@ -1304,7 +1306,8 @@ class WindowStatesManager: ObservableObject {
     }
 
     private func applyNextRestoreEntryIfAvailable(to state: WindowState) {
-        guard !restoreQueue.isEmpty else { return }
+        // routed windows never take launch-restore entries
+        guard state.acceptsLaunchRestoreEntries, !restoreQueue.isEmpty else { return }
         let entry = restoreQueue.removeFirst()
         #if DEBUG
             WorkspaceRestorePerfLog.log(
@@ -1709,6 +1712,46 @@ class WindowStatesManager: ObservableObject {
             windowWorkspaceNumberHistory = state.history
             restoredInstanceNumbersByWorkspace = state.restored
             return previous
+        }
+
+        func deliverRestoreSessionForTesting(_ snapshot: WindowSessionSnapshot?) {
+            hasLoadedRestoreSession = true
+            restorePersistenceGate.beginRestoreSessionLoad()
+            installRestoreEntries(snapshot?.windows.filter { !$0.isEphemeral } ?? [], snapshot: snapshot)
+            leftoverRestoreEntryGraceTask?.cancel()
+        }
+
+        var restoreQueueCountForTesting: Int {
+            restoreQueue.count
+        }
+
+        var restoreGateStateForTesting: (pendingEntryCount: Int, restoringWindowIDs: Set<Int>) {
+            (restorePersistenceGate.pendingRestoreEntryCount, restorePersistenceGate.restoringWindowIDs)
+        }
+
+        var isRestoreStateColdForTesting: Bool {
+            restoreQueue.isEmpty && !restorePersistenceGate.isRestoreSessionLoadPending && restorePersistenceGate.pendingRestoreEntryCount == 0 && restorePersistenceGate.restoringWindowIDs.isEmpty && leftoverRestoreEntryGraceTask == nil
+        }
+
+        /// Requires `isRestoreStateColdForTesting`; the caller skips the body otherwise.
+        func withIsolatedRestoreStateForTesting<T>(_ body: () async throws -> T) async throws -> T {
+            let saved = (restoreQueue, hasLoadedRestoreSession, restorePersistenceGate, abandonedRestoreEntryCount, initialWindowRestoreCompletion, agentSessionOversightRestoreTopologyState, afterOpenResultGateForTesting, afterOpenAdoptionGateForTesting, replaceInstanceAllocatorStateForTesting())
+            restoreQueue = []
+            restorePersistenceGate = WindowSessionRestorePersistenceGate()
+            abandonedRestoreEntryCount = 0
+            initialWindowRestoreCompletion = nil
+            agentSessionOversightRestoreTopologyState = .pending
+            afterOpenResultGateForTesting = nil
+            afterOpenAdoptionGateForTesting = nil
+            let outcome: Result<T, Error>
+            do { outcome = try await .success(body()) } catch { outcome = .failure(error) }
+            let grace = leftoverRestoreEntryGraceTask
+            grace?.cancel()
+            await grace?.value
+            leftoverRestoreEntryGraceTask = nil
+            (restoreQueue, hasLoadedRestoreSession, restorePersistenceGate, abandonedRestoreEntryCount, initialWindowRestoreCompletion, agentSessionOversightRestoreTopologyState, afterOpenResultGateForTesting, afterOpenAdoptionGateForTesting, _) = saved
+            replaceInstanceAllocatorStateForTesting(saved.8)
+            return try outcome.get()
         }
     #endif
 

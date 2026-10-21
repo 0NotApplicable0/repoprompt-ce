@@ -1160,6 +1160,11 @@ final class FleetManagerWindowTests: XCTestCase {
     }
 
     override func tearDown() async throws {
+        WindowStatesManager.shared.afterOpenResultGateForTesting = nil
+        for state in windows {
+            state.workspaceManager.setWorkspaceSwitchRequestedHandlerForTesting(nil)
+            state.workspaceManager.setWorkspaceSwitchDidBeginHandlerForTesting(nil)
+        }
         if let hudObserver {
             NotificationCenter.default.removeObserver(hudObserver)
         }
@@ -1723,9 +1728,10 @@ final class FleetManagerWindowTests: XCTestCase {
         XCTAssertNil(WindowStatesManager.shared.latestWindowState)
     }
 
-    private func registerProgrammaticWindow(requestID: UUID?) {
+    private func registerProgrammaticWindow(requestID: UUID?, prepare: ((WindowState) -> Void)? = nil) {
         let state = WindowState(domainRuntime: AppDomainRuntimeComposition.shared.runtime, openRequestID: requestID)
         windows.append(state)
+        prepare?(state)
         let window = NSWindow(
             contentRect: NSRect(x: 0, y: 0, width: 640, height: 420),
             styleMask: [.titled, .closable, .resizable], backing: .buffered, defer: false
@@ -1735,13 +1741,16 @@ final class FleetManagerWindowTests: XCTestCase {
         WindowStatesManager.shared.registerWindowState(state)
     }
 
-    private func withFleetOnlyRouting(_ body: (WindowRoutingService, UUID, String) async throws -> Void) async throws {
+    private func withFleetOnlyRouting(
+        prepare: ((WindowState) -> Void)? = nil,
+        _ body: (WindowRoutingService, UUID, String) async throws -> Void
+    ) async throws {
         XCTAssertTrue(WindowStatesManager.shared.allWindows.isEmpty)
         let previousPark = GlobalSettingsStore.shared.fleetParkAgentWindows()
         GlobalSettingsStore.shared.setFleetParkAgentWindows(false, commit: false)
         AppWindowOpener.shared.resetForTesting()
         AppWindowOpener.shared.installRequestAware { [unowned self] requestID in
-            registerProgrammaticWindow(requestID: requestID)
+            registerProgrammaticWindow(requestID: requestID, prepare: prepare)
         }
         let connectionID = UUID()
         let client = "FleetOnly-\(connectionID)"
@@ -1890,13 +1899,352 @@ final class FleetManagerWindowTests: XCTestCase {
         }
     }
 
+    @MainActor
+    private struct HeldDeletionSwitch {
+        let state: WindowState
+        let workspace: WorkspaceModel
+        let gate: BoundedGate
+        let task: Task<WorkspaceSwitchResult, Never>
+
+        func finish() async {
+            gate.release()
+            state.workspaceManager.setWorkspaceSwitchDidBeginHandlerForTesting(nil)
+            _ = await awaitBounded(label: "held switch completes") { _ = await task.value }
+        }
+    }
+
+    private func holdSwitchWhileDeletionTargetIsActive() async throws -> HeldDeletionSwitch {
+        let state = try await makeLiveWindow(authorityBacked: true)
+        let manager = state.workspaceManager
+        let creation = try manager.createPersistentWorkspace(name: "Deletion Target \(UUID())", repoPaths: [], savedInLibrary: true)
+        let workspace = try await creation.publishedWorkspace()
+        let switched = await manager.requestWorkspaceSwitch(to: workspace, saveState: false)
+        XCTAssertTrue(switched.didSwitch, switched.message ?? "")
+        let heldCreation = try manager.createPersistentWorkspace(name: "Held \(UUID())", repoPaths: [], savedInLibrary: true)
+        let held = try await heldCreation.publishedWorkspace()
+        let gate = BoundedGate()
+        manager.setWorkspaceSwitchDidBeginHandlerForTesting { targetID in
+            if targetID == held.id { await gate.hold() }
+        }
+        let task = Task { @MainActor in await manager.requestWorkspaceSwitch(to: held, saveState: false) }
+        let entered = await gate.waitUntilEntered()
+        XCTAssertTrue(entered)
+        return HeldDeletionSwitch(state: state, workspace: workspace, gate: gate, task: task)
+    }
+
+    func testMCPDeleteCloseWindowBlockedByActiveSwitchRaisesNoAlert() async throws {
+        let held = try await holdSwitchWhileDeletionTargetIsActive()
+        let connectionID = UUID()
+        let client = "FleetDelete-\(connectionID)"
+        WorkspaceApprovalManager.shared.addAutoApproval(clientID: client, operation: .deleteWorkspace)
+        let service = WindowRoutingService(windowStates: .shared, networkMgr: .shared)
+        await service.prepareDomainTools()
+
+        let result = await awaitBoundedResult(label: "MCP delete close_window while switch held") {
+            try await self.callFleetRouting(service, connectionID: connectionID, client: client, args: [
+                "action": .string("delete"), "workspace": .string(held.workspace.id.uuidString),
+                "window_id": .int(held.state.windowID), "close_window": .bool(true)
+            ])
+        }
+
+        let notice = held.state.workspaceManager.pendingWorkspaceSwitchBlockedNotice
+        await held.finish()
+        WorkspaceApprovalManager.shared.removeAutoApproval(clientID: client, operation: .deleteWorkspace)
+        await ServerNetworkManager.shared.debugRemoveConnection(connectionID)
+        switch result {
+        case .success:
+            XCTFail("delete close_window must fail while its switch is blocked")
+        case let .failure(error):
+            let payload = Mirror(reflecting: error).children.first
+            XCTAssertEqual(payload?.label, "invalidRequest")
+            XCTAssertTrue((payload?.value as? String)?.contains("active switch") == true, "\(error)")
+        }
+        XCTAssertNil(notice)
+    }
+
+    func testFleetUIDeletionBlockedByActiveSwitchKeepsAlert() async throws {
+        let held = try await holdSwitchWhileDeletionTargetIsActive()
+
+        let result = await WorkspaceWindowDeletion(target: held.state, workspace: held.workspace).execute()
+
+        let notice = held.state.workspaceManager.pendingWorkspaceSwitchBlockedNotice
+        await held.finish()
+        guard case .notSwitched = result else { return XCTFail("Expected .notSwitched, got \(result)") }
+        XCTAssertNotNil(notice)
+    }
+
     private struct WindowlessWorkspaceSeed {
         enum Document { case valid, futureSchema, absent, garbage }
 
         var id = UUID()
+        var lastUsed = Date(timeIntervalSince1970: 1_780_000_000)
         let name: String
         let repoPaths: [String]
         let document: Document
+    }
+
+    func testIsolatedRestoreFixtureDeliversEntriesAndRestoresColdState() async throws {
+        let manager = WindowStatesManager.shared
+        XCTAssertTrue(manager.allWindows.isEmpty)
+        let entry = WindowSessionEntry(
+            windowKind: .standard, workspaceID: UUID(), workspaceName: nil, isSystemWorkspace: false,
+            isEphemeral: false, primaryRepoPath: nil, lastFocused: true, workspaceInstanceNumber: nil
+        )
+        try await withIsolatedRestore {
+            XCTAssertEqual(manager.restoreQueueCountForTesting, 0)
+            manager.deliverRestoreSessionForTesting(WindowSessionSnapshot(version: 4, windows: [entry]))
+            XCTAssertEqual(manager.restoreQueueCountForTesting, 1)
+            XCTAssertEqual(manager.restoreGateStateForTesting.pendingEntryCount, 1)
+            XCTAssertTrue(manager.restoreGateStateForTesting.restoringWindowIDs.isEmpty)
+        }
+        XCTAssertTrue(manager.isRestoreStateColdForTesting)
+        XCTAssertEqual(manager.restoreQueueCountForTesting, 0)
+    }
+
+    func testBoundedGateHoldsUntilReleasedAndTimeoutAlwaysReturns() async {
+        let gate = BoundedGate()
+        let held = Task { @MainActor in await gate.hold(seconds: 15) }
+        let entered = await gate.waitUntilEntered()
+        XCTAssertTrue(entered)
+        gate.release()
+        await held.value
+        let timedOut = BoundedGate()
+        await timedOut.hold(seconds: 0.05)
+        let result = await awaitBoundedResult(seconds: 5, label: "bounded result") { 7 }
+        XCTAssertEqual(try? result.get(), 7)
+    }
+
+    private func makeRestoreEntry(workspace: WindowlessWorkspaceSeed) -> WindowSessionEntry {
+        WindowSessionEntry(
+            windowKind: .standard, workspaceID: workspace.id, workspaceName: workspace.name,
+            isSystemWorkspace: false, isEphemeral: false, primaryRepoPath: workspace.repoPaths.first,
+            lastFocused: true, workspaceInstanceNumber: nil
+        )
+    }
+
+    private struct RecordedSwitchRequest: Equatable {
+        let workspaceID: UUID
+        let reason: String
+        let origin: WorkspaceSwitchOrigin
+    }
+
+    private func assertRoutedRestoreEntry(
+        late: Bool, openInNewWindow: Bool, ordinaryConsumes: Bool = false, recordOrigins: Bool = false
+    ) async throws {
+        var routedRequests: [RecordedSwitchRequest] = []
+        var ordinaryRequests: [RecordedSwitchRequest] = []
+        let roots = try makeTestDirectory(name: #function, namespace: "FleetRestore")
+        let sharedRoot = roots.appendingPathComponent("shared", isDirectory: true)
+        let ordinaryRoot = roots.appendingPathComponent("ordinary", isDirectory: true)
+        try FileManager.default.createDirectory(at: sharedRoot, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: ordinaryRoot, withIntermediateDirectories: true)
+        let a = WindowlessWorkspaceSeed(name: "A", repoPaths: [sharedRoot.path], document: .valid)
+        let b = WindowlessWorkspaceSeed(name: "B", repoPaths: [sharedRoot.path], document: .valid)
+        let c = WindowlessWorkspaceSeed(name: "C", repoPaths: [ordinaryRoot.path], document: .valid)
+        let entry = makeRestoreEntry(workspace: ordinaryConsumes ? c : b)
+        let manager = WindowStatesManager.shared
+
+        try await withIsolatedRestore {
+            try await withSeededWorkspaceRuntime(ordinaryConsumes ? [a, b, c] : [a, b]) { _, _ in
+                var routed: WindowState?
+                if !late {
+                    manager.deliverRestoreSessionForTesting(WindowSessionSnapshot(version: 4, windows: [entry]))
+                }
+                try await withFleetOnlyRouting(prepare: { state in
+                    routed = state
+                    if recordOrigins {
+                        state.workspaceManager.setWorkspaceSwitchRequestedHandlerForTesting { id, reason, origin in
+                            routedRequests.append(RecordedSwitchRequest(workspaceID: id, reason: reason, origin: origin))
+                        }
+                    }
+                }) { service, connectionID, client in
+                    if late {
+                        manager.afterOpenResultGateForTesting = {
+                            manager.deliverRestoreSessionForTesting(WindowSessionSnapshot(version: 4, windows: [entry]))
+                        }
+                    }
+                    let args: [String: Value] = if openInNewWindow {
+                        [
+                            "action": .string("switch"), "workspace": .string(a.name),
+                            "open_in_new_window": .bool(true)
+                        ]
+                    } else {
+                        [
+                            "op": .string("bind"), "working_dirs": .array([.string(sharedRoot.path)]),
+                            "create_if_missing": .bool(false)
+                        ]
+                    }
+                    let toolName = openInNewWindow ? "manage_workspaces" : "bind_context"
+                    let result = await awaitBoundedResult(label: "routed workspace open") {
+                        try await self.callFleetRouting(service, connectionID: connectionID, client: client, toolName: toolName, args: args)
+                    }
+                    XCTAssertNoThrow(try result.get())
+                    let window = try XCTUnwrap(routed)
+                    XCTAssertEqual(manager.restoreQueueCountForTesting, 1)
+                    XCTAssertEqual(manager.restoreGateStateForTesting.pendingEntryCount, 1)
+                    XCTAssertTrue(manager.restoreGateStateForTesting.restoringWindowIDs.isEmpty)
+                    if ordinaryConsumes {
+                        self.registerProgrammaticWindow(requestID: nil, prepare: { state in
+                            if recordOrigins {
+                                state.workspaceManager.setWorkspaceSwitchRequestedHandlerForTesting { id, reason, origin in
+                                    ordinaryRequests.append(RecordedSwitchRequest(workspaceID: id, reason: reason, origin: origin))
+                                }
+                            }
+                        })
+                        let ordinary = try XCTUnwrap(self.windows.last)
+                        let quiesced = await awaitBounded(label: "ordinary restore quiescence") {
+                            await ordinary.awaitRestoreQuiescenceForTesting()
+                        }
+                        XCTAssertTrue(quiesced)
+                        XCTAssertEqual(ordinary.restoreDispatchCountForTesting, 1)
+                        XCTAssertEqual(ordinary.workspaceManager.activeWorkspaceID, c.id)
+                        XCTAssertEqual(window.restoreDispatchCountForTesting, 0)
+                        XCTAssertEqual(manager.restoreQueueCountForTesting, 0)
+                        XCTAssertEqual(manager.restoreGateStateForTesting.pendingEntryCount, 0)
+                        XCTAssertTrue(manager.restoreGateStateForTesting.restoringWindowIDs.isEmpty)
+                        if recordOrigins {
+                            XCTAssertEqual(routedRequests, [RecordedSwitchRequest(workspaceID: a.id, reason: "userOrInternal", origin: .programmatic)])
+                            XCTAssertEqual(ordinaryRequests, [RecordedSwitchRequest(workspaceID: c.id, reason: "restore", origin: .programmatic)])
+                        }
+                    } else {
+                        let quiesced = await awaitBounded(label: "routed restore quiescence") {
+                            await window.awaitRestoreQuiescenceForTesting()
+                        }
+                        XCTAssertTrue(quiesced)
+                        XCTAssertEqual(window.restoreDispatchCountForTesting, 0)
+                        XCTAssertEqual(manager.restoreGateStateForTesting.pendingEntryCount, 1)
+                        XCTAssertTrue(manager.restoreGateStateForTesting.restoringWindowIDs.isEmpty)
+                        XCTAssertEqual(window.workspaceManager.activeWorkspaceID, a.id)
+                    }
+                }
+            }
+        }
+    }
+
+    func testDW18EarlyLoadedRestoreEntryIsNotConsumedByRoutedBind() async throws {
+        try await assertRoutedRestoreEntry(late: false, openInNewWindow: false)
+    }
+
+    func testDW18LateLoadedRestoreEntryIsNotAssignedToRoutedBind() async throws {
+        try await assertRoutedRestoreEntry(late: true, openInNewWindow: false)
+    }
+
+    func testDW18OpenInNewWindowSwitchKeepsRestoreEntryEarlyLoad() async throws {
+        try await assertRoutedRestoreEntry(late: false, openInNewWindow: true)
+    }
+
+    func testDW18OpenInNewWindowSwitchKeepsRestoreEntryLateLoad() async throws {
+        try await assertRoutedRestoreEntry(late: true, openInNewWindow: true)
+    }
+
+    func testDW18PreservedRestoreEntryIsConsumedByLaterOrdinaryWindow() async throws {
+        try await assertRoutedRestoreEntry(late: false, openInNewWindow: false, ordinaryConsumes: true)
+    }
+
+    func testProgrammaticOriginReachesRoutedBindAndRestoreRequests() async throws {
+        try await assertRoutedRestoreEntry(late: false, openInNewWindow: false, ordinaryConsumes: true, recordOrigins: true)
+    }
+
+    func testDW18WindowlessBindDuplicateRootsOpensOneWindowOnRulePick() async throws {
+        let roots = try makeTestDirectory(name: #function, namespace: "FleetRestore")
+        let sharedRoot = roots.appendingPathComponent("shared", isDirectory: true)
+        try FileManager.default.createDirectory(at: sharedRoot, withIntermediateDirectories: true)
+        let a = WindowlessWorkspaceSeed(
+            lastUsed: Date(timeIntervalSince1970: 1_780_000_100), name: "A", repoPaths: [sharedRoot.path], document: .valid
+        )
+        let b = WindowlessWorkspaceSeed(
+            lastUsed: Date(timeIntervalSince1970: 1_780_000_000), name: "B", repoPaths: [sharedRoot.path], document: .valid
+        )
+        let entry = makeRestoreEntry(workspace: b)
+        let manager = WindowStatesManager.shared
+
+        try await withIsolatedRestore {
+            try await withSeededWorkspaceRuntime([a, b]) { _, _ in
+                var routed: WindowState?
+                try await withFleetOnlyRouting(prepare: { routed = $0 }) { service, connectionID, client in
+                    manager.deliverRestoreSessionForTesting(WindowSessionSnapshot(version: 4, windows: [entry]))
+                    let result = await awaitBoundedResult(label: "windowless duplicate-root bind") {
+                        try await self.callFleetRouting(service, connectionID: connectionID, client: client, toolName: "bind_context", args: [
+                            "op": .string("bind"), "working_dirs": .array([.string(sharedRoot.path)]),
+                            "create_if_missing": .bool(false)
+                        ])
+                    }
+                    let response = try result.get()
+                    let window = try XCTUnwrap(routed)
+                    let quiesced = await awaitBounded(label: "routed restore quiescence") {
+                        await window.awaitRestoreQuiescenceForTesting()
+                    }
+                    XCTAssertTrue(quiesced)
+                    XCTAssertEqual(manager.allWindows.count, 1)
+                    XCTAssertEqual(window.workspaceManager.activeWorkspaceID, a.id)
+                    XCTAssertEqual(window.restoreDispatchCountForTesting, 0)
+                    XCTAssertNil(window.workspaceManager.lastWorkspaceSwitchBlockageReport)
+                    XCTAssertNil(window.workspaceManager.pendingWorkspaceSwitchBlockedNotice)
+                    let binding = try XCTUnwrap(response.objectValue?["binding"]?.objectValue)
+                    XCTAssertEqual(binding["workspace_id"]?.stringValue, a.id.uuidString)
+                    XCTAssertEqual(binding["workspace_name"]?.stringValue, "A")
+                    let matchedBy = try XCTUnwrap(response.objectValue?["matched_by"]?.stringValue)
+                    XCTAssertTrue(matchedBy.contains("2 workspaces share these roots"), matchedBy)
+                    XCTAssertTrue(matchedBy.hasSuffix("resolved to \"A\" by the deterministic bind rule"), matchedBy)
+                }
+            }
+        }
+    }
+
+    func testDW18RestoreRequestDuringHeldBindSwitchPublishesNoBlockage() async throws {
+        let roots = try makeTestDirectory(name: #function, namespace: "FleetRestore")
+        let sharedRoot = roots.appendingPathComponent("shared", isDirectory: true)
+        try FileManager.default.createDirectory(at: sharedRoot, withIntermediateDirectories: true)
+        let a = WindowlessWorkspaceSeed(name: "A", repoPaths: [sharedRoot.path], document: .valid)
+        let b = WindowlessWorkspaceSeed(name: "B", repoPaths: [sharedRoot.path], document: .valid)
+        let entry = makeRestoreEntry(workspace: b)
+        let manager = WindowStatesManager.shared
+
+        try await withIsolatedRestore {
+            try await withSeededWorkspaceRuntime([a, b]) { _, _ in
+                var routed: WindowState?
+                var heldObservation: (report: WorkspaceSwitchBlockageReport?, notice: WorkspaceSwitchBlockedNotice?, dispatched: Int)?
+                try await withFleetOnlyRouting(prepare: { state in
+                    routed = state
+                    state.workspaceManager.setWorkspaceSwitchDidBeginHandlerForTesting { targetID in
+                        guard targetID == a.id else { return }
+                        manager.deliverRestoreSessionForTesting(WindowSessionSnapshot(version: 4, windows: [entry]))
+                        let quiesced = await awaitBounded(label: "restore quiescence while bind switch held") {
+                            await state.awaitRestoreQuiescenceForTesting()
+                        }
+                        heldObservation = (
+                            state.workspaceManager.lastWorkspaceSwitchBlockageReport,
+                            state.workspaceManager.pendingWorkspaceSwitchBlockedNotice,
+                            state.restoreDispatchCountForTesting
+                        )
+                        XCTAssertTrue(quiesced)
+                    }
+                }) { service, connectionID, client in
+                    let result = await awaitBoundedResult(label: "held bind") {
+                        try await self.callFleetRouting(service, connectionID: connectionID, client: client, toolName: "bind_context", args: [
+                            "op": .string("bind"), "working_dirs": .array([.string(sharedRoot.path)]),
+                            "create_if_missing": .bool(false)
+                        ])
+                    }
+                    XCTAssertNoThrow(try result.get())
+                }
+                let observed = try XCTUnwrap(heldObservation)
+                XCTAssertNil(observed.report)
+                XCTAssertNil(observed.notice)
+                XCTAssertEqual(observed.dispatched, 0)
+                XCTAssertEqual(manager.restoreQueueCountForTesting, 1)
+                XCTAssertEqual(try XCTUnwrap(routed).workspaceManager.activeWorkspaceID, a.id)
+            }
+        }
+    }
+
+    private func withIsolatedRestore(_ body: () async throws -> Void) async throws {
+        let manager = WindowStatesManager.shared
+        guard manager.isRestoreStateColdForTesting else {
+            XCTFail("restore state is not cold and idle; body skipped")
+            return
+        }
+        try await manager.withIsolatedRestoreStateForTesting(body)
     }
 
     private func closeRegisteredWindows() async {
@@ -1924,7 +2272,7 @@ final class FleetManagerWindowTests: XCTestCase {
         let date = Date(timeIntervalSince1970: 1_780_000_000)
         let tabID = UUID()
         let model = WorkspaceModel(
-            id: seed.id, dateModified: date, name: seed.name, repoPaths: seed.repoPaths, lastUsed: date,
+            id: seed.id, dateModified: date, name: seed.name, repoPaths: seed.repoPaths, lastUsed: seed.lastUsed,
             isSystemWorkspace: false, composeTabs: [ComposeTabState(id: tabID, name: "Fixture")], activeComposeTabID: tabID
         )
         var data = try JSONEncoder().encode(model)
@@ -2711,8 +3059,11 @@ final class FleetManagerActionTests: XCTestCase {
         if let pending = WorkspaceApprovalManager.shared.pendingRequest, pending.clientID == clientID {
             WorkspaceApprovalManager.shared.cancelPending(requestID: pending.id)
         }
+        WindowStatesManager.shared.afterOpenResultGateForTesting = nil
         for state in states {
             state.workspaceManager.setWorkspaceSwitchPhaseDidChangeHandlerForTesting(nil)
+            state.workspaceManager.setWorkspaceSwitchRequestedHandlerForTesting(nil)
+            state.workspaceManager.setWorkspaceSwitchDidBeginHandlerForTesting(nil)
             if state.mcpServer.windowToolsEnabled { await state.mcpServer.stopServer() }
             state.attachWindow(nil)
             state.beginClose()
@@ -3332,6 +3683,55 @@ final class FleetManagerActionTests: XCTestCase {
         XCTAssertEqual(windows.first?.performCloseCount, 0)
     }
 
+    func testDeletionForwardsOriginToSwitchForDeletion() async {
+        let person = DeletionProbe()
+        _ = await person.owner().execute()
+        XCTAssertEqual(person.target.switchOrigins, [.person])
+
+        let programmatic = DeletionProbe()
+        _ = await programmatic.owner(origin: .programmatic).execute()
+        XCTAssertEqual(programmatic.target.switchOrigins, [.programmatic])
+    }
+
+    func testMCPRemoveFinalFolderBlockedByActiveSwitchReturnsBlockage() async throws {
+        let (state, workspace) = try await makeState(name: "Target")
+        let manager = state.workspaceManager
+        let heldCreation = try manager.createPersistentWorkspace(name: "Held", repoPaths: [], savedInLibrary: true)
+        let held = try await heldCreation.publishedWorkspace()
+        let rootPath = try XCTUnwrap(workspace.repoPaths.first)
+        let gate = BoundedGate()
+        manager.setWorkspaceSwitchDidBeginHandlerForTesting { targetID in
+            if targetID == held.id { await gate.hold() }
+        }
+        defer {
+            gate.release()
+            manager.setWorkspaceSwitchDidBeginHandlerForTesting(nil)
+        }
+        let heldSwitch = Task { @MainActor in await manager.requestWorkspaceSwitch(to: held, saveState: false) }
+        let entered = await gate.waitUntilEntered()
+        XCTAssertTrue(entered)
+        WorkspaceApprovalManager.shared.addAutoApproval(clientID: clientID, operation: .removeFolder)
+        let service = WindowRoutingService(windowStates: .shared, networkMgr: .shared)
+
+        let result = await awaitBoundedResult(label: "MCP remove_folder while switch held") {
+            try await self.callRemoveFolder(service, target: state, workspace: workspace.id.uuidString, folderPath: rootPath)
+        }
+
+        gate.release()
+        _ = await awaitBounded(label: "held switch completes") { _ = await heldSwitch.value }
+        switch result {
+        case let .success(status):
+            XCTFail("remove_folder must not report \(status ?? "nil") while its fallback switch is blocked")
+        case let .failure(error):
+            let payload = Mirror(reflecting: error).children.first
+            XCTAssertEqual(payload?.label, "invalidRequest")
+            XCTAssertTrue((payload?.value as? String)?.contains("is blocked by a active switch to \"Held\"") == true, "\(error)")
+        }
+        XCTAssertEqual(manager.workspace(withID: workspace.id)?.repoPaths, workspace.repoPaths)
+        XCTAssertNotNil(manager.lastWorkspaceSwitchBlockageReport)
+        XCTAssertNil(manager.pendingWorkspaceSwitchBlockedNotice)
+    }
+
     func testActualMCPMapsEveryOwnerRefusalToInvalidRequestAndNeverOKWithNilClosedID() async throws {
         let (target, workspace) = try await makeState(name: "Target")
         WorkspaceApprovalManager.shared.addAutoApproval(clientID: clientID, operation: .deleteWorkspace)
@@ -3590,6 +3990,26 @@ final class FleetManagerActionTests: XCTestCase {
         return (json["status"] as? String, json["closed_window_id"] as? Int)
     }
 
+    private func callRemoveFolder(_ service: WindowRoutingService, target: WindowState, workspace: String, folderPath: String) async throws -> String? {
+        await service.prepareDomainTools()
+        let tools = await service.tools
+        let tool = try XCTUnwrap(tools.first { $0.name == "manage_workspaces" })
+        let connectionID = UUID()
+        let metadata = MCPRequestMetadata(connectionID: connectionID, clientName: clientID, windowID: nil)
+        let invocation = ToolInvocationContext.trustedLocal(toolName: "manage_workspaces", metadata: metadata)
+        let data = try await ServerNetworkManager.currentConnectionIDTaskLocal.withValue(connectionID) {
+            try await MCPInvocationContextBridge.withInvocation(invocation) {
+                let value = try await tool([
+                    "action": .string("remove_folder"), "workspace": .string(workspace),
+                    "folder_path": .string(folderPath), "window_id": .int(target.windowID)
+                ])
+                return try JSONEncoder().encode(value)
+            }
+        }
+        let json = try XCTUnwrap(try JSONSerialization.jsonObject(with: data) as? [String: Any])
+        return json["status"] as? String
+    }
+
     private func assertMCPError(_ error: Error, kind: String, message: String, file: StaticString = #filePath, line: UInt = #line) {
         let payload = Mirror(reflecting: error).children.first
         XCTAssertEqual(payload?.label, kind, file: file, line: line)
@@ -3670,6 +4090,7 @@ final class FleetManagerActionTests: XCTestCase {
         let fallback = WorkspaceModel(name: "System", repoPaths: [], isSystemWorkspace: true)
         var workspaceAfterSwitch: UUID?
         var switchResult: WorkspaceSwitchResult = .switched
+        var switchOrigins: [WorkspaceSwitchOrigin] = []
         var switchEffect: (() async -> Void)?
         var deleteEffect: (() async -> Void)?
         var deleteResult = true
@@ -3686,7 +4107,8 @@ final class FleetManagerActionTests: XCTestCase {
             fallback
         }
 
-        func switchForDeletion(to workspace: WorkspaceModel, saveState: Bool) async -> WorkspaceSwitchResult {
+        func switchForDeletion(to workspace: WorkspaceModel, saveState: Bool, origin: WorkspaceSwitchOrigin) async -> WorkspaceSwitchResult {
+            switchOrigins.append(origin)
             log.events.append("switch:\(saveState)")
             XCTAssertEqual(workspace.id, fallback.id)
             await switchEffect?()
@@ -3722,7 +4144,7 @@ final class FleetManagerActionTests: XCTestCase {
             [registered, other].compactMap(\.self).filter { $0.deletionWorkspaceID == workspaceID }.map(\.windowID).sorted()
         }
 
-        func owner() -> WorkspaceWindowDeletion {
+        func owner(origin: WorkspaceSwitchOrigin = .person) -> WorkspaceWindowDeletion {
             WorkspaceWindowDeletion(target: target, workspace: workspace, registeredTarget: { id in
                 guard self.registered?.windowID == id else { return nil }
                 return self.registered
@@ -3733,7 +4155,7 @@ final class FleetManagerActionTests: XCTestCase {
                 self.log.events.append("close:\(id)")
                 self.authorizations.append(authorization)
                 if let closeError = self.closeError { throw closeError }
-            })
+            }, origin: origin)
         }
     }
 }

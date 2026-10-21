@@ -6,7 +6,7 @@ protocol WorkspaceWindowDeletionTarget: AnyObject {
     var deletionWorkspaceID: UUID? { get }
     var isClosing: Bool { get }
     func systemWorkspaceForDeletion() -> WorkspaceModel
-    func switchForDeletion(to workspace: WorkspaceModel, saveState: Bool) async -> WorkspaceSwitchResult
+    func switchForDeletion(to workspace: WorkspaceModel, saveState: Bool, origin: WorkspaceSwitchOrigin) async -> WorkspaceSwitchResult
     func deleteForDeletion(_ workspace: WorkspaceModel) async -> Bool
 }
 
@@ -41,6 +41,7 @@ struct WorkspaceWindowDeletion {
     private let unpark: @MainActor (Int) -> Void
     private let requestClose: @MainActor (Int, WindowCloseAuthorization) throws -> Void
     private let authorization: WindowCloseAuthorization
+    private let origin: WorkspaceSwitchOrigin
 
     init(
         target: any WorkspaceWindowDeletionTarget,
@@ -54,7 +55,8 @@ struct WorkspaceWindowDeletion {
         requestClose: @escaping @MainActor (Int, WindowCloseAuthorization) throws -> Void = {
             try WindowStatesManager.shared.requestCloseWindow(windowID: $0, authorization: $1)
         },
-        authorization: WindowCloseAuthorization = WorkspaceWindowDeletion.closeAuthorization()
+        authorization: WindowCloseAuthorization = WorkspaceWindowDeletion.closeAuthorization(),
+        origin: WorkspaceSwitchOrigin = .person
     ) {
         self.target = target
         windowID = target.windowID
@@ -65,6 +67,7 @@ struct WorkspaceWindowDeletion {
         self.unpark = unpark
         self.requestClose = requestClose
         self.authorization = authorization
+        self.origin = origin
     }
 
     nonisolated static func closeAuthorization() -> WindowCloseAuthorization {
@@ -87,7 +90,7 @@ struct WorkspaceWindowDeletion {
         guard !holdersBeforeSwitch.contains(where: { $0 != windowID }) else {
             return .targetChanged(message: Self.duplicateWorkspaceMessage(name: workspace.name, windowIDs: holdersBeforeSwitch))
         }
-        let switched = await target.switchForDeletion(to: fallback, saveState: false)
+        let switched = await target.switchForDeletion(to: fallback, saveState: false, origin: origin)
         guard switched.didSwitch else {
             return .notSwitched(message: switched.message ?? "Workspace switch was cancelled.")
         }
@@ -132,8 +135,8 @@ extension WindowState: WorkspaceWindowDeletionTarget {
         workspaceManager.getOrCreateSystemWorkspace()
     }
 
-    func switchForDeletion(to workspace: WorkspaceModel, saveState: Bool) async -> WorkspaceSwitchResult {
-        await workspaceManager.requestWorkspaceSwitch(to: workspace, saveState: saveState)
+    func switchForDeletion(to workspace: WorkspaceModel, saveState: Bool, origin: WorkspaceSwitchOrigin) async -> WorkspaceSwitchResult {
+        await workspaceManager.requestWorkspaceSwitch(to: workspace, saveState: saveState, origin: origin)
     }
 
     func deleteForDeletion(_ workspace: WorkspaceModel) async -> Bool {
