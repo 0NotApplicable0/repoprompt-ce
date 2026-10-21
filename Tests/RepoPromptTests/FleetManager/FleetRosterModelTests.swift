@@ -1728,8 +1728,17 @@ final class FleetManagerWindowTests: XCTestCase {
         XCTAssertNil(WindowStatesManager.shared.latestWindowState)
     }
 
-    private func registerProgrammaticWindow(requestID: UUID?, prepare: ((WindowState) -> Void)? = nil) {
-        let state = WindowState(domainRuntime: AppDomainRuntimeComposition.shared.runtime, openRequestID: requestID)
+    private func registerProgrammaticWindow(
+        requestID: UUID?,
+        agentModeViewModelFactory: WindowStateCompositionFactory.AgentModeViewModelFactory? = nil,
+        prepare: ((WindowState) -> Void)? = nil
+    ) {
+        let state = agentModeViewModelFactory.map {
+            WindowState(
+                domainRuntime: AppDomainRuntimeComposition.shared.runtime, openRequestID: requestID,
+                agentModeViewModelFactory: $0
+            )
+        } ?? WindowState(domainRuntime: AppDomainRuntimeComposition.shared.runtime, openRequestID: requestID)
         windows.append(state)
         prepare?(state)
         let window = NSWindow(
@@ -1742,6 +1751,7 @@ final class FleetManagerWindowTests: XCTestCase {
     }
 
     private func withFleetOnlyRouting(
+        agentModeViewModelFactory: WindowStateCompositionFactory.AgentModeViewModelFactory? = nil,
         prepare: ((WindowState) -> Void)? = nil,
         _ body: (WindowRoutingService, UUID, String) async throws -> Void
     ) async throws {
@@ -1750,7 +1760,9 @@ final class FleetManagerWindowTests: XCTestCase {
         GlobalSettingsStore.shared.setFleetParkAgentWindows(false, commit: false)
         AppWindowOpener.shared.resetForTesting()
         AppWindowOpener.shared.installRequestAware { [unowned self] requestID in
-            registerProgrammaticWindow(requestID: requestID, prepare: prepare)
+            registerProgrammaticWindow(
+                requestID: requestID, agentModeViewModelFactory: agentModeViewModelFactory, prepare: prepare
+            )
         }
         let connectionID = UUID()
         let client = "FleetOnly-\(connectionID)"
@@ -2189,6 +2201,219 @@ final class FleetManagerWindowTests: XCTestCase {
                 }
             }
         }
+    }
+
+    private func makeNoLaunchAgentModeViewModelFactory(
+        root: URL,
+        headless: AgentSessionLinkCapturingHeadlessProvider
+    ) -> WindowStateCompositionFactory.AgentModeViewModelFactory {
+        { windowID, prompt, manager, server in
+            let viewModel = AgentModeViewModel(
+                testWindowID: windowID,
+                testWorkspacePath: root.path,
+                codexControllerFactory: { _, _, _, _, _, _ in preconditionFailure("DW-20 must not launch Codex") },
+                headlessProviderFactory: { _, _, _, _, _ in headless },
+                acpProviderFactory: { _, _ in
+                    AgentSessionLinkCapturingACPProvider(providerID: .cursor, commandPath: "/usr/bin/true")
+                },
+                acpControllerFactory: { _, _ in throw MCPError.internalError("Unexpected ACP dispatch in DW-20") },
+                connectionPolicyInstaller: { client, window, restricted, oneShot, reason, ttl, tab, run, additional, purpose, label, external, expectedPID in
+                    await ServerNetworkManager.shared.installClientConnectionPolicy(
+                        for: client, windowID: window, restrictedTools: restricted, oneShot: oneShot,
+                        reason: reason, ttl: ttl, tabID: tab, runID: run, additionalTools: additional,
+                        purpose: purpose, taskLabelKind: label, allowsAgentExternalControlTools: external,
+                        requiresExpectedAgentPID: expectedPID
+                    )
+                },
+                mcpRunRoutingCleaner: { _, _, _ in },
+                mcpServerEnabler: { true },
+                testMCPServer: server,
+                testWorkspaceFileContextStore: prompt.workspaceFileContextStore
+            )
+            viewModel.promptManager = prompt
+            viewModel.workspaceManager = manager
+            return viewModel
+        }
+    }
+
+    private func enableAntigravityRoute(on window: WindowState) async throws {
+        let priorModels = AntigravityModelRegistry.shared.currentModels()
+        AntigravityModelRegistry.shared.test_setModels(
+            ["gemini-3.8-flash-high", "gemini-3.8-flash-medium", "gemini-3.8-flash-low"]
+                .map { AntigravityModelRegistry.Model(id: $0, displayName: $0) }
+        )
+        let coordinator = AntigravityConnectionCoordinator.shared
+        let hintKey = "AntigravityCLIConnected"
+        let prior = await coordinator.latestProjection()
+        let priorHint = UserDefaults.standard.object(forKey: hintKey)
+        let generation = await coordinator.beginManualMutation()
+        _ = await coordinator.publishIfCurrent(generation: generation, isConnected: true, errorMessage: nil, hasOwnedMCPEntry: true)
+        addTeardownBlock { @MainActor in
+            let restoreGeneration = await coordinator.beginManualMutation()
+            _ = await coordinator.publishIfCurrent(
+                generation: restoreGeneration,
+                isConnected: prior?.isConnected ?? false,
+                errorMessage: prior?.errorMessage,
+                hasOwnedMCPEntry: prior?.hasOwnedMCPEntry ?? false
+            )
+            if let priorHint {
+                UserDefaults.standard.set(priorHint, forKey: hintKey)
+            } else {
+                UserDefaults.standard.removeObject(forKey: hintKey)
+            }
+            AntigravityModelRegistry.shared.test_setModels(priorModels)
+        }
+        window.apiSettingsViewModel.test_completeContextBuilderProviderValidation(verifiedProviders: [.antigravity])
+        try await AsyncTestWait.waitUntil("window sees Antigravity connected", timeout: 5) {
+            window.apiSettingsViewModel.isAntigravityConnected
+        }
+    }
+
+    private struct WindowlessBindThenStartOutcome {
+        let windowCount: Int
+        let boundWorkspaceID: String?
+        let startResponse: Value?
+        let startError: String?
+        let pollText: String
+        let hookRuns: Int
+        let messageCount: Int
+    }
+
+    private func runWindowlessBindThenStart(backdatePendingMask: Bool) async throws -> WindowlessBindThenStartOutcome {
+        let roots = try makeTestDirectory(name: #function, namespace: "FleetRestore")
+        let seedRoot = roots.appendingPathComponent("shared", isDirectory: true)
+        try FileManager.default.createDirectory(at: seedRoot, withIntermediateDirectories: true)
+        let seed = WindowlessWorkspaceSeed(name: "A", repoPaths: [seedRoot.path], document: .valid)
+        let headless = AgentSessionLinkCapturingHeadlessProvider()
+        var outcome: WindowlessBindThenStartOutcome?
+        try await withIsolatedRestore {
+            try await withSeededWorkspaceRuntime([seed]) { _, _ in
+                var routed: WindowState?
+                try await withFleetOnlyRouting(
+                    agentModeViewModelFactory: makeNoLaunchAgentModeViewModelFactory(root: seedRoot, headless: headless),
+                    prepare: { routed = $0 }
+                ) { service, connectionID, client in
+                    let bindResult = await awaitBoundedResult(label: "windowless bind before start") {
+                        try await self.callFleetRouting(service, connectionID: connectionID, client: client, toolName: "bind_context", args: [
+                            "op": .string("bind"), "working_dirs": .array([.string(seedRoot.path)]),
+                            "create_if_missing": .bool(false)
+                        ])
+                    }
+                    let bindResponse = try bindResult.get()
+                    let window = try XCTUnwrap(routed)
+                    try await self.enableAntigravityRoute(on: window)
+                    window.mcpServer.setRequestMetadataOverrideForTesting(
+                        MCPServerViewModel.RequestMetadata(connectionID: connectionID, clientName: client, windowID: window.windowID)
+                    )
+                    defer { window.mcpServer.setRequestMetadataOverrideForTesting(nil) }
+                    var hookRuns = 0
+                    if backdatePendingMask {
+                        window.agentModeViewModel.test_afterMCPControlSetupAwait = { session in
+                            hookRuns += 1
+                            XCTAssertEqual(session.mcpStartupAttempt?.isPending, true)
+                            XCTAssertNil(session.mcpControlContext?.currentEpoch)
+                            XCTAssertTrue(session.mcpFollowUpRunPending)
+                            session.mcpFollowUpRunPendingUpdatedAt = Date().addingTimeInterval(-16)
+                        }
+                        self.addTeardownBlock { @MainActor in window.agentModeViewModel.test_afterMCPControlSetupAwait = nil }
+                    }
+                    let startResult = await awaitBoundedResult(label: "agent_run start after windowless bind") {
+                        try await window.mcpServer.executeAgentRunForTesting(args: [
+                            "op": .string("start"), "model_id": .string("antigravity:gemini-3.8-flash-high"),
+                            "message": .string("DW-20 first start"), "detach": .bool(true)
+                        ])
+                    }
+                    var startResponse: Value?
+                    var startError: String?
+                    switch startResult {
+                    case let .success(value): startResponse = value
+                    case let .failure(error): startError = String(describing: error)
+                    }
+                    var pollText = ""
+                    for _ in 0 ..< 200 {
+                        guard let sessionID = startResponse?.objectValue?["session_id"]?.stringValue else { break }
+                        let poll = try await window.mcpServer.executeAgentRunForTesting(args: [
+                            "op": .string("poll"), "session_id": .string(sessionID)
+                        ])
+                        pollText = String(describing: poll)
+                        if await headless.messageCount >= 1 || poll.objectValue?["status"]?.stringValue == "failed" { break }
+                        try await Task.sleep(nanoseconds: 50_000_000)
+                    }
+                    outcome = await WindowlessBindThenStartOutcome(
+                        windowCount: WindowStatesManager.shared.allWindows.count,
+                        boundWorkspaceID: bindResponse.objectValue?["binding"]?.objectValue?["workspace_id"]?.stringValue,
+                        startResponse: startResponse,
+                        startError: startError,
+                        pollText: pollText,
+                        hookRuns: hookRuns,
+                        messageCount: headless.messageCount
+                    )
+                }
+            }
+        }
+        return try XCTUnwrap(outcome)
+    }
+
+    func testBindOpenedWindowUsesInjectedAgentModeViewModelFactoryAndStillClaimsOpenRequest() async throws {
+        let roots = try makeTestDirectory(name: #function, namespace: "FleetRestore")
+        let seedRoot = roots.appendingPathComponent("shared", isDirectory: true)
+        try FileManager.default.createDirectory(at: seedRoot, withIntermediateDirectories: true)
+        let seed = WindowlessWorkspaceSeed(name: "A", repoPaths: [seedRoot.path], document: .valid)
+        let headless = AgentSessionLinkCapturingHeadlessProvider()
+        let base = makeNoLaunchAgentModeViewModelFactory(root: seedRoot, headless: headless)
+        var constructed: [(windowID: Int, viewModel: AgentModeViewModel)] = []
+        let counting: WindowStateCompositionFactory.AgentModeViewModelFactory = { windowID, prompt, manager, server in
+            let viewModel = base(windowID, prompt, manager, server)
+            constructed.append((windowID, viewModel))
+            return viewModel
+        }
+        try await withIsolatedRestore {
+            try await withSeededWorkspaceRuntime([seed]) { _, _ in
+                var routed: WindowState?
+                try await withFleetOnlyRouting(agentModeViewModelFactory: counting, prepare: { routed = $0 }) { service, connectionID, client in
+                    let result = await awaitBoundedResult(label: "windowless bind with injected factory") {
+                        try await self.callFleetRouting(service, connectionID: connectionID, client: client, toolName: "bind_context", args: [
+                            "op": .string("bind"), "working_dirs": .array([.string(seedRoot.path)]),
+                            "create_if_missing": .bool(false)
+                        ])
+                    }
+                    let response = try result.get()
+                    let window = try XCTUnwrap(routed)
+                    XCTAssertEqual(constructed.count, 1)
+                    XCTAssertEqual(constructed.first?.windowID, window.windowID)
+                    XCTAssertTrue(constructed.first?.viewModel === window.agentModeViewModel)
+                    XCTAssertEqual(WindowStatesManager.shared.allWindows.count, 1)
+                    let binding = try XCTUnwrap(response.objectValue?["binding"]?.objectValue)
+                    XCTAssertEqual(binding["workspace_name"]?.stringValue, "A")
+                    let requestID = try XCTUnwrap(window.claimedOpenRequestID)
+                    XCTAssertNil(WindowStatesManager.shared.claimOpenRequest(id: requestID))
+                }
+            }
+        }
+    }
+
+    func testDW20AgentStartRightAfterWindowlessBindIsNotWithdrawn() async throws {
+        let outcome = try await runWindowlessBindThenStart(backdatePendingMask: true)
+        XCTAssertEqual(outcome.windowCount, 1)
+        XCTAssertNotNil(outcome.boundWorkspaceID)
+        XCTAssertGreaterThanOrEqual(outcome.hookRuns, 1)
+        XCTAssertNil(outcome.startError)
+        XCTAssertNotNil(outcome.startResponse?.objectValue?["session_id"]?.stringValue)
+        XCTAssertNotEqual(outcome.startResponse?.objectValue?["status"]?.stringValue, "failed")
+        XCTAssertFalse(
+            outcome.pollText.contains("The pending agent start was withdrawn or replaced during activation."),
+            outcome.pollText
+        )
+        XCTAssertEqual(outcome.messageCount, 1)
+    }
+
+    func testSecondStartAfterWindowlessBindStillSucceeds() async throws {
+        let outcome = try await runWindowlessBindThenStart(backdatePendingMask: false)
+        XCTAssertEqual(outcome.windowCount, 1)
+        XCTAssertNil(outcome.startError)
+        XCTAssertNotNil(outcome.startResponse?.objectValue?["session_id"]?.stringValue)
+        XCTAssertFalse(outcome.pollText.contains("withdrawn or replaced"), outcome.pollText)
+        XCTAssertEqual(outcome.messageCount, 1)
     }
 
     func testDW18RestoreRequestDuringHeldBindSwitchPublishesNoBlockage() async throws {

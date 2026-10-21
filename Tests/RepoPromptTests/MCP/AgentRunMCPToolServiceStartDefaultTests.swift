@@ -1239,6 +1239,106 @@ final class AgentRunMCPStartStallTests: XCTestCase {
         XCTAssertEqual(try viewModel.mcpSnapshot(sessionID: XCTUnwrap(target.sessionID))?.status, .running)
     }
 
+    func testSlowActivationDoesNotExpireServiceOwnedPendingStartMask() async throws {
+        let fixture = try await makeFixture()
+        let viewModel = fixture.window.agentModeViewModel
+        let clock = StartStallClock()
+        let observation = StartStallObservation()
+        let gate = StartStallGate()
+        var hookRuns = 0
+        var pendingAtActivationEnd: Bool?
+        viewModel.test_afterMCPControlSetupAwait = { session in
+            hookRuns += 1
+            XCTAssertEqual(session.mcpStartupAttempt?.isPending, true)
+            XCTAssertNil(session.mcpControlContext?.currentEpoch)
+            XCTAssertTrue(session.mcpFollowUpRunPending)
+            session.mcpFollowUpRunPendingUpdatedAt = Date().addingTimeInterval(-16)
+        }
+        viewModel.test_afterMCPControlActivation = { session in
+            pendingAtActivationEnd = session.mcpFollowUpRunPending
+        }
+        addTeardownBlock { @MainActor in
+            viewModel.test_afterMCPControlSetupAwait = nil
+            viewModel.test_afterMCPControlActivation = nil
+        }
+        let service = makeService(fixture, clock: clock, observation: observation)
+        _ = launch(
+            service, args: ["model_id": .string("cursor:composer-2.5")],
+            observation: observation, gate: gate, clock: clock
+        )
+        await drainScheduler(until: {
+            observation.dispatchCount == 1
+                || observation.sessionID.flatMap(viewModel.mcpSnapshot(sessionID:))?.status == .failed
+        })
+        let snapshot = observation.sessionID.flatMap(viewModel.mcpSnapshot(sessionID:))
+        let errorText = "\(snapshot?.statusText ?? "") \(String(describing: observation.result))"
+        XCTAssertGreaterThanOrEqual(hookRuns, 1)
+        XCTAssertFalse(errorText.contains("withdrawn or replaced"), errorText)
+        XCTAssertEqual(pendingAtActivationEnd, true)
+        XCTAssertEqual(observation.dispatchCount, 1)
+    }
+
+    func testExplicitStopDuringActivationStillRefusesDispatch() async throws {
+        let fixture = try await makeFixture()
+        let viewModel = fixture.window.agentModeViewModel
+        let clock = StartStallClock()
+        let observation = StartStallObservation()
+        let gate = StartStallGate()
+        var withdrawn = false
+        viewModel.test_afterMCPControlSetupAwait = { session in
+            guard !withdrawn else { return }
+            XCTAssertEqual(session.mcpStartupAttempt?.isPending, true)
+            guard let binding = session.persistentSessionBindingIdentity else {
+                XCTFail("The pending start must carry a persistent binding")
+                return
+            }
+            let admission = AgentRunCancellationAdmission(
+                scope: .pendingStart, session: session, binding: binding,
+                expectedOwnership: session.activeRunOwnership, expectedRunID: session.runID,
+                cancellationGeneration: session.stopState.cancellationGeneration,
+                pendingStartFence: AgentRunStartStopFence(session: session),
+                validateAndClaim: { viewModel.sessions[session.tabID] === session }
+            )
+            withdrawn = viewModel.withdrawPendingStartForSessionLink(session: session, admission: admission)
+            XCTAssertTrue(withdrawn)
+        }
+        addTeardownBlock { @MainActor in viewModel.test_afterMCPControlSetupAwait = nil }
+        let service = makeService(fixture, clock: clock, observation: observation)
+        _ = launch(
+            service, args: ["model_id": .string("cursor:composer-2.5")],
+            observation: observation, gate: gate, clock: clock
+        )
+        await drainScheduler(until: {
+            observation.dispatchCount == 1
+                || observation.sessionID.flatMap(viewModel.mcpSnapshot(sessionID:))?.status == .failed
+        })
+        let snapshot = observation.sessionID.flatMap(viewModel.mcpSnapshot(sessionID:))
+        let errorText = "\(snapshot?.statusText ?? "") \(String(describing: observation.result))"
+        XCTAssertTrue(withdrawn)
+        XCTAssertTrue(errorText.contains("withdrawn or replaced"), errorText)
+        XCTAssertEqual(observation.dispatchCount, 0)
+    }
+
+    func testStaleMaskStillClearsWhenNoPendingStartupAttempt() async throws {
+        let fixture = try await makeFixture()
+        let viewModel = fixture.window.agentModeViewModel
+        let target = try await viewModel.mcpResolveOrCreateSessionTarget(
+            tabID: nil, sessionID: nil, createIfNeeded: true, sessionName: "Stale mask"
+        )
+        let sessionID = try XCTUnwrap(target.sessionID)
+        _ = try await viewModel.mcpActivateControlContext(
+            forTabID: target.tabID, sessionID: sessionID, originatingConnectionID: nil,
+            taskLabelKind: nil, startPending: true, creationHandle: target.creationHandle
+        )
+        let session = try XCTUnwrap(viewModel.session(for: target.tabID, createIfNeeded: false))
+        XCTAssertNil(session.mcpStartupAttempt)
+        XCTAssertNil(session.mcpControlContext?.currentEpoch)
+        XCTAssertTrue(session.mcpFollowUpRunPending)
+        session.mcpFollowUpRunPendingUpdatedAt = Date().addingTimeInterval(-16)
+        _ = viewModel.mcpSnapshot(sessionID: sessionID)
+        XCTAssertFalse(session.mcpFollowUpRunPending)
+    }
+
     private func makeDeferredPreparationStart(
         runtime: StartRuntimeProbe,
         clock: StartStallClock,

@@ -8374,7 +8374,10 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                session.acpSteeringFlushTask == nil
             {
                 Self.steeringDebugLog("[AgentRunSteeringWake] clearing stale MCP running mask sessionID=\(context.sessionID) tab=\(session.tabID) runState=\(session.runState.rawValue) terminal=\(terminalStatus.rawValue) followUp=\(session.mcpFollowUpRunPending) superseding=\(session.pendingSupersedingTurnCompletions)")
-                session.mcpFollowUpRunPending = false
+                // ponytail: An activation-owned pending start keeps its pending mask.
+                if session.mcpControlContext?.currentEpoch != nil || session.mcpStartupAttempt?.isPending != true {
+                    session.mcpFollowUpRunPending = false
+                }
                 session.pendingSupersedingTurnCompletions = 0
             }
             if session.mcpFollowUpRunPending || session.pendingSupersedingTurnCompletions > 0 {

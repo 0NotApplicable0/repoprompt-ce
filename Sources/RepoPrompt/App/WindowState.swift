@@ -715,6 +715,21 @@ class WindowState: ObservableObject {
 
     #if DEBUG
         convenience init(
+            domainRuntime: MCPDomainRuntime,
+            openRequestID: UUID?,
+            agentModeViewModelFactory: @escaping WindowStateCompositionFactory.AgentModeViewModelFactory
+        ) {
+            self.init(
+                contextBuilderProviderFactory: nil,
+                loadStoredAPISettingsDataOnInit: true,
+                codexModelPollingService: .shared,
+                domainRuntimeOverride: domainRuntime,
+                agentModeViewModelFactory: agentModeViewModelFactory,
+                openRequestID: openRequestID
+            )
+        }
+
+        convenience init(
             agentModeViewModelFactory: @escaping WindowStateCompositionFactory.AgentModeViewModelFactory,
             contextBuilderProviderFactory: @escaping ContextBuilderAgentViewModel.ProviderFactory,
             domainRuntime: MCPDomainRuntime? = nil
