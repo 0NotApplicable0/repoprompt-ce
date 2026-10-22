@@ -159,6 +159,9 @@ public struct CompiledIgnoreRules: Sendable {
     /// Primary implementation - components-based to avoid repeated splits
     public func outcome(for components: [Substring], isDirectory: Bool) -> MatchOutcome {
         let path = components.joined(separator: "/")
+        var directoryCandidatePrefixes: [String] = []
+        var directoryCandidatePrefixRequests = 0
+        var directoryCandidatePrefixBuilds = 0
         #if DEBUG
             var patternVisits = 0
             var patternAttempts = 0
@@ -169,7 +172,9 @@ public struct CompiledIgnoreRules: Sendable {
                     patternVisits: patternVisits,
                     patternAttempts: patternAttempts,
                     prefilterChecks: prefilterChecks,
-                    prefilterSkips: prefilterSkips
+                    prefilterSkips: prefilterSkips,
+                    directoryCandidatePrefixRequests: directoryCandidatePrefixRequests,
+                    directoryCandidatePrefixBuilds: directoryCandidatePrefixBuilds
                 )
             }
         #endif
@@ -195,7 +200,15 @@ public struct CompiledIgnoreRules: Sendable {
             #if DEBUG
                 patternAttempts += 1
             #endif
-            if matchOnePattern(path: path, components: components, isDirectory: isDirectory, pat: pattern) {
+            if matchOnePattern(
+                path: path,
+                components: components,
+                isDirectory: isDirectory,
+                pat: pattern,
+                directoryCandidatePrefixes: &directoryCandidatePrefixes,
+                directoryCandidatePrefixRequests: &directoryCandidatePrefixRequests,
+                directoryCandidatePrefixBuilds: &directoryCandidatePrefixBuilds
+            ) {
                 return pattern.isNegation ? .allow : .ignore
             }
         }
@@ -272,7 +285,15 @@ public struct CompiledIgnoreRules: Sendable {
     // MARK: - Matching logic
 
     /// Returns `true` if `path` matches this pattern, respecting directory-only or absolute logic.
-    private func matchOnePattern(path: String, components: [Substring], isDirectory: Bool, pat: GitPattern) -> Bool {
+    private func matchOnePattern(
+        path: String,
+        components: [Substring],
+        isDirectory: Bool,
+        pat: GitPattern,
+        directoryCandidatePrefixes: inout [String],
+        directoryCandidatePrefixRequests: inout Int,
+        directoryCandidatePrefixBuilds: inout Int
+    ) -> Bool {
         // Directory-only patterns ----------------------------------------------
         if pat.directoryOnly {
             // Directory-only patterns match the directory itself and anything below it.
@@ -282,12 +303,23 @@ public struct CompiledIgnoreRules: Sendable {
             guard lastCandidateIndex >= 0 else { return false }
 
             for i in 0 ... lastCandidateIndex {
-                let directoryComps = Array(components[0 ... i])
-                let directoryPath = directoryComps.joined(separator: "/")
-                if matchesTrailingDoubleStarBase(path: directoryPath, components: directoryComps, isDirectory: true, pat: pat) {
+                #if DEBUG
+                    directoryCandidatePrefixRequests += 1
+                #endif
+                let directoryPath: String
+                if i < directoryCandidatePrefixes.count {
+                    directoryPath = directoryCandidatePrefixes[i]
+                } else {
+                    #if DEBUG
+                        directoryCandidatePrefixBuilds += 1
+                    #endif
+                    directoryPath = components.prefix(i + 1).joined(separator: "/")
+                    directoryCandidatePrefixes.append(directoryPath)
+                }
+                if matchesTrailingDoubleStarBase(path: directoryPath, isDirectory: true, pat: pat) {
                     return true
                 }
-                if matchesScopedPattern(path: directoryPath, components: directoryComps, pattern: pat.pattern, absolute: pat.absolute) {
+                if matchesScopedPattern(path: directoryPath, pattern: pat.pattern, absolute: pat.absolute) {
                     return true
                 }
             }
@@ -295,10 +327,10 @@ public struct CompiledIgnoreRules: Sendable {
         }
 
         // Regular patterns ------------------------------------------------------
-        if matchesTrailingDoubleStarBase(path: path, components: components, isDirectory: isDirectory, pat: pat) {
+        if matchesTrailingDoubleStarBase(path: path, isDirectory: isDirectory, pat: pat) {
             return true
         }
-        return matchesScopedPattern(path: path, components: components, pattern: pat.pattern, absolute: pat.absolute)
+        return matchesScopedPattern(path: path, pattern: pat.pattern, absolute: pat.absolute)
     }
 
     private func prefilterMayMatch(
@@ -331,17 +363,17 @@ public struct CompiledIgnoreRules: Sendable {
         isDirectory ? components.count : max(components.count - 1, 0)
     }
 
-    private func matchesTrailingDoubleStarBase(path: String, components: [Substring], isDirectory: Bool, pat: GitPattern) -> Bool {
+    private func matchesTrailingDoubleStarBase(path: String, isDirectory: Bool, pat: GitPattern) -> Bool {
         guard isDirectory, pat.pattern.hasSuffix("/**") else { return false }
         let basePattern = String(pat.pattern.dropLast(3))
         guard !basePattern.isEmpty else { return false }
         #if DEBUG
             IgnoreDebugMetricsRecorder.recordTrailingDoubleStarBaseCheck()
         #endif
-        return matchesScopedPattern(path: path, components: components, pattern: basePattern, absolute: pat.absolute)
+        return matchesScopedPattern(path: path, pattern: basePattern, absolute: pat.absolute)
     }
 
-    private func matchesScopedPattern(path: String, components: [Substring], pattern: String, absolute: Bool) -> Bool {
+    private func matchesScopedPattern(path: String, pattern: String, absolute: Bool) -> Bool {
         absolute
             ? matchesPathAnchored(path, pattern)
             : matchesPathAnywhere(path, pattern)

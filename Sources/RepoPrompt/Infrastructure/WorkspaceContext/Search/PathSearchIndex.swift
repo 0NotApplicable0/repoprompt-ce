@@ -36,11 +36,23 @@ final class PathSearchIndex: @unchecked Sendable {
     private let originalPaths: [String]
     private let filenames: [String]
 
-    init(paths: [String]) {
+    convenience init(paths: [String]) {
+        self.init(paths: paths, filenames: paths.map { path in
+            #if DEBUG
+                WorkspaceFileSearchDebugContext.catalogBuildObserver?.recordFilenameURLInput(
+                    isRelative: !path.hasPrefix("/"),
+                    explicitNonDirectory: false
+                )
+            #endif
+            return URL(fileURLWithPath: path).lastPathComponent
+        })
+    }
+
+    /// `paths` and `filenames` must be count- and order-aligned.
+    private init(paths: [String], filenames: [String]) {
+        precondition(paths.count == filenames.count)
         originalPaths = paths
-        filenames = paths.map { path in
-            URL(fileURLWithPath: path).lastPathComponent
-        }
+        self.filenames = filenames
 
         guard !paths.isEmpty else {
             cIndex = nil
@@ -53,6 +65,21 @@ final class PathSearchIndex: @unchecked Sendable {
         cIndex = cPathPointers.withUnsafeBufferPointer { buffer in
             path_search_create(buffer.baseAddress, paths.count)
         }
+    }
+
+    convenience init(catalogEntries entries: [WorkspaceSearchCatalogEntry], keys: [String]? = nil) {
+        self.init(
+            paths: keys ?? entries.map(\.pathSearchIndexKey),
+            filenames: entries.map { entry in
+                #if DEBUG
+                    WorkspaceFileSearchDebugContext.catalogBuildObserver?.recordFilenameURLInput(
+                        isRelative: !entry.standardizedFullPath.hasPrefix("/"),
+                        explicitNonDirectory: true
+                    )
+                #endif
+                return URL(fileURLWithPath: entry.standardizedFullPath, isDirectory: false).lastPathComponent
+            }
+        )
     }
 
     deinit {
@@ -467,13 +494,13 @@ final class WorkspaceSearchRootPathIndex: @unchecked Sendable {
                     nanoseconds: WorkspaceFileSearchDebugTiming.elapsed(since: keyStart, through: keyEnd)
                 )
                 let indexStart = WorkspaceFileSearchDebugTiming.now()
-                index = PathSearchIndex(paths: keys)
+                index = PathSearchIndex(catalogEntries: entries, keys: keys)
                 let indexEnd = WorkspaceFileSearchDebugTiming.now()
                 WorkspaceFileSearchDebugContext.catalogBuildObserver?.recordPathIndexConstruction(
                     nanoseconds: WorkspaceFileSearchDebugTiming.elapsed(since: indexStart, through: indexEnd)
                 )
             #else
-                index = PathSearchIndex(paths: entries.map(\.pathSearchIndexKey))
+                index = PathSearchIndex(catalogEntries: entries)
             #endif
         }
     }
@@ -485,7 +512,7 @@ final class WorkspaceSearchRootPathIndex: @unchecked Sendable {
 
         init(entries: [WorkspaceSearchCatalogEntry], affectedEntryIDs: Set<UUID>) {
             self.entries = entries
-            index = entries.isEmpty ? nil : PathSearchIndex(paths: entries.map(\.pathSearchIndexKey))
+            index = entries.isEmpty ? nil : PathSearchIndex(catalogEntries: entries)
             self.affectedEntryIDs = affectedEntryIDs
         }
     }
@@ -947,7 +974,7 @@ final class WorkspaceProjectedPathSearchIndex: @unchecked Sendable {
 
         init(entries: [WorkspaceSearchCatalogEntry], affectedRelativePaths: AffectedRelativePaths) {
             self.entries = entries
-            index = entries.isEmpty ? nil : PathSearchIndex(paths: entries.map(\.pathSearchIndexKey))
+            index = entries.isEmpty ? nil : PathSearchIndex(catalogEntries: entries)
             self.affectedRelativePaths = affectedRelativePaths
         }
     }
