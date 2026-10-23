@@ -35,7 +35,8 @@ extension OverseerAuthorizationEngine {
         ofChainFrom scope: DomainDelegationScopeRecord,
         projector: any DelegationMembershipProjector
     ) -> Bool {
-        waives(.scopeMembership) || isPlacedMember(sessionID, ofChainFrom: scope, projector: projector)
+        (waives(.scopeMembership) && !isQualifiedControllerScope(scope))
+            || isPlacedMember(sessionID, ofChainFrom: scope, projector: projector)
     }
 
     /// The write-time checkpoint for one admitted target: authority continuity (the lease is current,
@@ -79,7 +80,7 @@ extension OverseerAuthorizationEngine {
     func scopeChainHolds(_ capability: DomainDelegationScopeCapability, scope: DomainDelegationScopeRecord) -> Bool {
         guard let scopes else { return false }
         let chain = scopes.scopeChain(from: scope.id)
-        let capabilityWaived = waives(.scopeCapability)
+        let capabilityWaived = waives(.scopeCapability) && !isQualifiedControllerScope(scope)
         let ceilingWaived = waives(.allSessionsCapabilityCeiling)
         return !chain.isEmpty && chain.allSatisfy { record in
             guard record.isActive else { return false }
@@ -104,8 +105,8 @@ extension OverseerAuthorizationEngine {
     // MARK: - Links under a scope
 
     /// `observerMustBeCaller`: a scope only mints links its own grantee observes.
-    var requiresScopeLinksObservedByCaller: Bool {
-        !waives(.observerMustBeCaller)
+    func requiresScopeLinksObservedByCaller(scope: DomainDelegationScopeRecord) -> Bool {
+        !waives(.observerMustBeCaller) || isQualifiedControllerScope(scope)
     }
 
     /// `linkCapabilityCeiling`: a link created under a scope may carry no capability the scope chain
@@ -114,7 +115,7 @@ extension OverseerAuthorizationEngine {
         minted: Set<DomainAgentSessionLinkCapability>,
         scope: DomainDelegationScopeRecord
     ) -> DomainDelegationScopeCapability? {
-        guard let scopes, !waives(.linkCapabilityCeiling) else { return nil }
+        guard let scopes, !waives(.linkCapabilityCeiling) || isQualifiedControllerScope(scope) else { return nil }
         for record in scopes.scopeChain(from: scope.id) {
             if let missing = DomainDelegationScopeLinkPolicy.missingCapability(linkCapabilities: minted, grant: record.grant) {
                 return missing

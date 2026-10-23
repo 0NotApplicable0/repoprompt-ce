@@ -79,9 +79,9 @@ extension WindowStatesManager {
                 windowMatchesEndpoint: false, windowIsClosing: true, hasExactCurrentEndpoint: false,
                 hasSession: false, contextSessionMatchesEndpoint: false, hasMCPControlContext: false,
                 isMCPOriginated: false, parentSessionID: nil, createdByOverseerSessionID: nil,
-                taskLabelIsExplore: false, isDeletionBlocked: true, hasLoadedPersistedState: false,
+                taskLabelIsExplore: false, isDeletionInProgress: false, isDeletionCommitted: false, hasLoadedPersistedState: false,
                 bindingTransitionInProgress: false, candidateHasLoadedPersistedState: nil,
-                candidateHasDurableBinding: false, candidateIsClosing: true, candidateIsDeletionInProgress: true
+                candidateHasDurableBinding: false, candidateIsClosing: true, candidateIsDeletionInProgress: false
             )
         }
         let session = resolvedWindow.agentModeViewModel.session(for: endpoint.tabID, createIfNeeded: false)
@@ -98,13 +98,14 @@ extension WindowStatesManager {
             parentSessionID: session?.parentSessionID,
             createdByOverseerSessionID: session?.createdByOverseerSessionID,
             taskLabelIsExplore: context?.taskLabelKind == .explore,
-            isDeletionBlocked: AgentSessionDeletionRegistry.shared.blocksNewOversight(sessionID: endpoint.sessionID),
+            isDeletionInProgress: AgentSessionDeletionRegistry.shared.isDeletionInProgress(sessionID: endpoint.sessionID),
+            isDeletionCommitted: AgentSessionDeletionRegistry.shared.isPermanentlyDeleted(sessionID: endpoint.sessionID),
             hasLoadedPersistedState: session?.hasLoadedPersistedState ?? false,
             bindingTransitionInProgress: session?.bindingTransitionInProgress ?? false,
             candidateHasLoadedPersistedState: candidate?.eligibilityInput.hasLoadedPersistedState,
             candidateHasDurableBinding: candidate?.eligibilityInput.hasDurableBinding ?? false,
             candidateIsClosing: candidate?.isClosing ?? true,
-            candidateIsDeletionInProgress: candidate?.isDeletionInProgress ?? true
+            candidateIsDeletionInProgress: candidate?.isDeletionInProgress ?? false
         )
     }
 
@@ -292,8 +293,9 @@ final class SessionAdminWindowsStructureHost: SessionAdminStructureHost {
         DomainAgentSessionLinkCapability.managed
     }
 
-    func activeLinkCapabilities(observer: UUID, target: UUID) async -> Set<DomainAgentSessionLinkCapability>? {
-        await bridge().delegationActiveLink(observerSessionID: observer, targetSessionID: target)?.capabilities
+    func activeLink(observer: UUID, target: UUID) async -> SessionAdminActiveLink? {
+        await bridge().delegationActiveLink(observerSessionID: observer, targetSessionID: target)
+            .map { SessionAdminActiveLink(capabilities: $0.capabilities, sourceScopeID: $0.sourceScopeID) }
     }
 
     func addLink(

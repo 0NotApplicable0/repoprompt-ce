@@ -22,7 +22,8 @@ struct ScopedObserverControllerFacts {
     let parentSessionID: UUID?
     let createdByOverseerSessionID: UUID?
     let taskLabelIsExplore: Bool
-    let isDeletionBlocked: Bool
+    let isDeletionInProgress: Bool
+    let isDeletionCommitted: Bool
     let hasLoadedPersistedState: Bool
     let bindingTransitionInProgress: Bool
     let candidateHasLoadedPersistedState: Bool?
@@ -43,14 +44,16 @@ extension OverseerAuthorizationEngine {
             && facts.parentSessionID == nil
             && facts.createdByOverseerSessionID == nil
             && !facts.taskLabelIsExplore
-            && !facts.isDeletionBlocked
+            && !facts.isDeletionInProgress
+            && !facts.isDeletionCommitted
     }
 
     // MARK: - Consent-only route policy
 
-    /// Which scope-lifecycle calls a supported controller may make while it holds no independent live
-    /// grant: only its own `direct_children` request and the inspection or withdrawal of that request.
-    /// The service projects arguments and receipts; this decision stays here.
+    /// Which calls a supported controller may make while it holds no independent live grant: its own
+    /// `direct_children` request, inspection or release of its own grants and request, and `link` /
+    /// `unlink` under an explicit full-capability grant. The service projects arguments and receipts;
+    /// this decision stays here.
     func admitsScopeLifecycleCall(
         endpoint: DomainAgentSessionLinkEndpointIdentity,
         isController: Bool,
@@ -75,19 +78,17 @@ extension OverseerAuthorizationEngine {
             if case .directChildren = $0.grant.kind { return false }
             return true
         }) { return true }
-        let covering = live.filter { coversScopedObserver($0, endpoint: endpoint, at: scopes.currentDate) }
-        if !covering.isEmpty {
-            if ["scope_status", "release_scope"].contains(op), let scopeID {
-                return covering.contains { $0.id == scopeID }
-            }
-            if op == "scope_status", !hasScopeID, requestID == nil { return true }
-            if !["request_scope", "release_scope", "scope_status", "attenuate"].contains(op), case .authorized = observerStanding { return true }
-        }
+        let own = live.filter { isOwnDirectChildrenGrant($0, endpoint: endpoint) }
         switch op {
         case "request_scope" where requestsDirectChildren:
             return true
+        case "link", "unlink":
+            guard hasScopeID, let scopeID, case .authorized = observerStanding else { return false }
+            return live.contains { $0.id == scopeID && coversScopedObserver($0, endpoint: endpoint, at: scopes.currentDate) }
         case "scope_status", "release_scope":
-            guard !hasScopeID, let requestID,
+            if hasScopeID { return scopeID.map { id in own.contains { $0.id == id } } ?? false }
+            if op == "scope_status", requestID == nil { return !own.isEmpty }
+            guard let requestID,
                   let request = scopes.request(id: requestID, requesterSessionID: endpoint.sessionID),
                   request.kind == .directChildren(rootSessionID: endpoint.sessionID, workspaceID: endpoint.workspaceID)
             else { return false }
@@ -95,6 +96,41 @@ extension OverseerAuthorizationEngine {
         default:
             return false
         }
+    }
+
+    // MARK: - Qualified controller route
+
+    /// A `direct_children` scope held by a controller with no independent ordinary live grant. Overseer
+    /// full access never substitutes for, widens, or waives any gate on it.
+    func isQualifiedControllerScope(_ record: DomainDelegationScopeRecord) -> Bool {
+        guard let scopes, case .directChildren = record.grant.kind else { return false }
+        return !scopes.liveScopes(grantedTo: record.grant.granteeSessionID).contains {
+            if case .directChildren = $0.grant.kind { return false }
+            return true
+        }
+    }
+
+    /// The grantee of a `direct_children` scope may observe links under it without being its member.
+    func permitsLinkObserver(
+        _ sessionID: UUID, ofChainFrom scope: DomainDelegationScopeRecord, projector: any DelegationMembershipProjector
+    ) -> Bool {
+        if case let .directChildren(root, _) = scope.grant.kind, sessionID == root, root == scope.grant.granteeSessionID,
+           let scopes
+        {
+            let chain = scopes.scopeChain(from: scope.id)
+            if !chain.isEmpty, chain.allSatisfy(\.isActive) { return true }
+        }
+        return permitsMember(sessionID, ofChainFrom: scope, projector: projector)
+    }
+
+    /// An existing link sourced by another scope is reported, never re-sourced or upgraded.
+    func linkSourceConflicts(existing: UUID?, requested: UUID?) -> Bool {
+        existing != nil && existing != requested
+    }
+
+    private func isOwnDirectChildrenGrant(_ record: DomainDelegationScopeRecord, endpoint: DomainAgentSessionLinkEndpointIdentity) -> Bool {
+        guard case let .directChildren(root, workspaceID) = record.grant.kind else { return false }
+        return record.grant.granteeSessionID == endpoint.sessionID && root == endpoint.sessionID && workspaceID == endpoint.workspaceID
     }
 
     // MARK: - Scoped observer evidence
@@ -120,7 +156,7 @@ extension OverseerAuthorizationEngine {
               facts.hasSession,
               facts.parentSessionID == nil,
               facts.createdByOverseerSessionID == nil,
-              !facts.isDeletionBlocked
+              !facts.isDeletionCommitted
         else { return false }
         if facts.hasMCPControlContext {
             return facts.contextSessionMatchesEndpoint && !facts.taskLabelIsExplore
@@ -148,11 +184,11 @@ extension OverseerAuthorizationEngine {
         let candidateLoading = facts.candidateHasLoadedPersistedState.map { !$0 } ?? false
         let loading = !facts.hasMCPControlContext || !facts.hasLoadedPersistedState
             || facts.bindingTransitionInProgress || candidateLoading
+            || facts.isDeletionInProgress || facts.candidateIsDeletionInProgress
         if loading { return .awaitingReproof(evidence(.awaitingReproof)) }
         guard Self.admitsDirectChildrenConsentRequest(endpoint: endpoint, facts: facts),
               facts.candidateHasDurableBinding,
-              !facts.candidateIsClosing,
-              !facts.candidateIsDeletionInProgress
+              !facts.candidateIsClosing
         else { return .denied }
         return .authorized(evidence(.authorized))
     }
@@ -165,12 +201,17 @@ extension OverseerAuthorizationEngine {
     }
 
     /// Whether the host's own read of this target already proves a permanent loss of membership,
-    /// independent of the observer's standing: a pending observer must never mask it.
-    func scopedTargetIsPermanentlyOutside(_ scopeID: UUID, target: AgentSessionLinkEndpointCandidate) -> Bool {
+    /// independent of the observer's standing: a pending observer must never mask it. Deletion in
+    /// progress can still fail, so only a committed deletion is permanent.
+    func scopedTargetIsPermanentlyOutside(
+        _ scopeID: UUID, target: AgentSessionLinkEndpointCandidate,
+        deletionCommitted: Bool? = nil
+    ) -> Bool {
         guard let scopes, let record = scopes.record(id: scopeID),
               case let .directChildren(root, workspaceID) = record.grant.kind else { return false }
         return target.workspaceID != workspaceID || target.sessionID == root || target.parentSessionID != root
-            || target.isClosing || target.isDeletionInProgress
+            || target.isClosing
+            || deletionCommitted ?? AgentSessionDeletionRegistry.shared.isPermanentlyDeleted(sessionID: target.sessionID)
     }
 
     /// Issues the per-target endorsement for one exact direct child, or `nil`. Membership comes from the

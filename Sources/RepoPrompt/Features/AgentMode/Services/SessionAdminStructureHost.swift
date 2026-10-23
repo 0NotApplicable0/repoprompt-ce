@@ -32,6 +32,11 @@ struct SessionAdminPartialForkError: Error {
     let detail: String
 }
 
+struct SessionAdminActiveLink: Equatable {
+    let capabilities: Set<DomainAgentSessionLinkCapability>
+    let sourceScopeID: UUID?
+}
+
 enum SessionAdminLifecycleOutcome: Equatable {
     case applied(changed: Bool, fields: [String: String])
     /// The target is not in a state that accepts the change (busy, closing, revoked).
@@ -47,8 +52,8 @@ protocol SessionAdminStructureHost: AnyObject {
     /// durable write. `delegationScopeID == nil` keeps the existing value. Spawn provenance is never
     /// written. Returns `nil` when no loaded window owns the session.
     func commitOrganizationalPlacement(sessionID: UUID, parentID: UUID, delegationScopeID: UUID?) throws -> DelegationPlacementCommit?
-    /// Capabilities of the active link from `observer` to `target`, or `nil` when none.
-    func activeLinkCapabilities(observer: UUID, target: UUID) async -> Set<DomainAgentSessionLinkCapability>?
+    /// The active link from `observer` to `target` with its capabilities and source scope, or `nil` when none.
+    func activeLink(observer: UUID, target: UUID) async -> SessionAdminActiveLink?
     /// Capabilities every link minted through the bridge carries.
     var mintedLinkCapabilities: Set<DomainAgentSessionLinkCapability> { get }
     /// Adds the link through the bridge's shared durable Add with `isStillAuthorized` carried into the

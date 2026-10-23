@@ -311,8 +311,12 @@ bulk-confirmation threshold guardrails apply, not depth/session/worktree quotas.
 explicit user consent **even with Overseer full access or prior session-wide approval**. A matching
 live grant can be reused only if it covers the requested capabilities, remaining lifetime, and
 bulk threshold. The user may narrow it. Pending requests authorize nothing; inspect the returned
-request ID rather than issuing duplicates. Before a qualifying grant, the consent-only route admits
-its own request and `scope_status`/`release_scope` for that request ID, not inventory or management.
+request ID rather than issuing duplicates. A controller with no independent ordinary live grant may use
+only `request_scope kind=direct_children`; `scope_status`/`release_scope` on its own request ID or its
+own `direct_children` grants (narrowed or not); and `link`/`unlink` observed by itself under an explicit
+full-capability `scope_id`. Every other `session_admin` operation is unavailable on that route, and
+Overseer full access never substitutes for, widens, or waives any gate there. The grantee may observe
+links under its own scope without becoming a member or managed target.
 There is no **Grant all for this session** option for this kind. Consent creates no link: explicitly
 activate each returned direct-worker UUID with `session_admin link` under the returned scope ID.
 
@@ -327,7 +331,9 @@ effective inventory and epochs consume that same fresh proof through the existin
 physical-dispatch fences; there is no new wake scheduler or transport owner.
 
 Restoration preserves positively live, unexpired, server-origin scope-backed intent while current
-context proof is loading: `awaitingReproof` is transient and authorizes **no action**. Unknown,
+context proof is loading: `awaitingReproof` is transient and authorizes **no action**. Deletion in
+progress (controller or target) denies action the same way; only a committed deletion is permanent.
+An existing link sourced by another scope is reported as `source_scope_mismatch`, never re-sourced. Unknown,
 revoked, expired or unsupported authority is denied; saved intent alone never authorizes a response
 or wake. Reproof must recover current exact endpoints and membership; committed revocation wins.
 This is not hard containment of a compromised controller: independently valid parent API rights and

@@ -3262,6 +3262,7 @@ final class AgentSessionLinkRuntimeBridge {
         if evidence.status == .awaitingReproof { return .transientlyUnavailable }
         // Unloaded or not-yet-resolved target facts under a positively live grant are temporary.
         guard targets.count == 1, let target = targets.first else { return .transientlyUnavailable }
+        if target.isDeletionInProgress { return .transientlyUnavailable }
         guard scopedSourceIsCurrent(observer: observer.domainEndpoint, target: target, sourceScopeID: scopeID) else { return .disqualified }
         return .eligible
     }
