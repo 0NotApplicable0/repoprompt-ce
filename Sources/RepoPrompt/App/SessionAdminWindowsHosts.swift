@@ -2,17 +2,128 @@ import Foundation
 import MCP
 import RepoPromptDomainRuntime
 
+extension OverseerAuthorizationEngine {
+    static func admitsDirectChildrenConsentRequest(
+        endpoint: DomainAgentSessionLinkEndpointIdentity, window: WindowState
+    ) -> Bool {
+        admitsDirectChildrenConsentRequest(
+            endpoint: endpoint,
+            facts: WindowStatesManager.shared.agentSessionLinkScopedObserverFacts(for: endpoint, in: window)
+        )
+    }
+
+    func scopedObserverAuthorization(
+        for endpoint: DomainAgentSessionLinkEndpointIdentity, window: WindowState
+    ) -> ScopedObserverStanding {
+        scopedObserverAuthorization(
+            for: endpoint,
+            facts: WindowStatesManager.shared.agentSessionLinkScopedObserverFacts(for: endpoint, in: window)
+        )
+    }
+
+    func authorizeScopedObserverLink(
+        observer: DomainAgentSessionLinkEndpointIdentity,
+        target: AgentSessionLinkEndpointCandidate,
+        scopeID: UUID,
+        window: WindowState,
+        projector: any DelegationMembershipProjector
+    ) -> DomainDelegationScopeDirectChildEndorsement? {
+        authorizeScopedObserverLink(
+            observer: observer,
+            observerFacts: WindowStatesManager.shared.agentSessionLinkScopedObserverFacts(for: observer, in: window),
+            target: target,
+            scopeID: scopeID,
+            projector: projector
+        )
+    }
+}
+
+extension WindowState {
+    func agentSessionLinkAdmitsDirectChildrenConsentRequest(
+        endpoint: DomainAgentSessionLinkEndpointIdentity
+    ) -> Bool {
+        OverseerAuthorizationEngine.admitsDirectChildrenConsentRequest(endpoint: endpoint, window: self)
+    }
+
+    func agentSessionLinkScopeLifecycleAdmission(
+        endpoint: DomainAgentSessionLinkEndpointIdentity,
+        isController: Bool,
+        runtime: DelegationScopeRuntime,
+        op: String,
+        requestsDirectChildren: Bool,
+        hasScopeID: Bool,
+        requestID: UUID?,
+        scopeID: UUID?
+    ) -> Bool {
+        runtime.authorization.admitsScopeLifecycleCall(
+            endpoint: endpoint,
+            isController: isController,
+            op: op,
+            requestsDirectChildren: requestsDirectChildren,
+            hasScopeID: hasScopeID,
+            requestID: requestID,
+            scopeID: scopeID,
+            observerStanding: runtime.authorization.scopedObserverAuthorization(for: endpoint, window: self)
+        )
+    }
+}
+
 extension WindowStatesManager {
+    func agentSessionLinkScopedObserverFacts(
+        for endpoint: DomainAgentSessionLinkEndpointIdentity,
+        in window: WindowState? = nil
+    ) -> ScopedObserverControllerFacts {
+        let resolvedWindow = window ?? sessionRuntimeWindows.first(where: { $0.windowID == endpoint.windowID })
+        guard let resolvedWindow else {
+            return ScopedObserverControllerFacts(
+                windowMatchesEndpoint: false, windowIsClosing: true, hasExactCurrentEndpoint: false,
+                hasSession: false, contextSessionMatchesEndpoint: false, hasMCPControlContext: false,
+                isMCPOriginated: false, parentSessionID: nil, createdByOverseerSessionID: nil,
+                taskLabelIsExplore: false, isDeletionBlocked: true, hasLoadedPersistedState: false,
+                bindingTransitionInProgress: false, candidateHasLoadedPersistedState: nil,
+                candidateHasDurableBinding: false, candidateIsClosing: true, candidateIsDeletionInProgress: true
+            )
+        }
+        let session = resolvedWindow.agentModeViewModel.session(for: endpoint.tabID, createIfNeeded: false)
+        let context = session?.mcpControlContext
+        let candidate = resolvedWindow.agentModeViewModel.agentSessionLinkCandidate(for: endpoint, includeLocation: false)
+        return ScopedObserverControllerFacts(
+            windowMatchesEndpoint: resolvedWindow.windowID == endpoint.windowID,
+            windowIsClosing: resolvedWindow.isClosing,
+            hasExactCurrentEndpoint: resolvedWindow.agentModeViewModel.agentSessionLinkObserverEndpoint(tabID: endpoint.tabID) == endpoint,
+            hasSession: session != nil,
+            contextSessionMatchesEndpoint: context?.sessionID == endpoint.sessionID,
+            hasMCPControlContext: context != nil,
+            isMCPOriginated: session?.isMCPOriginated ?? false,
+            parentSessionID: session?.parentSessionID,
+            createdByOverseerSessionID: session?.createdByOverseerSessionID,
+            taskLabelIsExplore: context?.taskLabelKind == .explore,
+            isDeletionBlocked: AgentSessionDeletionRegistry.shared.blocksNewOversight(sessionID: endpoint.sessionID),
+            hasLoadedPersistedState: session?.hasLoadedPersistedState ?? false,
+            bindingTransitionInProgress: session?.bindingTransitionInProgress ?? false,
+            candidateHasLoadedPersistedState: candidate?.eligibilityInput.hasLoadedPersistedState,
+            candidateHasDurableBinding: candidate?.eligibilityInput.hasDurableBinding ?? false,
+            candidateIsClosing: candidate?.isClosing ?? true,
+            candidateIsDeletionInProgress: candidate?.isDeletionInProgress ?? true
+        )
+    }
+
     func agentSessionLinkScopedObserverStanding(for endpoint: DomainAgentSessionLinkEndpointIdentity, engine: OverseerAuthorizationEngine) -> ScopedObserverStanding {
         guard let window = sessionRuntimeWindows.first(where: { $0.windowID == endpoint.windowID }) else { return .denied }
         return engine.scopedObserverAuthorization(for: endpoint, window: window)
     }
 
     func agentSessionLinkEndorseScopedObserver(observer: DomainAgentSessionLinkEndpointIdentity, target: AgentSessionLinkEndpointCandidate, scopeID: UUID, engine: OverseerAuthorizationEngine) -> Bool {
-        guard let window = sessionRuntimeWindows.first(where: { $0.windowID == observer.windowID }),
-              let currentTarget = agentSessionLinkCandidate(for: target.domainEndpoint, includeLocation: false) else { return false }
+        guard let currentTarget = agentSessionLinkCandidate(for: target.domainEndpoint, includeLocation: false) else { return false }
         let projector = SpawnProvenanceDelegationMembershipProjector(source: OpenWindowsDelegationProvenanceSource(windows: { self.sessionRuntimeWindows }))
-        return engine.authorizeScopedObserverLink(observer: observer, target: currentTarget, scopeID: scopeID, window: window, projector: projector) != nil
+        guard let window = sessionRuntimeWindows.first(where: { $0.windowID == observer.windowID }) else { return false }
+        return engine.authorizeScopedObserverLink(
+            observer: observer,
+            target: currentTarget,
+            scopeID: scopeID,
+            window: window,
+            projector: projector
+        ) != nil
     }
 }
 

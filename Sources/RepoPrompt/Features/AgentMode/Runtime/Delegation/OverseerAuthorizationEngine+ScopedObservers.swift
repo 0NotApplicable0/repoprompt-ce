@@ -11,20 +11,39 @@ enum ScopedObserverStanding: Equatable {
     case denied
 }
 
+struct ScopedObserverControllerFacts {
+    let windowMatchesEndpoint: Bool
+    let windowIsClosing: Bool
+    let hasExactCurrentEndpoint: Bool
+    let hasSession: Bool
+    let contextSessionMatchesEndpoint: Bool
+    let hasMCPControlContext: Bool
+    let isMCPOriginated: Bool
+    let parentSessionID: UUID?
+    let createdByOverseerSessionID: UUID?
+    let taskLabelIsExplore: Bool
+    let isDeletionBlocked: Bool
+    let hasLoadedPersistedState: Bool
+    let bindingTransitionInProgress: Bool
+    let candidateHasLoadedPersistedState: Bool?
+    let candidateHasDurableBinding: Bool
+    let candidateIsClosing: Bool
+    let candidateIsDeletionInProgress: Bool
+}
+
 extension OverseerAuthorizationEngine {
     static func admitsDirectChildrenConsentRequest(
-        endpoint: DomainAgentSessionLinkEndpointIdentity, window: WindowState
+        endpoint: DomainAgentSessionLinkEndpointIdentity, facts: ScopedObserverControllerFacts
     ) -> Bool {
-        guard !window.isClosing, endpoint.windowID == window.windowID,
-              endpoint.hasResolvedPersistentBinding,
-              window.agentModeViewModel.agentSessionLinkObserverEndpoint(tabID: endpoint.tabID) == endpoint,
-              let session = window.agentModeViewModel.session(for: endpoint.tabID, createIfNeeded: false),
-              let context = session.mcpControlContext, context.sessionID == endpoint.sessionID,
-              session.parentSessionID == nil, session.createdByOverseerSessionID == nil,
-              context.taskLabelKind != .explore,
-              !AgentSessionDeletionRegistry.shared.blocksNewOversight(sessionID: endpoint.sessionID)
-        else { return false }
-        return true
+        facts.windowMatchesEndpoint && !facts.windowIsClosing
+            && endpoint.hasResolvedPersistentBinding
+            && facts.hasExactCurrentEndpoint
+            && facts.hasSession
+            && facts.contextSessionMatchesEndpoint
+            && facts.parentSessionID == nil
+            && facts.createdByOverseerSessionID == nil
+            && !facts.taskLabelIsExplore
+            && !facts.isDeletionBlocked
     }
 
     // MARK: - Consent-only route policy
@@ -95,42 +114,45 @@ extension OverseerAuthorizationEngine {
     /// The supported-controller shape without its exact-endpoint or readiness proof (those are checked
     /// separately so a loading controller can be told apart from an unsupported one).
     private func hasSupportedControllerShape(
-        _ session: AgentTabSession, endpoint: DomainAgentSessionLinkEndpointIdentity
+        _ facts: ScopedObserverControllerFacts, endpoint: DomainAgentSessionLinkEndpointIdentity
     ) -> Bool {
         guard endpoint.hasResolvedPersistentBinding,
-              session.parentSessionID == nil, session.createdByOverseerSessionID == nil,
-              !AgentSessionDeletionRegistry.shared.blocksNewOversight(sessionID: endpoint.sessionID)
+              facts.hasSession,
+              facts.parentSessionID == nil,
+              facts.createdByOverseerSessionID == nil,
+              !facts.isDeletionBlocked
         else { return false }
-        if let context = session.mcpControlContext {
-            return context.sessionID == endpoint.sessionID && context.taskLabelKind != .explore
+        if facts.hasMCPControlContext {
+            return facts.contextSessionMatchesEndpoint && !facts.taskLabelIsExplore
         }
-        return session.isMCPOriginated
+        return facts.isMCPOriginated
     }
 
     /// Fresh scope + current controller + exact endpoint. Issued only here and only from facts the app
     /// owns: no caller-supplied role, title, brief, or root proof is read.
     func scopedObserverAuthorization(
-        for endpoint: DomainAgentSessionLinkEndpointIdentity, window: WindowState
+        for endpoint: DomainAgentSessionLinkEndpointIdentity, facts: ScopedObserverControllerFacts
     ) -> ScopedObserverStanding {
-        guard let scopes, !window.isClosing, endpoint.windowID == window.windowID else { return .denied }
+        guard let scopes, !facts.windowIsClosing, facts.windowMatchesEndpoint else { return .denied }
         let date = scopes.currentDate
         guard let record = scopes.liveScopes(grantedTo: endpoint.sessionID)
             .filter({ coversScopedObserver($0, endpoint: endpoint, at: date) })
             .max(by: { ($0.grant.grantedAt, $0.id.uuidString) < ($1.grant.grantedAt, $1.id.uuidString) }),
-            let session = window.agentModeViewModel.session(for: endpoint.tabID, createIfNeeded: false),
-            hasSupportedControllerShape(session, endpoint: endpoint)
+            hasSupportedControllerShape(facts, endpoint: endpoint)
         else { return .denied }
         func evidence(_ status: DomainDelegationScopedObserverEvidence.Status) -> DomainDelegationScopedObserverEvidence {
             DomainDelegationScopedObserverEvidence(
                 scopeID: record.id, scopeGeneration: record.generation, observer: endpoint, status: status
             )
         }
-        let candidate = window.agentModeViewModel.agentSessionLinkCandidate(for: endpoint, includeLocation: false)
-        let candidateLoading = candidate.map { !$0.eligibilityInput.hasLoadedPersistedState } ?? false
-        let loading = session.mcpControlContext == nil || !session.hasLoadedPersistedState || session.bindingTransitionInProgress || candidateLoading
+        let candidateLoading = facts.candidateHasLoadedPersistedState.map { !$0 } ?? false
+        let loading = !facts.hasMCPControlContext || !facts.hasLoadedPersistedState
+            || facts.bindingTransitionInProgress || candidateLoading
         if loading { return .awaitingReproof(evidence(.awaitingReproof)) }
-        guard Self.admitsDirectChildrenConsentRequest(endpoint: endpoint, window: window), let candidate,
-              candidate.eligibilityInput.hasDurableBinding, !candidate.isClosing, !candidate.isDeletionInProgress
+        guard Self.admitsDirectChildrenConsentRequest(endpoint: endpoint, facts: facts),
+              facts.candidateHasDurableBinding,
+              !facts.candidateIsClosing,
+              !facts.candidateIsDeletionInProgress
         else { return .denied }
         return .authorized(evidence(.authorized))
     }
@@ -156,14 +178,14 @@ extension OverseerAuthorizationEngine {
     /// exact endpoint, and its parent must agree with the projector.
     func authorizeScopedObserverLink(
         observer: DomainAgentSessionLinkEndpointIdentity,
+        observerFacts: ScopedObserverControllerFacts,
         target: AgentSessionLinkEndpointCandidate,
         scopeID: UUID,
-        window: WindowState,
         projector: any DelegationMembershipProjector
     ) -> DomainDelegationScopeDirectChildEndorsement? {
         guard let scopes, let record = scopes.record(id: scopeID),
               coversScopedObserver(record, endpoint: observer, at: scopes.currentDate),
-              case .authorized = scopedObserverAuthorization(for: observer, window: window),
+              case .authorized = scopedObserverAuthorization(for: observer, facts: observerFacts),
               case let .directChildren(root, workspaceID) = record.grant.kind,
               target.workspaceID == workspaceID, target.sessionID != observer.sessionID,
               target.parentSessionID == root,

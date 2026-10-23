@@ -71,19 +71,23 @@ struct SessionAdminMCPToolService {
         }
 
         let endpoint = try await resolveCaller()
-        let isController = try OverseerAuthorizationEngine.admitsDirectChildrenConsentRequest(
-            endpoint: endpoint, window: requireTargetWindow()
-        )
+        let window = try requireTargetWindow()
+        let isController = window.agentSessionLinkAdmitsDirectChildrenConsentRequest(endpoint: endpoint)
         let requestsDirectChildren = op == "request_scope"
             && AgentMCPToolHelpers.normalizedString(args["kind"])?.lowercased() == "direct_children"
         if requestsDirectChildren, !isController { throw Self.unavailableError }
         let routedRequestID: UUID? = isController && ["scope_status", "release_scope"].contains(op)
             ? try Self.parseUUID(args["request_id"], field: "request_id") : nil
-        guard try scopes().authorization.admitsScopeLifecycleCall(
-            endpoint: endpoint, isController: isController, op: op,
-            requestsDirectChildren: requestsDirectChildren, hasScopeID: args["scope_id"] != nil, requestID: routedRequestID,
-            scopeID: Self.parseUUID(args["scope_id"], field: "scope_id"),
-            observerStanding: scopes().authorization.scopedObserverAuthorization(for: endpoint, window: requireTargetWindow())
+        let scopeID = try Self.parseUUID(args["scope_id"], field: "scope_id")
+        guard window.agentSessionLinkScopeLifecycleAdmission(
+            endpoint: endpoint,
+            isController: isController,
+            runtime: scopes(),
+            op: op,
+            requestsDirectChildren: requestsDirectChildren,
+            hasScopeID: args["scope_id"] != nil,
+            requestID: routedRequestID,
+            scopeID: scopeID
         ) else { throw Self.unavailableError }
         let caller = DomainAgentSessionCallerIdentity.agentSession(endpoint.sessionID)
         let value: Value = switch op {
