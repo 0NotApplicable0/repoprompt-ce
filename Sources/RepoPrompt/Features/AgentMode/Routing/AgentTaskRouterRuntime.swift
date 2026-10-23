@@ -194,11 +194,6 @@ private actor AgentTaskRouterActivation {
         receive(snapshot, id: id)
     }
 
-    private func receiveSnapshot(_ snapshot: DecisionReadiness, id: DecisionServiceID, streamVersion: UInt64) {
-        guard readinessStreamVersions[id, default: 0] == streamVersion else { return }
-        receive(snapshot, id: id)
-    }
-
     private func receive(_ snapshot: DecisionReadiness, id: DecisionServiceID) {
         guard !stopped, snapshot.generation >= (readiness[id]?.generation ?? 0) else { return }
         readiness[id] = snapshot
@@ -264,7 +259,8 @@ private actor AgentTaskRouterActivation {
     private func bootstrap(id: DecisionServiceID, controller: any DecisionServiceConfigurationController, epoch admittedEpoch: UInt64) async {
         let streamVersion = readinessStreamVersions[id, default: 0]
         let state = await controller.readinessSnapshot()
-        receiveSnapshot(state, id: id, streamVersion: streamVersion)
+        // Snapshots qualify bootstrap admission, not readiness publication. Publishing them
+        // can jump ahead of queued same-generation stream updates and then regress readiness.
         guard let source else { return }
         let latest = await source.routerDemandSnapshot()
         guard !stopped, !Task.isCancelled, admittedEpoch == epoch,
@@ -283,11 +279,9 @@ private actor AgentTaskRouterActivation {
         attemptedGenerations[id] = state.generation
         await controller.bootstrapStoredConfigurationIfNeeded()
         guard !stopped else { return }
-        let finalStreamVersion = readinessStreamVersions[id, default: 0]
         let final = await controller.readinessSnapshot()
         attemptedGenerations[id] = max(attemptedGenerations[id] ?? 0, final.generation)
         bootstraps[id] = nil
-        receiveSnapshot(final, id: id, streamVersion: finalStreamVersion)
     }
 
     func waitUntilInitialized() async {

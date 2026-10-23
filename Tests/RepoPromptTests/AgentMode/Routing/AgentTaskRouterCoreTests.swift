@@ -1038,6 +1038,26 @@ final class AgentTaskRouterRuntimeTests: XCTestCase {
         }
     }
 
+    func testBootstrapSnapshotCannotOvertakeOrderedReadinessUpdates() async throws {
+        let source = RuntimeTestDemandSource(.init(routerEnabled: true, selectedBackendRawValue: "jev", autoEffortEnabled: false, routerRevision: 0))
+        let ready = DecisionReadiness.ready(generation: 1, policyVersion: "test")
+        let jev = RuntimeTestController(bootstrapReadiness: ready)
+        let runtime = try makeRuntime(source, jev, RuntimeTestController())
+        await jev.waitUntilObserved()
+        await runtime.reconcileDemand()
+        // The controller's final snapshot is already ready, while stream delivery is held.
+        // It must not publish ahead of the ordered validating -> ready updates.
+        XCTAssertEqual(runtime.backendReadiness(.jev), .needsConfiguration(generation: 0, reason: "test"))
+        let calls = await jev.calls
+        XCTAssertEqual(calls, 1)
+        await jev.set(.validating(generation: 1))
+        try await waitForReadiness(.validating(generation: 1), id: .jev, runtime: runtime)
+        await jev.set(ready)
+        try await waitForReadiness(ready, id: .jev, runtime: runtime)
+        XCTAssertTrue(runtime.isBackendReady(.jev))
+        await runtime.teardown()
+    }
+
     func testEnabledLegacyProductionIntentBootstrapsJevWithoutSettingsVM() async throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
@@ -1263,9 +1283,11 @@ private actor RuntimeTestController: DecisionServiceConfigurationController {
     private var gateAdmission: Bool
     private var admissionWaiters: [CheckedContinuation<Void, Never>] = []
     private var releases: [CheckedContinuation<Void, Never>] = []
-    init(state: DecisionReadiness = .needsConfiguration(generation: 0, reason: "test"), gateAdmission: Bool = false) {
+    private let bootstrapReadiness: DecisionReadiness?
+    init(state: DecisionReadiness = .needsConfiguration(generation: 0, reason: "test"), gateAdmission: Bool = false, bootstrapReadiness: DecisionReadiness? = nil) {
         self.state = state
         self.gateAdmission = gateAdmission
+        self.bootstrapReadiness = bootstrapReadiness
     }
 
     func readinessSnapshot() async -> DecisionReadiness {
@@ -1310,6 +1332,7 @@ private actor RuntimeTestController: DecisionServiceConfigurationController {
 
     func bootstrapStoredConfigurationIfNeeded() {
         calls += 1
+        if let bootstrapReadiness { state = bootstrapReadiness }
     }
 
     func cancelAndAdvanceGeneration() {
