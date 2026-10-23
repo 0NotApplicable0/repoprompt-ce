@@ -1420,7 +1420,7 @@ final class SessionAdminScopeLifecycleTests: XCTestCase {
         }
     }
 
-    private func frontDoorRoute() async throws -> (
+    private func frontDoorRoute(ordinaryFullAccess: Bool = false) async throws -> (
         service: SessionAdminMCPToolService, record: DomainDelegationScopeRecord, host: RouteHost,
         endpoint: DomainAgentSessionLinkEndpointIdentity, fixture: Fixture
     ) {
@@ -1446,7 +1446,13 @@ final class SessionAdminScopeLifecycleTests: XCTestCase {
             administration: { frontDoor }
         )
         service.isToolEnabled = { true }
-        return try (service, grantDirectChildren(fixture, endpoint), host, endpoint, fixture)
+        guard ordinaryFullAccess else { return try (service, grantDirectChildren(fixture, endpoint), host, endpoint, fixture) }
+        fixture.runtime.isGlobalAutoApproveEnabled = { true }
+        let request = try fixture.runtime.requestScope(
+            requesterSessionID: endpoint.sessionID, requesterTabID: endpoint.tabID, kind: .tree(rootSessionID: endpoint.sessionID),
+            capabilities: [.observe, .control, .restructure], guardrails: .init(), expiresInSeconds: 3600, reason: nil, idempotencyKey: nil
+        ).get()
+        return try (service, fixture.runtime.approve(requestID: request.id).get(), host, endpoint, fixture)
     }
 
     func testRealFrontDoorLinkDeliversOriginalControllerEndpointToTheStructureHost() async throws {
@@ -1484,6 +1490,58 @@ final class SessionAdminScopeLifecycleTests: XCTestCase {
         XCTAssertTrue(host.added.isEmpty, "A rebound observer creates no link through the real front door")
     }
 
+    func testRealFrontDoorOrdinaryCallerLinksAnotherObserverAndDeliversItsOwnEndpoint() async throws {
+        let (service, record, host, endpoint, fixture) = try await frontDoorRoute(ordinaryFullAccess: true)
+        let observer = UUID(), child = UUID()
+        fixture.source.add(observer, parent: endpoint.sessionID, workspace: endpoint.workspaceID)
+        fixture.source.add(child, parent: endpoint.sessionID, workspace: endpoint.workspaceID)
+        let reply = try await service.execute(args: [
+            "op": .string("link"), "scope_id": .string(record.id.uuidString), "session_id": .string(child.uuidString),
+            "observer_session_id": .string(observer.uuidString)
+        ])
+        XCTAssertEqual(try linkItemResults(XCTUnwrap(reply.objectValue)), ["linked"], "\(reply)")
+        XCTAssertEqual(host.added.map(\.observer), [observer])
+        XCTAssertEqual(host.receivedCallerEndpoints, [endpoint], "The host receives the caller's own endpoint, not the observer's")
+    }
+
+    @MainActor
+    func testCallerContinuityLooksUpTheCallerNotTheObserver() {
+        let workspace = UUID(), tab = UUID()
+        func endpoint(_ session: UUID) -> DomainAgentSessionLinkEndpointIdentity {
+            DomainAgentSessionLinkEndpointIdentity(
+                windowID: 1, workspaceID: workspace, tabID: tab, sessionID: session,
+                persistentBindingGeneration: UUID(), bindingTransitionGeneration: 1
+            )
+        }
+        let callerID = UUID(), observerID = UUID()
+        let callerEndpoint = endpoint(callerID), observerEndpoint = endpoint(observerID)
+        var table = [callerID: callerEndpoint, observerID: observerEndpoint]
+        let lookup: (UUID) -> DomainAgentSessionLinkEndpointIdentity? = { table[$0] }
+        XCTAssertTrue(
+            SessionAdminWindowsStructureHost.callerEndpointIsCurrent(callerEndpoint, lookup: lookup),
+            "An ordinary caller linking another observer stays current"
+        )
+        let guarded = SessionAdminWindowsStructureHost.originalCallerContinuity(
+            callerEndpoint: callerEndpoint, lookup: lookup, isStillAuthorized: { true }
+        )
+        XCTAssertTrue(guarded(), "The bridge callback keeps an ordinary cross-observer link authorized")
+        table[callerID] = reboundEndpoint(callerEndpoint)
+        XCTAssertFalse(
+            SessionAdminWindowsStructureHost.callerEndpointIsCurrent(callerEndpoint, lookup: lookup),
+            "A rebound caller refuses"
+        )
+        XCTAssertFalse(guarded(), "A rebound caller refuses at the bridge callback")
+        table[callerID] = nil
+        XCTAssertFalse(
+            SessionAdminWindowsStructureHost.callerEndpointIsCurrent(callerEndpoint, lookup: lookup),
+            "A lost caller binding refuses"
+        )
+        XCTAssertTrue(
+            SessionAdminWindowsStructureHost.callerEndpointIsCurrent(nil, lookup: lookup),
+            "No routed caller endpoint keeps today's behavior"
+        )
+    }
+
     @MainActor
     func testShippedHostBridgeCallbackRefusesWhenObserverEndpointChangesAfterAdmission() {
         let endpoint = DomainAgentSessionLinkEndpointIdentity(
@@ -1492,10 +1550,10 @@ final class SessionAdminScopeLifecycleTests: XCTestCase {
         )
         var current: DomainAgentSessionLinkEndpointIdentity? = endpoint
         let guarded = SessionAdminWindowsStructureHost.originalCallerContinuity(
-            callerEndpoint: endpoint, observer: endpoint.sessionID, currentEndpoint: { current }, isStillAuthorized: { true }
+            callerEndpoint: endpoint, lookup: { _ in current }, isStillAuthorized: { true }
         )
         let unrouted = SessionAdminWindowsStructureHost.originalCallerContinuity(
-            callerEndpoint: nil, observer: endpoint.sessionID, currentEndpoint: { current }, isStillAuthorized: { true }
+            callerEndpoint: nil, lookup: { _ in current }, isStillAuthorized: { true }
         )
         XCTAssertTrue(guarded(), "Unchanged endpoint stays authorized")
         current = reboundEndpoint(endpoint)
@@ -1504,7 +1562,7 @@ final class SessionAdminScopeLifecycleTests: XCTestCase {
         XCTAssertFalse(guarded(), "A lost binding refuses")
         XCTAssertTrue(unrouted(), "Callers with no routed endpoint keep today's behavior")
         let revoked = SessionAdminWindowsStructureHost.originalCallerContinuity(
-            callerEndpoint: endpoint, observer: endpoint.sessionID, currentEndpoint: { endpoint }, isStillAuthorized: { false }
+            callerEndpoint: endpoint, lookup: { _ in endpoint }, isStillAuthorized: { false }
         )
         XCTAssertFalse(revoked(), "Revoked authority still refuses")
     }

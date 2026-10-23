@@ -319,14 +319,14 @@ final class SessionAdminWindowsStructureHost: SessionAdminStructureHost {
     ) async -> SessionAdminLinkOutcome {
         guard !Task.isCancelled, isStillAuthorized() else { return .revoked }
         let isStillAuthorized = Self.originalCallerContinuity(
-            callerEndpoint: callerEndpoint, observer: observer, isStillAuthorized: isStillAuthorized
+            callerEndpoint: callerEndpoint, isStillAuthorized: isStillAuthorized
         )
         let manager = WindowStatesManager.shared
         let initialObservers = WindowStatesManager.shared.agentSessionLinkCandidates(forSessionIDs: [observer], includeLocation: false)
         guard let initialObserver = initialObservers[observer]?.only?.domainEndpoint else {
             return .failed("observer_changed: The requesting session has no exact current binding; nothing was linked.")
         }
-        guard callerEndpoint == nil || callerEndpoint == initialObserver else {
+        guard Self.callerEndpointIsCurrent(callerEndpoint) else {
             return .failed("observer_changed: The requesting session's exact binding changed; nothing was linked.")
         }
         manager.beginPreparedOversightPreparation(target)
@@ -349,7 +349,7 @@ final class SessionAdminWindowsStructureHost: SessionAdminStructureHost {
             forSessionIDs: [observer, target], includeLocation: false
         )
         guard let observerEndpoint = candidates[observer]?.only?.domainEndpoint, observerEndpoint == initialObserver,
-              callerEndpoint == nil || callerEndpoint == observerEndpoint
+              Self.callerEndpointIsCurrent(callerEndpoint)
         else {
             return .failed("observer_changed: The requesting session's exact binding changed; nothing was linked.")
         }
@@ -399,16 +399,12 @@ final class SessionAdminWindowsStructureHost: SessionAdminStructureHost {
         callerEndpoint: DomainAgentSessionLinkEndpointIdentity?,
         isStillAuthorized: @escaping @MainActor () -> Bool
     ) async -> SessionAdminLinkOutcome {
-        let observerChanged = {
-            callerEndpoint.map {
-                WindowStatesManager.shared.agentSessionLinkCandidates(forSessionIDs: [observer], includeLocation: false)[observer]?.only?.domainEndpoint != $0
-            } ?? false
-        }
+        let observerChanged = { !Self.callerEndpointIsCurrent(callerEndpoint) }
         guard !observerChanged() else {
             return .failed("observer_changed: The requesting session's exact binding changed; nothing was unlinked.")
         }
         let isStillAuthorized = Self.originalCallerContinuity(
-            callerEndpoint: callerEndpoint, observer: observer, isStillAuthorized: isStillAuthorized
+            callerEndpoint: callerEndpoint, isStillAuthorized: isStillAuthorized
         )
         let bridge = bridge()
         guard let link = await bridge.delegationActiveLink(observerSessionID: observer, targetSessionID: target) else {
@@ -429,17 +425,25 @@ final class SessionAdminWindowsStructureHost: SessionAdminStructureHost {
         }
     }
 
+    static func currentEndpoint(of sessionID: UUID) -> DomainAgentSessionLinkEndpointIdentity? {
+        WindowStatesManager.shared.agentSessionLinkCandidates(forSessionIDs: [sessionID], includeLocation: false)[sessionID]?.only?.domainEndpoint
+    }
+
+    static func callerEndpointIsCurrent(
+        _ callerEndpoint: DomainAgentSessionLinkEndpointIdentity?,
+        lookup: (UUID) -> DomainAgentSessionLinkEndpointIdentity? = SessionAdminWindowsStructureHost.currentEndpoint(of:)
+    ) -> Bool {
+        guard let callerEndpoint else { return true }
+        return lookup(callerEndpoint.sessionID) == callerEndpoint
+    }
+
     static func originalCallerContinuity(
         callerEndpoint: DomainAgentSessionLinkEndpointIdentity?,
-        observer: UUID,
-        currentEndpoint: (@MainActor () -> DomainAgentSessionLinkEndpointIdentity?)? = nil,
+        lookup: @escaping (UUID) -> DomainAgentSessionLinkEndpointIdentity? = SessionAdminWindowsStructureHost.currentEndpoint(of:),
         isStillAuthorized: @escaping @MainActor () -> Bool
     ) -> @MainActor () -> Bool {
-        guard let callerEndpoint else { return isStillAuthorized }
-        let current = currentEndpoint ?? {
-            WindowStatesManager.shared.agentSessionLinkCandidates(forSessionIDs: [observer], includeLocation: false)[observer]?.only?.domainEndpoint
-        }
-        return { isStillAuthorized() && current() == callerEndpoint }
+        guard callerEndpoint != nil else { return isStillAuthorized }
+        return { isStillAuthorized() && callerEndpointIsCurrent(callerEndpoint, lookup: lookup) }
     }
 
     func setModel(
