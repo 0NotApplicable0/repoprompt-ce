@@ -169,6 +169,8 @@ final class OverseerContinuityRepository: @unchecked Sendable {
             workspace = nil
         case let .tree(root): anchor = root.uuidString
             workspace = nil
+        case let .directChildren(root, id): anchor = root.uuidString
+            workspace = id.uuidString
         case let .workspace(id): anchor = nil
             workspace = id.uuidString
         case .allSessions: anchor = nil
@@ -207,6 +209,9 @@ final class OverseerContinuityRepository: @unchecked Sendable {
                 result.sessions.insert(grant.granteeSessionID.uuidString)
                 switch grant.kind {
                 case let .session(id), let .tree(id): result.sessions.insert(id.uuidString)
+                case let .directChildren(root, id):
+                    result.sessions.insert(root.uuidString)
+                    result.workspaces.insert(id.uuidString)
                 case let .workspace(id): result.workspaces.insert(id.uuidString)
                 case .allSessions: break
                 }

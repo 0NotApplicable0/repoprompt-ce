@@ -38,7 +38,7 @@ struct DelegationProvenanceSnapshot {
             placementConflicts[target] == nil && placementConflicts[scope.granteeSessionID] == nil
         case let .workspace(workspaceID):
             !placementConflicts.values.contains { $0.isEmpty || $0.contains(workspaceID) }
-        case .tree, .allSessions:
+        case .tree, .directChildren, .allSessions:
             // A disputed ancestor could hide descendants from a tree census. Never count its
             // absence as free capacity; resolving that disagreement belongs to its real owner.
             placementConflicts.isEmpty

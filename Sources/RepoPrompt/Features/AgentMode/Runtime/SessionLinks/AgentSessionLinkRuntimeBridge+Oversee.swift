@@ -217,12 +217,10 @@ extension AgentSessionLinkRuntimeBridge {
         }
         func consentIsCurrent() -> Bool {
             scopes.reconcileGlobalAutoApprove()
-            return !Task.isCancelled && scopes.linkConsent.permits(
-                scopeID: scopeID, observer: observer.sessionID, target: targetSessionID, at: Date()
-            )
+            return !Task.isCancelled && sourceConsentEligibility(for: .init(observerSessionID: observer.sessionID, targetSessionID: targetSessionID, sourceScopeID: scopeID)) == .eligible
         }
         func interruptionCode() -> String {
-            if !scopes.linkConsent.permits(scopeID: scopeID, observer: observer.sessionID, target: targetSessionID, at: Date()) { return "scope_revoked" }
+            if sourceConsentEligibility(for: .init(observerSessionID: observer.sessionID, targetSessionID: targetSessionID, sourceScopeID: scopeID)) != .eligible { return "scope_revoked" }
             return Task.isCancelled ? "continuation_cancelled" : "caller_changed"
         }
         let required: Set<DomainDelegationScopeCapability> = [.observe, .control, .restructure]

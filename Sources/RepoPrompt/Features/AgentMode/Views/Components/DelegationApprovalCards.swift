@@ -145,7 +145,7 @@ struct DelegationActiveScopesSection: View {
                     .font(.headline)
                 if globalAutoApprove {
                     Label(
-                        "Overseer full access is on: no approvals or confirmation cards (Settings › Agent Permissions › Overseer).",
+                        "Overseer full access is on. Direct-child delegation still requires its own explicit consent; other approvals and confirmation cards are bypassed (Settings › Agent Permissions › Overseer).",
                         systemImage: "checkmark.shield"
                     )
                     .font(.caption)
@@ -156,7 +156,7 @@ struct DelegationActiveScopesSection: View {
                         VStack(alignment: .leading, spacing: 2) {
                             Text(DelegationDisplayNames.sessionTitle(sessionID) ?? "Session \(sessionID.uuidString.prefix(8))")
                                 .lineLimit(1)
-                            Text("Grant all for this session: new requests are approved without a card")
+                            Text("Grant all for this session: new requests except direct-child delegation are approved without a card")
                                 .font(.caption2)
                                 .foregroundStyle(.secondary)
                         }
@@ -200,7 +200,6 @@ struct DelegationActiveScopesSection: View {
                             Text(Self.summary(scope))
                                 .font(.caption2)
                                 .foregroundStyle(.secondary)
-                                .lineLimit(2)
                         }
                         Spacer()
                         Button("Revoke") { runtime.revoke(scopeID: scope.id) }
@@ -216,6 +215,8 @@ struct DelegationActiveScopesSection: View {
         let kind = switch scope.grant.kind {
         case let .session(target): "only session \(DelegationDisplayNames.sessionTitle(target) ?? target.uuidString)"
         case .tree: "its own tree"
+        case let .directChildren(root, workspace):
+            "session \(root.uuidString)'s existing and future directly spawned sessions in workspace \(workspace.uuidString), excluding indirect, adopted and creator-only lanes"
         case let .workspace(workspaceID): "workspace \(DelegationDisplayNames.workspaceName(workspaceID) ?? workspaceID.uuidString.prefix(8).description)"
         case .allSessions: "all sessions"
         }
@@ -225,7 +226,11 @@ struct DelegationActiveScopesSection: View {
             .joined(separator: ", ")
         let expiry = scope.grant.guardrails.expiresAt
             .map { " · expires \($0.formatted(date: .abbreviated, time: .shortened))" } ?? ""
-        return "\(kind) · \(capabilities)\(expiry)"
+        let summary = "\(kind) · \(capabilities)\(expiry)"
+        if case .directChildren = scope.grant.kind {
+            return summary + ". " + DelegationScopeApprovalCard.directChildrenDisclosure
+        }
+        return summary
     }
 }
 
@@ -254,7 +259,8 @@ struct DelegationScopeApprovalCard: View {
         self.authorityUnavailableReason = authorityUnavailableReason
         self.onApprove = onApprove
         self.onDeny = onDeny
-        self.onGrantAll = onGrantAll
+        if case .directChildren = request.kind { self.onGrantAll = nil }
+        else { self.onGrantAll = onGrantAll }
         _selected = State(initialValue: request.capabilities)
         _threshold = State(initialValue: request.guardrails.bulkConfirmationThreshold)
     }
@@ -305,6 +311,12 @@ struct DelegationScopeApprovalCard: View {
             Text(guardrailSummary)
                 .font(.caption)
                 .foregroundStyle(.secondary)
+
+            if case .directChildren = request.kind {
+                Text(Self.directChildrenDisclosure)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
 
             Stepper(value: $threshold, in: 1 ... 500) {
                 Text("Ask me before bulk changes over \(threshold) items")
@@ -384,18 +396,22 @@ struct DelegationScopeApprovalCard: View {
         reason.count > 1024 ? String(reason.prefix(1024)) + "… (truncated)" : reason
     }
 
-    private var kindDescription: String {
+    static let directChildrenDisclosure = "This consent covers managed observation, steering, responding to prompts and approvals, and stopping. It permits explicit managed links but creates no links automatically. Revoking this grant ends Overseer links and their managed actions. Existing parent-session controls and already-started work are separate."
+
+    var kindDescription: String {
         let requester = request.requesterTitle.map { "\"\($0)\" asks for " } ?? "Asks for "
         let scope = switch request.kind {
         case let .session(target): "only session \"\(DelegationDisplayNames.sessionTitle(target) ?? target.uuidString)\" (\(target.uuidString))"
         case .tree: "this session and the sessions it creates"
+        case let .directChildren(root, workspace):
+            "existing and future sessions directly spawned by requester \(root.uuidString) in workspace \(request.workspaceName.map { "\"\($0)\" " } ?? "")\(workspace.uuidString). Only immutable direct children still under this requester qualify; not siblings, grandchildren, adopted sessions, creator-only lanes, native-host subagents, or another workspace"
         case .workspace: "every session in workspace \"\(request.workspaceName ?? "this workspace")\""
         case .allSessions: "every session you own"
         }
         return requester + scope
     }
 
-    private var guardrailSummary: String {
+    var guardrailSummary: String {
         let guardrails = request.guardrails
         var parts: [String] = []
         if let limit = guardrails.maxLiveSessions { parts.append("max \(limit) live sessions") }

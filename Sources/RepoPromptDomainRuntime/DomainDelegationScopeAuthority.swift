@@ -1,7 +1,7 @@
 import Foundation
 
 /// A user's grant request, before it becomes a scope.
-package struct DomainDelegationScopeGrantRequest: Hashable, Sendable {
+package struct DomainDelegationScopeGrantRequest: Hashable {
     package let granteeSessionID: UUID
     package let kind: DomainDelegationScopeKind
     package let capabilities: Set<DomainDelegationScopeCapability>
@@ -28,7 +28,7 @@ package struct DomainDelegationScopeGrantRequest: Hashable, Sendable {
 ///
 /// `memberships` and `usage` are computed by the app from persisted provenance and live state; the
 /// MCP layer must never derive them from tool arguments.
-package struct DomainDelegationScopeAuthorizationRequest: Sendable {
+package struct DomainDelegationScopeAuthorizationRequest {
     package let operation: DomainAgentSessionTargetOperation
     package let caller: DomainAgentSessionCallerIdentity
     package let scopeID: UUID
@@ -76,7 +76,7 @@ package struct DomainDelegationScopeAuthorizationRequest: Sendable {
     }
 }
 
-package enum DomainDelegationScopeAuthorizationOutcome: Equatable, Sendable {
+package enum DomainDelegationScopeAuthorizationOutcome: Equatable {
     /// Every admitted target is authorized; `requires_control` items are set aside, not failed.
     /// Scope-level operations return no leases.
     case authorized(DomainDelegationScopeAuthorizedItems)
@@ -120,13 +120,13 @@ package enum DomainDelegationScopeAuthorizationOutcome: Equatable, Sendable {
 /// 4. guardrails allow the operation (spawn and worktree creation);
 /// 5. a batch confirmation card is not required for the admitted items, or a matching approved
 ///    one is presented.
-package struct DomainDelegationScopeAuthority: Sendable {
+package struct DomainDelegationScopeAuthority {
     private var records: [UUID: DomainDelegationScopeRecord] = [:]
     private var lastGeneration: UInt64 = 0
     // Derived addresses only; records remain the sole scope authority.
     private var scopeIDsByGrantee: [UUID: Set<UUID>] = [:]
     private var childScopeIDs: [UUID: Set<UUID>] = [:]
-    private struct Expiry: Sendable {
+    private struct Expiry {
         let scopeID: UUID
         let date: Date
     }
@@ -234,9 +234,18 @@ package struct DomainDelegationScopeAuthority: Sendable {
         capabilities: Set<DomainDelegationScopeCapability>,
         guardrails: DomainDelegationScopeGuardrails,
         now: Date,
-        unrestricted: Bool = false
+        unrestricted: Bool = false,
+        granteeSessionID: UUID? = nil
     ) -> DomainDelegationScopeDenial? {
         guard !capabilities.isEmpty else { return .capabilitiesEmpty }
+        if case let .directChildren(rootSessionID, _) = kind {
+            guard granteeSessionID == rootSessionID else { return .directChildrenRootNotGrantee }
+            let forbidden = capabilities.subtracting(DomainDelegationScopeCapability.directChildrenPermitted)
+            if let first = DomainDelegationScopeCapability.allCases.first(where: forbidden.contains) {
+                return .capabilityNotPermittedForKind(first)
+            }
+            if guardrails.maxLiveSessions != nil || guardrails.maxWorktrees != nil { return .guardrailsMalformed }
+        }
         if case .allSessions = kind, !unrestricted {
             let forbidden = capabilities.subtracting(DomainDelegationScopeCapability.allSessionsPermitted)
             if let first = DomainDelegationScopeCapability.allCases.first(where: forbidden.contains) {
@@ -264,7 +273,8 @@ package struct DomainDelegationScopeAuthority: Sendable {
             capabilities: request.capabilities,
             guardrails: request.guardrails,
             now: now,
-            unrestricted: request.unrestricted
+            unrestricted: request.unrestricted,
+            granteeSessionID: request.granteeSessionID
         ) {
             return .failure(denial)
         }
@@ -398,6 +408,7 @@ package struct DomainDelegationScopeAuthority: Sendable {
                 if record.grant.granteeSessionID == sessionID { return true }
                 if case let .session(target) = record.grant.kind { return target == sessionID }
                 if case let .tree(rootSessionID) = record.grant.kind { return rootSessionID == sessionID }
+                if case let .directChildren(rootSessionID, _) = record.grant.kind { return rootSessionID == sessionID }
                 return false
             }
             .map(\.id)
@@ -452,7 +463,8 @@ package struct DomainDelegationScopeAuthority: Sendable {
                     capabilities: grant.capabilities,
                     guardrails: grant.guardrails,
                     now: now,
-                    unrestricted: grant.unrestricted
+                    unrestricted: grant.unrestricted,
+                    granteeSessionID: grant.granteeSessionID
                 ) == nil else { continue }
                 installed.append(install(grant, state: .active))
                 progressed = true
@@ -837,6 +849,9 @@ package struct DomainDelegationScopeAuthority: Sendable {
         if case .allSessions = grant.kind, !grant.unrestricted {
             return DomainDelegationScopeCapability.allSessionsPermitted.contains(capability)
         }
+        if case .directChildren = grant.kind {
+            return DomainDelegationScopeCapability.directChildrenPermitted.contains(capability)
+        }
         return true
     }
 
@@ -855,6 +870,8 @@ package struct DomainDelegationScopeAuthority: Sendable {
             return path.first == targetSessionID
                 && path.last == rootSessionID
                 && Set(path).count == path.count
+        case let (.directChildren(rootSessionID, workspaceID), .directChild(proofRootSessionID, proofWorkspaceID)):
+            return rootSessionID == proofRootSessionID && workspaceID == proofWorkspaceID && targetSessionID != rootSessionID
         case let (.workspace(workspaceID), .workspace(proofWorkspaceID)):
             return workspaceID == proofWorkspaceID
         case (.allSessions, .allSessions):
@@ -885,8 +902,8 @@ package struct DomainDelegationScopeAuthority: Sendable {
         return record
     }
 
-    // Deadlines are immutable for a granted identity. Revoked entries are discarded lazily
-    // at their deadline; reads never scan unrelated records looking for the next expiration.
+    /// Deadlines are immutable for a granted identity. Revoked entries are discarded lazily
+    /// at their deadline; reads never scan unrelated records looking for the next expiration.
     private mutating func insertExpiry(_ expiry: Expiry) {
         expiries.append(expiry)
         var index = expiries.count - 1

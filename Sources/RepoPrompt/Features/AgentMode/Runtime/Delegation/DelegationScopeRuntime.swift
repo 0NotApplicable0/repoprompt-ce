@@ -301,6 +301,7 @@ final class DelegationScopeRuntime: ObservableObject {
                 guard !deletedSessionIDs.contains(grant.granteeSessionID) else { return false }
                 if case let .session(target) = grant.kind { return !deletedSessionIDs.contains(target) }
                 if case let .tree(root) = grant.kind { return !deletedSessionIDs.contains(root) }
+                if case let .directChildren(root, _) = grant.kind { return !deletedSessionIDs.contains(root) }
                 return true
             }
             let installed = authority.reactivate(compatible, revokedScopeIDs: Set(revokedScopeIDs), now: now())
@@ -344,6 +345,7 @@ final class DelegationScopeRuntime: ObservableObject {
             guard !deletedSessionIDs.contains(original.granteeSessionID) else { continue }
             if case let .session(target) = original.kind, deletedSessionIDs.contains(target) { continue }
             if case let .tree(root) = original.kind, deletedSessionIDs.contains(root) { continue }
+            if case let .directChildren(root, _) = original.kind, deletedSessionIDs.contains(root) { continue }
             do {
                 let request = try requestScope(
                     requesterSessionID: original.granteeSessionID,
@@ -372,7 +374,7 @@ final class DelegationScopeRuntime: ObservableObject {
         retryTask?.cancel()
         retryTask = nil
         availability = .terminating
-        linkConsent.replace([])
+        linkConsent.publish([])
         overseeContinuations.removeAll()
         overseeInitialRequests.removeAll()
         for running in overseeContinuationTasks.values {
@@ -440,6 +442,11 @@ final class DelegationScopeRuntime: ObservableObject {
         guard canUseAuthority else { return false }
         expireDueScopes()
         return authority.hasLiveScope(grantedTo: sessionID, now: now())
+    }
+
+    /// This runtime's clock, so engine decisions share the grant-expiry time base.
+    var currentDate: Date {
+        now()
     }
 
     func liveScopes(grantedTo sessionID: UUID) -> [DomainDelegationScopeRecord] {
@@ -529,6 +536,7 @@ final class DelegationScopeRuntime: ObservableObject {
             anchors.insert(record.grant.granteeSessionID)
             if case let .session(target) = record.grant.kind { anchors.insert(target) }
             if case let .tree(root) = record.grant.kind { anchors.insert(root) }
+            if case let .directChildren(root, _) = record.grant.kind { anchors.insert(root) }
         }
         return anchors
     }
@@ -626,7 +634,8 @@ final class DelegationScopeRuntime: ObservableObject {
             now: now(),
             // Global auto-approve answers any request with an unrestricted grant, so no capability is
             // refused for its kind before that.
-            unrestricted: authorization.validatesScopeRequestsWithoutCeiling
+            unrestricted: authorization.validatesScopeRequestsWithoutCeiling,
+            granteeSessionID: requesterSessionID
         ) {
             return .failure(.invalid(denial))
         }
@@ -809,6 +818,22 @@ final class DelegationScopeRuntime: ObservableObject {
     @discardableResult
     func approveWithStandingConsent(requestID: UUID) -> Bool {
         guard let request = requests[requestID], request.state == .pending else { return false }
+        if case .directChildren = request.kind {
+            guard canUseAuthority else { return false }
+            let requestedExpiry = request.expiresInSeconds.map { now().addingTimeInterval(TimeInterval($0)) }
+            if let record = liveScopes(grantedTo: request.requesterSessionID).first(where: {
+                guard $0.grant.kind == request.kind, !$0.grant.unrestricted,
+                      $0.grant.capabilities.isSuperset(of: request.capabilities),
+                      $0.grant.guardrails.bulkConfirmationThreshold >= request.guardrails.bulkConfirmationThreshold
+                else { return false }
+                guard let expiry = $0.grant.guardrails.expiresAt else { return true }
+                return requestedExpiry.map { expiry >= $0 } ?? false
+            }) {
+                settleGranted(requestID: requestID, record: record)
+                return true
+            }
+            return false
+        }
         // Global is global: answer any request with the one unrestricted grant, however narrow.
         if let global = ensureGlobalAutoApproveScope(for: request.requesterSessionID) {
             settleGranted(requestID: requestID, record: global)
@@ -931,6 +956,9 @@ final class DelegationScopeRuntime: ObservableObject {
     ) -> Result<DomainDelegationScopeRecord, DomainDelegationScopeDenial> {
         guard canUseAuthority else { return .failure(.unknownScope) }
         guard var request = requests[requestID], request.state == .pending else { return .failure(.unknownScope) }
+        if grantAllForSession, case .directChildren = request.kind {
+            return .failure(.approvalExceedsRequest)
+        }
         // Only the explicit user-facing Grant all action sets this flag. No MCP argument can.
         let allCapabilities: Set<DomainDelegationScopeCapability> = request.kind == .allSessions
             ? DomainDelegationScopeCapability.allSessionsPermitted : DomainDelegationScopeCapability.fullPreset
@@ -1239,7 +1267,8 @@ final class DelegationScopeRuntime: ObservableObject {
     }
 
     private func didChange(grantees: Set<UUID>, invalidated: [UUID]) {
-        linkConsent.replace(authority.liveRecords(now: now()).map(\.grant))
+        // Records carry generations: a changed or removed record drops its endorsements before this returns.
+        linkConsent.publish(authority.liveRecords(now: now()))
         if !invalidated.isEmpty { scopesDidInvalidate?(Set(invalidated)) }
         liveScopesDidChange?()
         revision &+= 1

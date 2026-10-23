@@ -210,10 +210,515 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         XCTAssertNil(editor.preview, "Readiness loss must invalidate a stale successful preview")
     }
 
+    // MARK: - Scoped MCP controller delivery (real engine, scope runtime, projector and bridge)
+
+    private struct ScopedController {
+        let controller: SessionAdminScopeLifecycleTests.Fixture
+        let endpoint: DomainAgentSessionLinkEndpointIdentity
+        let bridge: AgentSessionLinkRuntimeBridge
+        let host: FakeEndpointHost
+        let authority: DomainAgentSessionLinkAuthority
+        let child: AgentSessionLinkEndpointCandidate
+    }
+
+    private func scopedGrant(
+        _ controller: SessionAdminScopeLifecycleTests.Fixture,
+        _ endpoint: DomainAgentSessionLinkEndpointIdentity,
+        ttl: Int = 3600
+    ) throws -> DomainDelegationScopeRecord {
+        let request = try controller.runtime.requestScope(
+            requesterSessionID: endpoint.sessionID, requesterTabID: endpoint.tabID,
+            kind: .directChildren(rootSessionID: endpoint.sessionID, workspaceID: endpoint.workspaceID),
+            capabilities: [.observe, .control, .restructure], guardrails: .init(),
+            expiresInSeconds: ttl, reason: nil, idempotencyKey: nil
+        ).get()
+        return try controller.runtime.approve(requestID: request.id).get()
+    }
+
+    private func scopedChildCandidate(parent: UUID, workspace: UUID) -> AgentSessionLinkEndpointCandidate {
+        let sessionID = UUID(), tabID = UUID(), binding = UUID()
+        return AgentSessionLinkEndpointCandidate(
+            windowID: 2, workspaceID: workspace, tabID: tabID, sessionID: sessionID,
+            persistentBindingGeneration: binding, bindingTransitionGeneration: 1, isTopLevel: false,
+            hasLoadedPersistedState: true, bindingTransitionInProgress: false, isClosing: false,
+            isMCPControlled: false, isMCPOriginated: false, roleAllowsOutboundMonitoring: true,
+            displayName: "Worker", providerDisplayName: "Codex CLI", locationLabel: nil,
+            restorationReadiness: .authoritative(
+                AgentSessionRestorationBindingToken(
+                    bindingIdentity: AgentPersistentSessionBindingIdentity(tabID: tabID, sessionID: sessionID, generation: binding),
+                    bindingTransitionGeneration: 1
+                ), .persistedPayloadApplied
+            ),
+            parentSessionID: parent
+        )
+    }
+
+    /// A supported parentless MCP controller with one live direct child, wired to the real scope
+    /// runtime, engine and membership projector. Only provenance and the endpoint host are fakes.
+    private func makeScopedController(
+        grant: Bool = true, runtime: DelegationScopeRuntime? = nil, grantTTL: Int = 3600
+    ) async throws -> (ScopedController, DomainDelegationScopeRecord?) {
+        let controller = SessionAdminScopeLifecycleTests.Fixture(runtime: runtime)
+        addTeardownBlock { @MainActor in await controller.window.tearDown() }
+        let session = try await controller.installController()
+        session.hasLoadedPersistedState = true
+        session.recordRestorationAuthoritative(.persistedPayloadApplied)
+        let endpoint = try XCTUnwrap(controller.endpoint)
+        let record = grant ? try scopedGrant(controller, endpoint, ttl: grantTTL) : nil
+        let child = scopedChildCandidate(parent: endpoint.sessionID, workspace: endpoint.workspaceID)
+        controller.source.add(endpoint.sessionID, parent: nil, workspace: endpoint.workspaceID)
+        controller.source.add(child.sessionID, parent: endpoint.sessionID, workspace: endpoint.workspaceID)
+        let host = FakeEndpointHost()
+        host.candidates = try [
+            XCTUnwrap(controller.window.agentModeViewModel.agentSessionLinkCandidate(for: endpoint, includeLocation: false)),
+            child
+        ]
+        host.scopedStanding = { endpoint, engine in engine.scopedObserverAuthorization(for: endpoint, window: controller.window) }
+        let projector = SpawnProvenanceDelegationMembershipProjector(source: controller.source)
+        host.scopedEndorsement = { observer, target, scope, engine in
+            engine.authorizeScopedObserverLink(observer: observer, target: target, scopeID: scope, window: controller.window, projector: projector) != nil
+        }
+        let authority = makeAuthority()
+        let bridge = AgentSessionLinkRuntimeBridge(authority: authority, host: host, delegationScopes: controller.runtime)
+        addTeardownBlock { @MainActor in bridge.freezeForTermination() }
+        return (ScopedController(controller: controller, endpoint: endpoint, bridge: bridge, host: host, authority: authority, child: child), record)
+    }
+
+    private func addScopedLink(_ scoped: ScopedController, source: DomainDelegationScopeRecord) async -> AgentMonitorAddOutcome {
+        let runtime = scoped.controller.runtime
+        return await scoped.bridge.addDelegatedMonitorLink(
+            observerEndpoint: scoped.endpoint, targetEndpoint: scoped.child.domainEndpoint,
+            authorization: AgentSessionLinkDelegatedAddAuthorization(sourceScopeID: source.id) {
+                runtime.record(id: source.id)?.isActive == true
+            }
+        )
+    }
+
+    private func publishScopedChildStatus(_ scoped: ScopedController, status: DomainAgentSessionLinkStatus, activity: TimeInterval) async {
+        scoped.host.snapshotOverrides[scoped.child.sessionID] = DomainAgentSessionObservationSnapshot(
+            sessionID: scoped.child.sessionID, displayName: scoped.child.displayName, providerDisplayName: "Codex CLI",
+            status: status, board: .empty, idleForSend: status == .idle, pendingInteractionKind: nil,
+            latestVisibleAssistantPreview: nil, visibleRowCount: 1, lastActivityAt: Date(timeIntervalSince1970: activity)
+        )
+        scoped.host.fireObservation(for: scoped.child.sessionID)
+        await scoped.bridge.test_settleProjections()
+        await scoped.bridge.test_settleMonitorProjectionRefresh()
+    }
+
+    func testScopedControllerCollectsDeliverableTerminalStatusUnderItsLiveGrant() async throws {
+        let (scoped, record) = try await makeScopedController()
+        let source = try XCTUnwrap(record)
+        guard case .added = await addScopedLink(scoped, source: source) else { return XCTFail("Consented direct-child Add refused") }
+        await scoped.bridge.test_settleMonitorProjectionRefresh()
+        let baseline = try XCTUnwrap(scoped.host.publishedPassiveNoticesByEndpoint[scoped.endpoint])
+        XCTAssertTrue(baseline.isDeliverable, "a live matching grant on the supported controller must let its notices accumulate")
+        await publishScopedChildStatus(scoped, status: .running, activity: 200)
+        await publishScopedChildStatus(scoped, status: .idle, activity: 300)
+        let snapshot = try XCTUnwrap(scoped.host.publishedPassiveNoticesByEndpoint[scoped.endpoint])
+        XCTAssertEqual(snapshot.entries.map { "\($0.fromStatus.rawValue)->\($0.toStatus.rawValue)" }, ["running->idle"])
+        XCTAssertEqual(snapshot.entries.first?.targetSessionID, scoped.child.sessionID)
+    }
+
+    func testScopedControllerWithoutLiveGrantCollectsNothingDeliverable() async throws {
+        let (scoped, _) = try await makeScopedController(grant: false)
+        await scoped.bridge.test_settleMonitorProjectionRefresh()
+        XCTAssertNil(scoped.host.publishedPassiveNoticesByEndpoint[scoped.endpoint]?.entries.first)
+        XCTAssertNotEqual(scoped.host.publishedPassiveNoticesByEndpoint[scoped.endpoint]?.isDeliverable, true)
+    }
+
+    func testRevokedSourceRowIsNotSavedByAnotherLiveGrantAndDisclosesNothing() async throws {
+        let (scoped, record) = try await makeScopedController()
+        let sourceA = try XCTUnwrap(record)
+        guard case .added = await addScopedLink(scoped, source: sourceA) else { return XCTFail("Consented direct-child Add refused") }
+        await scoped.bridge.test_settleMonitorProjectionRefresh()
+        let published = try XCTUnwrap(scoped.host.publishedPromptInventories[scoped.endpoint.sessionID])
+        XCTAssertEqual(published.items.count, 1)
+        let before = scoped.bridge.promptInventoryForCurrentScope(published, observer: scoped.endpoint)
+        XCTAssertEqual(before.inventory.items.count, 1, "the original source A is current")
+        let sourceB = try scopedGrant(scoped.controller, scoped.endpoint)
+        scoped.controller.runtime.revoke(scopeID: sourceA.id)
+        XCTAssertTrue(scoped.controller.runtime.record(id: sourceB.id)?.isActive == true)
+        // The stale published row is read before async cleanup has republished.
+        let after = scoped.bridge.promptInventoryForCurrentScope(published, observer: scoped.endpoint)
+        XCTAssertTrue(after.inventory.items.isEmpty, "stale source-A rows must not disclose under source B")
+    }
+
+    private func makeScopedManagedChild(
+        _ scoped: ScopedController,
+        controller: ApprovalRecordingCodexController
+    ) throws -> (session: AgentModeViewModel.TabSession, candidate: AgentSessionLinkEndpointCandidate) {
+        let window = scoped.controller.window
+        let manager = window.workspaceManager
+        let index = try XCTUnwrap(manager.workspaces.firstIndex { $0.id == scoped.endpoint.workspaceID })
+        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        let sessionID = UUID()
+        manager.workspaces[index].composeTabs.append(ComposeTabState(id: session.tabID, name: "Worker", activeAgentSessionID: sessionID))
+        window.agentModeViewModel.test_installLiveSession(session)
+        _ = try XCTUnwrap(window.agentModeViewModel.test_installPersistentSessionBinding(sessionID: sessionID, on: session))
+        session.selectedAgent = .codexExec
+        session.codexController = controller
+        session.hasLoadedPersistedState = true
+        session.recordRestorationAuthoritative(.persistedPayloadApplied)
+        let real = try XCTUnwrap(window.agentModeViewModel.agentSessionLinkCandidate(
+            tabID: session.tabID, sessionID: sessionID, tabName: "Worker", isWindowClosing: false
+        ))
+        let child = AgentSessionLinkEndpointCandidate(
+            windowID: real.windowID, workspaceID: real.workspaceID, tabID: real.tabID, sessionID: real.sessionID,
+            persistentBindingGeneration: real.persistentBindingGeneration,
+            bindingTransitionGeneration: real.bindingTransitionGeneration, isTopLevel: false,
+            hasLoadedPersistedState: real.hasLoadedPersistedState, bindingTransitionInProgress: false, isClosing: false,
+            isMCPControlled: false, isMCPOriginated: false, roleAllowsOutboundMonitoring: true,
+            displayName: "Worker", providerDisplayName: real.providerDisplayName, locationLabel: nil,
+            restorationReadiness: real.restorationReadiness, parentSessionID: scoped.endpoint.sessionID
+        )
+        scoped.controller.source.add(child.sessionID, parent: scoped.endpoint.sessionID, workspace: child.workspaceID)
+        let observer = try XCTUnwrap(window.agentModeViewModel.agentSessionLinkCandidate(for: scoped.endpoint, includeLocation: false))
+        scoped.host.candidates = [observer, child]
+        scoped.host.interactionViewModel = window.agentModeViewModel
+        return (session, child)
+    }
+
+    private func scopedApprovalRequest(_ id: Int, command: String? = "swift test --filter FooTests", cwd: String? = "/tmp/worktree") -> AgentApprovalRequest {
+        AgentApprovalRequest(
+            requestID: .codex(.int(id)), method: "item/commandExecution/requestApproval", kind: .commandExecution,
+            threadID: "thread", turnID: "turn", itemID: "item-\(id)", command: command, cwd: cwd
+        )
+    }
+
+    private func scopedLinkedTarget(
+        _ scoped: ScopedController, source: DomainDelegationScopeRecord, child: AgentSessionLinkEndpointCandidate,
+        operation: DomainAgentSessionTargetOperation
+    ) async throws -> AgentSessionLinkRuntimeBridge.AuthorizedTarget {
+        let runtime = scoped.controller.runtime
+        let added = await scoped.bridge.addDelegatedMonitorLink(
+            observerEndpoint: scoped.endpoint, targetEndpoint: child.domainEndpoint,
+            authorization: AgentSessionLinkDelegatedAddAuthorization(sourceScopeID: source.id) {
+                runtime.record(id: source.id)?.isActive == true
+            }
+        )
+        guard case .added = added else { throw MCPError.internalError("scoped Add refused: \(added)") }
+        switch await scoped.bridge.authorizeTarget(
+            operation: operation, observerEndpoint: scoped.endpoint, targetSessionID: child.sessionID
+        ) {
+        case let .success(authorized): return authorized
+        case let .failure(failure): throw MCPError.internalError("scoped authorize failed: \(failure)")
+        }
+    }
+
+    func testScopedManagedPollPreservesConcreteCommandDetails() async throws {
+        let (scoped, record) = try await makeScopedController()
+        let recorder = ApprovalRecordingCodexController()
+        let (session, child) = try makeScopedManagedChild(scoped, controller: recorder)
+        let readTarget = try await scopedLinkedTarget(scoped, source: XCTUnwrap(record), child: child, operation: .monitorPoll)
+
+        let concrete = scopedApprovalRequest(301)
+        session.pendingApproval = concrete
+        let projected = await scoped.bridge.pendingInteractionsForObservation(leases: [readTarget.lease])
+        let inspection = try XCTUnwrap(projected?[child.sessionID], "scope-backed poll must project the real target prompt")
+        XCTAssertNil(inspection.manualOnlyReason)
+        XCTAssertEqual(inspection.interaction?.id, concrete.id)
+        XCTAssertEqual(inspection.interaction?.options.map(\.label), ["accept", "decline", "cancel"])
+        let values = inspection.interaction?.details.map(\.value) ?? []
+        XCTAssertTrue(values.contains("swift test --filter FooTests"), "command survives: \(values)")
+        XCTAssertTrue(values.contains("/tmp/worktree"), "cwd survives: \(values)")
+
+        let absent = scopedApprovalRequest(302, command: nil, cwd: nil)
+        session.pendingApproval = absent
+        let missing = await scoped.bridge.pendingInteractionsForObservation(leases: [readTarget.lease])
+        let missingValues = missing?[child.sessionID]?.interaction?.details.map(\.value) ?? []
+        XCTAssertFalse(missingValues.contains { $0.contains("swift") || $0.contains("/tmp") }, "absent command is never invented")
+
+        let oversized = scopedApprovalRequest(303, command: String(repeating: "x", count: 600_000))
+        session.pendingApproval = oversized
+        let big = await scoped.bridge.pendingInteractionsForObservation(leases: [readTarget.lease])
+        let bigInspection = try XCTUnwrap(big?[child.sessionID], "oversized prompt still yields a manual stub")
+        XCTAssertEqual(bigInspection.manualOnlyReason, .tooLarge)
+        XCTAssertNil(bigInspection.projectedObject()?["prompt"], "no usable prompt on the wire")
+        XCTAssertFalse(
+            (bigInspection.interaction?.details ?? []).contains { $0.value.count > 1000 || $0.value.contains("xxxx") },
+            "no usable command in the stub"
+        )
+        XCTAssertTrue(recorder.recorder.events.isEmpty)
+    }
+
+    func testScopedWrongInteractionIDAndSourceARevocationWithLiveBApplyNothing() async throws {
+        let (scoped, record) = try await makeScopedController()
+        let sourceA = try XCTUnwrap(record)
+        let recorder = ApprovalRecordingCodexController()
+        let (session, child) = try makeScopedManagedChild(scoped, controller: recorder)
+        let sendTarget = try await scopedLinkedTarget(scoped, source: sourceA, child: child, operation: .monitorRespond)
+
+        let first = scopedApprovalRequest(401)
+        session.pendingApproval = first
+        let wrong = try interactionRequest(UUID(), ["response": .string("accept")])
+        let mismatch = await scoped.bridge.respondToInteraction(target: sendTarget, request: wrong)
+        XCTAssertEqual(mismatch, .responded(.interactionMismatch(currentInteractionID: first.id)))
+        XCTAssertTrue(recorder.recorder.events.isEmpty)
+
+        let sourceB = try scopedGrant(scoped.controller, scoped.endpoint)
+        let host = scoped.host
+        let runtime = scoped.controller.runtime
+        host.beforeInteractionAuthorize = { runtime.revoke(scopeID: sourceA.id) }
+        let held = try await scoped.bridge.respondToInteraction(target: sendTarget, request: interactionRequest(first.id, ["response": .string("accept")]))
+        XCTAssertEqual(held, .responded(.unavailable))
+        XCTAssertTrue(runtime.record(id: sourceB.id)?.isActive == true)
+        XCTAssertTrue(recorder.recorder.events.isEmpty, "no provider response after source revocation")
+        XCTAssertEqual(session.pendingApproval, first, "prompt retained for the target's user")
+    }
+
+    @MainActor
+    private final class BridgeScopeClock {
+        var date = Date(timeIntervalSince1970: 1000)
+    }
+
+    private func awaitProviderEvents(_ controller: ApprovalRecordingCodexController, count: Int) async throws {
+        try await AsyncTestWait.waitUntil("\(count) request-scoped provider response(s)") {
+            await MainActor.run { controller.recorder.events.count >= count }
+        }
+    }
+
+    private func reboundCandidate(_ c: AgentSessionLinkEndpointCandidate) -> AgentSessionLinkEndpointCandidate {
+        AgentSessionLinkEndpointCandidate(
+            windowID: c.windowID, workspaceID: c.workspaceID, tabID: c.tabID, sessionID: c.sessionID,
+            persistentBindingGeneration: c.persistentBindingGeneration,
+            bindingTransitionGeneration: c.bindingTransitionGeneration + 1,
+            isTopLevel: c.isTopLevel, hasLoadedPersistedState: c.hasLoadedPersistedState,
+            bindingTransitionInProgress: false, isClosing: false,
+            isMCPControlled: c.isMCPControlled, isMCPOriginated: c.isMCPOriginated,
+            roleAllowsOutboundMonitoring: c.roleAllowsOutboundMonitoring,
+            displayName: c.displayName, providerDisplayName: c.providerDisplayName, locationLabel: c.locationLabel,
+            restorationReadiness: c.restorationReadiness, parentSessionID: c.parentSessionID
+        )
+    }
+
+    func testScopedFreshAcceptSubmitsExactlyOneProviderResponseAndStaleIDsCannotAnswerSuccessor() async throws {
+        let (scoped, record) = try await makeScopedController()
+        let recorder = ApprovalRecordingCodexController()
+        let (session, child) = try makeScopedManagedChild(scoped, controller: recorder)
+        let sendTarget = try await scopedLinkedTarget(scoped, source: XCTUnwrap(record), child: child, operation: .monitorRespond)
+
+        let first = scopedApprovalRequest(501)
+        session.pendingApproval = first
+        let accepted = try await scoped.bridge.respondToInteraction(target: sendTarget, request: interactionRequest(first.id, ["response": .string("accept")]))
+        guard case let .responded(.submitted(_, decision)) = accepted else { return XCTFail("positive control must submit: \(accepted)") }
+        XCTAssertEqual(decision, "accept")
+        try await awaitProviderEvents(recorder, count: 1)
+        XCTAssertEqual(recorder.recorder.events, ["501:accept"], "exactly one provider response")
+        XCTAssertNil(session.pendingApproval, "prompt consumed")
+
+        let replay = try await scoped.bridge.respondToInteraction(target: sendTarget, request: interactionRequest(first.id, ["response": .string("accept")]))
+        XCTAssertEqual(replay, .responded(.noPendingInteraction))
+        XCTAssertEqual(recorder.recorder.events, ["501:accept"], "replay submits nothing")
+
+        let successor = scopedApprovalRequest(502)
+        session.pendingApproval = successor
+        let stale = try await scoped.bridge.respondToInteraction(target: sendTarget, request: interactionRequest(first.id, ["response": .string("accept")]))
+        XCTAssertEqual(stale, .responded(.interactionMismatch(currentInteractionID: successor.id)))
+        let wrong = try await scoped.bridge.respondToInteraction(target: sendTarget, request: interactionRequest(UUID(), ["response": .string("accept")]))
+        XCTAssertEqual(wrong, .responded(.interactionMismatch(currentInteractionID: successor.id)))
+        XCTAssertEqual(recorder.recorder.events, ["501:accept"])
+        XCTAssertEqual(session.pendingApproval, successor)
+
+        let second = try await scoped.bridge.respondToInteraction(target: sendTarget, request: interactionRequest(successor.id, ["response": .string("decline")]))
+        guard case .responded(.submitted) = second else { return XCTFail("successor answerable by its own id: \(second)") }
+        try await awaitProviderEvents(recorder, count: 2)
+        XCTAssertEqual(recorder.recorder.events, ["501:accept", "502:decline"])
+    }
+
+    func testScopedPromptOrEndpointReplacementDuringAuthorityAwaitAppliesNothing() async throws {
+        let (scoped, record) = try await makeScopedController()
+        let recorder = ApprovalRecordingCodexController()
+        let (session, child) = try makeScopedManagedChild(scoped, controller: recorder)
+        let sendTarget = try await scopedLinkedTarget(scoped, source: XCTUnwrap(record), child: child, operation: .monitorRespond)
+        let host = scoped.host
+
+        let first = scopedApprovalRequest(701), successor = scopedApprovalRequest(702)
+        session.pendingApproval = first
+        host.beforeInteractionAuthorize = { session.pendingApproval = successor }
+        let swapped = try await scoped.bridge.respondToInteraction(target: sendTarget, request: interactionRequest(first.id, ["response": .string("accept")]))
+        XCTAssertEqual(swapped, .responded(.interactionMismatch(currentInteractionID: successor.id)))
+        XCTAssertTrue(recorder.recorder.events.isEmpty, "answer for the replaced prompt must not reach the successor")
+        XCTAssertEqual(session.pendingApproval, successor)
+
+        let observer = host.candidates[0]
+        let reboundChild = reboundCandidate(child), reboundObserver = reboundCandidate(observer)
+        for replacement in [[observer, reboundChild], [reboundObserver, child]] {
+            host.beforeInteractionAuthorize = { host.candidates = replacement }
+            let moved = try await scoped.bridge.respondToInteraction(target: sendTarget, request: interactionRequest(successor.id, ["response": .string("accept")]))
+            XCTAssertEqual(moved, .responded(.unavailable), "endpoint binding replaced mid-await")
+            XCTAssertTrue(recorder.recorder.events.isEmpty)
+            XCTAssertEqual(session.pendingApproval, successor, "prompt retained for the target's user")
+            host.candidates = [observer, child]
+        }
+        host.beforeInteractionAuthorize = nil
+    }
+
+    func testScopedSourceAndLinkInvalidationDuringAuthorityAwaitApplyNothing() async throws {
+        enum Race: String, CaseIterable {
+            case sourceExpiry, placementLoss, membershipLoss, relinkGeneration, targetBindingReplaced, observerBindingReplaced
+        }
+        @MainActor final class GenerationBox { var value: UUID? }
+        for race in Race.allCases {
+            let clock = BridgeScopeClock()
+            let runtime = DelegationScopeRuntime(
+                persistenceMode: .ephemeral, now: { MainActor.assumeIsolated { clock.date } }, notifyCatalogChanged: { _ in }
+            )
+            let (scoped, record) = try await makeScopedController(runtime: runtime, grantTTL: 60)
+            let sourceA = try XCTUnwrap(record)
+            let sourceB = try scopedGrant(scoped.controller, scoped.endpoint)
+            let recorder = ApprovalRecordingCodexController()
+            let (session, child) = try makeScopedManagedChild(scoped, controller: recorder)
+            let sendTarget = try await scopedLinkedTarget(scoped, source: sourceA, child: child, operation: .monitorRespond)
+
+            let control = scopedApprovalRequest(600)
+            session.pendingApproval = control
+            let ok = try await scoped.bridge.respondToInteraction(target: sendTarget, request: interactionRequest(control.id, ["response": .string("accept")]))
+            guard case .responded(.submitted) = ok else { XCTFail("\(race) positive control: \(ok)")
+                continue
+            }
+            try await awaitProviderEvents(recorder, count: 1)
+            XCTAssertEqual(recorder.recorder.events, ["600:accept"], "\(race) control")
+
+            let held = scopedApprovalRequest(601)
+            session.pendingApproval = held
+            let source = scoped.controller.source, bridge = scoped.bridge, authority = scoped.authority
+            let endpoint = scoped.endpoint, childEndpoint = child.domainEndpoint
+            let childID = child.sessionID, parentID = scoped.endpoint.sessionID, workspaceID = child.workspaceID
+            let vm = scoped.controller.window.agentModeViewModel
+            let controllerSession = vm.session(for: scoped.endpoint.tabID)
+            let replaced = GenerationBox()
+            switch race {
+            case .sourceExpiry:
+                scoped.host.beforeInteractionAuthorize = { clock.date = clock.date.addingTimeInterval(120) }
+            case .placementLoss:
+                scoped.host.beforeInteractionAuthorize = { source.add(childID, parent: UUID(), workspace: workspaceID) }
+            case .membershipLoss:
+                scoped.host.beforeInteractionAuthorize = { source.sessions[childID] = nil }
+            case .targetBindingReplaced:
+                scoped.host.beforeInteractionAuthorize = {
+                    replaced.value = vm.test_installPersistentSessionBinding(sessionID: UUID(), on: session)?.generation
+                }
+            case .observerBindingReplaced:
+                scoped.host.beforeInteractionAuthorize = {
+                    replaced.value = vm.test_installPersistentSessionBinding(sessionID: UUID(), on: controllerSession)?.generation
+                }
+            case .relinkGeneration:
+                scoped.host.beforeInteractionAuthorize = {
+                    let inventory = await authority.links(forObserver: parentID)
+                    guard let item = inventory.items.first(where: { $0.targetSessionID == childID }) else { return }
+                    _ = await bridge.stopMonitorLink(
+                        observerEndpoint: endpoint, targetEndpoint: childEndpoint,
+                        expectedReference: DomainAgentSessionLinkReference(linkID: item.linkID, generation: item.generation)
+                    )
+                    _ = await bridge.addDelegatedMonitorLink(
+                        observerEndpoint: endpoint, targetEndpoint: childEndpoint,
+                        authorization: AgentSessionLinkDelegatedAddAuthorization(sourceScopeID: sourceB.id) {
+                            runtime.record(id: sourceB.id)?.isActive == true
+                        }
+                    )
+                }
+            }
+            let outcome = try await scoped.bridge.respondToInteraction(target: sendTarget, request: interactionRequest(held.id, ["response": .string("accept")]))
+            switch race {
+            case .targetBindingReplaced:
+                XCTAssertNotNil(replaced.value, "\(race): real binding owner replaced the binding")
+                XCTAssertNotEqual(replaced.value, child.persistentBindingGeneration, "\(race)")
+            case .observerBindingReplaced:
+                XCTAssertNotNil(replaced.value, "\(race): real binding owner replaced the binding")
+                XCTAssertNotEqual(replaced.value, scoped.endpoint.persistentBindingGeneration, "\(race)")
+            default: break
+            }
+            XCTAssertEqual(outcome, .responded(.unavailable), "\(race)")
+            XCTAssertEqual(recorder.recorder.events, ["600:accept"], "\(race): no provider event after the race")
+            // submitApprovalDecision clears pendingApproval synchronously before it creates the provider Task,
+            // so a retained prompt is the deterministic witness that nothing was handed to the provider.
+            XCTAssertEqual(session.pendingApproval, held, "\(race): prompt retained")
+            XCTAssertTrue(runtime.record(id: sourceB.id)?.isActive == true, "\(race): independent B stays live and cannot re-source")
+            scoped.host.beforeInteractionAuthorize = nil
+        }
+    }
+
+    func testScopedApprovalProjectionKeepsAdvertisedScopeAmendmentAndOnlyOneTimeChoices() async throws {
+        let (scoped, record) = try await makeScopedController()
+        let recorder = ApprovalRecordingCodexController()
+        let (session, child) = try makeScopedManagedChild(scoped, controller: recorder)
+        let readTarget = try await scopedLinkedTarget(scoped, source: XCTUnwrap(record), child: child, operation: .monitorPoll)
+        let amendment = #"{"prefix_rule":["swift","test"]}"#
+        let rich = AgentApprovalRequest(
+            requestID: .codex(.int(801)), method: "item/commandExecution/requestApproval", kind: .commandExecution,
+            threadID: "thread", turnID: "turn", itemID: "item-801", reason: "needs network", command: "swift test",
+            cwd: "/tmp/worktree", grantRoot: "/tmp/grant-root", proposedExecpolicyAmendmentJSON: amendment,
+            sessionApprovalScope: .editsSession
+        )
+        session.pendingApproval = rich
+        let projected = await scoped.bridge.pendingInteractionsForObservation(leases: [readTarget.lease])
+        let inspection = try XCTUnwrap(projected?[child.sessionID])
+        XCTAssertNil(inspection.manualOnlyReason)
+        XCTAssertEqual(inspection.interaction?.options.map(\.label), ["accept", "decline", "cancel"], "persistent/amending choices never offered")
+        let values = inspection.interaction?.details.map(\.value) ?? []
+        XCTAssertTrue(values.contains("swift test") && values.contains("/tmp/worktree"), "command and cwd exact: \(values)")
+        XCTAssertEqual(values, ["commandExecution", "swift test", "/tmp/worktree", "/tmp/grant-root", amendment], "details exactly as advertised")
+        let plain = scopedApprovalRequest(802, command: nil, cwd: nil)
+        session.pendingApproval = plain
+        let bare = await scoped.bridge.pendingInteractionsForObservation(leases: [readTarget.lease])
+        let bareValues = bare?[child.sessionID]?.interaction?.details.map(\.value) ?? []
+        XCTAssertFalse(bareValues.contains { $0.contains("/tmp") || $0.contains("prefix_rule") || $0.contains("needs network") }, "absent data stays absent: \(bareValues)")
+        XCTAssertTrue(recorder.recorder.events.isEmpty)
+    }
+
+    func testScopedACPApprovalWithholdsOnlyAcceptWithoutGenuineOneTimeAllow() async throws {
+        let (scoped, record) = try await makeScopedController()
+        let recorder = ApprovalRecordingCodexController()
+        let (session, child) = try makeScopedManagedChild(scoped, controller: recorder)
+        let readTarget = try await scopedLinkedTarget(scoped, source: XCTUnwrap(record), child: child, operation: .monitorPoll)
+        let sendTarget: AgentSessionLinkRuntimeBridge.AuthorizedTarget
+        switch await scoped.bridge.authorizeTarget(operation: .monitorRespond, observerEndpoint: scoped.endpoint, targetSessionID: child.sessionID) {
+        case let .success(authorized): sendTarget = authorized
+        case let .failure(failure): return XCTFail("respond authorize failed: \(failure)")
+        }
+        func acpApproval(_ id: String, oneTimeAllowAvailable: Bool) -> AgentApprovalRequest {
+            AgentApprovalRequest(
+                requestID: .acp(id), method: "session/request_permission", kind: .commandExecution,
+                threadID: "acp-session", turnID: "acp-session", itemID: "tool-\(id)",
+                overseerOneTimeAllowAvailable: oneTimeAllowAvailable, plainApproveAvailable: oneTimeAllowAvailable
+            )
+        }
+        let restricted = acpApproval("no-once", oneTimeAllowAvailable: false)
+        session.pendingApproval = restricted
+        let projected = await scoped.bridge.pendingInteractionsForObservation(leases: [readTarget.lease])
+        let inspection = try XCTUnwrap(projected?[child.sessionID])
+        XCTAssertNil(inspection.manualOnlyReason)
+        XCTAssertEqual(inspection.interaction?.options.map(\.label), ["decline", "cancel"])
+        let accept = try await scoped.bridge.respondToInteraction(target: sendTarget, request: interactionRequest(restricted.id, ["response": .string("accept")]))
+        guard case .responded(.invalid) = accept else { return XCTFail("accept must be refused: \(accept)") }
+        XCTAssertEqual(session.pendingApproval, restricted)
+        for decision in ["decline", "cancel"] {
+            let outcome = try await scoped.bridge.respondToInteraction(target: sendTarget, request: interactionRequest(restricted.id, ["response": .string(decision)]))
+            XCTAssertEqual(outcome, .responded(.unavailable), "\(decision) reaches the (absent) ACP hop, not a manual-only refusal")
+        }
+        let open = acpApproval("once", oneTimeAllowAvailable: true)
+        session.pendingApproval = open
+        let reprojected = await scoped.bridge.pendingInteractionsForObservation(leases: [readTarget.lease])
+        XCTAssertEqual(reprojected?[child.sessionID]?.interaction?.options.map(\.label), ["accept", "decline", "cancel"])
+        XCTAssertNil(reprojected?[child.sessionID]?.manualOnlyReason)
+        XCTAssertTrue(recorder.recorder.events.isEmpty)
+    }
+
     // MARK: - Fake host
 
     final class FakeEndpointHost: AgentSessionLinkEndpointHost {
         weak var promptViewModel: AgentModeViewModel?
+        var scopedStanding: ((DomainAgentSessionLinkEndpointIdentity, OverseerAuthorizationEngine) -> ScopedObserverStanding)?
+        var scopedEndorsement: ((DomainAgentSessionLinkEndpointIdentity, AgentSessionLinkEndpointCandidate, UUID, OverseerAuthorizationEngine) -> Bool)?
+
+        func agentSessionLinkScopedObserverStanding(for endpoint: DomainAgentSessionLinkEndpointIdentity, engine: OverseerAuthorizationEngine) -> ScopedObserverStanding {
+            scopedStanding?(endpoint, engine) ?? .denied
+        }
+
+        func agentSessionLinkEndorseScopedObserver(observer: DomainAgentSessionLinkEndpointIdentity, target: AgentSessionLinkEndpointCandidate, scopeID: UUID, engine: OverseerAuthorizationEngine) -> Bool {
+            scopedEndorsement?(observer, target, scopeID, engine) ?? false
+        }
+
         var beforeActivation: ((DomainAgentSessionLinkEndpointIdentity) async -> Void)?
         func agentSessionLinkWillActivate(_ endpoint: DomainAgentSessionLinkEndpointIdentity) async {
             await beforeActivation?(endpoint)

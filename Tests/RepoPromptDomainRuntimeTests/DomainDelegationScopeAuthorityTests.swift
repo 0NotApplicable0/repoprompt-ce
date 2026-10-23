@@ -99,8 +99,14 @@ final class DomainDelegationScopeAuthorityTests: XCTestCase {
         let installed = await links.installScopeConsent(consent)
         XCTAssertTrue(installed)
         func endpoint(_ id: UUID) -> DomainAgentSessionLinkEndpointIdentity {
-            .init(windowID: 1, workspaceID: workspaceID, tabID: UUID(), sessionID: id,
-                  persistentBindingGeneration: UUID(), bindingTransitionGeneration: 1)
+            .init(
+                windowID: 1,
+                workspaceID: workspaceID,
+                tabID: UUID(),
+                sessionID: id,
+                persistentBindingGeneration: UUID(),
+                bindingTransitionGeneration: 1
+            )
         }
         let observerEndpoint = endpoint(overseer)
         let targetEndpoint = endpoint(child)
@@ -197,7 +203,7 @@ final class DomainDelegationScopeAuthorityTests: XCTestCase {
         for operation in [DomainAgentSessionTargetOperation.adminRetire, .adminRename] {
             XCTAssertNil(
                 DomainDelegationScopeAuthority.confirmationRequirement(
-                    operation: operation, itemCount: 10_000, guardrails: scope.grant.guardrails, unrestricted: true
+                    operation: operation, itemCount: 10000, guardrails: scope.grant.guardrails, unrestricted: true
                 ),
                 "\(operation.rawValue) is never carded under global auto-approve"
             )
@@ -1080,6 +1086,99 @@ final class DomainDelegationScopeAuthorityTests: XCTestCase {
         )
     }
 
+    // MARK: - Direct children
+
+    func testDirectChildrenProofIsTheOnlyMembershipBasisAndNeverCoversTheRoot() throws {
+        var authority = DomainDelegationScopeAuthority()
+        let scope = try authority.grant(
+            .init(granteeSessionID: overseer, kind: .directChildren(rootSessionID: overseer, workspaceID: workspaceID), capabilities: [.observe], guardrails: .init()),
+            scopeID: UUID(), now: now
+        ).get()
+        func proof(_ target: UUID, _ basis: DomainDelegationScopeMembershipProof.Basis) -> DomainDelegationScopeMembershipProof {
+            .init(scopeID: scope.id, targetSessionID: target, basis: basis)
+        }
+        XCTAssertNotNil(try? lease(authority, scope, .adminGet, target: child, proof: proof(child, .directChild(rootSessionID: overseer, workspaceID: workspaceID))).get())
+        for substitute in [
+            proof(child, .treePath([child, overseer])),
+            proof(child, .workspace(workspaceID)),
+            proof(child, .allSessions),
+            proof(child, .exactSession),
+            proof(child, .directChild(rootSessionID: outsider, workspaceID: workspaceID)),
+            proof(child, .directChild(rootSessionID: overseer, workspaceID: UUID())),
+            proof(overseer, .directChild(rootSessionID: overseer, workspaceID: workspaceID))
+        ] {
+            XCTAssertEqual(denial(lease(authority, scope, .adminGet, target: substitute.targetSessionID, proof: substitute)), .membershipProofInvalid, "\(substitute.basis)")
+        }
+        XCTAssertEqual(denial(lease(authority, scope, .adminGet, target: child, proof: nil)), .membershipProofMissing)
+    }
+
+    func testDirectChildrenGrantRoundTripsWithRootAndWorkspaceAndRejectsDepthLimits() throws {
+        let kind = DomainDelegationScopeKind.directChildren(rootSessionID: overseer, workspaceID: workspaceID)
+        XCTAssertEqual(kind.label, "direct_children")
+        let grant = DomainDelegationScopeGrant(
+            id: UUID(), granteeSessionID: overseer, kind: kind, capabilities: [.observe],
+            guardrails: .init(), origin: .user, grantedAt: now
+        )
+        let data = try JSONEncoder().encode(grant)
+        XCTAssertEqual(try JSONDecoder().decode(DomainDelegationScopeGrant.self, from: data), grant)
+        let wire = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        let encodedKind = try XCTUnwrap(wire["kind"] as? [String: String])
+        XCTAssertEqual(encodedKind, ["type": "direct_children", "root_session_id": overseer.uuidString, "workspace_id": workspaceID.uuidString])
+        XCTAssertEqual(
+            DomainDelegationScopeAuthority.validate(kind: kind, capabilities: [.observe], guardrails: .init(maxDepth: 1), now: now, granteeSessionID: overseer),
+            .guardrailsMalformed
+        )
+        XCTAssertNil(DomainDelegationScopeAuthority.validate(kind: kind, capabilities: [.observe], guardrails: .init(), now: now, granteeSessionID: overseer))
+    }
+
+    func testDirectChildrenScopeIsRevokedWithItsRootAndNeverPermitsLinkConsent() throws {
+        var authority = DomainDelegationScopeAuthority()
+        let scope = try authority.grant(
+            .init(granteeSessionID: overseer, kind: .directChildren(rootSessionID: overseer, workspaceID: workspaceID), capabilities: [.observe, .control, .restructure], guardrails: .init()),
+            scopeID: UUID(), now: now
+        ).get()
+        let consent = DomainDelegationScopeLinkConsent()
+        consent.replace([scope.grant])
+        XCTAssertFalse(consent.permits(scopeID: scope.id, observer: overseer, target: child, at: now))
+        XCTAssertEqual(authority.revokeAll(involving: overseer).map(\.id), [scope.id])
+    }
+
+    func testDirectChildrenAdmissionRequiresGranteeRootAndOnlyManagedCapabilities() {
+        let kind = DomainDelegationScopeKind.directChildren(rootSessionID: overseer, workspaceID: workspaceID)
+        func request(grantee: UUID = overseer, _ capabilities: Set<DomainDelegationScopeCapability>, guardrails: DomainDelegationScopeGuardrails = .init(), unrestricted: Bool = false) -> DomainDelegationScopeGrantRequest {
+            .init(granteeSessionID: grantee, kind: kind, capabilities: capabilities, guardrails: guardrails, unrestricted: unrestricted)
+        }
+        var authority = DomainDelegationScopeAuthority()
+        let managed: Set<DomainDelegationScopeCapability> = [.observe, .control, .restructure]
+        XCTAssertNotNil(try? authority.grant(request(managed, guardrails: .init(expiresAt: now.addingTimeInterval(3600), bulkConfirmationThreshold: 5)), scopeID: UUID(), now: now).get())
+        XCTAssertNotNil(authority.grant(request(grantee: outsider, managed), scopeID: UUID(), now: now).failureValue, "Root must be the grantee")
+        for forbidden in [DomainDelegationScopeCapability.organize, .spawn, .worktree, .destructive] {
+            for unrestricted in [false, true] {
+                XCTAssertEqual(
+                    authority.grant(request([.observe, forbidden], unrestricted: unrestricted), scopeID: UUID(), now: now).failureValue,
+                    .capabilityNotPermittedForKind(forbidden), "\(forbidden) unrestricted=\(unrestricted)"
+                )
+            }
+        }
+        for limits in [DomainDelegationScopeGuardrails(maxLiveSessions: 3), .init(maxDepth: 1), .init(maxWorktrees: 1)] {
+            XCTAssertEqual(authority.grant(request(managed, guardrails: limits), scopeID: UUID(), now: now).failureValue, .guardrailsMalformed)
+        }
+    }
+
+    func testDirectChildrenReloadNeverInstallsAnInconsistentRootOrForbiddenCapability() {
+        let kind = DomainDelegationScopeKind.directChildren(rootSessionID: overseer, workspaceID: workspaceID)
+        func grant(grantee: UUID, _ capabilities: Set<DomainDelegationScopeCapability>, limits: DomainDelegationScopeGuardrails = .init()) -> DomainDelegationScopeGrant {
+            .init(id: UUID(), granteeSessionID: grantee, kind: kind, capabilities: capabilities, guardrails: limits, origin: .user, grantedAt: now)
+        }
+        let valid = grant(grantee: overseer, [.observe, .control])
+        var authority = DomainDelegationScopeAuthority()
+        let installed = authority.reactivate([
+            valid, grant(grantee: outsider, [.observe]), grant(grantee: overseer, [.observe, .organize]),
+            grant(grantee: overseer, [.observe, .spawn]), grant(grantee: overseer, [.observe], limits: .init(maxLiveSessions: 2))
+        ], now: now)
+        XCTAssertEqual(installed.map(\.id), [valid.id])
+    }
+
     // MARK: - Durable coding
 
     func testGrantRoundTripsThroughCodableAndRejectsUnknownCapabilities() throws {
@@ -1092,5 +1191,12 @@ final class DomainDelegationScopeAuthorityTests: XCTestCase {
         XCTAssertEqual(try JSONDecoder().decode(DomainDelegationScopeGrant.self, from: data), grant)
         let tampered = try XCTUnwrap(String(data: data, encoding: .utf8)).replacingOccurrences(of: "\"organize\"", with: "\"keys\"")
         XCTAssertThrowsError(try JSONDecoder().decode(DomainDelegationScopeGrant.self, from: Data(tampered.utf8)))
+    }
+}
+
+private extension Result {
+    var failureValue: Failure? {
+        if case let .failure(error) = self { return error }
+        return nil
     }
 }

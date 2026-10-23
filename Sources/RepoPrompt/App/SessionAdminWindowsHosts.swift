@@ -1,6 +1,21 @@
 import Foundation
 import MCP
 import RepoPromptDomainRuntime
+
+extension WindowStatesManager {
+    func agentSessionLinkScopedObserverStanding(for endpoint: DomainAgentSessionLinkEndpointIdentity, engine: OverseerAuthorizationEngine) -> ScopedObserverStanding {
+        guard let window = sessionRuntimeWindows.first(where: { $0.windowID == endpoint.windowID }) else { return .denied }
+        return engine.scopedObserverAuthorization(for: endpoint, window: window)
+    }
+
+    func agentSessionLinkEndorseScopedObserver(observer: DomainAgentSessionLinkEndpointIdentity, target: AgentSessionLinkEndpointCandidate, scopeID: UUID, engine: OverseerAuthorizationEngine) -> Bool {
+        guard let window = sessionRuntimeWindows.first(where: { $0.windowID == observer.windowID }),
+              let currentTarget = agentSessionLinkCandidate(for: target.domainEndpoint, includeLocation: false) else { return false }
+        let projector = SpawnProvenanceDelegationMembershipProjector(source: OpenWindowsDelegationProvenanceSource(windows: { self.sessionRuntimeWindows }))
+        return engine.authorizeScopedObserverLink(observer: observer, target: currentTarget, scopeID: scopeID, window: window, projector: projector) != nil
+    }
+}
+
 import RepoPromptVCS
 import RepoPromptWorkspaceCore
 
@@ -154,6 +169,7 @@ final class SessionAdminWindowsStructureHost: SessionAdminStructureHost {
     ) throws -> DelegationPlacementCommit? {
         guard let viewModel = SessionAdminWindows.owningViewModel(for: sessionID) else { return nil }
         let scopeID = delegationScopeID ?? viewModel.ownerValidatedSessionIndex[sessionID]?.delegationScopeID
+        bridge().delegationScopes.linkConsent.invalidateEndorsements(sessionID: sessionID)
         return try viewModel.commitDelegationPlacement(
             sessionID: sessionID, organizationalParentID: parentID, delegationScopeID: scopeID
         )

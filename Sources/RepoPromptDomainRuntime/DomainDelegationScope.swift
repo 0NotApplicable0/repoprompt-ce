@@ -15,7 +15,7 @@ import Foundation
 // MARK: - Capabilities
 
 /// One delegable capability. The set is closed: anything not representable here is human-only.
-package enum DomainDelegationScopeCapability: String, CaseIterable, Codable, Hashable, Sendable {
+package enum DomainDelegationScopeCapability: String, CaseIterable, Codable, Hashable {
     /// Inventory, search, poll/wait/read across members.
     case observe
     /// Rename, pin/unpin/reorder, group, archive/unarchive.
@@ -37,6 +37,8 @@ package enum DomainDelegationScopeCapability: String, CaseIterable, Codable, Has
 
     /// The only capabilities an `.allSessions` scope may hold (design §6 default 2).
     package static let allSessionsPermitted: Set<Self> = [.observe, .organize, .restructure]
+    /// The only capabilities a `.directChildren` scope may hold, with or without `unrestricted`.
+    package static let directChildrenPermitted: Set<Self> = [.observe, .control, .restructure]
 
     /// "Manage this tree": everything except `destructive`.
     package static let manageTreePreset: Set<Self> = Set(allCases).subtracting([.destructive])
@@ -51,7 +53,7 @@ package enum DomainDelegationScopeCapability: String, CaseIterable, Codable, Has
 /// None of these maps to a `DomainDelegationScopeCapability`, so no scope can carry them. The
 /// operation authorizer additionally refuses the scope basis for the existing operations that
 /// perform them (for example `agent_manage.cleanup_sessions`, which deletes sessions).
-package enum DomainDelegationScopeHumanOnlyAction: String, CaseIterable, Hashable, Sendable {
+package enum DomainDelegationScopeHumanOnlyAction: String, CaseIterable, Hashable {
     case deleteSession = "delete_session"
     case removeWorktree = "remove_worktree"
     case pruneWorktree = "prune_worktree"
@@ -73,25 +75,157 @@ package enum DomainDelegationScopeHumanOnlyAction: String, CaseIterable, Hashabl
 
 /// Read-only, process-local input to link authorization. The app's decision owner publishes its
 /// live grants synchronously; storage is never consulted here. Missing/expired consent fails closed.
+///
+/// `directChildren` is never covered by a UUID: it needs an endpoint-qualified permit backed by an
+/// endorsement the app's single authorization owner issued against the current record generation.
 package final class DomainDelegationScopeLinkConsent: @unchecked Sendable {
+    private static let required: Set<DomainDelegationScopeCapability> = [.observe, .control, .restructure]
+
     private let lock = NSLock()
     private var grants: [UUID: DomainDelegationScopeGrant] = [:]
+    /// Generations of the records last published. Absent for grants installed through `replace`.
+    private var generations: [UUID: UInt64] = [:]
+    private var endorsements: Set<DomainDelegationScopeDirectChildEndorsement> = []
 
     package init() {}
 
+    /// Raw grants without generations: legacy `session`/`allSessions` consent only. Drops every endorsement.
     package func replace(_ grants: [DomainDelegationScopeGrant]) {
-        lock.withLock { self.grants = Dictionary(uniqueKeysWithValues: grants.map { ($0.id, $0) }) }
+        lock.withLock {
+            self.grants = Dictionary(uniqueKeysWithValues: grants.map { ($0.id, $0) })
+            generations = [:]
+            endorsements = []
+        }
+    }
+
+    /// Publishes the current live records. Only active records count; any endorsement whose scope
+    /// is absent or whose generation differs is dropped before this returns.
+    package func publish(_ records: [DomainDelegationScopeRecord]) {
+        lock.withLock {
+            let active = records.filter(\.isActive)
+            grants = Dictionary(active.map { ($0.id, $0.grant) }, uniquingKeysWith: { _, new in new })
+            generations = Dictionary(active.map { ($0.id, $0.generation) }, uniquingKeysWith: { _, new in new })
+            endorsements = endorsements.filter { generations[$0.scopeID] == $0.scopeGeneration }
+        }
+    }
+
+    /// Records an endorsement only if it names the current record and fits its exact kind. The
+    /// issuer is the app's authorization engine; membership is its decision, not checked here.
+    package func endorse(_ endorsement: DomainDelegationScopeDirectChildEndorsement, at date: Date) -> Bool {
+        lock.withLock {
+            guard Self.endorsable(endorsement, grants: grants, generations: generations, at: date) else { return false }
+            endorsements.insert(endorsement)
+            return true
+        }
+    }
+
+    package func invalidateEndorsements(scopeID: UUID) {
+        lock.withLock { endorsements = endorsements.filter { $0.scopeID != scopeID } }
+    }
+
+    package func invalidateEndorsements(endpoint: DomainAgentSessionLinkEndpointIdentity) {
+        lock.withLock { endorsements = endorsements.filter { $0.observer != endpoint && $0.target != endpoint } }
+    }
+
+    package func invalidateEndorsements(sessionID: UUID) {
+        lock.withLock {
+            endorsements = endorsements.filter { $0.observer.sessionID != sessionID && $0.target.sessionID != sessionID }
+        }
+    }
+
+    package func invalidateAllEndorsements() {
+        lock.withLock { endorsements = [] }
     }
 
     package func permits(scopeID: UUID, observer: UUID, target: UUID, at date: Date) -> Bool {
         guard let grant = lock.withLock({ grants[scopeID] }), grant.granteeSessionID == observer,
-              grant.capabilities.isSuperset(of: [.observe, .control, .restructure]),
+              grant.capabilities.isSuperset(of: Self.required),
               grant.guardrails.expiresAt.map({ $0 > date }) ?? true else { return false }
         switch grant.kind {
         case let .session(approvedTarget): return approvedTarget == target
         case .allSessions: return grant.unrestricted
-        case .tree, .workspace: return false
+        case .tree, .workspace, .directChildren: return false
         }
+    }
+
+    /// Endpoint-qualified permit. `session`/`allSessions` keep their UUID semantics; `directChildren`
+    /// additionally needs the current endorsement for these exact endpoints.
+    package func permits(
+        scopeID: UUID,
+        observer: DomainAgentSessionLinkEndpointIdentity,
+        target: DomainAgentSessionLinkEndpointIdentity,
+        at date: Date
+    ) -> Bool {
+        let state = lock.withLock { (grants[scopeID], generations[scopeID], endorsements) }
+        guard let grant = state.0, case .directChildren = grant.kind else {
+            return permits(scopeID: scopeID, observer: observer.sessionID, target: target.sessionID, at: date)
+        }
+        guard let generation = state.1 else { return false }
+        return state.2.contains(DomainDelegationScopeDirectChildEndorsement(
+            scopeID: scopeID, scopeGeneration: generation, observer: observer, target: target
+        )) && Self.endorsable(
+            DomainDelegationScopeDirectChildEndorsement(scopeID: scopeID, scopeGeneration: generation, observer: observer, target: target),
+            grants: [scopeID: grant], generations: [scopeID: generation], at: date
+        )
+    }
+
+    private static func endorsable(
+        _ endorsement: DomainDelegationScopeDirectChildEndorsement,
+        grants: [UUID: DomainDelegationScopeGrant],
+        generations: [UUID: UInt64],
+        at date: Date
+    ) -> Bool {
+        guard let grant = grants[endorsement.scopeID], generations[endorsement.scopeID] == endorsement.scopeGeneration,
+              case let .directChildren(root, workspaceID) = grant.kind,
+              root == grant.granteeSessionID, root == endorsement.observer.sessionID,
+              endorsement.observer.workspaceID == workspaceID, endorsement.target.workspaceID == workspaceID,
+              endorsement.target.sessionID != endorsement.observer.sessionID,
+              endorsement.observer.hasResolvedPersistentBinding, endorsement.target.hasResolvedPersistentBinding,
+              grant.capabilities.isSuperset(of: required),
+              grant.guardrails.expiresAt.map({ $0 > date }) ?? true else { return false }
+        return true
+    }
+}
+
+/// Process-local proof that the app's authorization engine found one exact target a direct child of
+/// one exact controller endpoint under one scope generation. Constructed only by that engine (tests
+/// build fixtures); never persisted. `DomainDelegationScopeLinkConsent` is the only consumer.
+package struct DomainDelegationScopeDirectChildEndorsement: Hashable {
+    package let scopeID: UUID
+    package let scopeGeneration: UInt64
+    package let observer: DomainAgentSessionLinkEndpointIdentity
+    package let target: DomainAgentSessionLinkEndpointIdentity
+
+    package init(
+        scopeID: UUID, scopeGeneration: UInt64,
+        observer: DomainAgentSessionLinkEndpointIdentity, target: DomainAgentSessionLinkEndpointIdentity
+    ) {
+        self.scopeID = scopeID
+        self.scopeGeneration = scopeGeneration
+        self.observer = observer
+        self.target = target
+    }
+}
+
+/// Engine-issued, endpoint- and generation-qualified evidence about one scoped observer. It lifts
+/// only the MCP-observer role exclusion in the endpoint resolver; `awaitingReproof` authorizes nothing.
+package struct DomainDelegationScopedObserverEvidence: Hashable {
+    package enum Status: Hashable {
+        case authorized
+        /// A live matching grant on a supported controller that is transiently loading or rebinding.
+        case awaitingReproof
+    }
+
+    package let scopeID: UUID
+    package let scopeGeneration: UInt64
+    package let observer: DomainAgentSessionLinkEndpointIdentity
+    package let status: Status
+
+    package init(scopeID: UUID, scopeGeneration: UInt64, observer: DomainAgentSessionLinkEndpointIdentity, status: Status) {
+        self.scopeID = scopeID
+        self.scopeGeneration = scopeGeneration
+        self.observer = observer
+        self.status = status
     }
 }
 
@@ -100,7 +234,7 @@ package final class DomainDelegationScopeLinkConsent: @unchecked Sendable {
 /// App-presented run state of one target, for operations whose requirement depends on it.
 ///
 /// `unknown` is treated exactly like `running`, so an uncertain state can only demand more authority.
-package enum DomainDelegationScopeTargetState: String, Hashable, Sendable {
+package enum DomainDelegationScopeTargetState: String, Hashable {
     /// Idle or finished: nothing to stop.
     case idle
     case running
@@ -111,11 +245,13 @@ package enum DomainDelegationScopeTargetState: String, Hashable, Sendable {
 
 /// What a scope covers. Membership is never taken from tool arguments; the app presents a
 /// `DomainDelegationScopeMembershipProof` computed from persisted provenance.
-package enum DomainDelegationScopeKind: Hashable, Sendable {
+package enum DomainDelegationScopeKind: Hashable {
     /// The grantee plus exactly one managed target; never its descendants or other workspace sessions.
     case session(targetSessionID: UUID)
     /// The root plus every session whose organizational parent chain reaches it.
     case tree(rootSessionID: UUID)
+    /// Sessions the root spawned directly and still parents, in one workspace. Never the root itself.
+    case directChildren(rootSessionID: UUID, workspaceID: UUID)
     /// Every session in one workspace.
     case workspace(workspaceID: UUID)
     /// Every session the user owns. Restricted to `allSessionsPermitted` capabilities.
@@ -125,6 +261,7 @@ package enum DomainDelegationScopeKind: Hashable, Sendable {
         switch self {
         case .session: "session"
         case .tree: "tree"
+        case .directChildren: "direct_children"
         case .workspace: "workspace"
         case .allSessions: "all_sessions"
         }
@@ -146,6 +283,11 @@ extension DomainDelegationScopeKind: Codable {
             self = try .session(targetSessionID: container.decode(UUID.self, forKey: .targetSessionID))
         case "tree":
             self = try .tree(rootSessionID: container.decode(UUID.self, forKey: .rootSessionID))
+        case "direct_children":
+            self = try .directChildren(
+                rootSessionID: container.decode(UUID.self, forKey: .rootSessionID),
+                workspaceID: container.decode(UUID.self, forKey: .workspaceID)
+            )
         case "workspace":
             self = try .workspace(workspaceID: container.decode(UUID.self, forKey: .workspaceID))
         case "all_sessions":
@@ -167,6 +309,9 @@ extension DomainDelegationScopeKind: Codable {
             try container.encode(targetSessionID, forKey: .targetSessionID)
         case let .tree(rootSessionID):
             try container.encode(rootSessionID, forKey: .rootSessionID)
+        case let .directChildren(rootSessionID, workspaceID):
+            try container.encode(rootSessionID, forKey: .rootSessionID)
+            try container.encode(workspaceID, forKey: .workspaceID)
         case let .workspace(workspaceID):
             try container.encode(workspaceID, forKey: .workspaceID)
         case .allSessions:
@@ -181,7 +326,7 @@ extension DomainDelegationScopeKind: Codable {
 ///
 /// Limits count the **whole** subtree: a parent's `maxLiveSessions` includes every live member of
 /// every nested overseer's sub-scope.
-package struct DomainDelegationScopeGuardrails: Codable, Hashable, Sendable {
+package struct DomainDelegationScopeGuardrails: Codable, Hashable {
     package static let defaultBulkConfirmationThreshold = 25
 
     package var maxLiveSessions: Int?
@@ -257,7 +402,7 @@ package struct DomainDelegationScopeGuardrails: Codable, Hashable, Sendable {
 }
 
 /// Which guardrail a spawn or worktree operation exceeded.
-package enum DomainDelegationScopeGuardrail: String, Codable, Hashable, Sendable {
+package enum DomainDelegationScopeGuardrail: String, Codable, Hashable {
     case maxLiveSessions = "max_live_sessions"
     case maxDepth = "max_depth"
     case maxWorktrees = "max_worktrees"
@@ -266,7 +411,7 @@ package enum DomainDelegationScopeGuardrail: String, Codable, Hashable, Sendable
 // MARK: - Durable grant and live record
 
 /// How a scope came to exist. Scopes are created only by the user or by attenuation.
-package enum DomainDelegationScopeOrigin: Hashable, Sendable {
+package enum DomainDelegationScopeOrigin: Hashable {
     case user
     case attenuatedFrom(scopeID: UUID)
 
@@ -312,7 +457,7 @@ extension DomainDelegationScopeOrigin: Codable {
 
 /// The durable intent of one scope. Carries no generation: generations are process-local and a
 /// launch reactivates every persisted grant under a fresh one.
-package struct DomainDelegationScopeGrant: Codable, Hashable, Sendable {
+package struct DomainDelegationScopeGrant: Codable, Hashable {
     package let id: UUID
     package let granteeSessionID: UUID
     package let kind: DomainDelegationScopeKind
@@ -388,7 +533,7 @@ package struct DomainDelegationScopeGrant: Codable, Hashable, Sendable {
 }
 
 /// Lifecycle of a live scope record.
-package enum DomainDelegationScopeState: String, Hashable, Sendable {
+package enum DomainDelegationScopeState: String, Hashable {
     case active
     /// Revoked by the user, released by its grantee, or cascaded from a revoked ancestor.
     case revoked
@@ -396,7 +541,7 @@ package enum DomainDelegationScopeState: String, Hashable, Sendable {
 }
 
 /// One scope as the authority currently holds it.
-package struct DomainDelegationScopeRecord: Hashable, Sendable {
+package struct DomainDelegationScopeRecord: Hashable {
     package let grant: DomainDelegationScopeGrant
     /// Bumped on every state change. A presented generation that differs is stale.
     package let generation: UInt64
@@ -424,12 +569,15 @@ package struct DomainDelegationScopeRecord: Hashable, Sendable {
 /// The app projects it from persisted provenance (`parentSessionID`, `createdByOverseerSessionID`,
 /// and later `organizationalParentID`) exactly as link leases are presented today. It is never
 /// constructed from tool arguments.
-package struct DomainDelegationScopeMembershipProof: Hashable, Sendable {
-    package enum Basis: Hashable, Sendable {
+package struct DomainDelegationScopeMembershipProof: Hashable {
+    package enum Basis: Hashable {
         /// A uniquely resolved app-owned identity in an exact-target grant.
         case exactSession
         /// Organizational chain from the target (first) up to the tree root (last), inclusive.
         case treePath([UUID])
+        /// Built only by the projector from fresh provenance: spawned by the root, currently placed
+        /// under it, and in the workspace.
+        case directChild(rootSessionID: UUID, workspaceID: UUID)
         /// The workspace the target currently belongs to.
         case workspace(UUID)
         /// The target is a session the user owns.
@@ -454,7 +602,7 @@ package struct DomainDelegationScopeMembershipProof: Hashable, Sendable {
 }
 
 /// App-measured usage of one scope (whole subtree), presented for spawn/worktree guardrails.
-package struct DomainDelegationScopeUsage: Hashable, Sendable {
+package struct DomainDelegationScopeUsage: Hashable {
     package let scopeID: UUID
     package let liveSessionCount: Int
     package let worktreeCount: Int
@@ -475,7 +623,7 @@ package struct DomainDelegationScopeUsage: Hashable, Sendable {
 
 /// A user-approved batch card, bound to the exact scope generation, operation, item set, key, and
 /// operation arguments.
-package struct DomainDelegationScopeConfirmation: Hashable, Sendable {
+package struct DomainDelegationScopeConfirmation: Hashable {
     package let confirmationID: UUID
     package let scopeID: UUID
     package let scopeGeneration: UInt64
@@ -510,7 +658,7 @@ package struct DomainDelegationScopeConfirmation: Hashable, Sendable {
 
 /// Proof issued by `DomainDelegationScopeAuthority` that one caller may exercise one capability on
 /// one target under one live scope generation. Consumed by `DomainAgentSessionOperationAuthorizer`.
-package struct DomainDelegationScopeLease: Hashable, Sendable {
+package struct DomainDelegationScopeLease: Hashable {
     package let scopeID: UUID
     package let generation: UInt64
     package let capability: DomainDelegationScopeCapability
@@ -542,7 +690,7 @@ package struct DomainDelegationScopeLease: Hashable, Sendable {
 /// established, so it discloses nothing about another session's scopes. Every other case is
 /// diagnostic only: callers must render it with the uniform "not found / not available" text so an
 /// Agent caller cannot probe whether an unrelated session or scope exists.
-package enum DomainDelegationScopeDenial: Error, Hashable, Sendable {
+package enum DomainDelegationScopeDenial: Error, Hashable {
     /// Caller-visible and recoverable: the scope does not hold this capability.
     case capabilityMissing(DomainDelegationScopeCapability)
     /// Per item, not per batch: the target is running (or its state is unknown) and the operation
@@ -584,6 +732,7 @@ package enum DomainDelegationScopeDenial: Error, Hashable, Sendable {
     case attenuationLoosensGuardrails
     case attenuationRequiresTreeRootedAtGrantee
     case attenuationParentInactive
+    case directChildrenRootNotGrantee
 
     /// Stable public code for the recoverable cases; `nil` means "render the uniform denial".
     package var publicCode: String? {
@@ -630,12 +779,13 @@ package enum DomainDelegationScopeDenial: Error, Hashable, Sendable {
         case .attenuationLoosensGuardrails: "attenuation_loosens_guardrails"
         case .attenuationRequiresTreeRootedAtGrantee: "attenuation_requires_tree_rooted_at_grantee"
         case .attenuationParentInactive: "attenuation_parent_inactive"
+        case .directChildrenRootNotGrantee: "direct_children_root_not_grantee"
         }
     }
 }
 
 /// The items one authorization admitted, and the items it set aside as needing `control`.
-package struct DomainDelegationScopeAuthorizedItems: Equatable, Sendable {
+package struct DomainDelegationScopeAuthorizedItems: Equatable {
     /// One lease per admitted target, in request order. Empty for scope-level operations.
     package let leases: [DomainDelegationScopeLease]
     package let bases: [DomainAgentSessionAuthorityBasis]
@@ -659,7 +809,7 @@ package struct DomainDelegationScopeAuthorizedItems: Equatable, Sendable {
 }
 
 /// Why an operation needs a batch confirmation card.
-package enum DomainDelegationScopeConfirmationReason: String, Hashable, Sendable {
+package enum DomainDelegationScopeConfirmationReason: String, Hashable {
     /// An operation that always forces a card (`retire`, `worktree_release`). The raw value is kept
     /// stable for callers; it does not mean anything is deleted.
     case destructive
