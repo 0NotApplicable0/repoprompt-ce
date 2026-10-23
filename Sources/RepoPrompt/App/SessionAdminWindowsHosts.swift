@@ -318,6 +318,9 @@ final class SessionAdminWindowsStructureHost: SessionAdminStructureHost {
         isStillAuthorized: @escaping @MainActor () -> Bool
     ) async -> SessionAdminLinkOutcome {
         guard !Task.isCancelled, isStillAuthorized() else { return .revoked }
+        let isStillAuthorized = Self.originalCallerContinuity(
+            callerEndpoint: callerEndpoint, observer: observer, isStillAuthorized: isStillAuthorized
+        )
         let manager = WindowStatesManager.shared
         let initialObservers = WindowStatesManager.shared.agentSessionLinkCandidates(forSessionIDs: [observer], includeLocation: false)
         guard let initialObserver = initialObservers[observer]?.only?.domainEndpoint else {
@@ -404,6 +407,9 @@ final class SessionAdminWindowsStructureHost: SessionAdminStructureHost {
         guard !observerChanged() else {
             return .failed("observer_changed: The requesting session's exact binding changed; nothing was unlinked.")
         }
+        let isStillAuthorized = Self.originalCallerContinuity(
+            callerEndpoint: callerEndpoint, observer: observer, isStillAuthorized: isStillAuthorized
+        )
         let bridge = bridge()
         guard let link = await bridge.delegationActiveLink(observerSessionID: observer, targetSessionID: target) else {
             return .notLinked
@@ -421,6 +427,19 @@ final class SessionAdminWindowsStructureHost: SessionAdminStructureHost {
         case .alreadyStopped: return .notLinked
         case let .failed(message): return .failed(message)
         }
+    }
+
+    static func originalCallerContinuity(
+        callerEndpoint: DomainAgentSessionLinkEndpointIdentity?,
+        observer: UUID,
+        currentEndpoint: (@MainActor () -> DomainAgentSessionLinkEndpointIdentity?)? = nil,
+        isStillAuthorized: @escaping @MainActor () -> Bool
+    ) -> @MainActor () -> Bool {
+        guard let callerEndpoint else { return isStillAuthorized }
+        let current = currentEndpoint ?? {
+            WindowStatesManager.shared.agentSessionLinkCandidates(forSessionIDs: [observer], includeLocation: false)[observer]?.only?.domainEndpoint
+        }
+        return { isStillAuthorized() && current() == callerEndpoint }
     }
 
     func setModel(

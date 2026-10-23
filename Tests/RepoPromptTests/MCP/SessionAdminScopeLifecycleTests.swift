@@ -1413,6 +1413,102 @@ final class SessionAdminScopeLifecycleTests: XCTestCase {
         XCTAssertTrue(addMessage.hasPrefix("observer_changed"), addMessage)
     }
 
+    @MainActor
+    private final class EmptyInventory: AgentSessionInventorySource {
+        func snapshot() async -> DomainAgentSessionInventorySnapshot {
+            DomainAgentSessionInventorySnapshot(records: [], edges: [], isComplete: true)
+        }
+    }
+
+    private func frontDoorRoute() async throws -> (
+        service: SessionAdminMCPToolService, record: DomainDelegationScopeRecord, host: RouteHost,
+        endpoint: DomainAgentSessionLinkEndpointIdentity, fixture: Fixture
+    ) {
+        let fixture = Fixture()
+        addTeardownBlock { @MainActor in await fixture.window.tearDown() }
+        let (_, endpoint) = try await readyController(fixture)
+        fixture.source.add(endpoint.sessionID, parent: nil, workspace: endpoint.workspaceID)
+        let host = RouteHost()
+        host.currentObserverEndpoint = endpoint
+        let projector = SpawnProvenanceDelegationMembershipProjector(source: fixture.source)
+        let frontDoor = AgentSessionAdministrationFrontDoor(
+            core: fixture.core, scopes: fixture.runtime, projector: projector, inventory: EmptyInventory(),
+            liveBoundSession: { _ in endpoint.sessionID }
+        )
+        frontDoor.register(SessionAdminRestructureHandler(
+            context: SessionAdminHandlerContext(scopes: fixture.runtime, projector: projector), host: host
+        ))
+        var service = SessionAdminMCPToolService(
+            captureRequestMetadata: { .init(connectionID: UUID(), clientName: "session-admin-test", windowID: fixture.window.windowID) },
+            requireTargetWindow: { fixture.window },
+            resolveObserverEndpoint: { _, _ in endpoint },
+            scopes: { fixture.runtime },
+            administration: { frontDoor }
+        )
+        service.isToolEnabled = { true }
+        return try (service, grantDirectChildren(fixture, endpoint), host, endpoint, fixture)
+    }
+
+    func testRealFrontDoorLinkDeliversOriginalControllerEndpointToTheStructureHost() async throws {
+        let (service, record, host, endpoint, fixture) = try await frontDoorRoute()
+        let child = UUID()
+        fixture.source.add(child, parent: endpoint.sessionID, workspace: endpoint.workspaceID)
+        let reply = try await service.execute(args: [
+            "op": .string("link"), "scope_id": .string(record.id.uuidString), "session_id": .string(child.uuidString)
+        ])
+        XCTAssertEqual(try linkItemResults(XCTUnwrap(reply.objectValue)), ["linked"], "\(reply)")
+        XCTAssertEqual(host.receivedCallerEndpoints, [endpoint], "The real front door must not erase the routed caller endpoint")
+    }
+
+    func testRealFrontDoorUnlinkDeliversOriginalControllerEndpointToTheStructureHost() async throws {
+        let (service, record, host, endpoint, fixture) = try await frontDoorRoute()
+        let child = UUID()
+        fixture.source.add(child, parent: endpoint.sessionID, workspace: endpoint.workspaceID)
+        host.links[RouteHost.Key(observer: endpoint.sessionID, target: child)] = (DomainAgentSessionLinkCapability.managed, record.id)
+        let reply = try await service.execute(args: [
+            "op": .string("unlink"), "scope_id": .string(record.id.uuidString), "session_id": .string(child.uuidString)
+        ])
+        XCTAssertEqual(try linkItemResults(XCTUnwrap(reply.objectValue)), ["unlinked"], "\(reply)")
+        XCTAssertEqual(host.receivedCallerEndpoints, [endpoint], "The real front door must not erase the routed caller endpoint")
+    }
+
+    func testRealFrontDoorLinkRefusesWhenObserverReboundBeforeTheHostRuns() async throws {
+        let (service, record, host, endpoint, fixture) = try await frontDoorRoute()
+        let child = UUID()
+        fixture.source.add(child, parent: endpoint.sessionID, workspace: endpoint.workspaceID)
+        host.currentObserverEndpoint = reboundEndpoint(endpoint)
+        let reply = try await service.execute(args: [
+            "op": .string("link"), "scope_id": .string(record.id.uuidString), "session_id": .string(child.uuidString)
+        ])
+        XCTAssertEqual(try linkItemResults(XCTUnwrap(reply.objectValue)), ["not_applied"], "\(reply)")
+        XCTAssertTrue(host.added.isEmpty, "A rebound observer creates no link through the real front door")
+    }
+
+    @MainActor
+    func testShippedHostBridgeCallbackRefusesWhenObserverEndpointChangesAfterAdmission() {
+        let endpoint = DomainAgentSessionLinkEndpointIdentity(
+            windowID: 1, workspaceID: UUID(), tabID: UUID(), sessionID: UUID(),
+            persistentBindingGeneration: UUID(), bindingTransitionGeneration: 1
+        )
+        var current: DomainAgentSessionLinkEndpointIdentity? = endpoint
+        let guarded = SessionAdminWindowsStructureHost.originalCallerContinuity(
+            callerEndpoint: endpoint, observer: endpoint.sessionID, currentEndpoint: { current }, isStillAuthorized: { true }
+        )
+        let unrouted = SessionAdminWindowsStructureHost.originalCallerContinuity(
+            callerEndpoint: nil, observer: endpoint.sessionID, currentEndpoint: { current }, isStillAuthorized: { true }
+        )
+        XCTAssertTrue(guarded(), "Unchanged endpoint stays authorized")
+        current = reboundEndpoint(endpoint)
+        XCTAssertFalse(guarded(), "A rebind during a bridge suspension refuses; the newer endpoint is never adopted")
+        current = nil
+        XCTAssertFalse(guarded(), "A lost binding refuses")
+        XCTAssertTrue(unrouted(), "Callers with no routed endpoint keep today's behavior")
+        let revoked = SessionAdminWindowsStructureHost.originalCallerContinuity(
+            callerEndpoint: endpoint, observer: endpoint.sessionID, currentEndpoint: { endpoint }, isStillAuthorized: { false }
+        )
+        XCTAssertFalse(revoked(), "Revoked authority still refuses")
+    }
+
     func testSourceLessExistingLinkVersusSourcedRequestReportsMismatchWithoutResourcing() async throws {
         let (fixture, endpoint, host) = try await routeFixture()
         let record = try grantDirectChildren(fixture, endpoint)
