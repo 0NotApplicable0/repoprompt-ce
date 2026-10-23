@@ -1134,9 +1134,33 @@ final class SessionAdminScopeLifecycleTests: XCTestCase {
         var added: [(observer: UUID, target: UUID, source: UUID?)] = []
         var stopped: [Key] = []
         var modelCalls: [UUID] = []
+        var receivedCallerEndpoints: [DomainAgentSessionLinkEndpointIdentity?] = []
+        var currentObserverEndpoint: DomainAgentSessionLinkEndpointIdentity?
 
         func commitOrganizationalPlacement(sessionID _: UUID, parentID _: UUID, delegationScopeID _: UUID?) throws -> DelegationPlacementCommit? {
             nil
+        }
+
+        func addLink(
+            observer: UUID, target: UUID, sourceScopeID: UUID?, callerEndpoint: DomainAgentSessionLinkEndpointIdentity?,
+            isStillAuthorized: @escaping @MainActor () -> Bool
+        ) async -> SessionAdminLinkOutcome {
+            receivedCallerEndpoints.append(callerEndpoint)
+            if let callerEndpoint, callerEndpoint != currentObserverEndpoint {
+                return .failed("observer_changed: The requesting session's exact binding changed; nothing was linked.")
+            }
+            return await addLink(observer: observer, target: target, sourceScopeID: sourceScopeID, isStillAuthorized: isStillAuthorized)
+        }
+
+        func stopLink(
+            observer: UUID, target: UUID, callerEndpoint: DomainAgentSessionLinkEndpointIdentity?,
+            isStillAuthorized: @escaping @MainActor () -> Bool
+        ) async -> SessionAdminLinkOutcome {
+            receivedCallerEndpoints.append(callerEndpoint)
+            if let callerEndpoint, callerEndpoint != currentObserverEndpoint {
+                return .failed("observer_changed: The requesting session's exact binding changed; nothing was unlinked.")
+            }
+            return await stopLink(observer: observer, target: target, isStillAuthorized: isStillAuthorized)
         }
 
         func activeLink(observer: UUID, target: UUID) async -> SessionAdminActiveLink? {
@@ -1189,6 +1213,7 @@ final class SessionAdminScopeLifecycleTests: XCTestCase {
         let (_, endpoint) = try await readyController(fixture)
         fixture.source.add(endpoint.sessionID, parent: nil, workspace: endpoint.workspaceID)
         let host = RouteHost()
+        host.currentObserverEndpoint = endpoint
         let context = SessionAdminHandlerContext(
             scopes: fixture.runtime, projector: SpawnProvenanceDelegationMembershipProjector(source: fixture.source)
         )
@@ -1323,6 +1348,96 @@ final class SessionAdminScopeLifecycleTests: XCTestCase {
             "op": .string("link"), "scope_id": .string(a.id.uuidString), "session_id": .string(child.uuidString)
         ])
         XCTAssertEqual(linkItemResults(same), ["already_linked"])
+    }
+
+    private func reboundEndpoint(_ endpoint: DomainAgentSessionLinkEndpointIdentity) -> DomainAgentSessionLinkEndpointIdentity {
+        DomainAgentSessionLinkEndpointIdentity(
+            windowID: endpoint.windowID, workspaceID: endpoint.workspaceID, tabID: endpoint.tabID, sessionID: endpoint.sessionID,
+            persistentBindingGeneration: UUID(), bindingTransitionGeneration: endpoint.bindingTransitionGeneration + 1
+        )
+    }
+
+    func testLinkCarriesOriginalControllerEndpointAndRefusesAfterRebind() async throws {
+        let (fixture, endpoint, host) = try await routeFixture()
+        let record = try grantDirectChildren(fixture, endpoint)
+        let drifted = UUID(), steady = UUID()
+        fixture.source.add(drifted, parent: endpoint.sessionID, workspace: endpoint.workspaceID)
+        fixture.source.add(steady, parent: endpoint.sessionID, workspace: endpoint.workspaceID)
+        host.currentObserverEndpoint = reboundEndpoint(endpoint)
+        let refused = try await fixture.call([
+            "op": .string("link"), "scope_id": .string(record.id.uuidString), "session_id": .string(drifted.uuidString)
+        ])
+        XCTAssertEqual(linkItemResults(refused), ["not_applied"], "\(refused)")
+        XCTAssertEqual(host.receivedCallerEndpoints, [endpoint], "The host receives the original routed endpoint, never the newer one")
+        XCTAssertTrue(host.added.isEmpty, "No link is created under a rebound observer")
+        host.currentObserverEndpoint = endpoint
+        let linked = try await fixture.call([
+            "op": .string("link"), "scope_id": .string(record.id.uuidString), "session_id": .string(steady.uuidString)
+        ])
+        XCTAssertEqual(linkItemResults(linked), ["linked"])
+        XCTAssertEqual(host.added.map(\.target), [steady])
+    }
+
+    func testUnlinkCarriesOriginalControllerEndpointAndStopsNothingAfterRebind() async throws {
+        let (fixture, endpoint, host) = try await routeFixture()
+        let record = try grantDirectChildren(fixture, endpoint)
+        let child = UUID()
+        fixture.source.add(child, parent: endpoint.sessionID, workspace: endpoint.workspaceID)
+        let key = RouteHost.Key(observer: endpoint.sessionID, target: child)
+        host.links[key] = (DomainAgentSessionLinkCapability.managed, record.id)
+        host.currentObserverEndpoint = reboundEndpoint(endpoint)
+        let refused = try await fixture.call([
+            "op": .string("unlink"), "scope_id": .string(record.id.uuidString), "session_id": .string(child.uuidString)
+        ])
+        XCTAssertEqual(linkItemResults(refused), ["not_applied"], "\(refused)")
+        XCTAssertEqual(host.receivedCallerEndpoints, [endpoint])
+        XCTAssertTrue(host.stopped.isEmpty, "No Stop under a rebound observer")
+        XCTAssertNotNil(host.links[key])
+        host.currentObserverEndpoint = endpoint
+        let unlinked = try await fixture.call([
+            "op": .string("unlink"), "scope_id": .string(record.id.uuidString), "session_id": .string(child.uuidString)
+        ])
+        XCTAssertEqual(linkItemResults(unlinked), ["unlinked"])
+    }
+
+    func testShippedWindowsHostRefusesCallerEndpointWithoutExactCurrentObserverBinding() async throws {
+        let (_, endpoint, _) = try await routeFixture()
+        let host = SessionAdminWindowsStructureHost()
+        let stop = await host.stopLink(observer: endpoint.sessionID, target: UUID(), callerEndpoint: endpoint, isStillAuthorized: { true })
+        guard case let .failed(stopMessage) = stop else { return XCTFail("stopLink accepted an endpoint that is not the current binding: \(stop)") }
+        XCTAssertTrue(stopMessage.hasPrefix("observer_changed"), stopMessage)
+        let add = await host.addLink(
+            observer: endpoint.sessionID, target: UUID(), sourceScopeID: UUID(), callerEndpoint: endpoint, isStillAuthorized: { true }
+        )
+        guard case let .failed(addMessage) = add else { return XCTFail("addLink accepted an endpoint that is not the current binding: \(add)") }
+        XCTAssertTrue(addMessage.hasPrefix("observer_changed"), addMessage)
+    }
+
+    func testSourceLessExistingLinkVersusSourcedRequestReportsMismatchWithoutResourcing() async throws {
+        let (fixture, endpoint, host) = try await routeFixture()
+        let record = try grantDirectChildren(fixture, endpoint)
+        let child = UUID()
+        fixture.source.add(child, parent: endpoint.sessionID, workspace: endpoint.workspaceID)
+        let key = RouteHost.Key(observer: endpoint.sessionID, target: child)
+        host.links[key] = (DomainAgentSessionLinkCapability.managed, nil)
+        let mismatch = try await fixture.call([
+            "op": .string("link"), "scope_id": .string(record.id.uuidString), "session_id": .string(child.uuidString)
+        ])
+        let item = try XCTUnwrap(mismatch["items"]?.arrayValue?.first?.objectValue)
+        XCTAssertEqual(item["reason"], .string("source_scope_mismatch"), "\(mismatch)")
+        XCTAssertNil(host.links[key]?.source, "The source-less link is not re-sourced")
+        XCTAssertTrue(host.added.isEmpty)
+    }
+
+    func testSourceLessExistingLinkVersusSourceLessRequestStaysAlreadyLinked() {
+        let fixture = Fixture()
+        addTeardownBlock { @MainActor in await fixture.window.tearDown() }
+        let engine = fixture.runtime.authorization
+        XCTAssertFalse(engine.linkSourceConflicts(existing: nil, requested: nil))
+        let scope = UUID()
+        XCTAssertFalse(engine.linkSourceConflicts(existing: scope, requested: scope))
+        XCTAssertTrue(engine.linkSourceConflicts(existing: nil, requested: scope))
+        XCTAssertTrue(engine.linkSourceConflicts(existing: scope, requested: UUID()))
     }
 
     func testUserNarrowedDirectChildrenGrantIsInspectableAndReleasableByItsGranteeButManagesNothing() async throws {

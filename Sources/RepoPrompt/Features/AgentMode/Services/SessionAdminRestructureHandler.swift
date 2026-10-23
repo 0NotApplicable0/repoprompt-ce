@@ -238,7 +238,9 @@ final class SessionAdminRestructureHandler: AgentSessionAdministrationOperationH
             // The same write-time check as `unlink`, carried into the shared Add and re-proved at its
             // durable insert and around reservation/activation: a caller-side pre-check alone cannot
             // cover the Add's own suspensions.
-            let outcome = await host.addLink(observer: observer, target: target, sourceScopeID: sourceScopeID) {
+            let outcome = await host.addLink(
+                observer: observer, target: target, sourceScopeID: sourceScopeID, callerEndpoint: batch.request.callerEndpoint
+            ) {
                 context.isStillAuthorized(lease, scope: scope) && context.permitsLinkObserver(observer, ofChainFrom: scope)
             }
             if outcome == .revoked { authorityLost = true }
@@ -270,7 +272,7 @@ final class SessionAdminRestructureHandler: AgentSessionAdministrationOperationH
             // endpoints are still members of the whole chain (management never chains).
             let context = context
             let scope = batch.scope
-            let outcome = await host.stopLink(observer: observer, target: target) {
+            let outcome = await host.stopLink(observer: observer, target: target, callerEndpoint: batch.request.callerEndpoint) {
                 context.isStillAuthorized(lease, scope: scope) && context.permitsLinkObserver(observer, ofChainFrom: scope)
             }
             items.append(Self.linkItem(target, outcome))

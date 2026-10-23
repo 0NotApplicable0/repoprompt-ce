@@ -310,11 +310,21 @@ final class SessionAdminWindowsStructureHost: SessionAdminStructureHost {
         observer: UUID, target: UUID, sourceScopeID: UUID?,
         isStillAuthorized: @escaping @MainActor () -> Bool
     ) async -> SessionAdminLinkOutcome {
+        await addLink(observer: observer, target: target, sourceScopeID: sourceScopeID, callerEndpoint: nil, isStillAuthorized: isStillAuthorized)
+    }
+
+    func addLink(
+        observer: UUID, target: UUID, sourceScopeID: UUID?, callerEndpoint: DomainAgentSessionLinkEndpointIdentity?,
+        isStillAuthorized: @escaping @MainActor () -> Bool
+    ) async -> SessionAdminLinkOutcome {
         guard !Task.isCancelled, isStillAuthorized() else { return .revoked }
         let manager = WindowStatesManager.shared
         let initialObservers = WindowStatesManager.shared.agentSessionLinkCandidates(forSessionIDs: [observer], includeLocation: false)
         guard let initialObserver = initialObservers[observer]?.only?.domainEndpoint else {
             return .failed("observer_changed: The requesting session has no exact current binding; nothing was linked.")
+        }
+        guard callerEndpoint == nil || callerEndpoint == initialObserver else {
+            return .failed("observer_changed: The requesting session's exact binding changed; nothing was linked.")
         }
         manager.beginPreparedOversightPreparation(target)
         defer { manager.endPreparedOversightPreparation(target) }
@@ -335,7 +345,9 @@ final class SessionAdminWindowsStructureHost: SessionAdminStructureHost {
         let candidates = WindowStatesManager.shared.agentSessionLinkCandidates(
             forSessionIDs: [observer, target], includeLocation: false
         )
-        guard let observerEndpoint = candidates[observer]?.only?.domainEndpoint, observerEndpoint == initialObserver else {
+        guard let observerEndpoint = candidates[observer]?.only?.domainEndpoint, observerEndpoint == initialObserver,
+              callerEndpoint == nil || callerEndpoint == observerEndpoint
+        else {
             return .failed("observer_changed: The requesting session's exact binding changed; nothing was linked.")
         }
         guard let targetEndpoint = candidates[target]?.only?.domainEndpoint,
@@ -375,12 +387,32 @@ final class SessionAdminWindowsStructureHost: SessionAdminStructureHost {
         target: UUID,
         isStillAuthorized: @escaping @MainActor () -> Bool
     ) async -> SessionAdminLinkOutcome {
+        await stopLink(observer: observer, target: target, callerEndpoint: nil, isStillAuthorized: isStillAuthorized)
+    }
+
+    func stopLink(
+        observer: UUID,
+        target: UUID,
+        callerEndpoint: DomainAgentSessionLinkEndpointIdentity?,
+        isStillAuthorized: @escaping @MainActor () -> Bool
+    ) async -> SessionAdminLinkOutcome {
+        let observerChanged = {
+            callerEndpoint.map {
+                WindowStatesManager.shared.agentSessionLinkCandidates(forSessionIDs: [observer], includeLocation: false)[observer]?.only?.domainEndpoint != $0
+            } ?? false
+        }
+        guard !observerChanged() else {
+            return .failed("observer_changed: The requesting session's exact binding changed; nothing was unlinked.")
+        }
         let bridge = bridge()
         guard let link = await bridge.delegationActiveLink(observerSessionID: observer, targetSessionID: target) else {
             return .notLinked
         }
         // The lookup suspended: authority is re-checked right before the ordinary Stop.
         guard isStillAuthorized() else { return .failed("Delegated authority ended before the unlink.") }
+        guard !observerChanged() else {
+            return .failed("observer_changed: The requesting session's exact binding changed; nothing was unlinked.")
+        }
         switch await bridge.stopMonitorLink(
             observerSessionID: observer, targetSessionID: target, linkID: link.linkID, generation: link.generation,
             isStillAuthorized: isStillAuthorized

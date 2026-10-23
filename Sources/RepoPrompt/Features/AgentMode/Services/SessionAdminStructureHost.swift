@@ -76,6 +76,14 @@ protocol SessionAdminStructureHost: AnyObject {
         target: UUID,
         isStillAuthorized: @escaping @MainActor () -> Bool
     ) async -> SessionAdminLinkOutcome
+    func addLink(
+        observer: UUID, target: UUID, sourceScopeID: UUID?, callerEndpoint: DomainAgentSessionLinkEndpointIdentity?,
+        isStillAuthorized: @escaping @MainActor () -> Bool
+    ) async -> SessionAdminLinkOutcome
+    func stopLink(
+        observer: UUID, target: UUID, callerEndpoint: DomainAgentSessionLinkEndpointIdentity?,
+        isStillAuthorized: @escaping @MainActor () -> Bool
+    ) async -> SessionAdminLinkOutcome
     func setModel(
         sessionID: UUID,
         modelID: String,
@@ -100,6 +108,20 @@ extension SessionAdminStructureHost {
     ) async -> SessionAdminLinkOutcome {
         guard sourceScopeID == nil else { return .failed("source_scope_unavailable: This host cannot retain exact-target consent; nothing was linked.") }
         return await addLink(observer: observer, target: target, isStillAuthorized: isStillAuthorized)
+    }
+
+    func addLink(
+        observer: UUID, target: UUID, sourceScopeID: UUID?, callerEndpoint _: DomainAgentSessionLinkEndpointIdentity?,
+        isStillAuthorized: @escaping @MainActor () -> Bool
+    ) async -> SessionAdminLinkOutcome {
+        await addLink(observer: observer, target: target, sourceScopeID: sourceScopeID, isStillAuthorized: isStillAuthorized)
+    }
+
+    func stopLink(
+        observer: UUID, target: UUID, callerEndpoint _: DomainAgentSessionLinkEndpointIdentity?,
+        isStillAuthorized: @escaping @MainActor () -> Bool
+    ) async -> SessionAdminLinkOutcome {
+        await stopLink(observer: observer, target: target, isStillAuthorized: isStillAuthorized)
     }
 }
 

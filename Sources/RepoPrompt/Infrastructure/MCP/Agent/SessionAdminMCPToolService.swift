@@ -446,7 +446,8 @@ struct SessionAdminMCPToolService {
             idempotencyKey: Self.parseIdempotencyKey(args["idempotency_key"], required: false),
             confirmationID: Self.parseUUID(args["confirmation_id"], field: "confirmation_id"),
             preview: Self.parsePreview(args["preview"]),
-            arguments: args
+            arguments: args,
+            callerEndpoint: endpoint
         )
         let outcome: AgentSessionAdministrationOutcome
         do {

@@ -125,7 +125,7 @@ extension OverseerAuthorizationEngine {
 
     /// An existing link sourced by another scope is reported, never re-sourced or upgraded.
     func linkSourceConflicts(existing: UUID?, requested: UUID?) -> Bool {
-        existing != nil && existing != requested
+        existing != requested
     }
 
     private func isOwnDirectChildrenGrant(_ record: DomainDelegationScopeRecord, endpoint: DomainAgentSessionLinkEndpointIdentity) -> Bool {
