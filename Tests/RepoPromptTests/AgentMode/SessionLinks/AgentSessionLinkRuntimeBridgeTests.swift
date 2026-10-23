@@ -441,6 +441,71 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         XCTAssertTrue(recorder.recorder.events.isEmpty)
     }
 
+    func testScopedManagedPollWireCarriesConcreteCommandDetails() async throws {
+        let (scoped, record) = try await makeScopedController()
+        let recorder = ApprovalRecordingCodexController()
+        let (session, child) = try makeScopedManagedChild(scoped, controller: recorder)
+        let readTarget = try await scopedLinkedTarget(scoped, source: XCTUnwrap(record), child: child, operation: .monitorPoll)
+        let childID = child.sessionID.uuidString
+
+        func inspections(for request: AgentApprovalRequest) async throws -> [UUID: AgentSessionLinkPendingInteractionInspection] {
+            session.pendingApproval = request
+            let projected = await scoped.bridge.pendingInteractionsForObservation(leases: [readTarget.lease])
+            return try XCTUnwrap(projected, "scope-backed poll must project the real target prompt")
+        }
+        func detailValues(_ pending: [String: Value]?) -> [String] {
+            (pending?["details"]?.arrayValue ?? []).compactMap { $0.objectValue?["value"]?.stringValue }
+        }
+
+        let concrete = scopedApprovalRequest(501)
+        let concreteInspections = try await inspections(for: concrete)
+
+        let single = try XCTUnwrap(AgentSessionLinkResponseRenderer.addPendingInteractions(
+            to: .object(["session_id": .string(childID)]), inspections: concreteInspections, isSingle: true
+        ).objectValue)
+        let singlePending = try XCTUnwrap(single["pending_interaction"]?.objectValue, "single-target wire carries pending_interaction")
+        XCTAssertEqual(singlePending["interaction_id"]?.stringValue, concrete.id.uuidString)
+        XCTAssertEqual(singlePending["respondable"], .bool(true))
+        XCTAssertNotNil(single["respond_hint"])
+        let singleValues = detailValues(singlePending)
+        XCTAssertTrue(singleValues.contains("swift test --filter FooTests"), "command on the wire: \(singleValues)")
+        XCTAssertTrue(singleValues.contains("/tmp/worktree"), "cwd on the wire: \(singleValues)")
+
+        let multi = try XCTUnwrap(AgentSessionLinkResponseRenderer.addPendingInteractions(
+            to: .object(["targets": .array([.object(["session_id": .string(childID)])])]),
+            inspections: concreteInspections, isSingle: false
+        ).objectValue)
+        let rows = try XCTUnwrap(multi["targets"]?.arrayValue)
+        XCTAssertEqual(rows.count, 1)
+        let row = try XCTUnwrap(rows.first?.objectValue)
+        XCTAssertNil(row["pending_interaction_omitted"])
+        let rowValues = detailValues(row["pending_interaction"]?.objectValue)
+        XCTAssertTrue(rowValues.contains("swift test --filter FooTests"), "command in multi-target row: \(rowValues)")
+        XCTAssertTrue(rowValues.contains("/tmp/worktree"), "cwd in multi-target row: \(rowValues)")
+
+        let absentInspections = try await inspections(for: scopedApprovalRequest(502, command: nil, cwd: nil))
+        let absent = try XCTUnwrap(AgentSessionLinkResponseRenderer.addPendingInteractions(
+            to: .object(["session_id": .string(childID)]), inspections: absentInspections, isSingle: true
+        ).objectValue)
+        let absentValues = detailValues(absent["pending_interaction"]?.objectValue)
+        XCTAssertFalse(absentValues.contains { $0.contains("swift") || $0.contains("/tmp") }, "absent command is never invented on the wire")
+
+        let oversizedInspections = try await inspections(for: scopedApprovalRequest(503, command: String(repeating: "x", count: 600_000)))
+        let oversized = try XCTUnwrap(AgentSessionLinkResponseRenderer.addPendingInteractions(
+            to: .object(["session_id": .string(childID)]), inspections: oversizedInspections, isSingle: true
+        ).objectValue)
+        let stub = try XCTUnwrap(oversized["pending_interaction"]?.objectValue, "oversized prompt still yields an ID-only stub")
+        XCTAssertEqual(stub["respondable"], .bool(false))
+        XCTAssertEqual(stub["manual_only_reason"]?.stringValue, AgentSessionLinkInteractionManualOnlyReason.tooLarge.rawValue)
+        XCTAssertNil(stub["details"])
+        XCTAssertNil(stub["prompt"])
+        XCTAssertNil(oversized["respond_hint"])
+        let stubJSON = try String(decoding: JSONEncoder().encode(Value.object(stub)), as: UTF8.self)
+        XCTAssertFalse(stubJSON.contains("xxxx"), "no usable command in the stub")
+
+        XCTAssertTrue(recorder.recorder.events.isEmpty, "polling never answers")
+    }
+
     func testScopedWrongInteractionIDAndSourceARevocationWithLiveBApplyNothing() async throws {
         let (scoped, record) = try await makeScopedController()
         let sourceA = try XCTUnwrap(record)
