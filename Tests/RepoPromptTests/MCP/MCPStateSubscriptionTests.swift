@@ -818,13 +818,31 @@ private final class ExecutionCounter: @unchecked Sendable {
             XCTAssertEqual(events.decisions, ["first-allowed"])
             await service.continuePendingApproval(allow: false, generation: second)
             XCTAssertEqual(events.decisions, ["first-allowed", "second-denied"])
+            // Publish a known diagnostic before finishing the streams, without relying
+            // on when the controller's unawaited denial diagnostic happens to run.
+            let marker = MCPDiagnostics(
+                issue: .lastClientApprovalDenied(clientID: "same-name"),
+                listenerStateDescription: "controlled approval diagnostic"
+            )
+            await service.updateDiagnostics(marker)
             await service.unsubscribeFromStateUpdates(id: windowA)
             await service.unsubscribeFromStateUpdates(id: windowB)
             var snapshotsB: [MCPService.Snapshot] = []
             for await snapshot in streamB {
                 snapshotsB.append(snapshot)
             }
-            XCTAssertEqual(snapshotsB.map(\.pendingApprovalGeneration), [nil, first, nil, second, nil])
+            let approvalPrefix = snapshotsB.prefix(5)
+            XCTAssertEqual(approvalPrefix.map(\.pendingClientID), [nil, "same-name", nil, "same-name", nil])
+            XCTAssertEqual(approvalPrefix.map(\.pendingApprovalGeneration), [nil, first, nil, second, nil])
+            XCTAssertEqual(approvalPrefix.map(\.pendingApprovalExecutablePath), [nil, nil, nil, nil, nil])
+            let approvalSuffix = snapshotsB.dropFirst(5)
+            _ = try XCTUnwrap(approvalSuffix.first { $0.diagnostics == marker })
+            for snapshot in approvalSuffix {
+                XCTAssertNil(snapshot.pendingClientID)
+                XCTAssertNil(snapshot.pendingApprovalGeneration)
+                XCTAssertNil(snapshot.pendingApprovalExecutablePath)
+                XCTAssertNotEqual(snapshot.diagnostics, MCPDiagnostics(), "only diagnostic publications may follow the final clear")
+            }
         }
 
         func testExplicitDenialRemainsConnectionSpecific() async {
