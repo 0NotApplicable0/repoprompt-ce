@@ -10926,10 +10926,14 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             )
         }
 
+        let timing = workspaceManager.makeAgentAdmissionTiming()
         return try await workspaceManager.withAgentSessionAdmission(
             workspaceID: owningWorkspaceID,
             admissionID: UUID(),
-            refreshCanonicalState: true
+            refreshCanonicalState: true,
+            kind: .existingTab,
+            classifyError: { $0 is MCPError ? .rejected : .threw },
+            timing: timing
         ) {
             let admissionWorkspace = workspaceManager.workspaces.first { $0.id == expectedWorkspaceID }
             let hasUnboundTargetTab: Bool = admissionWorkspace?.composeTabs.contains {
@@ -10974,11 +10978,14 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             }
 
             try Task.checkCancellation()
+            timing.begin(.save)
+            timing.recordSaveAttempt()
             let persistence = await workspaceManager.pollAndSaveStateWithOutcomeAsync(
                 workspaceID: expectedWorkspaceID,
                 source: WorkspaceSaveSource("agentSessionLifecycleExistingTabAdmission"),
                 allowRetainedAgentAdmissionRecoveryRetry: false
             )
+            timing.end()
             #if DEBUG
                 await test_afterProvisionalExistingTabBindingInstalled?()
             #endif
@@ -11831,7 +11838,11 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         do {
             return try await workspaceManager.withAgentSessionAdmission(
                 workspaceID: identity.workspaceID,
-                admissionID: identity.recoveryID
+                admissionID: identity.recoveryID,
+                kind: .discard,
+                classifyOutcome: { (result: MCPSessionTargetDiscardResult) in
+                    result == .complete ? .committed : .rejected
+                }
             ) {
                 switch claim.state {
                 case .accepted, .complete:
