@@ -265,11 +265,14 @@ private actor AgentTaskRouterActivation {
         let latest = await source.routerDemandSnapshot()
         guard !stopped, !Task.isCancelled, admittedEpoch == epoch,
               latest.key == lastSnapshot?.key, latest.requiredBackendIDs.contains(id),
-              readinessStreamVersions[id, default: 0] == streamVersion,
-              !state.isReady, attemptedGenerations[id] != state.generation
+              readinessStreamVersions[id, default: 0] == streamVersion
         else {
             bootstraps[id] = nil
             applyDemand(latest, retryAdmission: true)
+            return
+        }
+        guard !state.isReady, attemptedGenerations[id] != state.generation else {
+            bootstraps[id] = nil
             return
         }
         if case .validating = state {

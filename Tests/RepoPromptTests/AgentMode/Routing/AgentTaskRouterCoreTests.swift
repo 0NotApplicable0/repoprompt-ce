@@ -1058,6 +1058,31 @@ final class AgentTaskRouterRuntimeTests: XCTestCase {
         await runtime.teardown()
     }
 
+    func testReadyAdmissionSnapshotSettlesWithoutWaitingForHeldReadinessStream() async throws {
+        let source = RuntimeTestDemandSource(.init(routerEnabled: true, selectedBackendRawValue: "jev", autoEffortEnabled: false, routerRevision: 0))
+        let jev = RuntimeTestController(gateAdmission: true)
+        let runtime = try makeRuntime(source, jev, RuntimeTestController())
+        await jev.waitUntilObserved()
+        await jev.waitUntilAdmission()
+        let ready = DecisionReadiness.ready(generation: 1, policyVersion: "test")
+        await jev.setSnapshotWithoutPublishing(ready)
+        let reconciled = expectation(description: "ready admission needs no bootstrap or stream delivery")
+        let reconciliation = Task {
+            await runtime.reconcileDemand()
+            reconciled.fulfill()
+        }
+        await jev.releaseAdmission()
+        let result = await XCTWaiter.fulfillment(of: [reconciled], timeout: 15)
+        XCTAssertEqual(result, .completed)
+        XCTAssertEqual(runtime.backendReadiness(.jev), .needsConfiguration(generation: 0, reason: "test"))
+        let calls = await jev.calls
+        XCTAssertEqual(calls, 0)
+        await jev.set(ready)
+        await reconciliation.value
+        try await waitForReadiness(ready, id: .jev, runtime: runtime)
+        await runtime.teardown()
+    }
+
     func testEnabledLegacyProductionIntentBootstrapsJevWithoutSettingsVM() async throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
@@ -1324,6 +1349,10 @@ private actor RuntimeTestController: DecisionServiceConfigurationController {
     func set(_ state: DecisionReadiness) {
         self.state = state
         continuation?.yield(state)
+    }
+
+    func setSnapshotWithoutPublishing(_ state: DecisionReadiness) {
+        self.state = state
     }
 
     func perform(_ action: DecisionServiceSettingsAction) -> DecisionServiceSettingsActionResult {
