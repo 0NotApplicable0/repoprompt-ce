@@ -813,6 +813,7 @@ private final class ExecutionCounter: @unchecked Sendable {
             let second = try XCTUnwrap(secondSnapshot.pendingApprovalGeneration)
             XCTAssertNotEqual(first, second)
             XCTAssertEqual(secondSnapshot.pendingClientID, "same-name")
+            await service.updateDiagnostics(MCPDiagnostics())
             // A delayed second-window click cannot clear or resolve the successor.
             await service.continuePendingApproval(allow: false, generation: first)
             XCTAssertEqual(events.decisions, ["first-allowed"])
@@ -831,11 +832,22 @@ private final class ExecutionCounter: @unchecked Sendable {
             for await snapshot in streamB {
                 snapshotsB.append(snapshot)
             }
-            let approvalPrefix = snapshotsB.prefix(5)
-            XCTAssertEqual(approvalPrefix.map(\.pendingClientID), [nil, "same-name", nil, "same-name", nil])
-            XCTAssertEqual(approvalPrefix.map(\.pendingApprovalGeneration), [nil, first, nil, second, nil])
-            XCTAssertEqual(approvalPrefix.map(\.pendingApprovalExecutablePath), [nil, nil, nil, nil, nil])
-            let approvalSuffix = snapshotsB.dropFirst(5)
+            // Diagnostics also publish snapshots; compare approval transitions, not notification counts.
+            let approvalTransitions = snapshotsB.reduce(into: [MCPService.Snapshot]()) { transitions, snapshot in
+                if let previous = transitions.last,
+                   previous.pendingApprovalGeneration == snapshot.pendingApprovalGeneration,
+                   previous.pendingClientID == snapshot.pendingClientID,
+                   previous.pendingApprovalExecutablePath == snapshot.pendingApprovalExecutablePath
+                { return }
+                transitions.append(snapshot)
+            }
+            XCTAssertEqual(approvalTransitions.map(\.pendingApprovalGeneration), [nil, first, nil, second, nil])
+            XCTAssertEqual(approvalTransitions.map(\.pendingClientID), [nil, "same-name", nil, "same-name", nil])
+            XCTAssertEqual(approvalTransitions.map(\.pendingApprovalExecutablePath), [nil, nil, nil, nil, nil])
+            // Diagnostic snapshots may also occur while the successor is pending. Start
+            // the suffix after its final clear, rather than assuming five publications.
+            let lastPendingIndex = try XCTUnwrap(snapshotsB.lastIndex { $0.pendingApprovalGeneration == second })
+            let approvalSuffix = snapshotsB.dropFirst(lastPendingIndex + 2)
             _ = try XCTUnwrap(approvalSuffix.first { $0.diagnostics == marker })
             for snapshot in approvalSuffix {
                 XCTAssertNil(snapshot.pendingClientID)
