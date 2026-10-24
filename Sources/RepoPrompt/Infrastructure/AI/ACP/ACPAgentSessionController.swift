@@ -337,7 +337,9 @@ actor ACPAgentSessionController {
     private var nextRequestID = 1
     private var inboundMessageSequence: UInt64 = 0
     private var pendingRequests: [String: PendingRequest] = [:]
+    // Wire identity is typed; approval identity is a fresh incarnation owned by this controller.
     private var pendingPermissionRequests: [String: PendingPermissionRequest] = [:]
+    private var permissionStorageKeyByApprovalID: [String: String] = [:]
     private var recentDevinToolCalls: [String: [String: Any]] = [:]
     private var recentDevinToolCallIDs: [String] = []
     private var activePromptTurnID: UUID?
@@ -1507,7 +1509,9 @@ actor ACPAgentSessionController {
         decision: AgentApprovalDecision,
         authorize: @MainActor @Sendable () async -> Bool
     ) async -> OverseerPermissionResponseResult {
-        guard let initial = pendingPermissionRequests[id] else { return .notSubmitted }
+        guard let storageKey = permissionStorageKeyByApprovalID[id],
+              let initial = pendingPermissionRequests[storageKey]
+        else { return .notSubmitted }
         let options = initial.options.map { (optionID: $0.optionID, kind: $0.kind) }
         let selectedOptionID: String?
         switch decision {
@@ -1524,7 +1528,11 @@ actor ACPAgentSessionController {
         case .acceptForSession, .acceptWithExecpolicyAmendment:
             return .noOneTimeOption
         }
-        guard await authorize(), let pending = pendingPermissionRequests[id] else { return .notSubmitted }
+        guard await authorize(),
+              permissionStorageKeyByApprovalID[id] == storageKey,
+              let pending = pendingPermissionRequests[storageKey],
+              pending.request.id == initial.request.id
+        else { return .notSubmitted }
         do {
             if let selectedOptionID {
                 try sendPermissionSelectionResponse(id: pending.rpcID, optionID: selectedOptionID)
@@ -1535,7 +1543,7 @@ actor ACPAgentSessionController {
                     "result": ["outcome": ["outcome": "cancelled"]]
                 ])
             }
-            pendingPermissionRequests.removeValue(forKey: id)
+            removePendingPermissionRequest(approvalID: id)
             return .submitted
         } catch {
             log("Failed to submit Overseer ACP permission response: \(error.localizedDescription)")
@@ -1547,7 +1555,7 @@ actor ACPAgentSessionController {
         id: String,
         decision: AgentApprovalDecision
     ) async {
-        guard let pending = pendingPermissionRequests.removeValue(forKey: id) else {
+        guard let pending = removePendingPermissionRequest(approvalID: id) else {
             return
         }
         let result: [String: Any] = switch decision {
@@ -1684,9 +1692,16 @@ actor ACPAgentSessionController {
         ])
     }
 
+    @discardableResult
+    private func removePendingPermissionRequest(approvalID: String) -> PendingPermissionRequest? {
+        guard let storageKey = permissionStorageKeyByApprovalID.removeValue(forKey: approvalID) else { return nil }
+        return pendingPermissionRequests.removeValue(forKey: storageKey)
+    }
+
     private func cancelPendingPermissionRequestsLocally() {
         let pending = pendingPermissionRequests.values
         pendingPermissionRequests.removeAll()
+        permissionStorageKeyByApprovalID.removeAll()
         for request in pending {
             do {
                 try sendJSONLine([
@@ -2181,6 +2196,17 @@ actor ACPAgentSessionController {
     }
 
     private func handlePermissionRequest(id: JSONRPCID, params: [String: Any]) {
+        switch state {
+        case .failed, .closing, .closed:
+            return
+        default:
+            break
+        }
+        // A duplicate live wire ID is ambiguous even if it would be auto-approved.
+        guard pendingPermissionRequests[id.storageKey] == nil else {
+            handleProtocolViolation("Duplicate active ACP permission request ID")
+            return
+        }
         guard
             let sessionID = params["sessionId"] as? String,
             let toolCall = params["toolCall"] as? [String: Any]
@@ -2238,8 +2264,9 @@ actor ACPAgentSessionController {
         } else {
             nil
         }
+        let approvalID = UUID().uuidString
         let request = AgentApprovalRequest(
-            requestID: .acp(id.displayValue),
+            requestID: .acp(approvalID),
             method: "session/request_permission",
             kind: approvalKind(for: toolKind),
             threadID: sessionID,
@@ -2293,11 +2320,12 @@ actor ACPAgentSessionController {
             }
         }
 
-        pendingPermissionRequests[id.displayValue] = PendingPermissionRequest(
+        pendingPermissionRequests[id.storageKey] = PendingPermissionRequest(
             rpcID: id,
             options: options,
             request: request
         )
+        permissionStorageKeyByApprovalID[approvalID] = id.storageKey
         emit(.approvalRequested(request))
     }
 
@@ -2525,6 +2553,12 @@ actor ACPAgentSessionController {
     }
 
     private func failPendingRequests(with error: Error) {
+        let permissions = pendingPermissionRequests.values
+        pendingPermissionRequests.removeAll()
+        permissionStorageKeyByApprovalID.removeAll()
+        for permission in permissions {
+            emit(.approvalCancelled(permission.request.requestID))
+        }
         let pending = pendingRequests.values
         pendingRequests.removeAll()
         for pendingRequest in pending {
