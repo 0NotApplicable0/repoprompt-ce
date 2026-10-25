@@ -478,6 +478,7 @@ private final class ExecutionCounter: @unchecked Sendable {
             let second = try XCTUnwrap(secondSnapshot.pendingApprovalGeneration)
             XCTAssertNotEqual(first, second)
             XCTAssertEqual(secondSnapshot.pendingClientID, "same-name")
+            await service.updateDiagnostics(MCPDiagnostics())
             // A delayed second-window click cannot clear or resolve the successor.
             await service.continuePendingApproval(allow: false, generation: first)
             XCTAssertEqual(events.decisions, ["first-allowed"])
@@ -489,7 +490,15 @@ private final class ExecutionCounter: @unchecked Sendable {
             for await snapshot in streamB {
                 snapshotsB.append(snapshot)
             }
-            XCTAssertEqual(snapshotsB.map(\.pendingApprovalGeneration), [nil, first, nil, second, nil])
+            let approvalTransitions = snapshotsB.reduce(into: [MCPService.Snapshot]()) { transitions, snapshot in
+                if let previous = transitions.last,
+                   previous.pendingApprovalGeneration == snapshot.pendingApprovalGeneration,
+                   previous.pendingClientID == snapshot.pendingClientID
+                { return }
+                transitions.append(snapshot)
+            }
+            XCTAssertEqual(approvalTransitions.map(\.pendingApprovalGeneration), [nil, first, nil, second, nil])
+            XCTAssertEqual(approvalTransitions.map(\.pendingClientID), [nil, "same-name", nil, "same-name", nil])
         }
 
         func testExplicitDenialRemainsConnectionSpecific() async {
