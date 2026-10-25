@@ -387,11 +387,10 @@ import XCTest
         }
 
         func testUnchangedGitModePublicationDoesNotExhaustAdmissionSavePreparation() async throws {
-            try await assertGitModePublicationDuringAdmissionSave(changesMode: false)
+            try await assertGitModePublicationDuringAdmissionSave()
         }
 
         private func assertGitModePublicationDuringAdmissionSave(
-            changesMode: Bool,
             file: StaticString = #filePath,
             line: UInt = #line
         ) async throws {
@@ -409,13 +408,9 @@ import XCTest
                 guard workspaceID == fixture.workspaceID else { return }
                 preparations += 1
                 // Settings sync can republish the same mode while document preparation
-                // is suspended. The control changes it once, then republishes that value
-                // on the retry; only the real transition may invalidate the capture.
+                // is suspended; an unchanged value must not invalidate the capture.
                 let currentMode = gitViewModel.gitDiffInclusionMode
-                let publishedMode: GitDiffInclusionMode = changesMode && preparations == 1
-                    ? (currentMode == .all ? .none : .all)
-                    : currentMode
-                gitViewModel.gitDiffInclusionMode = publishedMode
+                gitViewModel.gitDiffInclusionMode = currentMode
                 await withCheckedContinuation { continuation in
                     DispatchQueue.main.async { continuation.resume() }
                 }
@@ -433,8 +428,8 @@ import XCTest
             XCTAssertEqual(observations.count, 1, file: file, line: line)
             XCTAssertEqual(
                 preparations,
-                changesMode ? 2 : 1,
-                "Only a changed Git mode may consume the one allowed save retry",
+                1,
+                "An unchanged Git mode must not consume the one allowed save retry",
                 file: file,
                 line: line
             )
