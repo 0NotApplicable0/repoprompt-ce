@@ -2543,6 +2543,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         skillCatalog: AgentSkillCatalog? = nil,
         modelRouterSettingsStore: GlobalSettingsStore = .shared,
         modelRouterRuntime: AgentTaskRouterRuntime? = nil,
+        usesProductionAgentDefaultsAndModelPolling: Bool = true,
         catalogDiagnosticsSink: any AgentSessionLinkCatalogEventSink = NoopAgentSessionLinkCatalogEventSink(),
         restorePerfRecorder: any WorkspaceRestorePerfRecording = NoopWorkspaceRestorePerfRecorder(),
         perfRecorder: any AgentModePerfRecording = NoopAgentModePerfRecorder()
@@ -2645,7 +2646,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         }
         providerConversationCleanupRegistry = ProviderConversationCleanupRegistry()
         shouldManageCodexTooling = true
-        usesProductionAgentDefaultsAndModelPolling = true
+        self.usesProductionAgentDefaultsAndModelPolling = usesProductionAgentDefaultsAndModelPolling
         codexCoordinator = CodexAgentModeCoordinator(
             windowID: windowID,
             runtimeWorkspacePathsProvider: codexRuntimeWorkspacePathsProvider,
@@ -2734,7 +2735,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         refreshAvailableAgents()
 
         // Restore last-used agent and model so new sessions default to the user's previous choice.
-        restoreLastUsedAgentSelectionIfNeeded()
+        if usesProductionAgentDefaultsAndModelPolling {
+            restoreLastUsedAgentSelectionIfNeeded()
+        }
 
         setupObservers()
         modelRouterRuntime?.objectWillChange
