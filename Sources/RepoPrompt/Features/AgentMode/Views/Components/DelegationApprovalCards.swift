@@ -74,6 +74,18 @@ struct DelegationApprovalSlot: View {
                                 presentedTabID: tabID, presentedSessionID: presentedSessionID,
                                 guardrails: guardrails, grantAllForSession: true
                             )
+                        },
+                        standingRuleOffer: runtime.standingRuleOffer(for: request),
+                        onApproveWithRule: { capabilities, threshold, options in
+                            guard let presentedSessionID = sessionID else { return .failure(.unknownScope) }
+                            var guardrails = request.guardrails
+                            guardrails.bulkConfirmationThreshold = threshold
+                            return runtime.approve(
+                                requestID: request.id, presentedWindowID: windowID,
+                                presentedTabID: tabID, presentedSessionID: presentedSessionID,
+                                capabilities: capabilities, guardrails: guardrails,
+                                standingRuleOptions: options
+                            )
                         }
                     )
                 }
@@ -136,9 +148,29 @@ struct DelegationActiveScopesSection: View {
     var body: some View {
         let scopes = runtime.allLiveScopes()
         let standing = runtime.sessionWideApprovals.sorted { $0.uuidString < $1.uuidString }
-        if !scopes.isEmpty || !standing.isEmpty || globalAutoApprove || runtime.persistenceStatusMessage != nil
-            || !runtime.continuityRecoveryOffers.isEmpty
-        {
+        let liveGrantIDs = Set(scopes.map(\.id))
+        let renderedAt = Date()
+        let ruleRows = runtime.rules
+            .filter { ActiveStandingRuleRowModel.isVisible(rule: $0, liveGrantIDs: liveGrantIDs, now: renderedAt) }
+            .map { rule in
+                ActiveStandingRuleRowModel(
+                    rule: rule,
+                    workspaceName: DelegationDisplayNames.workspaceName(rule.workspaceID),
+                    liveGrantIDs: liveGrantIDs,
+                    connectionLive: ServerNetworkManager.shared.isLiveStarter(rule.starter),
+                    now: renderedAt
+                )
+            }
+        if Self.hasContent(
+            scopes: scopes,
+            standing: standing,
+            globalAutoApprove: globalAutoApprove,
+            persistenceStatusMessage: runtime.persistenceStatusMessage,
+            continuityRecoveryOffers: runtime.continuityRecoveryOffers,
+            rules: runtime.rules,
+            notices: runtime.notices,
+            now: renderedAt
+        ) {
             VStack(alignment: .leading, spacing: 6) {
                 Divider()
                 Text("Active delegations")
@@ -150,6 +182,34 @@ struct DelegationActiveScopesSection: View {
                     )
                     .font(.caption)
                     .foregroundStyle(.orange)
+                }
+                ForEach(runtime.notices) { notice in
+                    HStack(alignment: .top, spacing: 8) {
+                        Label(notice.message, systemImage: "info.circle")
+                            .font(.caption)
+                            .foregroundStyle(.orange)
+                        Spacer()
+                        Button("Dismiss") { runtime.dismissStandingRuleNotice(id: notice.id) }
+                            .buttonStyle(.bordered)
+                            .controlSize(.small)
+                    }
+                }
+                ForEach(ruleRows) { row in
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text(row.title).font(.caption).bold()
+                        Text(row.detail).font(.caption2).foregroundStyle(.secondary)
+                        Text("\(row.asOf). \(ActiveStandingRuleRowModel.fullAccessNote)")
+                            .font(.caption2).foregroundStyle(.secondary)
+                        HStack {
+                            ForEach(row.actions, id: \.title) { action in
+                                Button(action.title, role: action.revokesIssuedGrants ? .destructive : nil) {
+                                    row.perform(action) { runtime.stopStandingRule(id: $0, revokeIssuedGrants: $1) }
+                                }
+                                .buttonStyle(.bordered)
+                                .controlSize(.small)
+                            }
+                        }
+                    }
                 }
                 ForEach(standing, id: \.self) { sessionID in
                     HStack(alignment: .top, spacing: 8) {
@@ -197,7 +257,7 @@ struct DelegationActiveScopesSection: View {
                         VStack(alignment: .leading, spacing: 2) {
                             Text(DelegationDisplayNames.sessionTitle(scope.grant.granteeSessionID) ?? "Session \(scope.grant.granteeSessionID.uuidString.prefix(8))")
                                 .lineLimit(1)
-                            Text(Self.summary(scope))
+                            Text(Self.summary(scope) + ActiveStandingRuleRowModel.grantSuffix(scopeID: scope.id, rules: runtime.rules))
                                 .font(.caption2)
                                 .foregroundStyle(.secondary)
                         }
@@ -209,6 +269,22 @@ struct DelegationActiveScopesSection: View {
                 }
             }
         }
+    }
+
+    static func hasContent(
+        scopes: [DomainDelegationScopeRecord],
+        standing: [UUID],
+        globalAutoApprove: Bool,
+        persistenceStatusMessage: String?,
+        continuityRecoveryOffers: [DelegationScopeRecoveryOffer],
+        rules: [DelegationStandingRule] = [],
+        notices: [StandingRuleNotice] = [],
+        now: Date = Date()
+    ) -> Bool {
+        let liveGrantIDs = Set(scopes.map(\.id))
+        return !scopes.isEmpty || !standing.isEmpty || globalAutoApprove || persistenceStatusMessage != nil
+            || !continuityRecoveryOffers.isEmpty || !notices.isEmpty
+            || rules.contains { ActiveStandingRuleRowModel.isVisible(rule: $0, liveGrantIDs: liveGrantIDs, now: now) }
     }
 
     static func summary(_ scope: DomainDelegationScopeRecord) -> String {
@@ -242,7 +318,10 @@ struct DelegationScopeApprovalCard: View {
     let onApprove: (Set<DomainDelegationScopeCapability>, Int) -> Result<DomainDelegationScopeRecord, DomainDelegationScopeDenial>
     let onDeny: () -> Void
     let onGrantAll: ((Int) -> Result<DomainDelegationScopeRecord, DomainDelegationScopeDenial>)?
+    let standingRuleOffer: StandingRuleOffer?
+    let onApproveWithRule: ((Set<DomainDelegationScopeCapability>, Int, StandingRuleOptions) -> Result<DomainDelegationScopeRecord, DomainDelegationScopeDenial>)?
 
+    @State private var ruleModel: StandingRuleCardModel?
     @State private var selected: Set<DomainDelegationScopeCapability>
     /// Only the user may loosen the agent's (already clamped) threshold.
     @State private var threshold: Int
@@ -253,7 +332,9 @@ struct DelegationScopeApprovalCard: View {
         authorityUnavailableReason: String? = nil,
         onApprove: @escaping (Set<DomainDelegationScopeCapability>, Int) -> Result<DomainDelegationScopeRecord, DomainDelegationScopeDenial>,
         onDeny: @escaping () -> Void,
-        onGrantAll: ((Int) -> Result<DomainDelegationScopeRecord, DomainDelegationScopeDenial>)? = nil
+        onGrantAll: ((Int) -> Result<DomainDelegationScopeRecord, DomainDelegationScopeDenial>)? = nil,
+        standingRuleOffer: StandingRuleOffer? = nil,
+        onApproveWithRule: ((Set<DomainDelegationScopeCapability>, Int, StandingRuleOptions) -> Result<DomainDelegationScopeRecord, DomainDelegationScopeDenial>)? = nil
     ) {
         self.request = request
         self.authorityUnavailableReason = authorityUnavailableReason
@@ -261,6 +342,11 @@ struct DelegationScopeApprovalCard: View {
         self.onDeny = onDeny
         if case .directChildren = request.kind { self.onGrantAll = nil }
         else { self.onGrantAll = onGrantAll }
+        self.standingRuleOffer = standingRuleOffer
+        self.onApproveWithRule = onApproveWithRule
+        _ruleModel = State(initialValue: standingRuleOffer.map {
+            StandingRuleCardModel(offer: $0, bulkThreshold: request.guardrails.bulkConfirmationThreshold)
+        })
         _selected = State(initialValue: request.capabilities)
         _threshold = State(initialValue: request.guardrails.bulkConfirmationThreshold)
     }
@@ -323,6 +409,8 @@ struct DelegationScopeApprovalCard: View {
                     .font(.caption)
             }
 
+            standingRuleControl
+
             Text("Deleting sessions, removing worktrees, keys, permission modes, and settings always stay with you.")
                 .font(.caption2)
                 .foregroundStyle(.secondary)
@@ -354,7 +442,15 @@ struct DelegationScopeApprovalCard: View {
                     .hoverTooltip("Grant every capability permitted for the scope shown above, without expiry, and approve this session's later requests without asking again until the app quits. Existing capacity and bulk-change limits remain. Stop auto-approving or revoke any time in Active delegations. Human-only actions remain excluded.")
                 }
                 Button("Grant") {
-                    switch onApprove(selected, threshold) {
+                    let route = StandingRuleCardModel.grantRoute(
+                        model: ruleModel, selectedCapabilities: selected, canApproveWithRule: onApproveWithRule != nil
+                    )
+                    let result = if case let .withRule(options) = route, let onApproveWithRule {
+                        onApproveWithRule(selected, threshold, options)
+                    } else {
+                        onApprove(selected, threshold)
+                    }
+                    switch result {
                     case .success: approvalFailure = nil
                     case let .failure(denial): approvalFailure = denial
                     }
@@ -370,6 +466,50 @@ struct DelegationScopeApprovalCard: View {
             RoundedRectangle(cornerRadius: 8, style: .continuous)
                 .stroke(Color.orange.opacity(0.32), lineWidth: 1)
         )
+    }
+
+    @ViewBuilder
+    private var standingRuleControl: some View {
+        if case .directChildren = request.kind, standingRuleOffer != nil,
+           selected == DomainDelegationScopeCapability.directChildrenPermitted,
+           let model = ruleModel?.presenting(standingRuleOffer)
+        {
+            VStack(alignment: .leading, spacing: 4) {
+                Toggle(model.checkboxLabel, isOn: Binding(
+                    get: { ruleModel?.isSelected ?? false },
+                    set: { ruleModel?.isSelected = $0 }
+                ))
+                .toggleStyle(.checkbox)
+                if model.isSelected {
+                    HStack(spacing: 12) {
+                        Picker("Rule lasts", selection: Binding(
+                            get: { ruleModel?.duration ?? StandingRuleOptions.defaultDuration },
+                            set: { ruleModel?.duration = $0 }
+                        )) {
+                            ForEach(StandingRuleCardModel.durationChoices, id: \.self) {
+                                Text(StandingRuleCardModel.durationTitle($0)).tag($0)
+                            }
+                        }
+                        Picker("Team leads", selection: Binding(
+                            get: { ruleModel?.maxTeamLeads ?? StandingRuleOptions.defaultTeamLeads },
+                            set: { ruleModel?.maxTeamLeads = $0 }
+                        )) {
+                            ForEach(StandingRuleCardModel.teamLeadChoices, id: \.self) { Text("\($0)").tag($0) }
+                        }
+                    }
+                    .controlSize(.small)
+                    Text(disclosure(for: model))
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+            }
+        }
+    }
+
+    private func disclosure(for model: StandingRuleCardModel) -> String {
+        var shown = model
+        shown.bulkThreshold = threshold
+        return shown.disclosure(now: Date())
     }
 
     private func binding(for capability: DomainDelegationScopeCapability) -> Binding<Bool> {

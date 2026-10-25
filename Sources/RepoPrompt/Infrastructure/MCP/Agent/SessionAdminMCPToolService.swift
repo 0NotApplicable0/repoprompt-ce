@@ -205,9 +205,13 @@ struct SessionAdminMCPToolService {
         case let .success(recorded):
             let runtime = scopes()
             // Standing user consent approves through the card's own path; no card is shown.
-            let autoApproved = recorded.state == .pending && runtime.approveWithStandingConsent(requestID: recorded.id)
+            let autoApproved = recorded.state == .pending && runtime.approveWithStandingConsent(
+                requestID: recorded.id,
+                standingRuleFacts: runtime.standingRuleFacts(for: recorded)
+            )
             let request = runtime.request(id: recorded.id, requesterSessionID: endpoint.sessionID) ?? recorded
             var value = Self.requestValue(request)
+            var standingRule: [String: Value] = [:]
             value["result"] = .string(request.state.label)
             if case let .granted(scopeID) = request.state, let record = runtime.record(id: scopeID) {
                 // The requested scope may be narrower than the authority that actually settled it.
@@ -225,11 +229,13 @@ struct SessionAdminMCPToolService {
                     value["guidance"] = .string(
                         "Granted by Overseer full access; no card was shown. scope is the actual unrestricted covering grant, not the narrower requested_scope. Just call the operation."
                     )
-                } else if autoApproved {
+                } else if autoApproved, runtime.standingRuleProvenance(scopeID: scopeID) == nil {
                     value["guidance"] = .string(
                         "Granted immediately by the user's standing consent for this session; no card was shown. scope describes the actual grant."
                     )
                 }
+                standingRule = Self.standingRuleFields(runtime, scopeID: scopeID)
+                value.merge(standingRule.filter { $0.key != "guidance" }) { _, new in new }
             }
             if request.state == .pending {
                 value["guidance"] = .string(
@@ -238,9 +244,8 @@ struct SessionAdminMCPToolService {
             }
             if case .directChildren = kind {
                 value["requires_explicit_link"] = .bool(true)
-                value["guidance"] = .string(
-                    "A granted sufficient direct-child scope permits explicit managed link activation to its direct workers using session_admin link with this scope_id; it creates no links automatically. Pending requests require this kind's explicit user card even with full access or session-wide approval and grant no management. Inspect or withdraw your own request using request_id; inspect or release your own granted scope using scope_id. Reasons are unverified agent statements."
-                )
+                let base = "A granted sufficient direct-child scope permits explicit managed link activation to its direct workers using session_admin link with this scope_id; it creates no links automatically. Pending requests require this kind's explicit user card even with full access or session-wide approval and grant no management. Inspect or withdraw your own request using request_id; inspect or release your own granted scope using scope_id. Reasons are unverified agent statements."
+                value["guidance"] = .string(standingRule["guidance"]?.stringValue.map { "\(base) \($0)" } ?? base)
             }
             return Self.withScopeAvailability(value, runtime: scopes())
         case let .failure(.invalid(denial)):
@@ -263,6 +268,20 @@ struct SessionAdminMCPToolService {
 
     // MARK: - scope_status
 
+    /// Provenance exists only for a grant the running app minted under a standing rule; it is absent
+    /// for card grants and after restart.
+    private static func standingRuleFields(_ runtime: DelegationScopeRuntime, scopeID: UUID) -> [String: Value] {
+        guard let rule = runtime.standingRuleProvenance(scopeID: scopeID) else { return [:] }
+        let endsAt = ISO8601DateFormatter().string(from: rule.expiresAt)
+        return [
+            "settled_by": .string("standing_rule"),
+            "rule_expires_at": .string(endsAt),
+            "guidance": .string(
+                "Granted without a card under a standing rule your user set for this connection; it ends no later than \(endsAt); link explicitly with this scope_id. When this grant expires, request again with a new idempotency_key and an expires_in_seconds that ends before \(endsAt)."
+            )
+        ]
+    }
+
     private func scopeStatus(args: [String: Value], callerSessionID: UUID) throws -> Value {
         let runtime = scopes()
         if args["request_id"] != nil, args["scope_id"] != nil {
@@ -276,6 +295,7 @@ struct SessionAdminMCPToolService {
             value["result"] = .string(request.state.label)
             if case let .granted(scopeID) = request.state, let record = runtime.record(id: scopeID) {
                 value["scope"] = Self.scopeValue(record, now: now())
+                value.merge(Self.standingRuleFields(runtime, scopeID: scopeID)) { _, new in new }
             }
             return Self.withScopeAvailability(value, runtime: runtime)
         }
@@ -286,13 +306,22 @@ struct SessionAdminMCPToolService {
             guard let record = runtime.record(id: scopeID), record.grant.granteeSessionID == callerSessionID else {
                 throw Self.unavailableError
             }
-            return Self.withScopeAvailability(["result": .string("ok"), "scope": Self.scopeValue(record, now: now())], runtime: runtime)
+            var value: [String: Value] = ["result": .string("ok"), "scope": Self.scopeValue(record, now: now())]
+            value.merge(Self.standingRuleFields(runtime, scopeID: scopeID)) { _, new in new }
+            return Self.withScopeAvailability(value, runtime: runtime)
         }
         let scopes = runtime.scopes(grantedTo: callerSessionID)
         return Self.withScopeAvailability([
             "result": .string("ok"),
             "has_live_scope": .bool(runtime.hasLiveScope(grantedTo: callerSessionID)),
-            "scopes": .array(scopes.map { Self.scopeValue($0, now: now()) }),
+            "scopes": .array(scopes.map { record in
+                var entry = Self.scopeValue(record, now: now())
+                if case var .object(fields) = entry {
+                    fields.merge(Self.standingRuleFields(runtime, scopeID: record.id)) { _, new in new }
+                    entry = .object(fields)
+                }
+                return entry
+            }),
             "operation_catalog": Self.operationCatalog(),
             "guidance": .string("Capabilities describe authority, not tool discovery. For a one-target task, become_overseer with session_id and optional message requests exactly the needed capabilities and continues automatically after approval, without waiting for catalog refresh. Other catalog changes may arrive next turn. A new link authorizes operations immediately on a current route. Use agent_session_link list for exact live link capabilities. Scope membership and guardrails are checked on every call.")
         ], runtime: runtime)

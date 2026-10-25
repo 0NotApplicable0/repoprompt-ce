@@ -5,6 +5,7 @@ import MCP
 @_spi(TestSupport) @testable import RepoPromptApp
 import RepoPromptDomainRuntime
 import RepoPromptSettingsCore
+import RepoPromptShared
 import XCTest
 
 /// Cross-window lifecycle bridge: synchronous first-link seeding, activation-time observation
@@ -19,6 +20,65 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
     override func setUp() {
         super.setUp()
         GlobalSettingsStore.installApplicationModelIdentityPolicy()
+    }
+
+    func testProductionCompositionOffersAStandingRuleForALiveStampedAdmittedRequest() async throws {
+        let manager = ServerNetworkManager.shared
+        let connectionID = UUID()
+        await manager.debugInstallDirectAdmissionConnectionForTesting(
+            connectionID: connectionID, connection: StarterProbeConnection(), pendingClientID: "production-composition"
+        )
+        let generation = try XCTUnwrap(manager.lifecycleGeneration(of: connectionID))
+        let stamp = StarterConnectionStamp(connectionID: connectionID, lifecycleGeneration: generation)
+        let bridge = AgentSessionLinkRuntimeBridge(authority: makeAuthority())
+        let fixture = SessionAdminScopeLifecycleTests.Fixture(runtime: bridge.delegationScopes)
+        let originalWindows = WindowStatesManager.shared.allWindows
+        WindowStatesManager.shared.allWindows = [fixture.window]
+        addTeardownBlock { @MainActor in
+            WindowStatesManager.shared.allWindows = originalWindows
+            await fixture.window.tearDown()
+            await manager.removeConnection(connectionID)
+            await manager.stop()
+        }
+        let session = try await fixture.installController(startedBy: stamp, clientLabel: "Production Client")
+        let endpoint = try XCTUnwrap(fixture.endpoint)
+        let request = try bridge.delegationScopes.requestScope(
+            requesterSessionID: endpoint.sessionID, requesterTabID: session.tabID,
+            kind: .directChildren(rootSessionID: endpoint.sessionID, workspaceID: endpoint.workspaceID),
+            capabilities: DomainDelegationScopeCapability.directChildrenPermitted, guardrails: .init(),
+            expiresInSeconds: 60, reason: nil, idempotencyKey: nil
+        ).get()
+
+        let facts = try XCTUnwrap(bridge.delegationScopes.standingRuleFacts(for: request))
+        XCTAssertEqual(facts, .init(starter: stamp, workspaceID: endpoint.workspaceID, clientLabel: "Production Client"))
+        let offer = try XCTUnwrap(bridge.delegationScopes.standingRuleOffer(for: request))
+        XCTAssertEqual(offer.clientLabel, "Production Client")
+        XCTAssertEqual(offer.connectionPrefix, String(connectionID.uuidString.prefix(8)))
+
+        XCTAssertNoThrow(try bridge.delegationScopes.approve(
+            requestID: request.id, presentedWindowID: endpoint.windowID,
+            presentedTabID: endpoint.tabID, presentedSessionID: endpoint.sessionID,
+            standingRuleOptions: .init()
+        ).get())
+        let rule = try XCTUnwrap(bridge.delegationScopes.rules.first)
+        let later = try bridge.delegationScopes.requestScope(
+            requesterSessionID: endpoint.sessionID, requesterTabID: session.tabID,
+            kind: .directChildren(rootSessionID: endpoint.sessionID, workspaceID: endpoint.workspaceID),
+            capabilities: DomainDelegationScopeCapability.directChildrenPermitted, guardrails: .init(),
+            expiresInSeconds: 120, reason: nil, idempotencyKey: UUID().uuidString
+        ).get()
+        XCTAssertTrue(bridge.delegationScopes.approveWithStandingConsent(requestID: later.id))
+        XCTAssertEqual(bridge.delegationScopes.rules.first { $0.id == rule.id }?.effectiveState(now: Date()), .active)
+
+        await manager.removeConnection(connectionID)
+        _ = try bridge.delegationScopes.requestScope(
+            requesterSessionID: endpoint.sessionID, requesterTabID: session.tabID,
+            kind: .directChildren(rootSessionID: endpoint.sessionID, workspaceID: endpoint.workspaceID),
+            capabilities: DomainDelegationScopeCapability.directChildrenPermitted, guardrails: .init(),
+            expiresInSeconds: 120, reason: nil, idempotencyKey: UUID().uuidString
+        ).get()
+        XCTAssertEqual(bridge.delegationScopes.rules.first { $0.id == rule.id }?.effectiveState(now: Date()), .connectionClosed)
+        XCTAssertNil(bridge.delegationScopes.standingRuleOffer(for: request), "control: the production liveness reader sees the removal")
     }
 
     func testComputerUseOrdinaryStopBlocksLinkAuthorityUntilRetirementCompletes() async throws {
@@ -588,6 +648,60 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         guard case .responded(.submitted) = second else { return XCTFail("successor answerable by its own id: \(second)") }
         try await awaitProviderEvents(recorder, count: 2)
         XCTAssertEqual(recorder.recorder.events, ["501:accept", "502:decline"])
+    }
+
+    func testRuleIssuedScopeRespondSubmitsOnceAndStopAndRevokeRefusesAFreshPrompt() async throws {
+        @MainActor final class WorkspaceBox { var id: UUID? }
+        let stamp = StarterConnectionStamp(connectionID: UUID(), lifecycleGeneration: 1)
+        let box = WorkspaceBox()
+        let runtime = DelegationScopeRuntime(
+            persistenceMode: .ephemeral,
+            standingRuleFacts: { _ in box.id.map { StandingRuleFacts(starter: stamp, workspaceID: $0) } },
+            isStarterLive: { $0 == stamp },
+            starterGeneration: { $0 == stamp.connectionID ? stamp.lifecycleGeneration : nil },
+            notifyCatalogChanged: { _ in }
+        )
+        let (scoped, _) = try await makeScopedController(grant: false, runtime: runtime)
+        box.id = scoped.endpoint.workspaceID
+        let rule = DelegationStandingRule(
+            id: UUID(), createdAt: Date(), expiresAt: Date().addingTimeInterval(7200), starter: stamp,
+            workspaceID: scoped.endpoint.workspaceID, countedTLs: [], ruleGrants: [], stoppedAt: nil,
+            replacedBy: nil, closedAt: nil
+        )
+        runtime.debugInstallStandingRuleForTesting(rule, issuedScopeID: UUID())
+        let request = try runtime.requestScope(
+            requesterSessionID: scoped.endpoint.sessionID, requesterTabID: scoped.endpoint.tabID,
+            kind: .directChildren(rootSessionID: scoped.endpoint.sessionID, workspaceID: scoped.endpoint.workspaceID),
+            capabilities: [.observe, .control, .restructure], guardrails: .init(), expiresInSeconds: 3600,
+            reason: nil, idempotencyKey: "rule-issued"
+        ).get()
+        XCTAssertTrue(runtime.approveWithStandingConsent(requestID: request.id), "the rule settles the request with no card")
+        guard case let .granted(scopeID)? = runtime.request(id: request.id, requesterSessionID: scoped.endpoint.sessionID)?.state,
+              let record = runtime.record(id: scopeID)
+        else { return XCTFail("rule-issued scope expected") }
+        XCTAssertEqual(runtime.rules.first?.ruleGrants, [scopeID])
+
+        let recorder = ApprovalRecordingCodexController()
+        let (session, child) = try makeScopedManagedChild(scoped, controller: recorder)
+        let sendTarget = try await scopedLinkedTarget(scoped, source: record, child: child, operation: .monitorRespond)
+
+        let first = scopedApprovalRequest(901)
+        session.pendingApproval = first
+        let accepted = try await scoped.bridge.respondToInteraction(target: sendTarget, request: interactionRequest(first.id, ["response": .string("accept")]))
+        guard case .responded(.submitted) = accepted else { return XCTFail("rule-issued scope must submit: \(accepted)") }
+        try await awaitProviderEvents(recorder, count: 1)
+        XCTAssertEqual(recorder.recorder.events, ["901:accept"], "exactly one provider response")
+        XCTAssertNil(session.pendingApproval, "prompt consumed")
+
+        runtime.stopStandingRule(id: rule.id, revokeIssuedGrants: true)
+        XCTAssertFalse(runtime.record(id: scopeID)?.isActive == true, "stop and revoke ends the rule-issued scope")
+
+        let fresh = scopedApprovalRequest(902)
+        session.pendingApproval = fresh
+        let refused = try await scoped.bridge.respondToInteraction(target: sendTarget, request: interactionRequest(fresh.id, ["response": .string("accept")]))
+        if case .responded(.submitted) = refused { XCTFail("a revoked rule scope must not answer: \(refused)") }
+        XCTAssertEqual(recorder.recorder.events, ["901:accept"], "nothing reaches the provider after stop and revoke")
+        XCTAssertEqual(session.pendingApproval, fresh, "prompt retained for the target's user")
     }
 
     func testScopedPromptOrEndpointReplacementDuringAuthorityAwaitAppliesNothing() async throws {
@@ -10092,3 +10206,42 @@ private extension Result {
         return value
     }
 }
+
+#if DEBUG
+    actor StarterProbeConnection: MCPServerConnection {
+        nonisolated var isFilesystemBacked: Bool {
+            false
+        }
+
+        nonisolated var connectionFolderURL: URL? {
+            nil
+        }
+
+        nonisolated var capabilityToken: String? {
+            nil
+        }
+
+        func start(approvalHandler _: @escaping (MCP.Client.Info) async -> Bool) async throws {}
+        func stop() async {}
+        func abortForExecutionWatchdog(context _: MCPExecutionWatchdogTerminalContext) async {}
+        func notifyToolListChanged() async {}
+        func connectionState() -> ConnectionStateSnapshot {
+            .ready
+        }
+
+        func isViableForRetention() -> Bool {
+            true
+        }
+
+        func secondsSinceLastActivity() async -> TimeInterval {
+            0
+        }
+
+        func transportIngressSnapshot() async -> MCPTransportIngressSnapshot? {
+            nil
+        }
+
+        func terminate(reason _: TerminationReason, message _: String?) async {}
+        func sendProgress(tool _: String, kind _: RepoPromptProgressKind, stage _: String, message _: String) async {}
+    }
+#endif

@@ -69,6 +69,31 @@ extension WindowState {
 }
 
 extension WindowStatesManager {
+    @MainActor
+    func standingRuleFacts(
+        for request: DelegationScopeRequest,
+        in windows: [WindowState]? = nil
+    ) -> StandingRuleFacts? {
+        guard let tabID = request.requesterTabID,
+              let presentation = DelegationScopeRuntime.loadedPresentation(forTab: tabID, in: windows ?? allWindows),
+              presentation.window.windowID == request.requesterWindowID,
+              presentation.sessionID == request.requesterSessionID,
+              let identity = presentation.window.agentModeViewModel.agentSessionLifecycleIdentity(
+                  tabID: tabID, expectedSessionID: request.requesterSessionID
+              ),
+              let endpoint = identity.monitorEndpoint(windowID: presentation.window.windowID),
+              let context = presentation.window.agentModeViewModel.sessions[tabID]?.mcpControlContext,
+              context.sessionID == request.requesterSessionID
+        else { return nil }
+        let facts = agentSessionLinkScopedObserverFacts(for: endpoint, in: presentation.window)
+        guard OverseerAuthorizationEngine.admitsDirectChildrenConsentRequest(endpoint: endpoint, facts: facts),
+              let starter = facts.startedBy
+        else { return nil }
+        return StandingRuleFacts(
+            starter: starter, workspaceID: identity.workspaceID, clientLabel: context.startedByClientLabel.name
+        )
+    }
+
     func agentSessionLinkScopedObserverFacts(
         for endpoint: DomainAgentSessionLinkEndpointIdentity,
         in window: WindowState? = nil
@@ -78,7 +103,7 @@ extension WindowStatesManager {
             return ScopedObserverControllerFacts(
                 windowMatchesEndpoint: false, windowIsClosing: true, hasExactCurrentEndpoint: false,
                 hasSession: false, contextSessionMatchesEndpoint: false, hasMCPControlContext: false,
-                isMCPOriginated: false, parentSessionID: nil, createdByOverseerSessionID: nil,
+                isMCPOriginated: false, startedBy: nil, parentSessionID: nil, createdByOverseerSessionID: nil,
                 taskLabelIsExplore: false, isDeletionInProgress: false, isDeletionCommitted: false, hasLoadedPersistedState: false,
                 bindingTransitionInProgress: false, candidateHasLoadedPersistedState: nil,
                 candidateHasDurableBinding: false, candidateIsClosing: true, candidateIsDeletionInProgress: false
@@ -95,6 +120,7 @@ extension WindowStatesManager {
             contextSessionMatchesEndpoint: context?.sessionID == endpoint.sessionID,
             hasMCPControlContext: context != nil,
             isMCPOriginated: session?.isMCPOriginated ?? false,
+            startedBy: context?.startedBy,
             parentSessionID: session?.parentSessionID,
             createdByOverseerSessionID: session?.createdByOverseerSessionID,
             taskLabelIsExplore: context?.taskLabelKind == .explore,

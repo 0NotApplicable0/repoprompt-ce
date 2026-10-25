@@ -78,6 +78,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         _ requiresExpectedAgentPID: Bool
     ) async -> Void
     typealias MCPServerEnabler = () async -> Bool
+    var mcpStarterGenerationReader: (UUID) -> UInt64? = { ServerNetworkManager.shared.lifecycleGeneration(of: $0) }
+    var mcpStarterClientNameReader: (UUID) async -> String? = { await ServerNetworkManager.shared.clientIdentifier(forConnection: $0) }
     typealias MCPRunRoutingCleaner = (_ runID: UUID, _ windowID: Int, _ reason: String) async -> Void
     typealias MCPRunToolCanceller = (_ runID: UUID, _ reason: String?) -> Int
     typealias ProviderConversationCleaner = ProviderConversationCleanupRegistry.Cleaner
@@ -11387,6 +11389,11 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         creationHandle: AgentSessionCreationHandle? = nil
     ) async throws -> AgentMCPControlContext {
         try Task.checkCancellation()
+        // The read suspends, so it precedes every ownership snapshot and guard below.
+        var starterClientName: String?
+        if creationHandle != nil, let originatingConnectionID {
+            starterClientName = await mcpStarterClientNameReader(originatingConnectionID)
+        }
         let admittedWindow = WindowStatesManager.shared.window(withID: windowID)
         var residentActivationTarget: MCPResidentTarget? = nil
         if creationHandle == nil {
@@ -11509,6 +11516,15 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         let priorAutoEditEnabled = existingContext?.sessionID == sessionID
             ? existingContext?.autoEditEnabledBeforeOverride ?? session.autoEditEnabled
             : session.autoEditEnabled
+        var starterStamp: StarterConnectionStamp?
+        if creationHandle != nil,
+           let originatingConnectionID,
+           let generation = mcpStarterGenerationReader(originatingConnectionID)
+        {
+            starterStamp = StarterConnectionStamp(
+                connectionID: originatingConnectionID, lifecycleGeneration: generation
+            )
+        }
         let activatedContext = AgentMCPControlContext(
             sessionID: sessionID,
             activationID: activationID,
@@ -11517,6 +11533,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             preparedEpoch: nil,
             pendingEpochTransition: nil,
             originatingConnectionID: originatingConnectionID,
+            startedBy: starterStamp,
+            startedByClientLabel: StarterClientLabel(name: starterStamp == nil ? nil : starterClientName),
             interactionTransport: .mcp(
                 sessionID: sessionID,
                 originatingConnectionID: originatingConnectionID
@@ -17087,6 +17105,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 persistedLoadProducerByTabID.removeValue(forKey: tabID)
             }
         }
+        AgentSessionLinkRuntimeBridge.shared.delegationScopes.standingRuleTabsDidRemove(runtimeCleanupTabIDs)
         // Drop any sidebar attention / observed run-state for tabs that are
         // going away so we don't leave dangling entries referring to dead IDs.
         if workspaceManager == nil || workspaceManager?.activeWorkspaceID == workspaceID {

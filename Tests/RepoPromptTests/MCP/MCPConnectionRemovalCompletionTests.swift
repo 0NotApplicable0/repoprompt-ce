@@ -127,6 +127,85 @@ import XCTest
             await manager.debugRemoveConnection(id)
         }
 
+        func testStandingRuleLifecycleGenerationWitness() async {
+            let manager = ServerNetworkManager(domainHost: AppDomainRuntimeComposition.shared.runtime.domainHost)
+            let id = UUID()
+            await manager.debugInstallDirectAdmissionConnectionForTesting(
+                connectionID: id, connection: RemovalTestConnection(), pendingClientID: "standing-rule"
+            )
+            let installed = await manager.debugDirectAdmissionStateForTesting(connectionID: id)
+            XCTAssertEqual(installed.pendingClientID, "standing-rule")
+            let generation = manager.lifecycleGeneration(of: id)
+            XCTAssertNotNil(generation, "generation")
+            guard let generation else { return }
+            XCTAssertTrue(manager.isLiveStarter(.init(connectionID: id, lifecycleGeneration: generation)))
+        }
+
+        func testLifecycleReadersRejectWrongGenerationAndUnknownConnection() async {
+            let manager = ServerNetworkManager(domainHost: AppDomainRuntimeComposition.shared.runtime.domainHost)
+            let id = UUID()
+            await manager.debugInstallDirectAdmissionConnectionForTesting(
+                connectionID: id, connection: RemovalTestConnection()
+            )
+            let generation = manager.lifecycleGeneration(of: id)
+            XCTAssertNotNil(generation)
+            guard let generation else { return }
+            XCTAssertTrue(manager.isLiveStarter(.init(connectionID: id, lifecycleGeneration: generation)))
+            XCTAssertFalse(manager.isLiveStarter(.init(connectionID: id, lifecycleGeneration: generation &+ 1)))
+            XCTAssertNil(manager.lifecycleGeneration(of: UUID()))
+            XCTAssertFalse(manager.isLiveStarter(.init(connectionID: UUID(), lifecycleGeneration: generation)))
+        }
+
+        func testLifecycleReadersReportNothingAfterRemoval() async {
+            let manager = ServerNetworkManager(domainHost: AppDomainRuntimeComposition.shared.runtime.domainHost)
+            let id = UUID()
+            await manager.debugInstallDirectAdmissionConnectionForTesting(
+                connectionID: id, connection: RemovalTestConnection()
+            )
+            let generation = manager.lifecycleGeneration(of: id)
+            XCTAssertNotNil(generation)
+            guard let generation else { return }
+            let stamp = StarterConnectionStamp(connectionID: id, lifecycleGeneration: generation)
+            XCTAssertTrue(manager.isLiveStarter(stamp))
+
+            await manager.removeConnection(id)
+
+            XCTAssertNil(manager.lifecycleGeneration(of: id))
+            XCTAssertFalse(manager.isLiveStarter(stamp))
+        }
+
+        func testStarterIsNotLiveOnceRemovalIsMarkedBeforeGenerationIsCleared() async {
+            let manager = ServerNetworkManager(domainHost: AppDomainRuntimeComposition.shared.runtime.domainHost)
+            let id = UUID()
+            await manager.debugInstallDirectAdmissionConnectionForTesting(
+                connectionID: id, connection: RemovalTestConnection()
+            )
+            let generation = manager.lifecycleGeneration(of: id)
+            XCTAssertNotNil(generation)
+            guard let generation else { return }
+            let stamp = StarterConnectionStamp(connectionID: id, lifecycleGeneration: generation)
+            XCTAssertTrue(manager.isLiveStarter(stamp))
+
+            let gate = RemovalGate()
+            let ownerPaused = expectation(description: "removal owner paused after the removal mark")
+            await manager.debugSetBeforeActiveToolCancellationScanForTesting { connectionID, _ in
+                guard connectionID == id else { return }
+                ownerPaused.fulfill()
+                await gate.wait()
+            }
+            let owner = Task { await manager.removeConnection(id) }
+            await fulfillment(of: [ownerPaused], timeout: 5)
+
+            XCTAssertEqual(manager.lifecycleGeneration(of: id), generation)
+            XCTAssertFalse(manager.isLiveStarter(stamp))
+
+            gate.release()
+            await owner.value
+            await manager.debugSetBeforeActiveToolCancellationScanForTesting(nil)
+            XCTAssertNil(manager.lifecycleGeneration(of: id))
+            XCTAssertFalse(manager.isLiveStarter(stamp))
+        }
+
         @MainActor
         private final class RemovalGate {
             private var released = false

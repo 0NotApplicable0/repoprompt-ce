@@ -340,6 +340,57 @@ This is not hard containment of a compromised controller: independently valid pa
 work already physically dispatched remain separate limits. Ordinary exact-target and full-access
 behavior outside this qualified MCP path is unchanged.
 
+#### Standing rules for direct-child consent
+
+A human can let one MCP connection's later `direct_children` requests settle without a card. The
+rule is a value owned by `DelegationScopeRuntime`: workspace, starter stamp, creation and end
+times (4, 8 or 24 h; at most 24 h), a team-lead ceiling (5, 10, 25 or 50),
+a bulk-threshold ceiling (at most 25), the counted team leads, and the scopes it minted. States come
+from one function, `effectiveState(now:)`: `active`, `stopped`, `replaced`, `expired`, or
+`connectionClosed`. A full team-lead count is not a state: it refuses only new team leads, while a
+counted one whose grant expired naturally can be re-issued without counting again.
+
+**Connection anchor.** A control context carries a write-once starter stamp: connection ID plus that
+connection's lifecycle generation. It is set only at fresh MCP creation (`agent_run start`,
+`agent_manage create_session`) when the connection is live, and never by steer, resume or
+reactivation; a session without a stamp falls back to the card. A rule matches only a request from a
+session with the same stamp, in the rule's workspace, that passes the ordinary `direct_children`
+admission. Liveness is one synchronous sample taken in the same MainActor turn as the grant. That
+sample is the authorization point: a connection removed before it always refuses; a removal recorded
+afterwards does not undo that one settlement, just as ordinary grants outlive a disconnect. A
+transient not-live sample refuses without ending the rule; `connectionClosed` latches only once the
+connection's generation is gone for good.
+
+**App-run scope.** Rules live in memory only and are dropped at termination, because connection IDs
+mean nothing after a restart. Derived grants are ordinary `.user`, non-unrestricted `direct_children`
+grants: they persist and restore like card grants, expire no later than the rule, and are revocable
+one by one. After a restart there is no rule, and no provenance or `settled_by` on those grants.
+
+**Creation and sweep.** Only the human creates a rule: an unchecked checkbox on the presented
+`direct_children` card, offered when the requester has a stamp, its connection is live, and all three
+capabilities are ticked. **Grant** runs the normal card approval first; if the connection or request
+changed, the approval stands, no rule exists, and a notice names the failed check. On creation, in the
+same turn, other pending requests with the same stamp and workspace are evaluated oldest first; those
+within caps settle and their cards go. No `session_admin`, `agent_run`, `agent_manage` or
+`app_settings` operation creates, widens or extends a rule, and full access and Grant all do not
+touch one.
+
+**Caps and exclusions.** A request settles only when its whole lifetime ends before the rule does,
+its bulk threshold is at most the rule ceiling, and its capabilities are the permitted set; the grant
+is exactly what was requested, never clamped, so rule authority never exceeds what a card could grant.
+Otherwise the request stays pending for the card. A team lead is excluded from automatic settlement
+once the human denies its card, approves a capability subset, or revokes one of its grants, or once
+it releases one; only a human card approval still works for it. Exclusions end with session deletion.
+
+**Stop.** Active delegations shows the rule while it is active or any of its grants is live. **Stop
+rule** ends issuance and lets issued grants run to expiry. **Stop rule and revoke** also revokes the
+rule-minted grants through the ordinary revoke cascade, never the seed team lead's card grant or other
+grants. Neither decides a pending card.
+
+**Transport limit.** The anchor is one open connection: an MCP stdio host or the interactive REPL.
+`rpce-cli -e` opens a new connection per invocation, so a rule made from a one-shot EM matches nothing
+later; those EMs keep getting cards. A cross-connection EM identity is out of scope.
+
 ### Authorization ownership: Overseer full access versus restricted delegation
 
 `OverseerAuthorizationEngine` (`Runtime/Delegation/OverseerAuthorizationEngine*.swift`, one per

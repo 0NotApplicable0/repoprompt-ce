@@ -381,6 +381,37 @@ final class MCPWorkspaceScopedCursorModelParameterTests: XCTestCase {
         }
     }
 
+    func testCreateSessionStampsStarterConnectionAndResumeDoesNot() async throws {
+        let fixture = try makeFixture()
+        defer { fixture.cleanup() }
+        let window = try await makeWindow(name: "Cursor starter stamp", root: fixture.root)
+        defer { WindowStatesManager.shared.unregisterWindowState(window) }
+        let viewModel = window.agentModeViewModel
+        viewModel.mcpStarterGenerationReader = { (_: UUID) in 7 }
+
+        let connectionID = UUID()
+        let service = makeManageService(window: window, connectionID: connectionID)
+        let created = try await service.execute(args: [
+            "op": .string("create_session"),
+            "model_id": .string(cursorModelID)
+        ])
+        let sessionID = try XCTUnwrap(created.objectValue?["session_id"]?.stringValue.flatMap(UUID.init))
+        let createdContext = try XCTUnwrap(viewModel.mcpControlledSession(sessionID: sessionID)?.mcpControlContext)
+        XCTAssertEqual(
+            createdContext.startedBy,
+            StarterConnectionStamp(connectionID: connectionID, lifecycleGeneration: 7)
+        )
+
+        await viewModel.mcpDeactivateControlContext(sessionID: sessionID, cleanupSessionStore: true)
+        _ = try await makeManageService(window: window, connectionID: connectionID).execute(args: [
+            "op": .string("resume_session"),
+            "session_id": .string(sessionID.uuidString)
+        ])
+        let resumedContext = try XCTUnwrap(viewModel.mcpControlledSession(sessionID: sessionID)?.mcpControlContext)
+        XCTAssertNil(resumedContext.startedBy)
+        await viewModel.mcpDeactivateControlContext(sessionID: sessionID, cleanupSessionStore: true)
+    }
+
     func testResumeRejectsModelParameterChangesWhileRunIsActive() async throws {
         let fixture = try makeFixture()
         defer { fixture.cleanup() }
@@ -1123,13 +1154,14 @@ final class MCPWorkspaceScopedCursorModelParameterTests: XCTestCase {
 
     private func makeManageService(
         window: WindowState,
+        connectionID: UUID? = nil,
         openCodeOneShotObservationProvider: AgentMCPModelParameterSupport.OneShotObservationProvider? = nil
     ) -> AgentManageMCPToolService {
         AgentManageMCPToolService(
             toolName: MCPWindowToolName.agentManage,
             captureRequestMetadata: {
                 MCPServerViewModel.RequestMetadata(
-                    connectionID: UUID(),
+                    connectionID: connectionID ?? UUID(),
                     clientName: "release-gated-cursor-model-parameters",
                     windowID: window.windowID
                 )

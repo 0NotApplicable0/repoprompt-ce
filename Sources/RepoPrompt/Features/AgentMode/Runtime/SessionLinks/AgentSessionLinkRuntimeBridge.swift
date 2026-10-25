@@ -1564,8 +1564,13 @@ final class AgentSessionLinkRuntimeBridge {
         restorePerfRecorder: any WorkspaceRestorePerfRecording = NoopWorkspaceRestorePerfRecorder(),
         delegationScopes: DelegationScopeRuntime? = nil
     ) {
+        let windows: @MainActor () -> [WindowState] = { WindowStatesManager.shared.allWindows }
         self.delegationScopes = delegationScopes ?? DelegationScopeRuntime(
-            persistenceMode: AppLaunchConfiguration.isUnitTestProcess ? .ephemeral : .requiresStore
+            persistenceMode: AppLaunchConfiguration.isUnitTestProcess ? .ephemeral : .requiresStore,
+            windows: windows,
+            standingRuleFacts: { WindowStatesManager.shared.standingRuleFacts(for: $0, in: windows()) },
+            isStarterLive: { ServerNetworkManager.shared.isLiveStarter($0) },
+            starterGeneration: { ServerNetworkManager.shared.lifecycleGeneration(of: $0) }
         )
         self.restorePerfRecorder = restorePerfRecorder
         self.authority = authority

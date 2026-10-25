@@ -19,6 +19,7 @@ struct ScopedObserverControllerFacts {
     let contextSessionMatchesEndpoint: Bool
     let hasMCPControlContext: Bool
     let isMCPOriginated: Bool
+    let startedBy: StarterConnectionStamp?
     let parentSessionID: UUID?
     let createdByOverseerSessionID: UUID?
     let taskLabelIsExplore: Bool
@@ -30,6 +31,36 @@ struct ScopedObserverControllerFacts {
     let candidateHasDurableBinding: Bool
     let candidateIsClosing: Bool
     let candidateIsDeletionInProgress: Bool
+
+    init(
+        windowMatchesEndpoint: Bool, windowIsClosing: Bool, hasExactCurrentEndpoint: Bool,
+        hasSession: Bool, contextSessionMatchesEndpoint: Bool, hasMCPControlContext: Bool,
+        isMCPOriginated: Bool, startedBy: StarterConnectionStamp? = nil,
+        parentSessionID: UUID?, createdByOverseerSessionID: UUID?, taskLabelIsExplore: Bool,
+        isDeletionInProgress: Bool, isDeletionCommitted: Bool, hasLoadedPersistedState: Bool,
+        bindingTransitionInProgress: Bool, candidateHasLoadedPersistedState: Bool?,
+        candidateHasDurableBinding: Bool, candidateIsClosing: Bool, candidateIsDeletionInProgress: Bool
+    ) {
+        self.windowMatchesEndpoint = windowMatchesEndpoint
+        self.windowIsClosing = windowIsClosing
+        self.hasExactCurrentEndpoint = hasExactCurrentEndpoint
+        self.hasSession = hasSession
+        self.contextSessionMatchesEndpoint = contextSessionMatchesEndpoint
+        self.hasMCPControlContext = hasMCPControlContext
+        self.isMCPOriginated = isMCPOriginated
+        self.startedBy = startedBy
+        self.parentSessionID = parentSessionID
+        self.createdByOverseerSessionID = createdByOverseerSessionID
+        self.taskLabelIsExplore = taskLabelIsExplore
+        self.isDeletionInProgress = isDeletionInProgress
+        self.isDeletionCommitted = isDeletionCommitted
+        self.hasLoadedPersistedState = hasLoadedPersistedState
+        self.bindingTransitionInProgress = bindingTransitionInProgress
+        self.candidateHasLoadedPersistedState = candidateHasLoadedPersistedState
+        self.candidateHasDurableBinding = candidateHasDurableBinding
+        self.candidateIsClosing = candidateIsClosing
+        self.candidateIsDeletionInProgress = candidateIsDeletionInProgress
+    }
 }
 
 extension OverseerAuthorizationEngine {

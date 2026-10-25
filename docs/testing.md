@@ -104,6 +104,33 @@ Use owning suites rather than a new registry or duplicated source-shape tests:
 | `AgentSessionLinkPromptEligibilityTests` and the prompt suites below | `testScopedMCPObserverNeedsAuthorizedEvidenceForItsExactEndpoint`: only current exact typed evidence lifts MCP prompt suppression. Existing renderer, claim, decision, provider-parity and VM cases retain budget/receipt/physical-route fences. |
 | `AgentSessionLinkAutoWakeTests` | `testScopedMCPObserverWakesForWorkerTerminalResult`, `testScopedMCPObserverWakesForWorkerApprovalWithoutAnsweringIt`, `testScopeLossTombstoneStaysAFenceAndNeverFallsThroughToOrdinaryDispatch`, `testScopeRevokedDuringWakePreparationCannotDispatch`: wake acquisition/refusal without automatic approval; existing tombstone remains the transport fence. |
 
+Standing-rule coverage lives in two files, `StandingRuleRuntimeTests.swift` and `StandingRuleSurfaceTests.swift`
+(both under `Tests/RepoPromptTests/MCP`), plus starter-stamp and lifecycle-reader cases in the owning suites below:
+
+| Boundary / focused suite | What it pins |
+| --- | --- |
+| `StandingRuleModelTests` | Rule value and `effectiveState(now:)` (`active`, `stopped`, `replaced`, `expired`, `connectionClosed`); the pure engine decision over facts, including the capability, lifetime, bulk-ceiling, team-lead-count and workspace caps and the exclusion set. |
+| `StandingRuleSettlementTests` | Runtime settlement of a `direct_children` request under a matching rule: same grant, notice and announcement path as the card, derived grant never outlives the rule, reuse of a sufficient grant spends no budget, natural-expiry re-issue for a counted team lead, a failed grant leaves the request pending, and full access or Grant all never widen a rule. |
+| `StandingRuleCreationTests` | Creation only through the presented-card Grant with the checkbox ticked; a stale card, a rebound tab, a missing stamp or a dead starter connection creates nothing and publishes the notice; one active rule per connection and workspace, with replacement. |
+| `StandingRuleSweepTests` | The same-turn sweep of other pending requests with the same stamp and workspace: oldest first over a snapshot, cap-limited, and counted team leads only once the count is full. |
+| `StandingRuleRevocationTests` | Stop rule, Stop rule and revoke (rule-minted grants only, never the seed card grant or unrelated grants), the exclusion hooks (Deny, capability-subset approval, Revoke, release), session deletion, and automatic stops. |
+| `StandingRuleFactsProviderTests` | The facts provider proves the request's own presentation (tab, window, session, endpoint) and returns `nil` for a rebound or ambiguous tab. |
+| `StandingRuleSurfaceTests` | The wire surface through the `request_scope` and `scope_status` tools: `settled_by` / `rule_expires_at` only on rule-settled requests and never on card grants, a request that outlives the rule stays pending beside an in-rule control, a rule grant gets the same standing endorsement and link as a card grant, no top-level or guardrail rule arguments and no app-settings key, and the full-access settings text. |
+| `StandingRuleCardModelTests` | Card checkbox visibility (stamp present, starter live, all three capabilities ticked), pickers, replace wording, disclosure text and the self-declared client name with its fallback, the Grant route that still reaches the rule entry when the offer has since gone, and the Active delegations rule row: state lines, Stop and Stop-and-revoke action mapping, visibility, the "settled by standing rule" suffix and the notice messages. |
+| `MCPConnectionRemovalCompletionTests` | `lifecycleGeneration(of:)` and `isLiveStarter(_:)`: wrong generation, unknown connection and removal marked before the generation is cleared all report not live; `testStandingRuleLifecycleGenerationWitness` ties the reader to the real lifecycle state. |
+| `AgentRunMCPToolServiceStartDefaultTests`, `MCPWorkspaceScopedCursorModelParameterTests`, `AgentRunMCPToolServiceSteerResumeTests` | Starter stamp is written only at fresh MCP creation (`agent_run start`, `agent_manage create_session`) with a live connection, survives `replacingRegistration`, and stays `nil` after steer or resume reactivation. The starter's self-declared client name is captured beside it for display only and never takes part in context equality; `testDefaultReadersStampFromTheSharedConnectionManager` runs the default generation and name readers against `ServerNetworkManager.shared`. |
+| `AgentSessionLinkRuntimeBridgeTests` | `testRuleIssuedScopeRespondSubmitsOnceAndStopAndRevokeRefusesAFreshPrompt`: a rule-issued scope answers a linked `respond` exactly like a card-issued one, and Stop rule and revoke makes the next one refuse. `testProductionCompositionOffersAStandingRuleForALiveStampedAdmittedRequest` builds the bridge with its production facts, liveness and generation readers over a connection installed in `ServerNetworkManager.shared` and shows a live, stamped request is offered a rule until the connection is removed. |
+
+```sh
+make dev-test MODULE=RepoPromptTests FILTER='StandingRule(Model|Settlement|Creation|Sweep|Revocation)Tests'
+make dev-test MODULE=RepoPromptTests FILTER='StandingRule(FactsProvider|Surface|CardModel)Tests'
+make dev-test MODULE=RepoPromptTests FILTER=MCPConnectionRemovalCompletionTests
+make dev-test MODULE=RepoPromptTests FILTER=AgentRunMCPToolServiceStartDefaultTests
+make dev-test MODULE=RepoPromptTests FILTER=MCPWorkspaceScopedCursorModelParameterTests
+make dev-test MODULE=RepoPromptTests FILTER=AgentRunMCPToolServiceSteerResumeTests
+make dev-test MODULE=RepoPromptTests FILTER=AgentSessionLinkRuntimeBridgeTests/testRuleIssuedScopeRespondSubmitsOnceAndStopAndRevokeRefusesAFreshPrompt
+```
+
 Run the relevant row's suite with `make dev-test MODULE=RepoPromptTests FILTER=<suite>`.
 The prompt source file is **not** a suite: `FILTER=AgentSessionLinkPromptSupplementTests` matches
 zero tests. Use the actual six-suite filter:

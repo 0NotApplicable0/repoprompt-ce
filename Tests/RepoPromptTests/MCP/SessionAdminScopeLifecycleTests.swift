@@ -321,7 +321,11 @@ final class SessionAdminScopeLifecycleTests: XCTestCase {
             )
         }
 
-        func installController(task: AgentModelCatalog.TaskLabelKind = .pair) async throws -> AgentModeViewModel.TabSession {
+        func installController(
+            task: AgentModelCatalog.TaskLabelKind = .pair,
+            startedBy: StarterConnectionStamp? = nil,
+            clientLabel: String? = nil
+        ) async throws -> AgentModeViewModel.TabSession {
             await window.workspaceManager.awaitInitialized()
             let workspace = window.workspaceManager.createEphemeralWorkspace(name: "Controller fixture", repoPaths: [])
             let activation = await window.workspaceManager.requestWorkspaceSwitch(
@@ -341,7 +345,8 @@ final class SessionAdminScopeLifecycleTests: XCTestCase {
             session.mcpControlContext = AgentModeViewModel.AgentMCPControlContext(
                 sessionID: sessionID, activationID: UUID(), registration: registration,
                 currentEpoch: nil, preparedEpoch: nil, pendingEpochTransition: nil,
-                originatingConnectionID: nil,
+                originatingConnectionID: nil, startedBy: startedBy,
+                startedByClientLabel: StarterClientLabel(name: clientLabel),
                 interactionTransport: .mcp(sessionID: sessionID, originatingConnectionID: nil),
                 suppressUserNotifications: true, forceAutoEditEnabled: false,
                 autoEditEnabledBeforeOverride: session.autoEditEnabled, taskLabelKind: task
