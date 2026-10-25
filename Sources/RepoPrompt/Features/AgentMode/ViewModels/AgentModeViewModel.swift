@@ -6874,7 +6874,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
 
     /// Publishes the current local projection for a retained cancelled-drift scope, without latching
     /// completion, recording proof or marking the binding hydrated. Revalidates synchronously right
-    /// before publication.
+    /// before publication. Returns whether this scope owns the local projection, including a no-op
+    /// publication, so ordinary refreshes never replace its unchanged content with a loading frame.
     @discardableResult
     private func publishRetainedLocalProjection(_ session: TabSession) -> Bool {
         guard session.tabID == currentTabID,
@@ -6882,7 +6883,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
               canSynchronizeDerivedTranscript(for: session, requiringLoadedPersistedState: false)
         else { return false }
         guard retainsCancelledLocalDrift(session) else { return false }
-        return publishTranscriptPresentation(from: session)
+        _ = publishTranscriptPresentation(from: session)
+        return true
     }
 
     /// Cancelled current attempt whose source changed: project current local items without latching
@@ -13937,7 +13939,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
 
     func applySessionToBindings(_ session: TabSession) {
         guard canBuildOrPublishActiveTranscriptBindings(for: session) else {
-            if session.tabID == currentTabID {
+            if session.tabID == currentTabID, !publishRetainedLocalProjection(session) {
                 publishLoadingTranscriptPresentation(tabID: session.tabID)
             }
             return
@@ -14471,7 +14473,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             return
         }
         guard canBuildOrPublishActiveTranscriptBindings(for: session) else {
-            publishLoadingTranscriptPresentation(tabID: session.tabID)
+            if !publishRetainedLocalProjection(session) {
+                publishLoadingTranscriptPresentation(tabID: session.tabID)
+            }
             return
         }
 
