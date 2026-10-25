@@ -924,6 +924,7 @@ private extension XCTestCase {
             firstError = firstError ?? error
         }
         await viewModel.prepareForWindowClose()
+        await viewModel.test_drainSessionPersistenceAfterWindowClose()
         // Reset only after every producer/index/activation path has drained.
         viewModel.test_setSuppressesAgentSessionPersistence(nil)
         viewModel.test_afterTabActivationContinuation = nil
@@ -1003,6 +1004,7 @@ private extension XCTestCase {
             firstError = firstError ?? error
         }
         await viewModel.prepareForWindowClose()
+        await viewModel.test_drainSessionPersistenceAfterWindowClose()
         viewModel.test_afterTabActivationContinuation = nil
         viewModel.test_afterWorkspaceSwitchAdoptionQueued = nil
         viewModel.test_afterWorkspaceSwitchAdoptionCompleted = nil
