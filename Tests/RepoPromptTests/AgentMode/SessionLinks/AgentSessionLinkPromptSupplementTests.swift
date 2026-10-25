@@ -3286,6 +3286,32 @@ final class AgentSessionLinkPromptEligibilityTests: XCTestCase {
         }
     }
 
+    func testScopedMCPObserverNeedsAuthorizedEvidenceForItsExactEndpoint() {
+        func endpoint(_ binding: UUID) -> DomainAgentSessionLinkEndpointIdentity {
+            DomainAgentSessionLinkEndpointIdentity(
+                windowID: 1, workspaceID: UUID(uuidString: "00000000-0000-0000-0000-0000000000A1")!,
+                tabID: UUID(uuidString: "00000000-0000-0000-0000-0000000000A2")!,
+                sessionID: UUID(uuidString: "00000000-0000-0000-0000-0000000000A3")!,
+                persistentBindingGeneration: binding, bindingTransitionGeneration: 1
+            )
+        }
+        let live = endpoint(UUID()), rebound = endpoint(UUID())
+        func evidence(_ status: DomainDelegationScopedObserverEvidence.Status, for observer: DomainAgentSessionLinkEndpointIdentity) -> DomainDelegationScopedObserverEvidence {
+            DomainDelegationScopedObserverEvidence(scopeID: UUID(), scopeGeneration: 1, observer: observer, status: status)
+        }
+        func allows(_ evidence: DomainDelegationScopedObserverEvidence?, isChild: Bool = false) -> Bool {
+            AgentSessionLinkPromptEligibility.allowsSupplement(AgentSessionLinkPromptEligibility.Input(
+                isChildSession: isChild, isMCPControlled: true, isMCPOriginated: true,
+                roleAllowsOutboundMonitoring: true, scopedEvidence: evidence, endpoint: live
+            ))
+        }
+        XCTAssertTrue(allows(evidence(.authorized, for: live)))
+        XCTAssertFalse(allows(nil), "no evidence")
+        XCTAssertFalse(allows(evidence(.awaitingReproof, for: live)), "pending proof authorizes nothing")
+        XCTAssertFalse(allows(evidence(.authorized, for: rebound)), "another incarnation's proof")
+        XCTAssertFalse(allows(evidence(.authorized, for: live), isChild: true), "parented shape stays excluded")
+    }
+
     func testExploreRoleCannotReceiveTheSupplement() {
         XCTAssertFalse(
             AgentSessionLinkToolPolicy.allowsOutboundMonitoring(taskLabelKind: .explore),

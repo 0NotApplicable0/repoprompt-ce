@@ -5038,6 +5038,241 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
         XCTAssertFalse(fixture.viewModel.agentSessionLinkPeriodicWakeIsEligible(fixture.session, endpoint: endpoint))
     }
 
+    // MARK: - Scoped MCP controller (real scope runtime, engine, projector, view model and shared bridge)
+
+    /// A parentless MCP controller in a real window whose direct child is linked through the shared
+    /// bridge under a real `direct_children` grant. Only provenance and the endpoint host are fakes;
+    /// scope, engine standing and endorsement are the production owners.
+    private struct ScopedWake {
+        let controller: SessionAdminScopeLifecycleTests.Fixture
+        let viewModel: AgentModeViewModel
+        let session: AgentModeViewModel.TabSession
+        let endpoint: DomainAgentSessionLinkEndpointIdentity
+        let host: AgentSessionLinkRuntimeBridgeTests.FakeEndpointHost
+        let child: AgentSessionLinkEndpointCandidate
+        let scopes: DelegationScopeRuntime
+        let grantA: DomainDelegationScopeRecord
+    }
+
+    private func scopedDirectChildrenGrant(
+        _ scopes: DelegationScopeRuntime, _ endpoint: DomainAgentSessionLinkEndpointIdentity
+    ) throws -> DomainDelegationScopeRecord {
+        let request = try scopes.requestScope(
+            requesterSessionID: endpoint.sessionID, requesterTabID: endpoint.tabID,
+            kind: .directChildren(rootSessionID: endpoint.sessionID, workspaceID: endpoint.workspaceID),
+            capabilities: [.observe, .control, .restructure], guardrails: .init(),
+            expiresInSeconds: 3600, reason: nil, idempotencyKey: nil
+        ).get()
+        return try scopes.approve(requestID: request.id).get()
+    }
+
+    private func makeScopedWake() async throws -> ScopedWake {
+        let controller = SessionAdminScopeLifecycleTests.Fixture()
+        let bridge = AgentSessionLinkRuntimeBridge.shared
+        let scopes = bridge.delegationScopes
+        addTeardownBlock { @MainActor in
+            WindowStatesManager.shared.attachAgentSessionLinkBridge()
+            await controller.window.tearDown()
+        }
+        let session = try await controller.installController()
+        session.hasLoadedPersistedState = true
+        session.recordRestorationAuthoritative(.persistedPayloadApplied)
+        let endpoint = try XCTUnwrap(controller.endpoint)
+        let viewModel = controller.window.agentModeViewModel
+        session.selectedAgent = .openCode
+        if session.runID == nil { session.installRunID(UUID()) }
+        let runID = try XCTUnwrap(session.runID)
+        viewModel.agentSessionLinkPublishRunCatalogProjection(
+            AgentSessionLinkRunCatalogProjection(
+                runID: runID,
+                routeToken: AgentSessionLinkRunCatalogRouteToken(
+                    runID: runID, observerEndpoint: endpoint, connectionID: UUID(),
+                    routingAuthorityGeneration: 1, connectionLifecycleGeneration: 1
+                ),
+                projectionRevision: 1, hasAgentSessionLink: true, hasAnyActiveLink: true
+            ),
+            to: endpoint
+        )
+        let tabID = UUID(), childSessionID = UUID(), binding = UUID()
+        let child = AgentSessionLinkEndpointCandidate(
+            windowID: 2, workspaceID: endpoint.workspaceID, tabID: tabID, sessionID: childSessionID,
+            persistentBindingGeneration: binding, bindingTransitionGeneration: 1, isTopLevel: false,
+            hasLoadedPersistedState: true, bindingTransitionInProgress: false, isClosing: false,
+            isMCPControlled: false, isMCPOriginated: false, roleAllowsOutboundMonitoring: true,
+            displayName: "Worker", providerDisplayName: "Codex CLI", locationLabel: nil,
+            restorationReadiness: .authoritative(
+                AgentSessionRestorationBindingToken(
+                    bindingIdentity: AgentPersistentSessionBindingIdentity(tabID: tabID, sessionID: childSessionID, generation: binding),
+                    bindingTransitionGeneration: 1
+                ), .persistedPayloadApplied
+            ),
+            parentSessionID: endpoint.sessionID
+        )
+        controller.source.add(endpoint.sessionID, parent: nil, workspace: endpoint.workspaceID)
+        controller.source.add(child.sessionID, parent: endpoint.sessionID, workspace: endpoint.workspaceID)
+        let host = AgentSessionLinkRuntimeBridgeTests.FakeEndpointHost()
+        host.promptViewModel = viewModel
+        host.candidates = try [XCTUnwrap(viewModel.agentSessionLinkCandidate(for: endpoint, includeLocation: false)), child]
+        host.scopedStanding = { endpoint, engine in engine.scopedObserverAuthorization(for: endpoint, window: controller.window) }
+        let projector = SpawnProvenanceDelegationMembershipProjector(source: controller.source)
+        host.scopedEndorsement = { observer, target, scope, engine in
+            engine.authorizeScopedObserverLink(observer: observer, target: target, scopeID: scope, window: controller.window, projector: projector) != nil
+        }
+        bridge.attach(host: host)
+        let grantA = try scopedDirectChildrenGrant(scopes, endpoint)
+        addTeardownBlock { @MainActor in scopes.revoke(scopeID: grantA.id) }
+        let added = await bridge.addDelegatedMonitorLink(
+            observerEndpoint: endpoint, targetEndpoint: child.domainEndpoint,
+            authorization: AgentSessionLinkDelegatedAddAuthorization(sourceScopeID: grantA.id) {
+                scopes.record(id: grantA.id)?.isActive == true
+            }
+        )
+        guard case .added = added else {
+            XCTFail("Scoped Add refused: \(added)")
+            throw CancellationError()
+        }
+        session.oversight.autoWakeOnUpdates = false
+        session.oversight.autoWakeTargetSessionIDs = [child.sessionID]
+        host.autoWakeTargetsByEndpoint[endpoint] = [child.sessionID]
+        session.runState = .running
+        await bridge.test_settleMonitorProjectionRefresh()
+        return ScopedWake(
+            controller: controller, viewModel: viewModel, session: session, endpoint: endpoint,
+            host: host, child: child, scopes: scopes, grantA: grantA
+        )
+    }
+
+    private func finishScopedChild(
+        _ scoped: ScopedWake,
+        awaiting: DomainAgentSessionLinkPendingInteractionKind? = nil
+    ) async {
+        let bridge = AgentSessionLinkRuntimeBridge.shared
+        let last: DomainAgentSessionLinkStatus = awaiting == nil ? .idle : .awaitingUser
+        for (status, activity) in [(DomainAgentSessionLinkStatus.running, 200.0), (last, 300.0)] {
+            scoped.host.snapshotOverrides[scoped.child.sessionID] = DomainAgentSessionObservationSnapshot(
+                sessionID: scoped.child.sessionID, displayName: scoped.child.displayName, providerDisplayName: "Codex CLI",
+                status: status, board: .empty, idleForSend: status == .idle,
+                pendingInteractionKind: status == .awaitingUser ? awaiting : nil,
+                latestVisibleAssistantPreview: "Done.", visibleRowCount: 1, lastActivityAt: Date(timeIntervalSince1970: activity)
+            )
+            scoped.host.fireObservation(for: scoped.child.sessionID)
+            await bridge.test_settleProjections()
+            await bridge.test_settleMonitorProjectionRefresh()
+        }
+    }
+
+    func testScopedMCPObserverWakesForWorkerTerminalResult() async throws {
+        let scoped = try await makeScopedWake()
+        await finishScopedChild(scoped)
+        let reserved = try XCTUnwrap(
+            scoped.session.oversight.pendingAutoWake,
+            "a live direct-child grant lets the worker's terminal result reserve the ordinary wake"
+        )
+        reserved.task?.cancel()
+        let claim = try XCTUnwrap(scoped.viewModel.agentSessionLinkPromptClaim(
+            for: scoped.session, dispatchID: .autoWake(wakeID: reserved.wakeID)
+        ))
+        XCTAssertTrue(claim.fragment.contains("Worker"), "the rendered supplement names the oversee target")
+        var preparing = reserved
+        preparing.phase = .preparingDispatch
+        preparing.task = nil
+        scoped.session.oversight.pendingAutoWake = preparing
+        XCTAssertTrue(scoped.viewModel.agentSessionLinkAcquirePhysicalDispatch(for: scoped.session, dispatchID: claim.dispatchID))
+        XCTAssertEqual(scoped.session.oversight.pendingAutoWake?.phase, .dispatching)
+    }
+
+    func testScopedMCPObserverWakesForWorkerApprovalWithoutAnsweringIt() async throws {
+        let scoped = try await makeScopedWake()
+        await finishScopedChild(scoped, awaiting: .approval)
+        let reserved = try XCTUnwrap(
+            scoped.session.oversight.pendingAutoWake,
+            "a pending worker approval reserves the ordinary wake under a live grant"
+        )
+        reserved.task?.cancel()
+        let claim = try XCTUnwrap(scoped.viewModel.agentSessionLinkPromptClaim(
+            for: scoped.session, dispatchID: .autoWake(wakeID: reserved.wakeID)
+        ))
+        var preparing = reserved
+        preparing.phase = .preparingDispatch
+        preparing.task = nil
+        scoped.session.oversight.pendingAutoWake = preparing
+        XCTAssertTrue(scoped.viewModel.agentSessionLinkAcquirePhysicalDispatch(for: scoped.session, dispatchID: claim.dispatchID))
+        XCTAssertTrue(scoped.host.sendLivenessReadings.isEmpty)
+        XCTAssertEqual(scoped.host.snapshotOverrides[scoped.child.sessionID]?.pendingInteractionKind, .approval)
+    }
+
+    func testEndpointReplacementAfterClaimCannotReachPhysicalDispatch() async throws {
+        let scoped = try await makeScopedWake()
+        await finishScopedChild(scoped)
+        let reserved = try XCTUnwrap(scoped.session.oversight.pendingAutoWake)
+        reserved.task?.cancel()
+        let claim = try XCTUnwrap(scoped.viewModel.agentSessionLinkPromptClaim(
+            for: scoped.session, dispatchID: .autoWake(wakeID: reserved.wakeID)
+        ))
+        var preparing = reserved
+        preparing.phase = .preparingDispatch
+        preparing.task = nil
+        scoped.session.oversight.pendingAutoWake = preparing
+        _ = scoped.viewModel.test_installPersistentSessionBinding(sessionID: nil, on: scoped.session)
+        _ = scoped.viewModel.test_installPersistentSessionBinding(sessionID: scoped.endpoint.sessionID, on: scoped.session)
+        scoped.session.hasLoadedPersistedState = true
+        scoped.session.recordRestorationAuthoritative(.persistedPayloadApplied)
+        XCTAssertNotEqual(
+            scoped.viewModel.agentSessionLinkObserverEndpoint(tabID: scoped.session.tabID)?.persistentBindingGeneration,
+            scoped.endpoint.persistentBindingGeneration
+        )
+        XCTAssertFalse(scoped.viewModel.agentSessionLinkAcquirePhysicalDispatch(for: scoped.session, dispatchID: claim.dispatchID))
+        XCTAssertNil(scoped.session.oversight.pendingAutoWake)
+        XCTAssertNil(scoped.viewModel.agentSessionLinkPromptClaimStore.pendingClaim(
+            dispatchID: claim.dispatchID, observerSessionID: scoped.endpoint.sessionID
+        ))
+    }
+
+    func testScopeLossTombstoneStaysAFenceAndNeverFallsThroughToOrdinaryDispatch() async throws {
+        let scoped = try await makeScopedWake()
+        await finishScopedChild(scoped)
+        let reserved = try XCTUnwrap(scoped.session.oversight.pendingAutoWake)
+        reserved.task?.cancel()
+        let claim = try XCTUnwrap(scoped.viewModel.agentSessionLinkPromptClaim(
+            for: scoped.session, dispatchID: .autoWake(wakeID: reserved.wakeID)
+        ))
+        var preparing = reserved
+        preparing.phase = .preparingDispatch
+        preparing.task = nil
+        scoped.session.oversight.pendingAutoWake = preparing
+        scoped.viewModel.cancelAgentSessionLinkAutoWake(for: reserved.observerEndpoint, reason: .endpointInvalidated)
+        XCTAssertEqual(scoped.session.oversight.pendingAutoWake?.phase, .cancelledBeforeDispatch)
+        scoped.scopes.revoke(scopeID: scoped.grantA.id)
+        XCTAssertFalse(scoped.viewModel.agentSessionLinkAcquirePhysicalDispatch(for: scoped.session, dispatchID: claim.dispatchID))
+        XCTAssertNil(scoped.session.oversight.pendingAutoWake)
+    }
+
+    func testScopeRevokedDuringWakePreparationCannotDispatch() async throws {
+        let scoped = try await makeScopedWake()
+        await finishScopedChild(scoped)
+        let reserved = try XCTUnwrap(scoped.session.oversight.pendingAutoWake)
+        reserved.task?.cancel()
+        let claim = try XCTUnwrap(scoped.viewModel.agentSessionLinkPromptClaim(
+            for: scoped.session, dispatchID: .autoWake(wakeID: reserved.wakeID)
+        ))
+        var preparing = reserved
+        preparing.phase = .preparingDispatch
+        preparing.task = nil
+        scoped.session.oversight.pendingAutoWake = preparing
+        let grantB = try scopedDirectChildrenGrant(scoped.scopes, scoped.endpoint)
+        addTeardownBlock { @MainActor in scoped.scopes.revoke(scopeID: grantB.id) }
+        scoped.scopes.revoke(scopeID: scoped.grantA.id)
+        XCTAssertTrue(scoped.scopes.record(id: grantB.id)?.isActive == true)
+        XCTAssertFalse(
+            scoped.viewModel.agentSessionLinkAcquirePhysicalDispatch(for: scoped.session, dispatchID: claim.dispatchID),
+            "revoked source A must refuse the physical call even though grant B qualifies the observer"
+        )
+        XCTAssertNil(scoped.session.oversight.pendingAutoWake, "no false acknowledgement or surviving reservation")
+        XCTAssertNil(scoped.viewModel.agentSessionLinkPromptClaimStore.pendingClaim(
+            dispatchID: claim.dispatchID, observerSessionID: scoped.endpoint.sessionID
+        ))
+    }
+
     // MARK: - Fixture
 
     private struct Fixture {

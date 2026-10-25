@@ -506,6 +506,111 @@ final class AgentSessionLinkEndpointResolverTests: XCTestCase {
         XCTAssertFalse(first.hasResolvedPersistentBinding)
         XCTAssertNotEqual(first, second)
     }
+
+    // MARK: - Scoped observer evidence
+
+    private func evidence(
+        for candidate: AgentSessionLinkEndpointCandidate,
+        status: DomainDelegationScopedObserverEvidence.Status = .authorized,
+        endpoint: DomainAgentSessionLinkEndpointIdentity? = nil
+    ) -> DomainDelegationScopedObserverEvidence {
+        DomainDelegationScopedObserverEvidence(
+            scopeID: UUID(), scopeGeneration: 1, observer: endpoint ?? candidate.domainEndpoint, status: status
+        )
+    }
+
+    private func eligibility(
+        _ candidate: AgentSessionLinkEndpointCandidate,
+        evidence: DomainDelegationScopedObserverEvidence?,
+        currentEndpoint: DomainAgentSessionLinkEndpointIdentity?
+    ) -> AgentSessionLinkEndpointEligibility.OperationEligibility {
+        AgentSessionLinkEndpointEligibility.observerOperationEligibility(
+            candidate.eligibilityInput, roleAllowsOutboundMonitoring: candidate.roleAllowsOutboundMonitoring,
+            scopedEvidence: evidence, currentEndpoint: currentEndpoint
+        )
+    }
+
+    private func addReason(
+        _ candidate: AgentSessionLinkEndpointCandidate,
+        evidence: DomainDelegationScopedObserverEvidence?,
+        currentEndpoint: DomainAgentSessionLinkEndpointIdentity?
+    ) -> String? {
+        AgentSessionLinkEndpointEligibility.addDisabledReason(
+            candidate.eligibilityInput, roleAllowsOutboundMonitoring: candidate.roleAllowsOutboundMonitoring,
+            scopedEvidence: evidence, currentEndpoint: currentEndpoint
+        )
+    }
+
+    func testParentlessMCPObserverRequiresMatchingScopedEvidence() {
+        let mcp = makeCandidate(isMCPControlled: true, isMCPOriginated: true)
+        let endpoint = mcp.domainEndpoint
+        XCTAssertEqual(AgentSessionLinkEndpointEligibility.addDisabledReason(mcp.eligibilityInput, roleAllowsOutboundMonitoring: true), AgentSessionLinkEndpointEligibility.roleDeniedReason)
+        XCTAssertEqual(AgentSessionLinkEndpointEligibility.observerOperationEligibility(mcp.eligibilityInput, roleAllowsOutboundMonitoring: true), .disqualified)
+        XCTAssertEqual(eligibility(mcp, evidence: nil, currentEndpoint: endpoint), .disqualified)
+        XCTAssertNotNil(addReason(mcp, evidence: nil, currentEndpoint: endpoint))
+
+        let proof = evidence(for: mcp)
+        XCTAssertEqual(eligibility(mcp, evidence: proof, currentEndpoint: endpoint), .eligible)
+        XCTAssertNil(addReason(mcp, evidence: proof, currentEndpoint: endpoint))
+
+        let sameSession: [DomainAgentSessionLinkEndpointIdentity] = [
+            DomainAgentSessionLinkEndpointIdentity(windowID: endpoint.windowID, workspaceID: endpoint.workspaceID, tabID: UUID(), sessionID: endpoint.sessionID, persistentBindingGeneration: endpoint.persistentBindingGeneration, bindingTransitionGeneration: endpoint.bindingTransitionGeneration),
+            DomainAgentSessionLinkEndpointIdentity(windowID: endpoint.windowID, workspaceID: endpoint.workspaceID, tabID: endpoint.tabID, sessionID: endpoint.sessionID, persistentBindingGeneration: UUID(), bindingTransitionGeneration: endpoint.bindingTransitionGeneration),
+            DomainAgentSessionLinkEndpointIdentity(windowID: endpoint.windowID, workspaceID: endpoint.workspaceID, tabID: endpoint.tabID, sessionID: endpoint.sessionID, persistentBindingGeneration: endpoint.persistentBindingGeneration, bindingTransitionGeneration: endpoint.bindingTransitionGeneration + 1),
+            DomainAgentSessionLinkEndpointIdentity(windowID: endpoint.windowID + 1, workspaceID: endpoint.workspaceID, tabID: endpoint.tabID, sessionID: endpoint.sessionID, persistentBindingGeneration: endpoint.persistentBindingGeneration, bindingTransitionGeneration: endpoint.bindingTransitionGeneration)
+        ]
+        for foreign in sameSession {
+            XCTAssertEqual(eligibility(mcp, evidence: evidence(for: mcp, endpoint: foreign), currentEndpoint: endpoint), .disqualified)
+            XCTAssertNotNil(addReason(mcp, evidence: evidence(for: mcp, endpoint: foreign), currentEndpoint: endpoint))
+        }
+        XCTAssertEqual(eligibility(mcp, evidence: proof, currentEndpoint: nil), .disqualified)
+        XCTAssertEqual(eligibility(mcp, evidence: proof, currentEndpoint: sameSession[1]), .disqualified)
+
+        let parented = makeCandidate(isTopLevel: false, isMCPControlled: true, isMCPOriginated: true, parentSessionID: UUID())
+        let creatorOnly = makeCandidate(isMCPControlled: true, isMCPOriginated: true, createdByOverseerSessionID: UUID())
+        let explore = makeCandidate(isMCPControlled: true, isMCPOriginated: true, roleAllowsOutboundMonitoring: false)
+        let closing = makeCandidate(isClosing: true, isMCPControlled: true, isMCPOriginated: true)
+        for excluded in [parented, creatorOnly, explore, closing] {
+            XCTAssertEqual(eligibility(excluded, evidence: evidence(for: excluded), currentEndpoint: excluded.domainEndpoint), .disqualified)
+            XCTAssertNotNil(addReason(excluded, evidence: evidence(for: excluded), currentEndpoint: excluded.domainEndpoint))
+            XCTAssertEqual(
+                eligibility(excluded, evidence: evidence(for: excluded, endpoint: UUID().isolatedEndpoint), currentEndpoint: excluded.domainEndpoint),
+                .disqualified, "A bad or foreign token changes nothing"
+            )
+        }
+
+        let ordinary = makeCandidate()
+        XCTAssertEqual(eligibility(ordinary, evidence: nil, currentEndpoint: ordinary.domainEndpoint), .eligible)
+        XCTAssertNil(addReason(ordinary, evidence: nil, currentEndpoint: ordinary.domainEndpoint))
+        let unloaded = makeCandidate(hasLoadedPersistedState: false, isMCPControlled: true, isMCPOriginated: true)
+        XCTAssertEqual(eligibility(unloaded, evidence: evidence(for: unloaded), currentEndpoint: unloaded.domainEndpoint), .transientlyUnavailable)
+    }
+
+    func testPendingReproofEvidenceMapsToTransientWithZeroAuthority() {
+        let mcp = makeCandidate(isMCPControlled: true, isMCPOriginated: true)
+        let pending = evidence(for: mcp, status: .awaitingReproof)
+        XCTAssertEqual(eligibility(mcp, evidence: pending, currentEndpoint: mcp.domainEndpoint), .transientlyUnavailable)
+        XCTAssertNotNil(addReason(mcp, evidence: pending, currentEndpoint: mcp.domainEndpoint), "Pending reproof never enables Add")
+        XCTAssertEqual(eligibility(mcp, evidence: pending, currentEndpoint: nil), .disqualified)
+        XCTAssertEqual(
+            eligibility(mcp, evidence: evidence(for: mcp, status: .awaitingReproof, endpoint: UUID().isolatedEndpoint), currentEndpoint: mcp.domainEndpoint),
+            .disqualified
+        )
+        let parented = makeCandidate(isTopLevel: false, isMCPControlled: true, isMCPOriginated: true, parentSessionID: UUID())
+        XCTAssertEqual(
+            eligibility(parented, evidence: evidence(for: parented, status: .awaitingReproof), currentEndpoint: parented.domainEndpoint),
+            .disqualified
+        )
+    }
+}
+
+private extension UUID {
+    var isolatedEndpoint: DomainAgentSessionLinkEndpointIdentity {
+        DomainAgentSessionLinkEndpointIdentity(
+            windowID: 99, workspaceID: UUID(), tabID: UUID(), sessionID: self,
+            persistentBindingGeneration: UUID(), bindingTransitionGeneration: 1
+        )
+    }
 }
 
 // MARK: - Helpers

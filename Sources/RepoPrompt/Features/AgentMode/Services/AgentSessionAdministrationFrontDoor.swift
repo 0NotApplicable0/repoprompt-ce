@@ -789,7 +789,8 @@ extension AgentSessionAdministrationRequest {
             idempotencyKey: idempotencyKey,
             confirmationID: confirmationID ?? self.confirmationID,
             preview: preview,
-            arguments: arguments
+            arguments: arguments,
+            callerEndpoint: callerEndpoint
         )
     }
 }

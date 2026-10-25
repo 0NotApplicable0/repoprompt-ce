@@ -32,6 +32,14 @@ enum AgentSessionLinkModelOutcome {
 }
 
 extension AgentSessionLinkEndpointHost {
+    func agentSessionLinkScopedObserverStanding(for endpoint: DomainAgentSessionLinkEndpointIdentity, engine: OverseerAuthorizationEngine) -> ScopedObserverStanding {
+        .denied
+    }
+
+    func agentSessionLinkEndorseScopedObserver(observer: DomainAgentSessionLinkEndpointIdentity, target: AgentSessionLinkEndpointCandidate, scopeID: UUID, engine: OverseerAuthorizationEngine) -> Bool {
+        false
+    }
+
     func agentSessionLinkLocalInputSnapshot(for endpoint: DomainAgentSessionLinkEndpointIdentity, includeRecords: Bool) -> AgentSessionLinkRetainedLocalInputIndex.Snapshot? {
         nil
     }
@@ -161,6 +169,9 @@ protocol PreparedAgentSessionRuntimeRegistry: AnyObject {
 
 @MainActor
 protocol AgentSessionLinkEndpointHost: AnyObject {
+    func agentSessionLinkScopedObserverStanding(for endpoint: DomainAgentSessionLinkEndpointIdentity, engine: OverseerAuthorizationEngine) -> ScopedObserverStanding
+    func agentSessionLinkEndorseScopedObserver(observer: DomainAgentSessionLinkEndpointIdentity, target: AgentSessionLinkEndpointCandidate, scopeID: UUID, engine: OverseerAuthorizationEngine) -> Bool
+
     /// Exact bounded retained-input lookup. Metadata-only lifecycle calls never copy text.
     func agentSessionLinkLocalInputSnapshot(for endpoint: DomainAgentSessionLinkEndpointIdentity, includeRecords: Bool) -> AgentSessionLinkRetainedLocalInputIndex.Snapshot?
 
@@ -1594,6 +1605,7 @@ final class AgentSessionLinkRuntimeBridge {
         self.host = host
         AgentSessionLinkInvalidationSink.invalidateBinding = { [weak self] windowID, tabID, reason in
             guard let self else { return }
+            delegationScopes.linkConsent.invalidateAllEndorsements()
             Task { @MainActor in
                 await self.invalidateBinding(windowID: windowID, tabID: tabID, reason: reason)
             }
@@ -1918,6 +1930,7 @@ final class AgentSessionLinkRuntimeBridge {
     /// completion. The event never carries state; the coordinator always rereads the level snapshot.
     func noteTopologyMayHaveChanged() {
         guard !isFrozenForTermination else { return }
+        delegationScopes.linkConsent.invalidateAllEndorsements()
         requestCandidatePresentationRefresh()
         guard let launchCoordinator else { return }
         if let host {
@@ -1934,6 +1947,7 @@ final class AgentSessionLinkRuntimeBridge {
     /// identity changing at all, so neither the stale-endpoint sweep nor identity revalidation would
     /// ever notice.
     func noteCandidateReadinessChanged() {
+        delegationScopes.linkConsent.invalidateAllEndorsements()
         guard !isFrozenForTermination else { return }
         launchCoordinator?.markDirty()
         requestCandidatePresentationRefresh()
@@ -1952,10 +1966,7 @@ final class AgentSessionLinkRuntimeBridge {
         guard !isFrozenForTermination, let host else { return }
         for endpoint in knownObserverEndpoints {
             guard let candidate = host.agentSessionLinkCandidate(for: endpoint, includeLocation: false) else { continue }
-            guard AgentSessionLinkEndpointEligibility.observerOperationEligibility(
-                candidate.eligibilityInput,
-                roleAllowsOutboundMonitoring: candidate.roleAllowsOutboundMonitoring
-            ) == .disqualified else {
+            guard observerOperationEligibility(candidate) == .disqualified else {
                 continue
             }
             await revokeOutboundLinks(
@@ -2915,7 +2926,9 @@ final class AgentSessionLinkRuntimeBridge {
         let active = await authority.links(forObserver: pair.observerSessionID)
         let matching = active.items.filter { $0.targetSessionID == pair.targetSessionID }
         if matching.count == 1, let existing = matching.first {
-            // Reassertion never changes an already-active grant's consent provenance.
+            guard existing.sourceScopeID == pair.sourceScopeID || expectedEndpoints.delegatedAuthorization == nil else {
+                return .rejected(message: "source_scope_mismatch: The existing link has a different source. Resolve it explicitly; nothing was changed.")
+            }
             pair = AgentSessionOversightIntent(
                 observerSessionID: pair.observerSessionID, targetSessionID: pair.targetSessionID,
                 sourceScopeID: existing.sourceScopeID
@@ -3234,15 +3247,104 @@ final class AgentSessionLinkRuntimeBridge {
         )
     }
 
+    func sourceConsentEligibility(for pair: AgentSessionOversightIntent) -> AgentSessionLinkEndpointEligibility.OperationEligibility {
+        guard let scopeID = pair.sourceScopeID else { return .eligible }
+        if delegationScopes.linkConsent.permits(scopeID: scopeID, observer: pair.observerSessionID, target: pair.targetSessionID, at: delegationScopes.currentDate) { return .eligible }
+        guard let host else { return .disqualified }
+        let observers = host.agentSessionLinkCandidates(forSessionIDs: [pair.observerSessionID], includeLocation: false)[pair.observerSessionID] ?? []
+        guard observers.count == 1, let observer = observers.first,
+              let evidence = scopedObserverEvidence(for: observer.domainEndpoint),
+              delegationScopes.authorization.scopedSourceMatches(scopeID, evidence: evidence) else { return .disqualified }
+        let targets = host.agentSessionLinkCandidates(forSessionIDs: [pair.targetSessionID], includeLocation: false)[pair.targetSessionID] ?? []
+        // Independently proven permanent target loss wins over a pending observer.
+        if targets.count == 1, let target = targets.first,
+           delegationScopes.authorization.scopedTargetIsPermanentlyOutside(scopeID, target: target) { return .disqualified }
+        if evidence.status == .awaitingReproof { return .transientlyUnavailable }
+        // Unloaded or not-yet-resolved target facts under a positively live grant are temporary.
+        guard targets.count == 1, let target = targets.first else { return .transientlyUnavailable }
+        if target.isDeletionInProgress { return .transientlyUnavailable }
+        guard scopedSourceIsCurrent(observer: observer.domainEndpoint, target: target, sourceScopeID: scopeID) else { return .disqualified }
+        return .eligible
+    }
+
+    func promptInventoryForCurrentScope(
+        _ inventory: AgentSessionLinkPromptInventory,
+        observer: DomainAgentSessionLinkEndpointIdentity
+    ) -> (inventory: AgentSessionLinkPromptInventory, evidence: DomainDelegationScopedObserverEvidence?) {
+        guard let host,
+              let candidate = host.agentSessionLinkCandidate(for: observer, includeLocation: false),
+              candidate.isMCPControlled || candidate.isMCPOriginated
+        else { return (inventory, nil) }
+        guard let evidence = scopedObserverEvidence(for: observer), evidence.status == .authorized else {
+            return (AgentSessionLinkPromptInventory(observerSessionID: inventory.observerSessionID, linkSetRevision: inventory.linkSetRevision, items: []), nil)
+        }
+        let items = inventory.items.filter { item in
+            guard let reference = item.reference,
+                  let bookkeeping = bookkeepingByReference[reference],
+                  bookkeeping.observerEndpoint == observer,
+                  bookkeeping.targetEndpoint.sessionID == item.targetSessionID,
+                  let target = host.agentSessionLinkCandidate(for: bookkeeping.targetEndpoint, includeLocation: false)
+            else { return false }
+            return scopedSourceIsCurrent(observer: observer, target: target, sourceScopeID: bookkeeping.pair.sourceScopeID, host: host)
+        }
+        return (
+            AgentSessionLinkPromptInventory(
+                observerSessionID: inventory.observerSessionID,
+                linkSetRevision: inventory.linkSetRevision,
+                items: items
+            ),
+            evidence
+        )
+    }
+
+    func scopedObserverEvidence(for endpoint: DomainAgentSessionLinkEndpointIdentity) -> DomainDelegationScopedObserverEvidence? {
+        guard let host else { return nil }
+        switch host.agentSessionLinkScopedObserverStanding(for: endpoint, engine: delegationScopes.authorization) {
+        case let .authorized(evidence):
+            for entry in bookkeepingByReference.values where entry.observerEndpoint == endpoint {
+                guard let scopeID = entry.pair.sourceScopeID,
+                      let target = host.agentSessionLinkCandidate(for: entry.targetEndpoint, includeLocation: false) else { continue }
+                _ = host.agentSessionLinkEndorseScopedObserver(observer: endpoint, target: target, scopeID: scopeID, engine: delegationScopes.authorization)
+            }
+            return evidence
+        case let .awaitingReproof(evidence): return evidence
+        case .denied: return nil
+        }
+    }
+
+    func observerAddDisabledReason(_ candidate: AgentSessionLinkEndpointCandidate) -> String? {
+        AgentSessionLinkEndpointEligibility.addDisabledReason(candidate.eligibilityInput, roleAllowsOutboundMonitoring: candidate.roleAllowsOutboundMonitoring, scopedEvidence: scopedObserverEvidence(for: candidate.domainEndpoint), currentEndpoint: candidate.domainEndpoint)
+    }
+
+    func observerOperationEligibility(_ candidate: AgentSessionLinkEndpointCandidate) -> AgentSessionLinkEndpointEligibility.OperationEligibility {
+        AgentSessionLinkEndpointEligibility.observerOperationEligibility(candidate.eligibilityInput, roleAllowsOutboundMonitoring: candidate.roleAllowsOutboundMonitoring, scopedEvidence: scopedObserverEvidence(for: candidate.domainEndpoint), currentEndpoint: candidate.domainEndpoint)
+    }
+
+    func scopedSourceIsCurrent(observer: DomainAgentSessionLinkEndpointIdentity, target: AgentSessionLinkEndpointCandidate, sourceScopeID: UUID?) -> Bool {
+        guard let host else { return false }
+        return scopedSourceIsCurrent(observer: observer, target: target, sourceScopeID: sourceScopeID, host: host)
+    }
+
+    private func scopedSourceIsCurrent(
+        observer: DomainAgentSessionLinkEndpointIdentity,
+        target: AgentSessionLinkEndpointCandidate,
+        sourceScopeID: UUID?,
+        host: any AgentSessionLinkEndpointHost
+    ) -> Bool {
+        guard let candidate = host.agentSessionLinkCandidate(for: observer, includeLocation: false) else { return false }
+        if candidate.isMCPControlled || candidate.isMCPOriginated {
+            guard let sourceScopeID else { return false }
+            return host.agentSessionLinkEndorseScopedObserver(observer: observer, target: target, scopeID: sourceScopeID, engine: delegationScopes.authorization)
+        }
+        return sourceScopeID.map { delegationScopes.linkConsent.permits(scopeID: $0, observer: observer, target: target.domainEndpoint, at: delegationScopes.currentDate) } ?? true
+    }
+
     private func inheritanceObserverCandidate(
         endpoint: DomainAgentSessionLinkEndpointIdentity,
         candidates: [AgentSessionLinkEndpointCandidate]
     ) -> AgentSessionLinkEndpointCandidate? {
         guard let candidate = candidates.first(where: { $0.domainEndpoint == endpoint }),
-              AgentSessionLinkEndpointEligibility.addDisabledReason(
-                  candidate.eligibilityInput,
-                  roleAllowsOutboundMonitoring: candidate.roleAllowsOutboundMonitoring
-              ) == nil
+              observerAddDisabledReason(candidate) == nil
         else {
             return nil
         }
@@ -3294,6 +3396,14 @@ final class AgentSessionLinkRuntimeBridge {
     ) -> AgentSessionLinkResolveFailure? {
         guard let observerSessionID else {
             return AgentSessionLinkEndpointEligibility.targetResolveFailure(for: candidate)
+        }
+        if let host {
+            let observers = host.agentSessionLinkCandidates(forSessionIDs: [observerSessionID], includeLocation: false)[observerSessionID] ?? []
+            if observers.count == 1, let observer = observers.first, observer.isMCPControlled || observer.isMCPOriginated {
+                let evidence = scopedObserverEvidence(for: observer.domainEndpoint)
+                let approved = evidence.map { $0.status == .authorized && host.agentSessionLinkEndorseScopedObserver(observer: observer.domainEndpoint, target: candidate, scopeID: $0.scopeID, engine: delegationScopes.authorization) } ?? false
+                return AgentSessionLinkEndpointEligibility.targetResolveFailure(for: candidate, observerSessionID: observerSessionID, permitsChildTarget: approved)
+            }
         }
         let approved = delegationScopes.authorization.permitsChildLinkTarget(
             observerSessionID: observerSessionID, targetSessionID: candidate.sessionID
@@ -3347,10 +3457,7 @@ final class AgentSessionLinkRuntimeBridge {
         case let .failure(failure):
             return .rejected(message: Self.observerMessage(for: failure))
         }
-        if let reason = AgentSessionLinkEndpointEligibility.addDisabledReason(
-            observer.eligibilityInput,
-            roleAllowsOutboundMonitoring: observer.roleAllowsOutboundMonitoring
-        ) {
+        if let reason = observerAddDisabledReason(observer) {
             return .rejected(message: reason)
         }
         let target: AgentSessionLinkEndpointCandidate
@@ -3442,10 +3549,7 @@ final class AgentSessionLinkRuntimeBridge {
         case let .failure(failure):
             return EstablishmentResult(outcome: .rejected(message: Self.observerMessage(for: failure)))
         }
-        if let reason = AgentSessionLinkEndpointEligibility.addDisabledReason(
-            observer.eligibilityInput,
-            roleAllowsOutboundMonitoring: observer.roleAllowsOutboundMonitoring
-        ) {
+        if let reason = observerAddDisabledReason(observer) {
             return EstablishmentResult(outcome: .rejected(message: reason))
         }
         guard targetSessionID != observerSessionID else {
@@ -3499,6 +3603,9 @@ final class AgentSessionLinkRuntimeBridge {
            !liveCandidatesStillMatch(expectedEndpoints, pair: pair)
         {
             return EstablishmentResult(outcome: .failed(.rebinding))
+        }
+        guard scopedSourceIsCurrent(observer: observerEndpoint, target: target, sourceScopeID: pair.sourceScopeID) else {
+            return EstablishmentResult(outcome: .rejected(message: "source_scope_unavailable: Current direct-child consent and exact endpoints are required."))
         }
         let capturedBookkeeping = bookkeepingByReference
         let reservation: DomainAgentSessionLinkPendingReservation
@@ -3948,13 +4055,11 @@ final class AgentSessionLinkRuntimeBridge {
                 candidates: candidates,
                 observerSessionID: pair.observerSessionID
             ),
-            AgentSessionLinkEndpointEligibility.addDisabledReason(
-                observer.eligibilityInput,
-                roleAllowsOutboundMonitoring: observer.roleAllowsOutboundMonitoring
-            ) == nil
+            observerAddDisabledReason(observer) == nil
         else {
             return false
         }
+        guard scopedSourceIsCurrent(observer: observer.domainEndpoint, target: target, sourceScopeID: pair.sourceScopeID) else { return false }
         if let basis = expectations.laneCreationActivation {
             guard host?.agentSessionLinkBootstrapState(for: observer.domainEndpoint)?.activation == basis.activation,
                   basis.activation.endpoint == observer.domainEndpoint,
@@ -4818,7 +4923,7 @@ final class AgentSessionLinkRuntimeBridge {
         if let host {
             for endpoint in catalog.activeOutboundObserverEndpoints {
                 guard let candidate = host.agentSessionLinkCandidate(for: endpoint, includeLocation: false),
-                      AgentSessionLinkEndpointEligibility.addDisabledReason(candidate.eligibilityInput, roleAllowsOutboundMonitoring: candidate.roleAllowsOutboundMonitoring) == nil
+                      observerAddDisabledReason(candidate) == nil
                 else { continue }
                 eligibleEndpoints.insert(endpoint)
                 eligibleCountBySession[endpoint.sessionID, default: 0] += 1
@@ -4864,7 +4969,7 @@ final class AgentSessionLinkRuntimeBridge {
             createdByLabel: creatorID.flatMap { peers[$0]?.resolvedDisplayName ?? creatorNames.snapshot[$0] ?? host.agentSessionLinkLaneCreatorLabel(for: endpoint) },
             creatorSessionID: creatorID,
             targetIneligibleReason: targetReason,
-            observerIneligibleReason: AgentSessionLinkEndpointEligibility.addDisabledReason(candidate.eligibilityInput, roleAllowsOutboundMonitoring: candidate.roleAllowsOutboundMonitoring)
+            observerIneligibleReason: observerAddDisabledReason(candidate)
         )
     }
 
@@ -5120,10 +5225,7 @@ final class AgentSessionLinkRuntimeBridge {
                     )
                 )
             },
-            canAddReason: AgentSessionLinkEndpointEligibility.addDisabledReason(
-                candidate.eligibilityInput,
-                roleAllowsOutboundMonitoring: candidate.roleAllowsOutboundMonitoring
-            ),
+            canAddReason: observerAddDisabledReason(candidate),
             // The persisted observer-session setting, read straight from the exact live incarnation.
             // Unlike the queue it schedules against, it is session configuration rather than runtime
             // state, so it renders identically on an authoritative pass and a presentation-only repaint.
@@ -5699,6 +5801,11 @@ final class AgentSessionLinkRuntimeBridge {
     }
 
     /// Rechecks both exact live endpoint incarnations before a management action commits.
+    private func scopedLeaseIsCurrent(_ lease: DomainAgentSessionLinkLease, host: any AgentSessionLinkEndpointHost) -> Bool {
+        guard let target = host.agentSessionLinkCandidate(for: lease.target, includeLocation: false) else { return false }
+        return scopedSourceIsCurrent(observer: lease.observer, target: target, sourceScopeID: lease.sourceScopeID, host: host)
+    }
+
     private func managementEndpointsAreEligible(
         observerEndpoint: DomainAgentSessionLinkEndpointIdentity,
         targetEndpoint: DomainAgentSessionLinkEndpointIdentity,
@@ -5708,10 +5815,7 @@ final class AgentSessionLinkRuntimeBridge {
         guard let observer = candidates.first(where: { $0.domainEndpoint == observerEndpoint }),
               let target = candidates.first(where: { $0.domainEndpoint == targetEndpoint })
         else { return false }
-        return AgentSessionLinkEndpointEligibility.observerOperationEligibility(
-            observer.eligibilityInput,
-            roleAllowsOutboundMonitoring: observer.roleAllowsOutboundMonitoring
-        ) == .eligible
+        return observerOperationEligibility(observer) == .eligible
             && targetResolveFailure(for: target, observerSessionID: observerEndpoint.sessionID) == nil
     }
 
@@ -5743,10 +5847,8 @@ final class AgentSessionLinkRuntimeBridge {
             guard !registry.blocksNewOversight(sessionID: lease.observer.sessionID),
                   !registry.blocksNewOversight(sessionID: lease.target.sessionID),
                   let observer = candidates.first(where: { $0.domainEndpoint == lease.observer }),
-                  AgentSessionLinkEndpointEligibility.observerOperationEligibility(
-                      observer.eligibilityInput,
-                      roleAllowsOutboundMonitoring: observer.roleAllowsOutboundMonitoring
-                  ) == .eligible,
+                  observerOperationEligibility(observer) == .eligible,
+                  scopedLeaseIsCurrent(lease, host: host),
                   let target = candidates.first(where: { $0.domainEndpoint == lease.target }),
                   targetResolveFailure(for: target, observerSessionID: lease.observer.sessionID) == nil
             else { return nil }
@@ -5790,10 +5892,8 @@ final class AgentSessionLinkRuntimeBridge {
             guard let candidate = candidates.first(where: { $0.domainEndpoint == lease.target }),
                   targetResolveFailure(for: candidate, observerSessionID: lease.observer.sessionID) == nil,
                   let observer = candidates.first(where: { $0.domainEndpoint == lease.observer }),
-                  AgentSessionLinkEndpointEligibility.observerOperationEligibility(
-                      observer.eligibilityInput,
-                      roleAllowsOutboundMonitoring: observer.roleAllowsOutboundMonitoring
-                  ) == .eligible
+                  observerOperationEligibility(observer) == .eligible,
+                  scopedLeaseIsCurrent(lease, host: host)
             else { return nil }
             if managedIDs.contains(lease.target.sessionID) {
                 inspections[lease.target.sessionID] = host.agentSessionLinkPendingInteraction(for: candidate)
@@ -5873,7 +5973,7 @@ final class AgentSessionLinkRuntimeBridge {
               !isFrozenForTermination,
               let host
         else { return false }
-        guard managementEndpointsAreEligible(
+        guard scopedLeaseIsCurrent(lease, host: host), managementEndpointsAreEligible(
             observerEndpoint: lease.observer,
             targetEndpoint: lease.target,
             host: host
@@ -6112,7 +6212,7 @@ final class AgentSessionLinkRuntimeBridge {
     ) -> AgentSessionLinkLocalInputDecoration? {
         guard !isFrozenForTermination, let host,
               let observerCandidate = host.agentSessionLinkCandidate(for: observer, includeLocation: false),
-              Self.passiveDeliveryIsPermitted(for: observerCandidate),
+              passiveDeliveryIsPermitted(for: observerCandidate),
               var notices = passiveNoticesByObserver[observer],
               let entries = baseline.passiveBatch?.entries else { return nil }
         var offers: [AgentSessionLinkPassiveStatusNotices.LocalInputOffer] = []
@@ -6134,7 +6234,7 @@ final class AgentSessionLinkRuntimeBridge {
     func localInputContentIsCurrent(_ decoration: AgentSessionLinkLocalInputDecoration, observer: DomainAgentSessionLinkEndpointIdentity) -> Bool {
         guard !isFrozenForTermination, let host,
               let candidate = host.agentSessionLinkCandidate(for: observer, includeLocation: false),
-              Self.passiveDeliveryIsPermitted(for: candidate),
+              passiveDeliveryIsPermitted(for: candidate),
               let notices = passiveNoticesByObserver[observer],
               notices.canConsumeLocalInputs(decoration.requirements.map(\.offer.range)) else { return false }
         return decoration.requirements.allSatisfy { requirement in
@@ -6200,7 +6300,7 @@ final class AgentSessionLinkRuntimeBridge {
         // endpoint that vanished during the hop is not deliverable.
         // The caller supplies the fresh post-hop exact candidate; nil is an authoritative absence,
         // never a request to reconstruct candidates or reuse the pre-hop presentation snapshot.
-        let deliverable = current.map(Self.passiveDeliveryIsPermitted) ?? false
+        let deliverable = current.map { passiveDeliveryIsPermitted(for: $0) } ?? false
         var notices = existing
             ?? AgentSessionLinkPassiveStatusNotices(observerEndpoint: endpoint)
         // One clock value per reconciliation, so a single sample set cannot stamp two edges with two
@@ -6262,15 +6362,21 @@ final class AgentSessionLinkRuntimeBridge {
     ///
     /// Reuses the prompt eligibility predicate rather than inventing a second rule, so a suspended
     /// observer stops accumulating a backlog for exactly as long as it could not be told about it.
-    private static func passiveDeliveryIsPermitted(
+    ///
+    /// A parentless MCP controller is eligible only on fresh engine standing for this exact endpoint,
+    /// re-read here on every call; nothing cached stands in for it.
+    private func passiveDeliveryIsPermitted(
         for candidate: AgentSessionLinkEndpointCandidate
     ) -> Bool {
-        AgentSessionLinkPromptEligibility.allowsSupplement(
+        let isMCP = candidate.isMCPControlled || candidate.isMCPOriginated
+        return AgentSessionLinkPromptEligibility.allowsSupplement(
             AgentSessionLinkPromptEligibility.Input(
                 isChildSession: !candidate.isTopLevel,
                 isMCPControlled: candidate.isMCPControlled,
                 isMCPOriginated: candidate.isMCPOriginated,
-                roleAllowsOutboundMonitoring: candidate.roleAllowsOutboundMonitoring
+                roleAllowsOutboundMonitoring: candidate.roleAllowsOutboundMonitoring,
+                scopedEvidence: isMCP ? scopedObserverEvidence(for: candidate.domainEndpoint) : nil,
+                endpoint: candidate.domainEndpoint
             )
         )
     }
@@ -6382,7 +6488,7 @@ final class AgentSessionLinkRuntimeBridge {
               let currentObserver = currentCandidates.first(where: {
                   $0.domainEndpoint == authorization.observer
               }),
-              Self.passiveDeliveryIsPermitted(for: currentObserver)
+              passiveDeliveryIsPermitted(for: currentObserver)
         else {
             return .denied
         }
@@ -6408,7 +6514,7 @@ final class AgentSessionLinkRuntimeBridge {
               let finalObserver = finalCandidates.first(where: {
                   $0.domainEndpoint == authorization.observer
               }),
-              Self.passiveDeliveryIsPermitted(for: finalObserver),
+              passiveDeliveryIsPermitted(for: finalObserver),
               !registry.isPermanentlyDeleted(sessionID: authorization.target.sessionID),
               !registry.isPermanentlyDeleted(sessionID: authorization.observer.sessionID),
               !registry.isDeletionInProgress(sessionID: authorization.target.sessionID),
@@ -6513,6 +6619,7 @@ final class AgentSessionLinkRuntimeBridge {
         observerEndpoint: DomainAgentSessionLinkEndpointIdentity,
         targetSessionID: UUID
     ) async -> Result<AuthorizedTarget, AuthorizationFailure> {
+        _ = scopedObserverEvidence(for: observerEndpoint)
         // Off means off: a full-access grant left from an earlier "on" never elevates or sources a link.
         delegationScopes.reconcileGlobalAutoApprove()
         var leaseResult = await authority.authorize(
@@ -6577,7 +6684,8 @@ final class AgentSessionLinkRuntimeBridge {
         targetSessionID: UUID
     ) async -> DomainAgentSessionLinkLease? {
         let engine = delegationScopes.authorization
-        guard let host, targetSessionID != observerEndpoint.sessionID,
+        guard scopedObserverEvidence(for: observerEndpoint) == nil,
+              let host, targetSessionID != observerEndpoint.sessionID,
               let source = engine.fullAccessLinkSource(observerSessionID: observerEndpoint.sessionID)
         else { return nil }
         let candidates = host.agentSessionLinkCandidates()
@@ -6699,6 +6807,7 @@ final class AgentSessionLinkRuntimeBridge {
               let current = host.agentSessionLinkCandidate(for: liveTarget.domainEndpoint, includeLocation: false),
               targetResolveFailure(for: current, observerSessionID: lease.observer.sessionID) == nil
         else { return nil }
+        guard scopedSourceIsCurrent(observer: lease.observer, target: current, sourceScopeID: lease.sourceScopeID, host: host) else { return nil }
         return current
     }
 
@@ -6709,10 +6818,7 @@ final class AgentSessionLinkRuntimeBridge {
     private func revalidateObserverCapability(
         _ observer: AgentSessionLinkEndpointCandidate
     ) async -> Bool {
-        switch AgentSessionLinkEndpointEligibility.observerOperationEligibility(
-            observer.eligibilityInput,
-            roleAllowsOutboundMonitoring: observer.roleAllowsOutboundMonitoring
-        ) {
+        switch observerOperationEligibility(observer) {
         case .eligible:
             return true
         case .transientlyUnavailable:
@@ -7211,8 +7317,11 @@ final class AgentSessionLinkRuntimeBridge {
         request.startStopFence = startStopFence
         // Keep the host that supplied this exact candidate through the send transaction. The
         // host itself still fences window teardown and both endpoint incarnations at every probe.
-        let liveness: AgentSessionLinkSendLivenessProbe = {
-            host.agentSessionLinkSendLiveness(
+        let liveness: AgentSessionLinkSendLivenessProbe = { [self] in
+            guard scopedLeaseIsCurrent(target.lease, host: host) else {
+                return AgentSessionLinkSendLiveness(observerEndpointIsLive: false, targetEndpointIsLive: false, targetWindowIsClosing: false)
+            }
+            return host.agentSessionLinkSendLiveness(
                 observer: request.observerEndpoint,
                 target: target.lease.target
             )
@@ -7304,10 +7413,8 @@ final class AgentSessionLinkRuntimeBridge {
               !observer.isClosing, !target.isClosing,
               targetResolveFailure(for: target, observerSessionID: lease.observer.sessionID) == nil,
               !observer.isDeletionInProgress, !target.isDeletionInProgress,
-              AgentSessionLinkEndpointEligibility.observerOperationEligibility(
-                  observer.eligibilityInput,
-                  roleAllowsOutboundMonitoring: observer.roleAllowsOutboundMonitoring
-              ) == .eligible
+              observerOperationEligibility(observer) == .eligible,
+              scopedLeaseIsCurrent(lease, host: host)
         else { return nil }
         return target
     }
@@ -7390,8 +7497,11 @@ final class AgentSessionLinkRuntimeBridge {
         )
         // Keep the host that supplied this candidate through the same persistence and provider
         // suspensions as send. The host still re-proves both exact endpoints on every probe.
-        let liveness: AgentSessionLinkSendLivenessProbe = {
-            host.agentSessionLinkSendLiveness(
+        let liveness: AgentSessionLinkSendLivenessProbe = { [self] in
+            guard scopedLeaseIsCurrent(target.lease, host: host) else {
+                return AgentSessionLinkSendLiveness(observerEndpointIsLive: false, targetEndpointIsLive: false, targetWindowIsClosing: false)
+            }
+            return host.agentSessionLinkSendLiveness(
                 observer: request.observerEndpoint,
                 target: target.lease.target
             )
@@ -7476,8 +7586,11 @@ final class AgentSessionLinkRuntimeBridge {
         let targetEndpoint = target.lease.target
         // Keep the validated host across Stop's authorization suspension, just as for send.
         // Its probe still re-proves both exact endpoints and the target window's closing state.
-        let liveness: AgentSessionLinkSendLivenessProbe = {
-            host.agentSessionLinkSendLiveness(
+        let liveness: AgentSessionLinkSendLivenessProbe = { [self] in
+            guard scopedLeaseIsCurrent(target.lease, host: host) else {
+                return AgentSessionLinkSendLiveness(observerEndpointIsLive: false, targetEndpointIsLive: false, targetWindowIsClosing: false)
+            }
+            return host.agentSessionLinkSendLiveness(
                 observer: request.observerEndpoint, target: targetEndpoint
             )
         }
@@ -8264,9 +8377,7 @@ final class AgentSessionLinkRuntimeBridge {
             guard host.agentSessionLinkBootstrapState(for: endpoint)?.activation == activation else { return false }
         }
         guard let candidate = host.agentSessionLinkCandidate(for: endpoint, includeLocation: false) else { return false }
-        return AgentSessionLinkEndpointEligibility.addDisabledReason(
-            candidate.eligibilityInput, roleAllowsOutboundMonitoring: candidate.roleAllowsOutboundMonitoring
-        ) == nil
+        return observerAddDisabledReason(candidate) == nil
     }
 
     private func laneCreationCallerBasis(for endpoint: DomainAgentSessionLinkEndpointIdentity) -> LaneCreationCallerBasis {
@@ -8957,10 +9068,7 @@ final class AgentSessionLinkRuntimeBridge {
         if inventory.items.contains(where: { $0.targetSessionID == excludingTargetSessionID }) {
             return .success(.alreadyLinked)
         }
-        if let reason = AgentSessionLinkEndpointEligibility.addDisabledReason(
-            candidate.eligibilityInput,
-            roleAllowsOutboundMonitoring: candidate.roleAllowsOutboundMonitoring
-        ) {
+        if let reason = observerAddDisabledReason(candidate) {
             return .failure(AgentOversightResolutionMessage(message: reason))
         }
         return .success(.candidate(candidate))
@@ -9067,6 +9175,10 @@ final class AgentSessionLinkRuntimeBridge {
 /// handles — is what guarantees automatic restoration cannot bypass the shared establishment path,
 /// the pair retirement barrier, or expected-token removal.
 extension AgentSessionLinkRuntimeBridge: AgentSessionOversightLaunchCoordinatorDelegate {
+    func launchCoordinatorObserverEligibility(for candidate: AgentSessionLinkEndpointCandidate) -> AgentSessionLinkEndpointEligibility.OperationEligibility {
+        observerOperationEligibility(candidate)
+    }
+
     func launchCoordinatorTargetFailure(for candidate: AgentSessionLinkEndpointCandidate, observerSessionID: UUID) -> AgentSessionLinkResolveFailure? {
         targetResolveFailure(for: candidate, observerSessionID: observerSessionID)
     }

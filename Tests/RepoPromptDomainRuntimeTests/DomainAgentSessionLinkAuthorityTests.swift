@@ -1811,6 +1811,226 @@ final class DomainAgentSessionLinkAuthorityTests: XCTestCase {
         XCTAssertEqual(expired.failureError, .cursorExpired)
     }
 
+    // MARK: - Direct-child endpoint endorsement
+
+    private final class MutableClock: @unchecked Sendable {
+        private let lock = NSLock()
+        private var date: Date
+        init(_ date: Date) {
+            self.date = date
+        }
+
+        func set(_ value: Date) {
+            lock.withLock { date = value }
+        }
+
+        func read() -> Date {
+            lock.withLock { date }
+        }
+    }
+
+    private struct DirectChildFixture {
+        let workspaceID: UUID
+        let observer: DomainAgentSessionLinkEndpointIdentity
+        let target: DomainAgentSessionLinkEndpointIdentity
+        let record: DomainDelegationScopeRecord
+        let consent: DomainDelegationScopeLinkConsent
+    }
+
+    private func makeDirectChildRecord(
+        observer: DomainAgentSessionLinkEndpointIdentity,
+        capabilities: Set<DomainDelegationScopeCapability> = [.observe, .control, .restructure],
+        expiresAt: Date? = Date(timeIntervalSince1970: 4600),
+        generation: UInt64 = 1,
+        id: UUID = UUID(),
+        state: DomainDelegationScopeState = .active
+    ) -> DomainDelegationScopeRecord {
+        DomainDelegationScopeRecord(
+            grant: DomainDelegationScopeGrant(
+                id: id, granteeSessionID: observer.sessionID,
+                kind: .directChildren(rootSessionID: observer.sessionID, workspaceID: observer.workspaceID),
+                capabilities: capabilities, guardrails: .init(expiresAt: expiresAt), origin: .user,
+                grantedAt: Date(timeIntervalSince1970: 1000)
+            ),
+            generation: generation, state: state
+        )
+    }
+
+    private func makeDirectChildFixture() -> DirectChildFixture {
+        let workspaceID = UUID()
+        let observer = makeEndpoint(workspaceID: workspaceID)
+        let target = makeEndpoint(windowID: 2, workspaceID: workspaceID)
+        let consent = DomainDelegationScopeLinkConsent()
+        let record = makeDirectChildRecord(observer: observer)
+        consent.publish([record])
+        return DirectChildFixture(workspaceID: workspaceID, observer: observer, target: target, record: record, consent: consent)
+    }
+
+    private func endorsement(
+        _ fixture: DirectChildFixture,
+        generation: UInt64? = nil,
+        observer: DomainAgentSessionLinkEndpointIdentity? = nil,
+        target: DomainAgentSessionLinkEndpointIdentity? = nil
+    ) -> DomainDelegationScopeDirectChildEndorsement {
+        DomainDelegationScopeDirectChildEndorsement(
+            scopeID: fixture.record.id, scopeGeneration: generation ?? fixture.record.generation,
+            observer: observer ?? fixture.observer, target: target ?? fixture.target
+        )
+    }
+
+    func testDirectChildScopeConsentRequiresCurrentEndpointAndGenerationEndorsement() async throws {
+        let fixture = makeDirectChildFixture()
+        let now = Date(timeIntervalSince1970: 1000)
+        let authority = makeAuthority()
+        let installed = await authority.installScopeConsent(fixture.consent)
+        XCTAssertTrue(installed)
+        let scopeID = fixture.record.id
+
+        XCTAssertFalse(fixture.consent.permits(scopeID: scopeID, observer: fixture.observer.sessionID, target: fixture.target.sessionID, at: now))
+        XCTAssertFalse(fixture.consent.permits(scopeID: scopeID, observer: fixture.observer, target: fixture.target, at: now))
+        let unproven = await authority.reserveLink(
+            observer: fixture.observer, target: fixture.target, capabilities: DomainAgentSessionLinkCapability.managed, sourceScopeID: scopeID
+        )
+        guard case .rejected(.sourceScopeUnavailable) = unproven else { return XCTFail("Unproven direct_children reserved: \(unproven)") }
+
+        let otherWorkspaceTarget = makeEndpoint(workspaceID: UUID())
+        let foreignObserver = makeEndpoint(workspaceID: fixture.workspaceID)
+        for rejected in [
+            endorsement(fixture, generation: fixture.record.generation + 1),
+            endorsement(fixture, generation: 0),
+            endorsement(fixture, target: otherWorkspaceTarget),
+            endorsement(fixture, target: fixture.observer),
+            endorsement(fixture, observer: foreignObserver)
+        ] {
+            XCTAssertFalse(fixture.consent.endorse(rejected, at: now))
+        }
+        XCTAssertFalse(fixture.consent.permits(scopeID: scopeID, observer: fixture.observer, target: fixture.target, at: now))
+
+        XCTAssertTrue(fixture.consent.endorse(endorsement(fixture), at: now))
+        XCTAssertTrue(fixture.consent.permits(scopeID: scopeID, observer: fixture.observer, target: fixture.target, at: now))
+        fixture.consent.replace([fixture.record.grant])
+        XCTAssertFalse(fixture.consent.permits(scopeID: scopeID, observer: fixture.observer, target: fixture.target, at: now))
+        fixture.consent.publish([fixture.record])
+        XCTAssertFalse(
+            fixture.consent.permits(scopeID: scopeID, observer: fixture.observer, target: fixture.target, at: now),
+            "Republishing the record must not resurrect a dropped endorsement"
+        )
+
+        XCTAssertTrue(fixture.consent.endorse(endorsement(fixture), at: now))
+        let grant = try await activateLink(authority, observer: fixture.observer, target: fixture.target, sourceScopeID: scopeID)
+        XCTAssertEqual(grant.sourceScopeID, scopeID)
+        let lease = try await authority.authorize(
+            operation: .monitorPoll, observerEndpoint: fixture.observer, targetSessionID: fixture.target.sessionID
+        ).get()
+        XCTAssertEqual(lease.sourceScopeID, scopeID)
+
+        let sibling = makeEndpoint(workspaceID: fixture.workspaceID)
+        let siblingReservation = await authority.reserveLink(
+            observer: fixture.observer, target: sibling, capabilities: DomainAgentSessionLinkCapability.managed, sourceScopeID: scopeID
+        )
+        guard case .rejected(.sourceScopeUnavailable) = siblingReservation else { return XCTFail("Unendorsed sibling reserved") }
+        let selfReservation = await authority.reserveLink(
+            observer: fixture.observer, target: fixture.observer, capabilities: DomainAgentSessionLinkCapability.managed, sourceScopeID: scopeID
+        )
+        guard case .rejected = selfReservation else { return XCTFail("Root self-target reserved") }
+    }
+
+    func testDirectChildEndorsementRejectsRevocationExpiryAndEndpointReplacement() async throws {
+        let clock = MutableClock(Date(timeIntervalSince1970: 1000))
+        let fixture = makeDirectChildFixture()
+        let scopeID = fixture.record.id
+        let authority = makeAuthority(now: { clock.read() })
+        let installed = await authority.installScopeConsent(fixture.consent)
+        XCTAssertTrue(installed)
+        func endorseAndLink() async throws -> DomainAgentSessionLinkGrant {
+            XCTAssertTrue(fixture.consent.endorse(endorsement(fixture), at: clock.read()))
+            return try await activateLink(authority, observer: fixture.observer, target: fixture.target, sourceScopeID: scopeID)
+        }
+
+        let grant = try await endorseAndLink()
+        let reference = DomainAgentSessionLinkReference(linkID: grant.id, generation: grant.generation)
+        let beforeRevoke = await authority.activeGrant(for: reference)
+        XCTAssertNotNil(beforeRevoke)
+        fixture.consent.publish([])
+        let afterRevoke = await authority.activeGrant(for: reference)
+        XCTAssertNil(afterRevoke)
+        let revokedLease = await authority.authorize(
+            operation: .monitorPoll, observerEndpoint: fixture.observer, targetSessionID: fixture.target.sessionID
+        )
+        XCTAssertNil(try? revokedLease.get())
+        fixture.consent.publish([fixture.record])
+        XCTAssertFalse(fixture.consent.permits(scopeID: scopeID, observer: fixture.observer, target: fixture.target, at: clock.read()))
+        let revokedReservation = await authority.reserveLink(
+            observer: fixture.observer, target: fixture.target, capabilities: DomainAgentSessionLinkCapability.managed, sourceScopeID: scopeID
+        )
+        guard case .rejected(.sourceScopeUnavailable) = revokedReservation else { return XCTFail("Revoked proof reserved") }
+
+        XCTAssertTrue(fixture.consent.endorse(endorsement(fixture), at: clock.read()))
+        fixture.consent.publish([makeDirectChildRecord(
+            observer: fixture.observer, generation: fixture.record.generation + 1, id: scopeID
+        )])
+        XCTAssertFalse(fixture.consent.permits(scopeID: scopeID, observer: fixture.observer, target: fixture.target, at: clock.read()))
+        fixture.consent.publish([fixture.record])
+        XCTAssertTrue(fixture.consent.endorse(endorsement(fixture), at: clock.read()))
+        fixture.consent.publish([makeDirectChildRecord(observer: fixture.observer, capabilities: [.observe], id: scopeID)])
+        XCTAssertFalse(fixture.consent.permits(scopeID: scopeID, observer: fixture.observer, target: fixture.target, at: clock.read()))
+        XCTAssertFalse(fixture.consent.endorse(endorsement(fixture), at: clock.read()), "Reduced grant cannot be endorsed")
+        fixture.consent.publish([makeDirectChildRecord(observer: fixture.observer, id: scopeID, state: .revoked)])
+        XCTAssertFalse(fixture.consent.endorse(endorsement(fixture), at: clock.read()), "Non-active record cannot be endorsed")
+
+        fixture.consent.publish([fixture.record])
+        XCTAssertTrue(fixture.consent.endorse(endorsement(fixture), at: clock.read()))
+        let reboundTarget = makeEndpoint(
+            windowID: fixture.target.windowID, workspaceID: fixture.workspaceID, tabID: fixture.target.tabID,
+            sessionID: fixture.target.sessionID, persistentBindingGeneration: UUID()
+        )
+        let reboundObserver = makeEndpoint(
+            windowID: fixture.observer.windowID, workspaceID: fixture.workspaceID, tabID: fixture.observer.tabID,
+            sessionID: fixture.observer.sessionID, persistentBindingGeneration: UUID()
+        )
+        XCTAssertFalse(fixture.consent.permits(scopeID: scopeID, observer: fixture.observer, target: reboundTarget, at: clock.read()))
+        XCTAssertFalse(fixture.consent.permits(scopeID: scopeID, observer: reboundObserver, target: fixture.target, at: clock.read()))
+        let reboundReservation = await authority.reserveLink(
+            observer: fixture.observer, target: reboundTarget, capabilities: DomainAgentSessionLinkCapability.managed, sourceScopeID: scopeID
+        )
+        guard case .rejected(.sourceScopeUnavailable) = reboundReservation else { return XCTFail("Replaced target endpoint reserved") }
+        fixture.consent.invalidateEndorsements(endpoint: fixture.target)
+        XCTAssertFalse(fixture.consent.permits(scopeID: scopeID, observer: fixture.observer, target: fixture.target, at: clock.read()))
+        XCTAssertTrue(fixture.consent.endorse(endorsement(fixture), at: clock.read()))
+        fixture.consent.invalidateEndorsements(scopeID: scopeID)
+        XCTAssertFalse(fixture.consent.permits(scopeID: scopeID, observer: fixture.observer, target: fixture.target, at: clock.read()))
+        XCTAssertTrue(fixture.consent.endorse(endorsement(fixture), at: clock.read()))
+        fixture.consent.invalidateAllEndorsements()
+        XCTAssertFalse(fixture.consent.permits(scopeID: scopeID, observer: fixture.observer, target: fixture.target, at: clock.read()))
+
+        // Expiry between issue and use, at both the consent and the live link fences.
+        // (A fresh pair: the earlier physical link legitimately revives as `existing` once proof returns.)
+        let fresh = makeDirectChildFixture()
+        let expiryAuthority = makeAuthority(now: { clock.read() })
+        let expiryInstalled = await expiryAuthority.installScopeConsent(fresh.consent)
+        XCTAssertTrue(expiryInstalled)
+        XCTAssertTrue(fresh.consent.endorse(
+            DomainDelegationScopeDirectChildEndorsement(
+                scopeID: fresh.record.id, scopeGeneration: fresh.record.generation, observer: fresh.observer, target: fresh.target
+            ), at: clock.read()
+        ))
+        let expiring = try await activateLink(expiryAuthority, observer: fresh.observer, target: fresh.target, sourceScopeID: fresh.record.id)
+        let expiringReference = DomainAgentSessionLinkReference(linkID: expiring.id, generation: expiring.generation)
+        let beforeExpiry = await expiryAuthority.activeGrant(for: expiringReference)
+        XCTAssertNotNil(beforeExpiry)
+        clock.set(Date(timeIntervalSince1970: 4600))
+        let afterExpiry = await expiryAuthority.activeGrant(for: expiringReference)
+        XCTAssertNil(afterExpiry)
+        XCTAssertFalse(fresh.consent.permits(scopeID: fresh.record.id, observer: fresh.observer, target: fresh.target, at: clock.read()))
+        XCTAssertFalse(
+            fresh.consent.endorse(
+                DomainDelegationScopeDirectChildEndorsement(
+                    scopeID: fresh.record.id, scopeGeneration: fresh.record.generation, observer: fresh.observer, target: fresh.target
+                ), at: clock.read()
+            ), "An expired grant cannot be endorsed"
+        )
+    }
+
     func testWaitCursorResolutionRejectsInvalidBatchShapes() async throws {
         let authority = makeAuthority()
         let observer = makeEndpoint()

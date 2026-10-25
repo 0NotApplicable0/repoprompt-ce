@@ -212,7 +212,7 @@ final class OverseerAuthorizationEngine {
             // agent needs no recovery call. An unknown ID (above) and another session's scope stay
             // identity/input refusals (`explicitScopeInput`) that disclose nothing about other grants.
             guard waives(.restrictedScopeNarrowing), Self.explicitPassNarrows(explicit),
-                  !record.grant.unrestricted,
+                  !record.grant.unrestricted, !isQualifiedControllerScope(record),
                   record.grant.granteeSessionID == callerSessionID,
                   let global = scopes.ensureGlobalAutoApproveScope(for: callerSessionID)
             else { return explicit }
@@ -239,7 +239,7 @@ final class OverseerAuthorizationEngine {
         if let scopeID = request.scopeID {
             guard let record = scopes.record(id: scopeID),
                   record.grant.granteeSessionID == callerSessionID else { return nil }
-            if waives(.restrictedScopeNarrowing), !record.grant.unrestricted,
+            if waives(.restrictedScopeNarrowing), !record.grant.unrestricted, !isQualifiedControllerScope(record),
                let global = scopes.ensureGlobalAutoApproveScope(for: callerSessionID) { return global }
             return record.isActive ? record : nil
         }

@@ -279,6 +279,11 @@ struct AgentSessionScopeVisibility {
                 true
             case let .workspace(workspaceID):
                 record.workspaceID == workspaceID
+            case let .directChildren(rootSessionID, workspaceID):
+                snapshot.records[rootSessionID]?.workspaceID == workspaceID
+                    && record.sessionID != rootSessionID && record.workspaceID == workspaceID
+                    && record.parentSessionID == rootSessionID
+                    && (record.organizationalParentID ?? record.parentSessionID ?? record.createdByOverseerSessionID) == rootSessionID
             case let .tree(rootSessionID):
                 snapshot.isInTree(record.sessionID, rootSessionID: rootSessionID)
             }
@@ -290,7 +295,7 @@ struct AgentSessionScopeVisibility {
             switch scope.grant.kind {
             case .allSessions: true
             case let .session(target): sessionID == target || sessionID == scope.grant.granteeSessionID
-            case .workspace: false
+            case .workspace, .directChildren: false
             case let .tree(root): sessionID == root
             }
         }
@@ -433,6 +438,7 @@ struct AgentSessionInventoryRead {
         let needsHistory = needsGlobal || filter?.createdBefore != nil || filter?.createdAfter != nil
         let workspace = chain.compactMap { scope -> UUID? in
             if case let .workspace(id) = scope.grant.kind { return id }
+            if case let .directChildren(_, id) = scope.grant.kind { return id }
             return nil
         }.first ?? (isTree || needsGlobal ? nil : filter?.workspaceID)
         return AgentSessionInventoryRead(

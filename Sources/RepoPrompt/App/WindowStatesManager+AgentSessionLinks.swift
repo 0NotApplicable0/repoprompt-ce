@@ -300,11 +300,8 @@ extension WindowStatesManager: AgentSessionLinkEndpointHost, PreparedAgentSessio
                 preparedOversightCleanupDirty = false
                 let bridge = AgentSessionLinkRuntimeBridge.shared
                 let inventory = await bridge.oversightInventory(includeLocation: false)
-                let consent = bridge.delegationScopes.linkConsent
                 let retained = Set(inventory.live.filter { item in
-                    item.sourceScopeID.map {
-                        consent.permits(scopeID: $0, observer: item.observerSessionID, target: item.targetSessionID, at: Date())
-                    } ?? true
+                    bridge.sourceConsentEligibility(for: .init(observerSessionID: item.observerSessionID, targetSessionID: item.targetSessionID, sourceScopeID: item.sourceScopeID)) != .disqualified
                 }.flatMap { [$0.observerSessionID, $0.targetSessionID] })
                 for id in Array(preparedOversightWindows.keys) where preparedOversightPreparationInFlight[id] == nil {
                     guard let owner = preparedOversightWindows[id] else { continue }
@@ -315,9 +312,7 @@ extension WindowStatesManager: AgentSessionLinkEndpointHost, PreparedAgentSessio
                         preparedOversightConsentPairs[id, default: []].update(with: pair)
                     }
                     let knownPairs = preparedOversightConsentPairs[id] ?? []
-                    let revoked = !knownPairs.isEmpty && knownPairs.allSatisfy { pair in
-                        pair.sourceScopeID.map { !consent.permits(scopeID: $0, observer: pair.observerSessionID, target: id, at: Date()) } ?? false
-                    }
+                    let revoked = preparedOversightConsentIsPermanentlyLost(knownPairs, bridge: bridge)
                     if deleted || revoked {
                         let visit = preparedOversightPendingVisits.removeValue(forKey: id)
                         await retirePreparedOversightOwner(sessionID: id, preservingIntent: false)
@@ -343,6 +338,14 @@ extension WindowStatesManager: AgentSessionLinkEndpointHost, PreparedAgentSessio
                     }
                 }
             }
+        }
+    }
+
+    /// Only a permanent, engine-classified loss for every known sourced pair retires the owner; a
+    /// pending reproof or unloaded target facts under a live grant keep it.
+    func preparedOversightConsentIsPermanentlyLost(_ pairs: Set<AgentSessionOversightIntent>, bridge: AgentSessionLinkRuntimeBridge) -> Bool {
+        !pairs.isEmpty && pairs.allSatisfy { pair in
+            pair.sourceScopeID != nil && bridge.sourceConsentEligibility(for: pair) == .disqualified
         }
     }
 

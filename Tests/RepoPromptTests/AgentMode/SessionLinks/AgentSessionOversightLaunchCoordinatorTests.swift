@@ -18,6 +18,16 @@ final class AgentSessionOversightLaunchCoordinatorTests: XCTestCase {
     /// topology reason. The focused bridge tests elsewhere rely on the protocol defaults instead.
     private final class FakeHost: AgentSessionLinkEndpointHost {
         var preparedSessionRuntimes: (any PreparedAgentSessionRuntimeRegistry)?
+        var scopedStanding: ((DomainAgentSessionLinkEndpointIdentity, OverseerAuthorizationEngine) -> ScopedObserverStanding)?
+        var scopedEndorsement: ((DomainAgentSessionLinkEndpointIdentity, AgentSessionLinkEndpointCandidate, UUID, OverseerAuthorizationEngine) -> Bool)?
+        func agentSessionLinkScopedObserverStanding(for endpoint: DomainAgentSessionLinkEndpointIdentity, engine: OverseerAuthorizationEngine) -> ScopedObserverStanding {
+            scopedStanding?(endpoint, engine) ?? .denied
+        }
+
+        func agentSessionLinkEndorseScopedObserver(observer: DomainAgentSessionLinkEndpointIdentity, target: AgentSessionLinkEndpointCandidate, scopeID: UUID, engine: OverseerAuthorizationEngine) -> Bool {
+            scopedEndorsement?(observer, target, scopeID, engine) ?? false
+        }
+
         var candidates: [AgentSessionLinkEndpointCandidate] = [] {
             didSet {
                 byEndpoint = Dictionary(candidates.map { ($0.domainEndpoint, $0) }, uniquingKeysWith: { first, _ in first })
@@ -310,7 +320,7 @@ final class AgentSessionOversightLaunchCoordinatorTests: XCTestCase {
         let gate: WriteGate
     }
 
-    private func makeFixture(mode: AgentSessionOversightPersistenceMode = .enabled) -> Fixture {
+    private func makeFixture(mode: AgentSessionOversightPersistenceMode = .enabled, scopes: DelegationScopeRuntime? = nil) -> Fixture {
         let authority = DomainAgentSessionLinkAuthority(
             identity: DomainRuntimeIdentity(
                 runtimeID: UUID(),
@@ -338,9 +348,169 @@ final class AgentSessionOversightLaunchCoordinatorTests: XCTestCase {
         let bridge = AgentSessionLinkRuntimeBridge(
             authority: authority,
             host: host,
-            toolAdvertisementInvalidator: { _ in }
+            toolAdvertisementInvalidator: { _ in }, delegationScopes: scopes
         )
         return Fixture(bridge: bridge, authority: authority, host: host, store: store, gate: gate)
+    }
+
+    func testLiveScopedMCPLinkSurvivesRestartSuspendedUntilReproof() async throws {
+        let controller = SessionAdminScopeLifecycleTests.Fixture()
+        addTeardownBlock { @MainActor in await controller.window.tearDown() }
+        let session = try await controller.installController()
+        session.hasLoadedPersistedState = true
+        session.recordRestorationAuthoritative(.persistedPayloadApplied)
+        session.isMCPOriginated = true
+        let endpoint = try XCTUnwrap(controller.endpoint)
+        observerSessionID = endpoint.sessionID
+        let request = try controller.runtime.requestScope(requesterSessionID: endpoint.sessionID, requesterTabID: endpoint.tabID, kind: .directChildren(rootSessionID: endpoint.sessionID, workspaceID: endpoint.workspaceID), capabilities: [.observe, .control, .restructure], guardrails: .init(), expiresInSeconds: 3600, reason: nil, idempotencyKey: nil).get()
+        let approved = try controller.runtime.approve(requestID: request.id).get()
+        let scopeURL = directory.appendingPathComponent(DelegationScopeStore.filename)
+        try JSONEncoder().encode(DelegationScopeDocument(scopes: [approved.grant])).write(to: scopeURL)
+        let restored = DelegationScopeRuntime(persistenceMode: .requiresStore, notifyCatalogChanged: { _ in })
+        let scopeStore = DelegationScopeStore(fileURL: scopeURL, backupsDirectoryURL: directory.appendingPathComponent("Backups"), mode: .enabled)
+        let savedPair = AgentSessionOversightIntent(observerSessionID: endpoint.sessionID, targetSessionID: targetSessionID, sourceScopeID: approved.id)
+        try JSONEncoder().encode(AgentSessionOversightIntentDocument(links: [savedPair])).write(to: directory.appendingPathComponent(AgentSessionOversightIntentStore.filename))
+        let fixture = makeFixture(scopes: restored)
+        defer { fixture.bridge.freezeForTermination() }
+        var target = makeReadyCandidate(windowID: 2, sessionID: targetSessionID, workspaceID: endpoint.workspaceID)
+        target = AgentSessionLinkEndpointCandidate(windowID: target.windowID, workspaceID: target.workspaceID, tabID: target.tabID, sessionID: target.sessionID, persistentBindingGeneration: target.persistentBindingGeneration, bindingTransitionGeneration: target.bindingTransitionGeneration, isTopLevel: false, hasLoadedPersistedState: true, bindingTransitionInProgress: false, isClosing: false, isMCPControlled: false, isMCPOriginated: true, roleAllowsOutboundMonitoring: true, displayName: "Worker", providerDisplayName: nil, locationLabel: nil, restorationReadiness: target.restorationReadiness, parentSessionID: endpoint.sessionID)
+        controller.source.add(endpoint.sessionID, parent: nil, workspace: endpoint.workspaceID)
+        controller.source.add(targetSessionID, parent: endpoint.sessionID, workspace: endpoint.workspaceID)
+        let projector = SpawnProvenanceDelegationMembershipProjector(source: controller.source)
+        fixture.host.scopedStanding = { endpoint, engine in engine.scopedObserverAuthorization(for: endpoint, window: controller.window) }
+        fixture.host.scopedEndorsement = { observer, target, scope, engine in engine.authorizeScopedObserverLink(observer: observer, target: target, scopeID: scope, window: controller.window, projector: projector) != nil }
+        let oldEndorsement = try XCTUnwrap(controller.runtime.authorization.authorizeScopedObserverLink(observer: endpoint, target: target, scopeID: approved.id, window: controller.window, projector: projector))
+        XCTAssertTrue(controller.runtime.linkConsent.permits(scopeID: approved.id, observer: endpoint, target: target.domainEndpoint, at: Date()))
+        let context = try XCTUnwrap(session.mcpControlContext)
+        session.mcpControlContext = nil
+        let observer = try XCTUnwrap(controller.window.agentModeViewModel.agentSessionLinkCandidate(for: endpoint, includeLocation: false))
+        replaceTopology(fixture, with: [observer, target])
+        await fixture.bridge.bootstrapContinuity(scopeStore: scopeStore, intentStore: fixture.store)
+        await fixture.bridge.test_settleLaunchReconciliation()
+        let pendingInventory = await fixture.authority.links(forObserver: observerSessionID)
+        XCTAssertTrue(pendingInventory.isEmpty)
+        let pendingToken = await fixture.store.token(for: savedPair)
+        XCTAssertNotNil(pendingToken, "A positively live saved MCP scope must wait, not delete intent")
+        XCTAssertFalse(restored.linkConsent.permits(scopeID: approved.id, observer: endpoint, target: target.domainEndpoint, at: Date()), "Old endorsement is absent in the fresh scope runtime")
+        let restoredRecord = try XCTUnwrap(restored.record(id: approved.id))
+        XCTAssertTrue(restoredRecord.isActive)
+        for operation in [DomainAgentSessionTargetOperation.manageList, .manageGetLog, .monitorPoll, .monitorRead, .runRespond, .manageStop] {
+            if case .success = await fixture.bridge.authorizeTarget(operation: operation, observerEndpoint: endpoint, targetSessionID: targetSessionID) {
+                XCTFail("Suspended scoped link must not authorize \(operation)")
+            }
+        }
+        let pendingLease = await fixture.authority.links(forObserver: observerSessionID)
+        XCTAssertTrue(pendingLease.isEmpty, "No lease until fresh proof")
+
+        let viewModel = controller.window.agentModeViewModel
+        _ = viewModel.test_installPersistentSessionBinding(sessionID: nil, on: session)
+        _ = try XCTUnwrap(viewModel.test_installPersistentSessionBinding(sessionID: endpoint.sessionID, on: session))
+        session.hasLoadedPersistedState = true
+        session.recordRestorationAuthoritative(.persistedPayloadApplied)
+        session.mcpControlContext = context
+        let liveEndpoint = try XCTUnwrap(viewModel.agentSessionLinkObserverEndpoint(tabID: session.tabID))
+        let rebound = try XCTUnwrap(viewModel.agentSessionLinkCandidate(for: liveEndpoint, includeLocation: false))
+        XCTAssertNotEqual(rebound.domainEndpoint.persistentBindingGeneration, endpoint.persistentBindingGeneration, "Real rebind produced a new endpoint generation")
+        replaceTopology(fixture, with: [rebound, target])
+        fixture.bridge.noteCandidateReadinessChanged()
+        await fixture.bridge.test_settleLaunchReconciliation()
+        let active = await fixture.authority.links(forObserver: observerSessionID)
+        XCTAssertEqual(active.items.first?.sourceScopeID, approved.id)
+        XCTAssertEqual(active.items.count, 1)
+        let newItem = try XCTUnwrap(active.items.first)
+        let newReference = DomainAgentSessionLinkReference(linkID: newItem.linkID, generation: newItem.generation)
+        let activeGrant = await fixture.authority.activeGrant(for: newReference)
+        XCTAssertNotNil(activeGrant)
+        let staleReference = DomainAgentSessionLinkReference(linkID: UUID(), generation: 0)
+        let staleGrant = await fixture.authority.activeGrant(for: staleReference)
+        XCTAssertNil(staleGrant)
+        XCTAssertFalse(restored.linkConsent.permits(scopeID: approved.id, observer: endpoint, target: target.domainEndpoint, at: Date()), "Old endpoint is not endorsed")
+        XCTAssertTrue(restored.linkConsent.permits(scopeID: approved.id, observer: rebound.domainEndpoint, target: target.domainEndpoint, at: Date()))
+        let freshEndorsement = try XCTUnwrap(restored.authorization.authorizeScopedObserverLink(observer: rebound.domainEndpoint, target: target, scopeID: approved.id, window: controller.window, projector: projector))
+        XCTAssertEqual(freshEndorsement.scopeGeneration, try XCTUnwrap(restored.record(id: approved.id)).generation, "Endorsement carries the fresh record's current issued generation")
+        XCTAssertEqual(freshEndorsement.observer, rebound.domainEndpoint)
+        XCTAssertNotEqual(freshEndorsement.observer, oldEndorsement.observer)
+        // Cross-instance numerics are incarnation-local: report, do not assert inequality.
+        XCTContext.runActivity(named: "scope generations old=\(oldEndorsement.scopeGeneration) restored=\(freshEndorsement.scopeGeneration)") { _ in }
+        if case .success = await fixture.bridge.authorizeTarget(operation: .monitorPoll, observerEndpoint: endpoint, targetSessionID: targetSessionID) {
+            XCTFail("Old endpoint must not authorize after rebind")
+        }
+        restored.revoke(scopeID: approved.id)
+        let revoked = await fixture.authority.links(forObserver: observerSessionID)
+        XCTAssertTrue(revoked.isEmpty)
+    }
+
+    func testRevokedOrExpiredScopedMCPLinkDisqualifiesAfterRestart() async throws {
+        enum Case: String, CaseIterable { case revoked, expired, unknownScope, parented, native, awaiting }
+        for scenario in Case.allCases {
+            try FileManager.default.removeItem(at: directory)
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            let controller = SessionAdminScopeLifecycleTests.Fixture()
+            let session = try await controller.installController()
+            session.hasLoadedPersistedState = true
+            session.recordRestorationAuthoritative(.persistedPayloadApplied)
+            session.isMCPOriginated = true
+            let endpoint = try XCTUnwrap(controller.endpoint)
+            observerSessionID = endpoint.sessionID
+            let request = try controller.runtime.requestScope(requesterSessionID: endpoint.sessionID, requesterTabID: endpoint.tabID, kind: .directChildren(rootSessionID: endpoint.sessionID, workspaceID: endpoint.workspaceID), capabilities: [.observe, .control, .restructure], guardrails: .init(), expiresInSeconds: 3600, reason: nil, idempotencyKey: nil).get()
+            let approved = try controller.runtime.approve(requestID: request.id).get()
+            let grants = [approved.grant]
+            var revokedIDs: [UUID]?
+            let scopeURL = directory.appendingPathComponent(DelegationScopeStore.filename)
+            var now = Date()
+            switch scenario {
+            case .revoked:
+                revokedIDs = [approved.id]
+            case .expired: now = now.addingTimeInterval(7200)
+            case .parented: session.parentSessionID = UUID()
+            case .native: session.mcpControlContext = nil
+                session.isMCPOriginated = false
+            case .unknownScope, .awaiting: break
+            }
+            try JSONEncoder().encode(DelegationScopeDocument(scopes: grants, revokedScopeIDs: revokedIDs)).write(to: scopeURL)
+            let frozenNow = now
+            let restored = DelegationScopeRuntime(persistenceMode: .requiresStore, now: { frozenNow }, notifyCatalogChanged: { _ in })
+            let scopeStore = DelegationScopeStore(fileURL: scopeURL, backupsDirectoryURL: directory.appendingPathComponent("Backups"), mode: .enabled)
+            let savedPair = AgentSessionOversightIntent(observerSessionID: endpoint.sessionID, targetSessionID: targetSessionID, sourceScopeID: scenario == .unknownScope ? UUID() : approved.id)
+            try JSONEncoder().encode(AgentSessionOversightIntentDocument(links: [savedPair])).write(to: directory.appendingPathComponent(AgentSessionOversightIntentStore.filename))
+            let fixture = makeFixture(scopes: restored)
+            var target = makeReadyCandidate(windowID: 2, sessionID: targetSessionID, workspaceID: endpoint.workspaceID)
+            target = AgentSessionLinkEndpointCandidate(windowID: target.windowID, workspaceID: target.workspaceID, tabID: target.tabID, sessionID: target.sessionID, persistentBindingGeneration: target.persistentBindingGeneration, bindingTransitionGeneration: target.bindingTransitionGeneration, isTopLevel: false, hasLoadedPersistedState: true, bindingTransitionInProgress: false, isClosing: false, isMCPControlled: false, isMCPOriginated: true, roleAllowsOutboundMonitoring: true, displayName: "Worker", providerDisplayName: nil, locationLabel: nil, restorationReadiness: target.restorationReadiness, parentSessionID: endpoint.sessionID)
+            controller.source.add(endpoint.sessionID, parent: nil, workspace: endpoint.workspaceID)
+            controller.source.add(targetSessionID, parent: endpoint.sessionID, workspace: endpoint.workspaceID)
+            let projector = SpawnProvenanceDelegationMembershipProjector(source: controller.source)
+            fixture.host.scopedStanding = { endpoint, engine in engine.scopedObserverAuthorization(for: endpoint, window: controller.window) }
+            fixture.host.scopedEndorsement = { observer, target, scope, engine in engine.authorizeScopedObserverLink(observer: observer, target: target, scopeID: scope, window: controller.window, projector: projector) != nil }
+            let context = session.mcpControlContext
+            if scenario == .awaiting { session.mcpControlContext = nil }
+            let observer = try XCTUnwrap(controller.window.agentModeViewModel.agentSessionLinkCandidate(for: endpoint, includeLocation: false))
+            replaceTopology(fixture, with: [observer, target])
+            await fixture.bridge.bootstrapContinuity(scopeStore: scopeStore, intentStore: fixture.store)
+            await fixture.bridge.test_settleLaunchReconciliation()
+            let inventory = await fixture.authority.links(forObserver: observerSessionID)
+            XCTAssertTrue(inventory.isEmpty, "\(scenario) restores no authority")
+            let token = await fixture.store.token(for: savedPair)
+            if scenario == .awaiting {
+                XCTAssertNotNil(token, "Positively live awaiting reproof keeps intent without actions")
+                session.mcpControlContext = context
+            } else {
+                // Disqualification never restores authority; the dormant saved row is kept for a later launch by design.
+                XCTAssertNotNil(token, "\(scenario): ineligible keeps the row dormant")
+                XCTAssertFalse(restored.linkConsent.permits(scopeID: savedPair.sourceScopeID ?? approved.id, observer: endpoint, target: target.domainEndpoint, at: frozenNow), "\(scenario)")
+                // A native session with an unknown/ungranted saved source is refused at establishment (never classified
+                // as a supported controller), so only the standing-based cases terminalize at classification.
+                if [.revoked, .expired, .parented].contains(scenario) {
+                    XCTAssertEqual(fixture.bridge.test_launchEntryState(for: savedPair), .terminal(.ineligible), "\(scenario)")
+                }
+                for operation in [DomainAgentSessionTargetOperation.manageList, .monitorPoll, .runRespond] {
+                    if case .success = await fixture.bridge.authorizeTarget(operation: operation, observerEndpoint: endpoint, targetSessionID: targetSessionID) {
+                        XCTFail("\(scenario) must not authorize \(operation)")
+                    }
+                }
+            }
+            fixture.bridge.freezeForTermination()
+            await controller.window.tearDown()
+        }
     }
 
     private func isRestored(_ fixture: Fixture) async -> Bool {
