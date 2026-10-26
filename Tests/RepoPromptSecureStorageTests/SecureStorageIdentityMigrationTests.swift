@@ -433,6 +433,8 @@ final class SecureStorageIdentityMigrationTests: XCTestCase {
         XCTAssertFalse(migrationAccounts.contains(.openAIDecisionsRouterAPIKey))
         XCTAssertFalse(migrationAccounts.contains(.agentPermissionAntigravityDocument))
         XCTAssertTrue(runtimeAccounts.contains(.agentPermissionAntigravityDocument))
+        XCTAssertFalse(migrationAccounts.contains(.agentPermissionGrokDocument))
+        XCTAssertTrue(runtimeAccounts.contains(.agentPermissionGrokDocument))
         XCTAssertFalse(migrationAccounts.contains(.agentPermissionDevinDocument))
         XCTAssertTrue(runtimeAccounts.contains(.agentPermissionDevinDocument))
         XCTAssertTrue(SecureStorageIdentityMigrationBootstrap.preparerCatalogSupportsFrozenCatalog())

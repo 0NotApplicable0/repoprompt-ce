@@ -76,11 +76,7 @@ enum GrokBuildAgentToolPreferences {
         defaults: UserDefaults = .standard,
         secureStore: AgentPermissionSecureStore? = nil
     ) {
-        if let secureStore = resolvedSecureStore(defaults: defaults, secureStore: secureStore) {
-            secureStore.setGrokBuildPermissionLevel(level)
-            return
-        }
-        defaults.set(level.rawValue, forKey: permissionLevelKey)
+        // Retired preferences are read-only outside the explicit global permission reset.
     }
 
     private static func resolvedSecureStore(

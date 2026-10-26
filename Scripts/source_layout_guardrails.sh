@@ -817,6 +817,7 @@ allowed_tracked_docs=(
   "docs/architecture/model-routing.md"
   "docs/architecture/modules.md"
   "docs/architecture/oracle-groups-rewrite.md"
+  "docs/architecture/process-spawning.md"
   "docs/architecture/provider-plugins.md"
   "docs/architecture/routing-profile-publication.md"
   "docs/architecture/settings-persistence.md"

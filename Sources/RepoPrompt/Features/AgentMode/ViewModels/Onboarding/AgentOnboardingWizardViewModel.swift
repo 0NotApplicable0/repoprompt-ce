@@ -74,7 +74,8 @@ final class AgentOnboardingWizardViewModel: ObservableObject {
     @Published var isLoadingCodex = false
     @Published var isLoadingOpenCode = false
     @Published var isLoadingCursor = false
-    @Published var isLoadingGrokBuild = false
+    @Published var isLoadingAntigravity = false
+    @Published var isLoadingGrok = false
 
     // MCP & CLI installers
     @Published var cliInstallStatus: CLIPathInstaller.InstallationStatus = .notInstalled
@@ -137,7 +138,8 @@ final class AgentOnboardingWizardViewModel: ObservableObject {
                 api.$isCodexConnected.map { _ in () },
                 api.$isOpenCodeConnected.map { _ in () },
                 api.$isCursorConnected.map { _ in () },
-                api.$isGrokBuildConnected.map { _ in () },
+                api.$isAntigravityConnected.map { _ in () },
+                api.$isGrokConnected.map { _ in () },
                 api.$isOpenAIKeyValid.map { _ in () }
             )
             .debounce(for: .milliseconds(300), scheduler: RunLoop.main)
@@ -220,8 +222,12 @@ final class AgentOnboardingWizardViewModel: ObservableObject {
         apiSettingsViewModel?.isCursorConnected ?? false
     }
 
-    var grokBuildConnected: Bool {
-        apiSettingsViewModel?.isGrokBuildConnected ?? false
+    var antigravityConnected: Bool {
+        apiSettingsViewModel?.isAntigravityConnected ?? false
+    }
+
+    var grokConnected: Bool {
+        apiSettingsViewModel?.isGrokConnected ?? false
     }
 
     var claudeCodeError: String? {
@@ -240,8 +246,12 @@ final class AgentOnboardingWizardViewModel: ObservableObject {
         apiSettingsViewModel?.cursorError
     }
 
-    var grokBuildError: String? {
-        apiSettingsViewModel?.grokBuildError
+    var antigravityError: String? {
+        apiSettingsViewModel?.antigravityError
+    }
+
+    var grokError: String? {
+        apiSettingsViewModel?.grokError
     }
 
     func testClaudeCode() {
@@ -296,15 +306,28 @@ final class AgentOnboardingWizardViewModel: ObservableObject {
         }
     }
 
-    func testGrokBuild() {
-        isLoadingGrokBuild = true
+    func testAntigravity() {
+        isLoadingAntigravity = true
         Task {
             do {
-                _ = try await apiSettingsViewModel?.testGrokBuildConnection()
+                _ = try await apiSettingsViewModel?.testAntigravityConnection()
             } catch {
                 // Error state is set on apiSettingsViewModel
             }
-            isLoadingGrokBuild = false
+            isLoadingAntigravity = false
+            refreshProviderStatus()
+        }
+    }
+
+    func testGrok() {
+        isLoadingGrok = true
+        Task {
+            do {
+                _ = try await apiSettingsViewModel?.testGrokConnection()
+            } catch {
+                // Error state is set on apiSettingsViewModel
+            }
+            isLoadingGrok = false
             refreshProviderStatus()
         }
     }

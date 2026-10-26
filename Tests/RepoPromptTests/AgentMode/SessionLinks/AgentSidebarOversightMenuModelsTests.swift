@@ -2769,7 +2769,7 @@ final class AgentSidebarHostedContextMenuTests: XCTestCase {
                         providerAttempts.record("claude")
                         return MonitorFakeNativeController()
                     },
-                    headlessProviderFactory: { _, _ in
+                    headlessProviderFactory: { _, _, _, _, _ in
                         providerAttempts.record("headless")
                         return AgentSessionLinkCapturingHeadlessProvider(failuresRemaining: 1)
                     },

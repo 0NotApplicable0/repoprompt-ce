@@ -1568,6 +1568,10 @@ private enum AppSettingsMCPRegistry {
             .devin
         case .cursor:
             .cursor
+        case .antigravity:
+            nil
+        case .grok:
+            nil
         case .grokBuild:
             .grokBuild
         }

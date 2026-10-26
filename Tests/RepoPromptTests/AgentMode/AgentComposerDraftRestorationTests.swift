@@ -191,7 +191,7 @@ final class AgentComposerDraftRestorationTests: XCTestCase {
             codexControllerFactory: { _, _, _, _, _, _ in
                 preconditionFailure("Draft restoration tests must not start Codex")
             },
-            headlessProviderFactory: { _, _ in
+            headlessProviderFactory: { _, _, _, _, _ in
                 UnsupportedHeadlessAgentProvider(reason: "draft restoration test")
             }
         )

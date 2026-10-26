@@ -1,6 +1,6 @@
 import Foundation
 
-/// Immutable runtime configuration for the Grok Build ACP provider (`grok agent stdio`).
+/// Configuration for prompt-only Grok Build Chat and Oracle requests.
 struct GrokBuildAgentConfig {
     /// Process-local MCP import isolation shared by Grok's ACP and one-shot launch adapters.
     static let importIsolationEnvironment: [String: String] = [
@@ -20,10 +20,8 @@ struct GrokBuildAgentConfig {
     let additionalPathHints: [String]
     let enableDebugLogging: Bool
     let modelString: String?
+    // Retained for existing callers; prompt-only requests expose no RepoPrompt tools.
     let includeRepoPromptMCPServer: Bool
-    /// Provider-native full-access intent; when true the provider launches
-    /// `grok agent --always-approve --no-leader stdio`. Interactive runs may also carry the
-    /// intent via `ACPRunRequest.autoApproveAllToolPermissions`; the provider ORs both.
     let alwaysApproveTools: Bool
     /// Context Builder discovery restricts the native tool profile to MCP discovery/dispatch.
     /// Other callers retain their native profile by default.

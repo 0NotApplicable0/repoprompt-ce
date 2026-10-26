@@ -4,25 +4,18 @@ import RepoPromptFileSystem
 import RepoPromptProcess
 import XCTest
 
-final class GrokBuildACPLaunchResolverTests: XCTestCase {
-    func testMakeLaunchConfigurationResolvesExactPathWithoutPriorProbe() throws {
+final class GrokBuildCLILaunchResolverTests: XCTestCase {
+    func testResolvedLaunchResolvesExactPathAndIdentityWithoutPriorProbe() throws {
         let directory = try makeTemporaryDirectory()
         let executable = try makeExecutable(named: "grok", in: directory)
-        let resolver = GrokBuildACPLaunchResolver()
-        let provider = GrokBuildACPAgentProvider(
-            config: GrokBuildAgentConfig(
-                commandName: executable.path,
-                additionalPathHints: [],
-                includeRepoPromptMCPServer: false
-            ),
-            launchResolver: resolver
-        )
+        let resolver = GrokBuildCLILaunchResolver()
+        let config = GrokBuildAgentConfig(commandName: executable.path, additionalPathHints: [])
 
-        let launch = try provider.makeLaunchConfiguration(for: makeRunRequest(workspacePath: directory.path))
+        let launch = try resolver.resolvedLaunch(for: config)
 
         XCTAssertEqual(launch.command, try canonicalExecutablePath(executable))
-        XCTAssertEqual(launch.arguments, ["agent", "--no-leader", "stdio"])
-        XCTAssertEqual(launch.expectedExecutableIdentity?.canonicalPath, launch.command)
+        XCTAssertEqual(launch.executableIdentity.canonicalPath, launch.command)
+        XCTAssertNoThrow(try launch.executableIdentity.validateForTrustedPathLaunch(atPath: launch.command))
     }
 
     func testProviderPathHintsIncludeDotGrokBin() {
@@ -32,32 +25,32 @@ final class GrokBuildACPLaunchResolverTests: XCTestCase {
     }
 
     func testNonGrokBareCommandIsRejected() async throws {
-        let resolver = GrokBuildACPLaunchResolver(environmentProvider: { _ in [:] })
+        let resolver = GrokBuildCLILaunchResolver(environmentProvider: { _ in [:] })
         let config = GrokBuildAgentConfig(commandName: "not-grok", additionalPathHints: [])
         let support = try await ProviderProcessLaunchPolicy.$allowsLaunchForTesting.withValue(true) { try await resolver.probeSupport(for: config) }
         guard case let .unsupported(reason) = support else {
             return XCTFail("expected unsupported, got \(support)")
         }
-        XCTAssertTrue(reason.contains("Refusing unsafe Grok Build ACP command"))
+        XCTAssertTrue(reason.contains("Refusing unsafe Grok Build CLI command"))
     }
 
     func testAbsolutePathWithWrongEntryBasenameIsRejected() async throws {
         let directory = try makeTemporaryDirectory()
         let executable = try makeExecutable(named: "grokd", in: directory)
-        let resolver = GrokBuildACPLaunchResolver(environmentProvider: { _ in [:] })
+        let resolver = GrokBuildCLILaunchResolver(environmentProvider: { _ in [:] })
         let support = try await ProviderProcessLaunchPolicy.$allowsLaunchForTesting.withValue(true) { try await resolver.probeSupport(
             for: GrokBuildAgentConfig(commandName: executable.path, additionalPathHints: [])
         ) }
         guard case let .unsupported(reason) = support else {
             return XCTFail("expected unsupported, got \(support)")
         }
-        XCTAssertTrue(reason.contains("Refusing unsafe Grok Build ACP command"))
+        XCTAssertTrue(reason.contains("Refusing unsafe Grok Build CLI command"))
     }
 
     func testSupportProbeRequiresZeroExitStatus() async throws {
         let directory = try makeTemporaryDirectory()
         let executable = try makeExecutable(named: "grok", in: directory, exitStatus: 3)
-        let resolver = GrokBuildACPLaunchResolver(environmentProvider: { _ in ["PATH": directory.path, "SHELL": "/bin/false"] })
+        let resolver = GrokBuildCLILaunchResolver(environmentProvider: { _ in ["PATH": directory.path, "SHELL": "/bin/false"] })
         let support = try await ProviderProcessLaunchPolicy.$allowsLaunchForTesting.withValue(true) { try await resolver.probeSupport(
             for: GrokBuildAgentConfig(commandName: "grok", additionalPathHints: [])
         ) }
@@ -68,10 +61,10 @@ final class GrokBuildACPLaunchResolverTests: XCTestCase {
         _ = executable
     }
 
-    func testSupportProbeRequiresStdioMarker() async throws {
+    func testSupportProbeRequiresPromptFileCapability() async throws {
         let directory = try makeTemporaryDirectory()
-        _ = try makeExecutable(named: "grok", in: directory, output: "no agent surface here")
-        let resolver = GrokBuildACPLaunchResolver(environmentProvider: { _ in ["PATH": directory.path, "SHELL": "/bin/false"] })
+        _ = try makeExecutable(named: "grok", in: directory, output: "grok agent stdio support")
+        let resolver = GrokBuildCLILaunchResolver(environmentProvider: { _ in ["PATH": directory.path, "SHELL": "/bin/false"] })
         let support = try await ProviderProcessLaunchPolicy.$allowsLaunchForTesting.withValue(true) { try await resolver.probeSupport(
             for: GrokBuildAgentConfig(commandName: "grok", additionalPathHints: [])
         ) }
@@ -79,6 +72,32 @@ final class GrokBuildACPLaunchResolverTests: XCTestCase {
             return XCTFail("expected unsupported, got \(support)")
         }
         XCTAssertTrue(reason.contains("did not advertise"), "unexpected reason: \(reason)")
+    }
+
+    func testPromptOnlySupportProbeAcceptsRootPromptFileHelpWithoutStdioCapability() async throws {
+        let directory = try makeTemporaryDirectory()
+        let argumentsMarker = directory.appendingPathComponent("arguments.txt")
+        _ = try makeExecutable(
+            named: "grok",
+            in: directory,
+            argumentsMarker: argumentsMarker,
+            output: "Usage: grok --prompt-file <path>"
+        )
+        let resolver = GrokBuildCLILaunchResolver(environmentProvider: { _ in
+            ["PATH": directory.path, "SHELL": "/bin/false"]
+        })
+
+        let support = try await ProviderProcessLaunchPolicy.$allowsLaunchForTesting.withValue(true) {
+            try await resolver.probeSupport(
+                for: GrokBuildAgentConfig(commandName: "grok", additionalPathHints: [])
+            )
+        }
+
+        XCTAssertEqual(support, .supported)
+        let receivedArguments = try String(contentsOf: argumentsMarker, encoding: .utf8)
+            .split(separator: "\n")
+            .map(String.init)
+        XCTAssertEqual(receivedArguments, ["--help"])
     }
 
     func testOfficialInstallerSymlinkShapeIsAccepted() async throws {
@@ -96,7 +115,7 @@ final class GrokBuildACPLaunchResolverTests: XCTestCase {
             withDestinationURL: downloads.appendingPathComponent("grok-real")
         )
 
-        let resolver = GrokBuildACPLaunchResolver(environmentProvider: { _ in ["PATH": binDirectory.path, "SHELL": "/bin/false"] })
+        let resolver = GrokBuildCLILaunchResolver(environmentProvider: { _ in ["PATH": binDirectory.path, "SHELL": "/bin/false"] })
         let support = try await ProviderProcessLaunchPolicy.$allowsLaunchForTesting.withValue(true) { try await resolver.probeSupport(
             for: GrokBuildAgentConfig(commandName: "grok", additionalPathHints: [])
         ) }
@@ -108,32 +127,21 @@ final class GrokBuildACPLaunchResolverTests: XCTestCase {
     func testChangedExecutableIdentityFailsLaunchResolution() throws {
         let directory = try makeTemporaryDirectory()
         let executable = try makeExecutable(named: "grok", in: directory)
-        let resolver = GrokBuildACPLaunchResolver()
+        let resolver = GrokBuildCLILaunchResolver()
         let config = GrokBuildAgentConfig(commandName: executable.path, additionalPathHints: [])
         _ = try resolver.resolvedLaunch(for: config)
 
         // Replace the executable so the cached identity no longer validates.
         try FileManager.default.removeItem(at: executable)
-        _ = try makeExecutable(named: "grok", in: directory, output: "grok agent changed")
+        _ = try makeExecutable(named: "grok", in: directory, output: "Usage: grok --prompt-file <path> changed")
 
         XCTAssertThrowsError(try resolver.resolvedLaunch(for: config))
     }
 
     // MARK: - Helpers
 
-    private func makeRunRequest(workspacePath: String) -> ACPRunRequest {
-        ACPRunRequest(
-            agentKind: .grokBuild,
-            modelString: nil,
-            workspacePath: workspacePath,
-            resumeSessionID: nil,
-            attachments: [],
-            taskLabelKind: nil
-        )
-    }
-
     private func makeTemporaryDirectory() throws -> URL {
-        try makeTestDirectory(name: "GrokBuildACPLaunchResolverTests")
+        try makeTestDirectory(name: "GrokBuildCLILaunchResolverTests")
     }
 
     private func canonicalExecutablePath(_ url: URL) throws -> String {
@@ -145,13 +153,17 @@ final class GrokBuildACPLaunchResolverTests: XCTestCase {
         named name: String,
         in directory: URL,
         marker: URL? = nil,
-        output: String = "grok agent stdio support",
+        argumentsMarker: URL? = nil,
+        output: String = "Usage: grok --prompt-file <path>",
         exitStatus: Int32 = 0
     ) throws -> URL {
         let executable = directory.appendingPathComponent(name)
         var lines = ["#!/bin/sh"]
         if let marker {
             lines.append("printf '%s' \"$0\" > '\(marker.path)'")
+        }
+        if let argumentsMarker {
+            lines.append("printf '%s\\n' \"$@\" > '\(argumentsMarker.path)'")
         }
         lines.append("printf '%s\\n' '\(output)'")
         lines.append("exit \(exitStatus)")

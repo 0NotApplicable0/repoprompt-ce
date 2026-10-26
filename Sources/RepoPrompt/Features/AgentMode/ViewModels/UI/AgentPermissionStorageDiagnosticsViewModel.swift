@@ -47,6 +47,8 @@ final class AgentPermissionStorageDiagnosticsViewModel: ObservableObject {
              .decodeFailed,
              .unsupportedFutureSchema:
             true
+        case .unsupportedStoredPermission:
+            false
         }
     }
 

@@ -56,7 +56,7 @@ extension AgentModeViewModel {
         case .claudeCode:
             let conversation = session.providerSessionID?.trimmingCharacters(in: .whitespacesAndNewlines)
             return conversation?.isEmpty == false ? .claudeCode : .noProviderSession
-        case .devin, .grokBuild, .antigravity:
+        case .devin:
             // Bind the exact stored conversation — it is what the controller's snapshot compares.
             guard let conversation = session.providerSessionID,
                   !conversation.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
@@ -89,7 +89,7 @@ extension AgentModeViewModel {
             return advertised.names.contains(AgentProviderControlCommand.Kind.compact.rawValue)
                 ? .acpAdvertisedCommand
                 : .notSupported
-        case .claudeCodeGLM, .kimiCode, .customClaudeCompatible, .openCode, .cursor:
+        case .claudeCodeGLM, .kimiCode, .customClaudeCompatible, .openCode, .cursor, .antigravity, .grok, .grokBuild:
             return .notSupported
         }
     }

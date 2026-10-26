@@ -8,6 +8,8 @@ enum CLIPathHints {
     static let codex: [String] = CLILaunchProfiles.codex.supplementalSearchPaths
     static let openCode: [String] = CLILaunchProfiles.openCodeProviderSpecificPaths
     static let cursor: [String] = CLILaunchProfiles.cursorProviderSpecificPaths
+    static let antigravity: [String] = CLILaunchProfiles.antigravity.supplementalSearchPaths
+    static let grok: [String] = CLILaunchProfiles.grok.supplementalSearchPaths
     static let grokBuild: [String] = CLILaunchProfiles.grokBuildProviderSpecificPaths
     static let devin: [String] = CLILaunchProfiles.devinProviderSpecificPaths
 

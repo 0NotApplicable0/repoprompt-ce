@@ -17,8 +17,9 @@ enum AgentProviderPermissionLevelID: Hashable {
     case codex(CodexAgentToolPreferences.PermissionLevel)
     case claude(ClaudeAgentToolPreferences.PermissionLevel)
     case openCode(OpenCodeAgentToolPreferences.PermissionLevel)
-    case antigravity(AntigravityAgentToolPreferences.PermissionLevel)
     case cursor(CursorAgentToolPreferences.PermissionLevel)
+    case antigravity(AntigravityAgentToolPreferences.PermissionLevel)
+    case grok(GrokAgentToolPreferences.PermissionLevel)
     case grokBuild(GrokBuildAgentToolPreferences.PermissionLevel)
     case devin(DevinAgentToolPreferences.PermissionLevel)
 
@@ -30,10 +31,12 @@ enum AgentProviderPermissionLevelID: Hashable {
             .claude
         case .openCode:
             .openCode
-        case .antigravity:
-            .antigravity
         case .cursor:
             .cursor
+        case .antigravity:
+            .antigravity
+        case .grok:
+            .grok
         case .grokBuild:
             .grokBuild
         case .devin:
@@ -49,10 +52,12 @@ enum AgentProviderPermissionLevelID: Hashable {
             .claude(.requireApproval)
         case .openCode:
             .openCode(.managedDefault)
-        case .antigravity:
-            .antigravity(.autoEdit)
         case .cursor:
             .cursor(.managedDefault)
+        case .antigravity:
+            .antigravity(.managedDefault)
+        case .grok:
+            .grok(.managedDefault)
         case .grokBuild:
             .grokBuild(.managedDefault)
         case .devin:
@@ -68,10 +73,12 @@ enum AgentProviderPermissionLevelID: Hashable {
             ClaudeAgentToolPreferences.PermissionLevel.allCases.map(AgentProviderPermissionLevelID.claude)
         case .openCode:
             OpenCodeAgentToolPreferences.PermissionLevel.allCases.map(AgentProviderPermissionLevelID.openCode)
-        case .antigravity:
-            AntigravityAgentToolPreferences.PermissionLevel.allCases.map(AgentProviderPermissionLevelID.antigravity)
         case .cursor:
             CursorAgentToolPreferences.PermissionLevel.allCases.map(AgentProviderPermissionLevelID.cursor)
+        case .antigravity:
+            AntigravityAgentToolPreferences.PermissionLevel.allCases.map(AgentProviderPermissionLevelID.antigravity)
+        case .grok:
+            GrokAgentToolPreferences.PermissionLevel.allCases.map(AgentProviderPermissionLevelID.grok)
         case .grokBuild:
             GrokBuildAgentToolPreferences.PermissionLevel.allCases.map(AgentProviderPermissionLevelID.grokBuild)
         case .devin:
@@ -91,12 +98,19 @@ enum AgentProviderPermissionLevelID: Hashable {
         case .openCode:
             guard let level = OpenCodeAgentToolPreferences.PermissionLevel(rawValue: raw) else { return nil }
             self = .openCode(level)
-        case .antigravity:
-            guard let level = AntigravityAgentToolPreferences.PermissionLevel(rawValue: raw) else { return nil }
-            self = .antigravity(level)
         case .cursor:
             guard let level = CursorAgentToolPreferences.PermissionLevel(rawValue: raw) else { return nil }
             self = .cursor(level)
+        case .antigravity:
+            guard let level = AntigravityAgentToolPreferences.PermissionLevel(rawValue: raw),
+                  AntigravityAgentToolPreferences.PermissionLevel.allCases.contains(level)
+            else { return nil }
+            self = .antigravity(level)
+        case .grok:
+            guard let level = GrokAgentToolPreferences.PermissionLevel(rawValue: raw),
+                  GrokAgentToolPreferences.PermissionLevel.allCases.contains(level)
+            else { return nil }
+            self = .grok(level)
         case .grokBuild:
             guard let level = GrokBuildAgentToolPreferences.PermissionLevel(rawValue: raw) else { return nil }
             self = .grokBuild(level)
@@ -114,9 +128,11 @@ enum AgentProviderPermissionLevelID: Hashable {
             level.rawValue
         case let .openCode(level):
             level.rawValue
+        case let .cursor(level):
+            level.rawValue
         case let .antigravity(level):
             level.rawValue
-        case let .cursor(level):
+        case let .grok(level):
             level.rawValue
         case let .grokBuild(level):
             level.rawValue
@@ -133,9 +149,11 @@ enum AgentProviderPermissionLevelID: Hashable {
             level.displayName
         case let .openCode(level):
             level.displayName
+        case let .cursor(level):
+            level.displayName
         case let .antigravity(level):
             level.displayName
-        case let .cursor(level):
+        case let .grok(level):
             level.displayName
         case let .grokBuild(level):
             level.displayName
@@ -152,9 +170,11 @@ enum AgentProviderPermissionLevelID: Hashable {
             level.iconName
         case let .openCode(level):
             level.iconName
+        case let .cursor(level):
+            level.iconName
         case let .antigravity(level):
             level.iconName
-        case let .cursor(level):
+        case let .grok(level):
             level.iconName
         case let .grokBuild(level):
             level.iconName
@@ -171,9 +191,11 @@ enum AgentProviderPermissionLevelID: Hashable {
             level.detailText
         case let .openCode(level):
             level.detailText
+        case let .cursor(level):
+            level.detailText
         case let .antigravity(level):
             level.detailText
-        case let .cursor(level):
+        case let .grok(level):
             level.detailText
         case let .grokBuild(level):
             level.detailText
@@ -190,9 +212,11 @@ enum AgentProviderPermissionLevelID: Hashable {
             level.isWarning
         case let .openCode(level):
             level.isWarning
+        case let .cursor(level):
+            level.isWarning
         case let .antigravity(level):
             level.isWarning
-        case let .cursor(level):
+        case let .grok(level):
             level.isWarning
         case let .grokBuild(level):
             level.isWarning
@@ -232,6 +256,19 @@ struct AgentProviderRuntimePermissionBinding: Equatable {
     let acpSessionModeID: String?
     let autoApproveAllACPToolPermissions: Bool
     let acceptsPendingACPApprovalWhenActivated: Bool
+    /// Session-resolved Antigravity (`agy`) permission level. Headless `agy` runs have no
+    /// per-run permission channel, so the resolved level is consumed at provider construction
+    /// (`--sandbox`, `--sandbox --dangerously-skip-permissions`, or bypass without a sandbox)
+    /// rather than via an ACP/session field. Headless mode cannot prompt, but bypass remains an
+    /// explicit opt-in because it also approves globally configured third-party MCP servers.
+    /// MCP Safe Managed resolves to an internal unavailable sentinel because agy's global config
+    /// and persisted grants cannot be isolated per run.
+    let antigravityPermissionLevel: AntigravityAgentToolPreferences.PermissionLevel?
+    /// Session-resolved Grok (`grok`) permission level. Headless `grok` runs have no
+    /// per-run permission channel, so the resolved level is consumed at provider construction
+    /// (`--sandbox workspace --permission-mode bypassPermissions` vs. `--permission-mode bypassPermissions`)
+    /// rather than via an ACP/session field.
+    let grokPermissionLevel: GrokAgentToolPreferences.PermissionLevel?
 
     init(
         codexSandboxMode: CodexAgentToolPreferences.SandboxMode? = nil,
@@ -241,7 +278,9 @@ struct AgentProviderRuntimePermissionBinding: Equatable {
         acpLaunchPermissionMode: String? = nil,
         acpSessionModeID: String? = nil,
         autoApproveAllACPToolPermissions: Bool = false,
-        acceptsPendingACPApprovalWhenActivated: Bool = false
+        acceptsPendingACPApprovalWhenActivated: Bool = false,
+        antigravityPermissionLevel: AntigravityAgentToolPreferences.PermissionLevel? = nil,
+        grokPermissionLevel: GrokAgentToolPreferences.PermissionLevel? = nil
     ) {
         self.codexSandboxMode = codexSandboxMode
         self.codexApprovalPolicy = codexApprovalPolicy
@@ -251,6 +290,8 @@ struct AgentProviderRuntimePermissionBinding: Equatable {
         self.acpSessionModeID = acpSessionModeID
         self.autoApproveAllACPToolPermissions = autoApproveAllACPToolPermissions
         self.acceptsPendingACPApprovalWhenActivated = acceptsPendingACPApprovalWhenActivated
+        self.antigravityPermissionLevel = antigravityPermissionLevel
+        self.grokPermissionLevel = grokPermissionLevel
     }
 }
 

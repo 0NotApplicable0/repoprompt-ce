@@ -410,11 +410,9 @@ final class AutoRecommendationEngine {
                 enabledRecommendationProviders.contains(.codex)
             case .cursor:
                 enabledRecommendationProviders.contains(.cursor)
-            case .grokBuild:
-                enabledRecommendationProviders.contains(.grokBuild)
-            case .openCode, .claudeCodeGLM, .kimiCode, .customClaudeCompatible:
+            case .openCode, .claudeCodeGLM, .kimiCode, .customClaudeCompatible, .antigravity, .grok:
                 true
-            case .antigravity, .devin:
+            case .grokBuild, .devin:
                 false
             }
         }) else {
@@ -483,6 +481,8 @@ final class AutoRecommendationEngine {
             cursorAvailable: status.cursorCLI == .ready,
             grokBuildAvailable: status.grokBuildCLI == .ready,
             antigravityAvailable: runtimeAvailability.antigravityAvailable,
+            grokAvailable: runtimeAvailability.grokAvailable,
+            grokBuildAvailable: false,
             devinAvailable: runtimeAvailability.devinAvailable,
             zaiConfigured: backendStore.isConfigured(.glmZAI) && backendStore.config(for: .glmZAI).isEnabled && backendStore.config(for: .glmZAI).isValid,
             kimiConfigured: backendStore.isConfigured(.kimi) && backendStore.config(for: .kimi).isEnabled && backendStore.config(for: .kimi).isValid,
@@ -498,6 +498,9 @@ final class AutoRecommendationEngine {
         let runtimeAvailability = apiSettingsViewModel?.agentModeAvailabilityContext ?? .none
         let availability = mcpAgentAvailabilityContext(from: actualStatus, runtimeAvailability: runtimeAvailability)
         let recommendedAvailability = mcpAgentAvailabilityContext(from: recommendedStatus, runtimeAvailability: runtimeAvailability)
+        guard AgentProviderKind.allCases.contains(where: { AgentModelCatalog.isAgentAvailable($0, availability: availability) }) else {
+            return nil
+        }
         let profileStore = AgentModelsProfileRoleDefaultsStore(
             overrides: profile(for: scope).mcpAgentRoleOverrides
         )

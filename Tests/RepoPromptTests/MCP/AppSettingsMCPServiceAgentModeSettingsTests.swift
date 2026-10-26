@@ -573,7 +573,7 @@ final class AppSettingsMCPServiceAgentModeSettingsTests: XCTestCase {
 
             var previousAgentRaw = codexRaw
             for (agent, seededModel, storedModel): (AgentProviderKind, String, String) in [
-                (.grokBuild, "default", "default"),
+                (.grok, "default", "default"),
                 (.cursor, "auto", "cursor-custom[Cursor.Thought-Level=High,Cursor.Fast-Mode=true]")
             ] {
                 let setAgent = try await service.handleForTesting([
@@ -682,8 +682,7 @@ final class AppSettingsMCPServiceAgentModeSettingsTests: XCTestCase {
         try await withContextBuilderSettings { store, service, _, _ in
             let claudeRaw = AgentProviderKind.claudeCode.rawValue
             for (agentRaw, rememberedModel) in [
-                ("unknown-context-builder-agent", "unknown-remembered-model"),
-                (AgentProviderKind.antigravity.rawValue, "antigravity-remembered-model")
+                ("unknown-context-builder-agent", "unknown-remembered-model")
             ] {
                 for requestedModel in ["sonnet", "haiku"] {
                     let scenario = "\(agentRaw), requested=\(requestedModel)"
@@ -832,7 +831,7 @@ final class AppSettingsMCPServiceAgentModeSettingsTests: XCTestCase {
         }
     }
 
-    func testContextBuilderGrokOptionsUseKnownModelsWithoutClaimingAvailability() async throws {
+    func testContextBuilderRetiredGrokBuildOptionsStayUnavailableAfterDiscovery() async throws {
         let registry = AgentACPModelRegistry.shared
         registry.test_reset(providerID: .grokBuild)
         defer { registry.test_reset(providerID: .grokBuild) }
@@ -845,7 +844,7 @@ final class AppSettingsMCPServiceAgentModeSettingsTests: XCTestCase {
                 ),
                 contextBuilderWriteIntent: .userInitiated
             )
-            try await assertContextBuilderModelOptions(service: service, agent: .grokBuild, expectedModels: ["default"])
+            try await assertContextBuilderModelOptions(service: service, agent: .grokBuild, expectedModels: [])
 
             _ = registry.updateDiscoveredModels(
                 ACPDiscoveredSessionModels(
@@ -862,8 +861,10 @@ final class AppSettingsMCPServiceAgentModeSettingsTests: XCTestCase {
             try await assertContextBuilderModelOptions(
                 service: service,
                 agent: .grokBuild,
-                expectedModels: ["default", "grok-settings-test-model"]
+                expectedModels: []
             )
+            XCTAssertEqual(store.globalAgentModelsProfile().contextBuilderAgentRaw, AgentProviderKind.grokBuild.rawValue)
+            XCTAssertEqual(store.globalAgentModelsProfile().contextBuilderModelsByAgent?[AgentProviderKind.grokBuild.rawValue], "default")
         }
     }
 

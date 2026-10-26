@@ -191,18 +191,17 @@ package enum SentryTelemetryModel {
     }
 
     package enum ProviderKind: String {
+        case antigravity
         case claudeCode = "claude_code"
         case claudeCodeGLM = "claude_code_glm"
         case codexExec = "codex_exec"
         case cursor
         case customClaudeCompatible = "custom_claude_compatible"
+        case grok
         case kimiCode = "kimi_code"
         case openCode = "opencode"
         case grokBuild = "grok_build"
-        case antigravity
         case devin
-
-
     }
 
     package enum ToolName: String {

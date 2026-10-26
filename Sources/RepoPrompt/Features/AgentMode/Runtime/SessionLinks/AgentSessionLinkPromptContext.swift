@@ -253,6 +253,7 @@ enum AgentSessionLinkPromptProviderContext: String, Hashable, CaseIterable {
     case cursor
     case grokBuild
     case antigravity
+    case grok
     case devin
 
     init(agentKind: AgentProviderKind?) {
@@ -270,6 +271,7 @@ enum AgentSessionLinkPromptProviderContext: String, Hashable, CaseIterable {
         case .cursor: self = .cursor
         case .grokBuild: self = .grokBuild
         case .antigravity: self = .antigravity
+        case .grok: self = .grok
         case .devin: self = .devin
         }
     }

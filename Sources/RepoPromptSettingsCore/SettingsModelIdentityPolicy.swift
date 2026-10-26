@@ -3,6 +3,10 @@ import Foundation
 /// The persistence codec needs model identity, never provider discovery or execution.
 /// App composition must install its existing Cursor catalog projection before reading pins.
 package enum SettingsModelIdentityPolicy {
+    package static func preservesSavedSelection(agentRaw: String) -> Bool {
+        ["antigravity", "grok", "grokBuild"].contains(agentRaw)
+    }
+
     private static let cursorPolicy = CursorPolicy()
 
     package static func installCursorCanonicalizer(_ canonicalize: @escaping @Sendable (String) -> String) {

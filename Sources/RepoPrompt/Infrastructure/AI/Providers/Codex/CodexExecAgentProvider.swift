@@ -17,7 +17,7 @@ final class CodexExecAgentProvider: HeadlessAgentProvider {
     private let runtimeStatePreparer: @Sendable (CodexRuntimeAuthority.Runtime) throws -> Void
     private let configService = MCPConfigExportService.shared
     private let toolTracking = AgentToolTrackingController()
-    private var streamTask: Task<Void, Never>?
+    private let streamTasks = HeadlessProviderStreamTaskAuthority()
     private var codexItemInvocationIDs: [String: UUID] = [:]
 
     private var enableDebugLogging: Bool {
@@ -188,11 +188,16 @@ final class CodexExecAgentProvider: HeadlessAgentProvider {
     // MARK: - Streaming
 
     func streamAgentMessage(_ message: AgentMessage, runID: UUID? = nil) async throws -> AsyncThrowingStream<AIStreamResult, Error> {
-        AsyncThrowingStream { continuation in
-            // Cancel any previous lingering task (defensive)
-            self.streamTask?.cancel()
-            self.streamTask = Task { [weak self] in
-                guard let self else { return }
+        let (raw, continuation) = AsyncThrowingStream<AIStreamResult, Error>.makeStream()
+        guard let producer = await streamTasks.start(
+            onDiscarded: {
+                continuation.finish(throwing: AIProviderError.invalidConfiguration(detail: "Codex Exec run cancelled."))
+            },
+            operation: { [weak self] in
+                guard let self else {
+                    continuation.finish()
+                    return
+                }
                 await withTaskCancellationHandler(operation: {
                     // Try up to 3 times total to allow one retry for model fallback and one for broken server.
                     var attemptNumber = 0
@@ -206,7 +211,7 @@ final class CodexExecAgentProvider: HeadlessAgentProvider {
                         let selectedModelString = attemptModelString
                         var shouldRetryBrokenServer = false
                         var shouldRetryModelFallback = false
-                        codexItemInvocationIDs = [:]
+                        self.codexItemInvocationIDs = [:]
 
                         do {
                             if self.enableDebugLogging {
@@ -236,7 +241,7 @@ final class CodexExecAgentProvider: HeadlessAgentProvider {
                                     selectedModelString: selectedModelString,
                                     serverEntries: serverEntries,
                                     brokenServers: brokenServers,
-                                    fullAccess: config.fullAccess
+                                    fullAccess: self.config.fullAccess
                                 )
                                 let args = command.args
                                 let modelSpecifier = command.modelSpecifier
@@ -264,13 +269,13 @@ final class CodexExecAgentProvider: HeadlessAgentProvider {
                                 // Register tool observer with cleanup
                                 try await AsyncScope.withCleanup({}, cleanup: {
                                     await runner.cancelAll()
-                                    await self.toolTracking.stopTracking()
+                                    await self.toolTracking.stopTracking(ifTracking: context.runID)
                                 }) {
                                     if self.enableDebugLogging {
                                         print("[DEBUG] CodexExec: CLI process streaming started")
                                     }
 
-                                    self.toolTracking.startTracking(
+                                    await self.toolTracking.startTracking(
                                         runID: context.runID,
                                         clientNameHint: Self.codexMCPClientID,
                                         continuation: continuation
@@ -371,6 +376,7 @@ final class CodexExecAgentProvider: HeadlessAgentProvider {
                                             }
                                         }
                                     }
+                                    try Task.checkCancellation()
 
                                     // If we saw completion but no explicit termination yet,
                                     // proactively stop the underlying process to finish quicker.
@@ -413,6 +419,7 @@ final class CodexExecAgentProvider: HeadlessAgentProvider {
                                             )
                                         }
                                     }
+                                    try Task.checkCancellation()
 
                                     if exitStatus == nil && !sawCompletion {
                                         if self.enableDebugLogging {
@@ -486,6 +493,7 @@ final class CodexExecAgentProvider: HeadlessAgentProvider {
                                     }
                                 }
                             }
+                            try Task.checkCancellation()
                             if shouldRetryModelFallback {
                                 if self.enableDebugLogging {
                                     print("[DEBUG] CodexExec: Restarting Codex exec stream with fallback model \(attemptModelString ?? "default")")
@@ -500,6 +508,9 @@ final class CodexExecAgentProvider: HeadlessAgentProvider {
                                 continue
                             }
 
+                            // Both cleanup scopes have completed here. In particular, the scoped
+                            // tracker stop has unregistered this run and drained captured callbacks
+                            // before the continuation closes.
                             continuation.finish()
                             return
                         } catch is CancellationError {
@@ -518,28 +529,38 @@ final class CodexExecAgentProvider: HeadlessAgentProvider {
                     } // end while loop
                 }, onCancel: { [weak self] in
                     if self?.enableDebugLogging == true {
-                        print("[DEBUG] CodexExec: stream task cancellation – cancelling runner")
+                        print("[DEBUG] CodexExec: stream task cancellation observed")
                     }
-                    Task { [weak self] in
-                        // Kill the child aggressively, then ensure our outer stream ends.
-                        await self?.runner?.cancelAll()
-                        continuation.finish()
-                    }
+                    // Do not launch runner-wide teardown outside the producer task. Its structured
+                    // cleanup cancels and awaits the runner before the task authority admits a
+                    // replacement, so stale cancellation can never kill the replacement process.
                 })
             }
-            // If the consumer drops the outer stream, stop our task immediately.
-            continuation.onTermination = { [weak self] _ in
-                self?.streamTask?.cancel()
-            }
+        ) else {
+            continuation.finish()
+            throw CancellationError()
         }
+        return try await withTaskCancellationHandler(operation: {
+            HeadlessProviderStreamTaskAuthority.installTerminationHandler(
+                on: continuation,
+                producerTask: producer.task
+            )
+            try Task.checkCancellation()
+            return raw
+        }, onCancel: {
+            producer.task.cancel()
+        })
     }
 
     func dispose() async {
         if enableDebugLogging {
             print("[DEBUG] CodexExec: Disposing provider, cancelling stream task & runners")
         }
-        streamTask?.cancel()
+        let producerTasks = await streamTasks.beginDisposal()
         await runner?.cancelAll()
+        for producerTask in producerTasks {
+            await producerTask.value
+        }
     }
 
     func extractUserMessage(from aiMessage: AIMessage) -> String {

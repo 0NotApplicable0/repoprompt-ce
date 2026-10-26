@@ -1014,7 +1014,10 @@ actor MCPBootstrapLease {
             taskLabelKind: spec.taskLabelKind,
             allowsAgentExternalControlTools: spec.allowsAgentExternalControlTools,
             requiresExpectedAgentPID: spec.requiresExpectedAgentPID,
-            prunesOnlyAfterSettlement: spec.purpose == .discoverRun
+            prunesOnlyAfterSettlement: MCPPolicySettlement.prunesOnlyAfterSettlement(
+                clientName: clientName,
+                purpose: spec.purpose
+            )
         )
     }
 

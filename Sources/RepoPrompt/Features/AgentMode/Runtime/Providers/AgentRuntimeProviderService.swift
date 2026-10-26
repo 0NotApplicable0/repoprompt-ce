@@ -13,6 +13,18 @@ final class AgentRuntimeProviderService {
 
     private init() {}
 
+    private func rejectedModelProvider(for agent: AgentProviderKind, modelString: String?) -> HeadlessAgentProvider? {
+        let model = modelString ?? AgentModel.defaultModel.rawValue
+        guard !AgentModelCatalog.isValid(
+            rawModel: model,
+            for: agent,
+            availability: .none.assumingAvailable(agent)
+        ) else { return nil }
+        return UnsupportedHeadlessAgentProvider(
+            reason: "Model '\(model)' is unavailable for \(agent.displayName). Choose Default or a model from the provider's current model catalog. The saved selection has not been changed."
+        )
+    }
+
     /// Create a headless agent provider.
     /// - Parameters:
     ///   - agent: The provider kind to create
@@ -27,6 +39,8 @@ final class AgentRuntimeProviderService {
         modelString: String? = nil,
         runType: AgentRunType = .discover,
         workspacePath: String? = nil,
+        antigravityPermissionLevel: AntigravityAgentToolPreferences.PermissionLevel? = nil,
+        grokPermissionLevel: GrokAgentToolPreferences.PermissionLevel? = nil,
         modelParameterSelections: [ACPModelParameterSelection] = []
     ) -> HeadlessAgentProvider {
         if Self.enableDebugLogging {
@@ -92,20 +106,70 @@ final class AgentRuntimeProviderService {
                 Self.logger.debug("Created CursorACPHeadlessAgentProvider")
             }
             return CursorACPHeadlessAgentProvider(config: config, workspacePath: workspacePath)
-        case .grokBuild:
-            let config = GrokBuildAgentConfig(
-                enableDebugLogging: Self.enableDebugLogging,
-                modelString: modelString,
-                alwaysApproveTools: false,
-                discoveryMode: true,
-                backgroundFeatureEnvironment: GrokBuildAgentConfig.managedBackgroundFeatureEnvironment
-            )
-            if Self.enableDebugLogging {
-                Self.logger.debug("Created GrokBuildACPHeadlessAgentProvider")
-            }
-            return GrokBuildACPHeadlessAgentProvider(config: config, workspacePath: workspacePath)
         case .antigravity:
-            return UnsupportedHeadlessAgentProvider(reason: "Headless execution is not supported for this provider.")
+            // Real Agent Mode runs pass the session-resolved level (honoring Safe-Managed /
+            // per-provider overrides); discovery / no-session callers omit it and fall back to
+            // the user's global Antigravity permission preference.
+            let permissionLevel = antigravityPermissionLevel ?? AntigravityAgentToolPreferences.permissionLevel()
+            // Safe Managed must retain its pre-preparation rejection, even for an unknown model.
+            if permissionLevel.supportsHeadlessRun,
+               let rejection = rejectedModelProvider(for: agent, modelString: modelString)
+            {
+                return rejection
+            }
+            let config = AntigravityAgentConfig(
+                modelString: modelString,
+                useSandbox: permissionLevel.useSandbox,
+                dangerouslySkipPermissions: permissionLevel.dangerouslySkipPermissions,
+                supportsHeadlessRun: permissionLevel.supportsHeadlessRun,
+                enableDebugLogging: Self.enableDebugLogging
+            )
+            var processConfig = CLIProcessConfiguration(
+                command: config.commandName,
+                workingDirectory: workspacePath,
+                enableDebugLogging: Self.enableDebugLogging,
+                captureStdoutTailBytes: 0,
+                captureStderrTailBytes: 256 * 1024,
+                logStdinSampleBytes: 0
+            )
+            processConfig.ensureAdditionalPaths(config.additionalPathHints)
+            let runner = CLIProcessRunner(config: processConfig)
+            if Self.enableDebugLogging {
+                Self.logger.debug("Created AntigravityAgentProvider")
+            }
+            return AntigravityAgentProvider(runner: runner, config: config, workspacePath: workspacePath)
+        case .grok:
+            let permissionLevel = grokPermissionLevel ?? GrokAgentToolPreferences.permissionLevel()
+            guard permissionLevel != .storedPermissionUnavailable else {
+                return UnsupportedHeadlessAgentProvider(reason: permissionLevel.detailText)
+            }
+            if let rejection = rejectedModelProvider(for: agent, modelString: modelString) {
+                return rejection
+            }
+            let config = GrokAgentConfig(
+                modelString: modelString,
+                useSandbox: permissionLevel.useSandbox,
+                dangerouslySkipPermissions: permissionLevel.dangerouslySkipPermissions,
+                enableDebugLogging: Self.enableDebugLogging
+            )
+            var processConfig = CLIProcessConfiguration(
+                command: config.commandName,
+                workingDirectory: workspacePath,
+                enableDebugLogging: Self.enableDebugLogging,
+                captureStdoutTailBytes: 0,
+                captureStderrTailBytes: 256 * 1024,
+                logStdinSampleBytes: 0
+            )
+            processConfig.ensureAdditionalPaths(config.additionalPathHints)
+            let runner = CLIProcessRunner(config: processConfig)
+            if Self.enableDebugLogging {
+                Self.logger.debug("Created GrokAgentProvider")
+            }
+            return GrokAgentProvider(runner: runner, config: config, workspacePath: workspacePath)
+        case .grokBuild:
+            return UnsupportedHeadlessAgentProvider(
+                reason: "Grok Build (grokBuild) is retired for Agent Mode and Context Builder. Choose Grok CLI or another active agent provider. Grok Build remains available for Chat and Oracle."
+            )
         case .devin:
             return DevinACPHeadlessAgentProvider(
                 config: DevinAgentConfig(

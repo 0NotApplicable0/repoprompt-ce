@@ -1201,7 +1201,7 @@ extension AgentComposerSubmissionAttemptTests {
                 if let codexController { return codexController }
                 preconditionFailure("Routing transaction test must not start Codex")
             },
-            headlessProviderFactory: { _, _ in UnsupportedHeadlessAgentProvider(reason: "test terminal") }
+            headlessProviderFactory: { _, _, _, _, _ in UnsupportedHeadlessAgentProvider(reason: "test terminal") }
         )
         addTeardownBlock { @MainActor in
             for session in viewModel.sessions.values {

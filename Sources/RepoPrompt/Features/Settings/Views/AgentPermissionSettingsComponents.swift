@@ -267,6 +267,8 @@ struct AgentPermissionSecureStorageDegradedBanner: View {
             "secure storage authentication was denied or cancelled"
         case .decodeFailed:
             "stored permissions could not be decoded"
+        case .unsupportedStoredPermission:
+            nil
         case .unsupportedFutureSchema:
             "stored permissions were written by a newer version"
         }

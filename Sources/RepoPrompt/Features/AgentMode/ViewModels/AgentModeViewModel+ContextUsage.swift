@@ -6,7 +6,7 @@ extension AgentModeViewModel {
         switch agent {
         case .claudeCode, .claudeCodeGLM, .kimiCode, .customClaudeCompatible:
             claudeContextUsageEstimator
-        case .openCode, .cursor, .grokBuild, .antigravity, .devin:
+        case .openCode, .cursor, .antigravity, .grok, .grokBuild, .devin:
             acpContextUsageEstimator
         case .codexExec:
             nil
@@ -86,7 +86,7 @@ extension AgentModeViewModel {
         // `observationContextLoad`), so the count vouch is withdrawn and no billed count takes one.
         // Vouch presence then always matches whether a count is exported, and its transitions
         // republish (a later `usage_update` confirming the same figure establishes a vouch).
-        if session.selectedAgent.acpProviderID != nil, !heldOccupancy {
+        if session.selectedAgent.usesBilledContextUsage, !heldOccupancy {
             session.withdrawContextCountVouch(notingWindow: modelContextWindow)
             return
         }

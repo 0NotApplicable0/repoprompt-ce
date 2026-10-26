@@ -152,6 +152,9 @@ enum AgentMCPSelectionResolver {
         surface: AgentModelCatalog.AgentSelectionSurface
     ) throws -> (selection: AgentModelCatalog.NormalizedAgentSelection, modelParameters: [ACPModelParameterSelection], usageBalancingEligible: Bool)? {
         if let providerSelection = roleSelectionProvider?(role, availability) {
+            guard providerSelection.agent != .grokBuild else {
+                throw MCPError.invalidParams("Agent 'grokBuild' is retired. Choose Grok CLI or another active provider for this role.")
+            }
             guard surface.allows(providerSelection.agent) else {
                 throw MCPError.invalidParams(
                     "Agent '\(providerSelection.agent.rawValue)' selected for role '\(role.rawValue)' is available only in interactive Agent Mode and cannot run headlessly. Choose a headless-capable model for this role in Agent Models settings or use interactive Agent Mode."
@@ -164,6 +167,9 @@ enum AgentMCPSelectionResolver {
             availability: availability,
             workspaceID: workspaceID
         ) {
+            guard resolution.effective.agent != .grokBuild else {
+                throw MCPError.invalidParams("Agent 'grokBuild' is retired. Choose Grok CLI or another active provider for this role.")
+            }
             guard surface.allows(resolution.effective.agent) else {
                 throw MCPError.invalidParams(
                     "Agent '\(resolution.effective.agent.rawValue)' selected for role '\(role.rawValue)' is available only in interactive Agent Mode and cannot run headlessly. Choose a headless-capable model for this role in Agent Models settings or use interactive Agent Mode."
