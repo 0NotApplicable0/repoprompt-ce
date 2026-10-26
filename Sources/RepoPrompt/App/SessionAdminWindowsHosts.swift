@@ -987,3 +987,17 @@ private extension Array {
         count == 1 ? first : nil
     }
 }
+
+extension DelegationScopeRuntime {
+    /// Live-app wiring sits in `App` so the runtime bridge does not reference App window types.
+    static func appWired(persistenceMode: PersistenceMode) -> DelegationScopeRuntime {
+        let windows: @MainActor () -> [WindowState] = { WindowStatesManager.shared.allWindows }
+        return DelegationScopeRuntime(
+            persistenceMode: persistenceMode,
+            windows: windows,
+            standingRuleFacts: { WindowStatesManager.shared.standingRuleFacts(for: $0, in: windows()) },
+            isStarterLive: { ServerNetworkManager.shared.isLiveStarter($0) },
+            starterGeneration: { ServerNetworkManager.shared.lifecycleGeneration(of: $0) }
+        )
+    }
+}
