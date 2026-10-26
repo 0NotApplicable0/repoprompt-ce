@@ -14,6 +14,8 @@
         package var outcomeEvaluationCount = 0
         package var patternVisitCount = 0
         package var patternMatchAttemptCount = 0
+        package var directoryCandidatePrefixRequestCount = 0
+        package var directoryCandidatePrefixBuildCount = 0
         package var outcomeZeroAttemptCount = 0
         package var outcomeOneAttemptCount = 0
         package var outcomeTwoToFourAttemptCount = 0
@@ -124,12 +126,16 @@
             patternVisits: Int,
             patternAttempts: Int,
             prefilterChecks: Int = 0,
-            prefilterSkips: Int = 0
+            prefilterSkips: Int = 0,
+            directoryCandidatePrefixRequests: Int = 0,
+            directoryCandidatePrefixBuilds: Int = 0
         ) {
             mutate {
                 $0.outcomeEvaluationCount += 1
                 $0.patternVisitCount += patternVisits
                 $0.patternMatchAttemptCount += patternAttempts
+                $0.directoryCandidatePrefixRequestCount += directoryCandidatePrefixRequests
+                $0.directoryCandidatePrefixBuildCount += directoryCandidatePrefixBuilds
                 $0.patternPrefilterCheckCount += prefilterChecks
                 $0.patternPrefilterSkipCount += prefilterSkips
                 $0.patternPrefilterPassCount += max(0, prefilterChecks - prefilterSkips)

@@ -177,6 +177,97 @@ import XCTest
             await bridge.stopAndJoinForTesting()
         }
 
+        func testDuplicateRootTieBreaksAndWindowPriority() throws {
+            let root = try makeRepoDirectory("duplicate-root")
+            func workspace(
+                _ name: String, id: String, lastUsed: TimeInterval = 100, modified: TimeInterval = 100, hidden: Bool = false
+            ) -> WorkspaceModel {
+                WorkspaceModel(
+                    id: UUID(uuidString: id)!,
+                    dateModified: Date(timeIntervalSince1970: modified),
+                    name: name,
+                    repoPaths: [root],
+                    lastUsed: Date(timeIntervalSince1970: lastUsed),
+                    isHiddenInMenus: hidden
+                )
+            }
+            func pick(
+                _ workspaces: [WorkspaceModel],
+                windows: [(windowID: Int, workspace: WorkspaceModel, isFocused: Bool)] = [],
+                includeHidden: Bool = false
+            ) throws -> WorkspaceModel {
+                let matches = WindowRoutingService.test_collapsedWorkingDirsWorkspaceMatches(
+                    workingDirs: [root],
+                    diskWorkspaces: workspaces,
+                    activeWindows: windows,
+                    includeHidden: includeHidden
+                )
+                XCTAssertEqual(matches.count, 1)
+                return try XCTUnwrap(matches.first).workspace
+            }
+            let idLow = "00000000-0000-0000-0000-000000000001"
+            let idHigh = "00000000-0000-0000-0000-000000000002"
+            let idOther = "00000000-0000-0000-0000-000000000003"
+
+            let older = workspace("Older", id: idLow, lastUsed: 100)
+            let newer = workspace("Newer", id: idHigh, lastUsed: 200)
+            XCTAssertEqual(try pick([older, newer]).id, newer.id, "lastUsed descending")
+            XCTAssertEqual(try pick([newer, older]).id, newer.id)
+
+            let modifiedOld = workspace("Zed", id: idHigh, modified: 100)
+            let modifiedNew = workspace("Alpha", id: idLow, modified: 200)
+            XCTAssertEqual(try pick([modifiedOld, modifiedNew]).id, modifiedNew.id, "equal lastUsed: newer dateModified")
+
+            let lowerName = workspace("alpha", id: idHigh)
+            let upperName = workspace("Beta", id: idLow)
+            XCTAssertEqual(try pick([upperName, lowerName]).id, lowerName.id, "equal both: lowercased name ascending")
+
+            let sameNameLowID = workspace("Same", id: idLow)
+            let sameNameHighID = workspace("Same", id: idHigh)
+            XCTAssertEqual(try pick([sameNameHighID, sameNameLowID]).id, sameNameLowID.id, "equal name: smaller id.uuidString")
+
+            let caseA = workspace("abc", id: idHigh)
+            let caseB = workspace("ABC", id: idLow)
+            XCTAssertEqual(try pick([caseA, caseB]).id, caseB.id, "equal lowercased name: raw name ascending")
+
+            let hiddenRecent = workspace("Hidden", id: idLow, lastUsed: 900, hidden: true)
+            let visibleOld = workspace("Visible", id: idHigh, lastUsed: 100)
+            XCTAssertEqual(try pick([hiddenRecent, visibleOld], includeHidden: true).id, visibleOld.id, "visible beats hidden")
+
+            let unfocusedRecent = workspace("Recent", id: idLow, lastUsed: 900)
+            let focusedOld = workspace("Focused", id: idHigh, lastUsed: 100)
+            let focusedPick = try pick(
+                [unfocusedRecent, focusedOld],
+                windows: [(windowID: 7, workspace: focusedOld, isFocused: true), (windowID: 3, workspace: unfocusedRecent, isFocused: false)]
+            )
+            XCTAssertEqual(focusedPick.id, focusedOld.id, "focused window's workspace beats a more recent unfocused one")
+
+            let lowWindow = workspace("LowWindow", id: idHigh, lastUsed: 100)
+            let highWindow = workspace("HighWindow", id: idOther, lastUsed: 900)
+            let windowPick = try pick(
+                [lowWindow, highWindow],
+                windows: [(windowID: 9, workspace: highWindow, isFocused: false), (windowID: 2, workspace: lowWindow, isFocused: false)]
+            )
+            XCTAssertEqual(windowPick.id, lowWindow.id, "unfocused windows: lowest windowID")
+        }
+
+        func testMatchedByNoteUsesFinalResolutionAndPreservesExistingText() {
+            let exact = WindowRoutingService.test_workingDirsMatchedBy(candidateCount: 1, disambiguatedByWindowID: false)
+            let superset = WindowRoutingService.test_supersetWorkingDirsMatchedBy(candidateCount: 2, disambiguatedByWindowID: true)
+            XCTAssertEqual(
+                WindowRoutingService.test_workingDirsMatchedByNote(matchedBy: exact, equivalentCount: 1, workspaceName: "A"),
+                exact
+            )
+            XCTAssertEqual(
+                WindowRoutingService.test_workingDirsMatchedByNote(matchedBy: exact, equivalentCount: 2, workspaceName: "A"),
+                exact + "; 2 workspaces share these roots, resolved to \"A\" by the deterministic bind rule"
+            )
+            let supersetNote = WindowRoutingService.test_workingDirsMatchedByNote(matchedBy: superset, equivalentCount: 3, workspaceName: "Final")
+            XCTAssertTrue(supersetNote.hasPrefix(superset), supersetNote)
+            XCTAssertTrue(supersetNote.contains("window_id"), supersetNote)
+            XCTAssertTrue(supersetNote.hasSuffix("3 workspaces share these roots, resolved to \"Final\" by the deterministic bind rule"), supersetNote)
+        }
+
         // MARK: - Helpers
 
         private func makeRepoDirectory(_ name: String) throws -> String {

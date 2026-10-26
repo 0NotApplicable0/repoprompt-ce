@@ -9678,21 +9678,9 @@ actor WorkspaceFileContextStore {
     }
 
     static func compareUTF8Binary(_ lhs: String, _ rhs: String) -> ComparisonResult {
-        var lhsIterator = lhs.utf8.makeIterator()
-        var rhsIterator = rhs.utf8.makeIterator()
-        while true {
-            switch (lhsIterator.next(), rhsIterator.next()) {
-            case let (lhsByte?, rhsByte?):
-                if lhsByte < rhsByte { return .orderedAscending }
-                if lhsByte > rhsByte { return .orderedDescending }
-            case (nil, nil):
-                return .orderedSame
-            case (nil, _?):
-                return .orderedAscending
-            case (_?, nil):
-                return .orderedDescending
-            }
-        }
+        if WorkspaceCodemapGraphOrdering.utf8Precedes(lhs, rhs) { return .orderedAscending }
+        if WorkspaceCodemapGraphOrdering.utf8Precedes(rhs, lhs) { return .orderedDescending }
+        return .orderedSame
     }
 
     private static func searchCatalogFilePrecedes(_ lhs: WorkspaceFileRecord, _ rhs: WorkspaceFileRecord) -> Bool {
@@ -21004,10 +20992,13 @@ actor WorkspaceFileContextStore {
         var commands: [CodemapInvalidationCommand] = []
         for prepared in deltas {
             switch prepared.delta {
-            case .fileAdded:
-                commands.append(.modified([prepared.relativePath]))
-            case .fileModified:
-                commands.append(.modified([prepared.relativePath]))
+            case .fileAdded, .fileModified:
+                // A content write must not fence or reschedule the graph unless this path can
+                // appear in the code-map projection; cataloged files without a code map (logs, for
+                // example) are excluded.
+                if codemapWatcherPathAffectsGraph(prepared.relativePath) {
+                    commands.append(.modified([prepared.relativePath]))
+                }
             case .fileRemoved:
                 commands.append(.deleted([prepared.relativePath]))
             case .folderRemoved:
@@ -21025,6 +21016,11 @@ actor WorkspaceFileContextStore {
             }
         }
         return (nil, commands)
+    }
+
+    private func codemapWatcherPathAffectsGraph(_ relativePath: String) -> Bool {
+        let fileExtension = (relativePath as NSString).pathExtension
+        return SyntaxManager.supportsCodeMap(fileExtension: fileExtension)
     }
 
     private func applyPreparedIndexDeltasBody(
@@ -22446,6 +22442,10 @@ actor WorkspaceFileContextStore {
     }
 
     #if DEBUG
+        func pathMatchIndexBuildCountForTesting() async -> Int {
+            await pathMatchWorker.indexBuildCountForTesting()
+        }
+
         func staticPathMatchSnapshotCacheCountForTesting() -> Int {
             staticPathMatchSnapshotsByScope.count
         }

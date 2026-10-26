@@ -21,6 +21,11 @@ enum WorkspaceSwitchResult: Equatable {
     }
 }
 
+enum WorkspaceSwitchOrigin: Equatable {
+    case person
+    case programmatic
+}
+
 enum WorkspaceSwitchPhase: String, Equatable {
     case preparing
     case awaitingConfirmation

@@ -749,6 +749,99 @@ import XCTest
             }
         }
 
+        func testRemoveFolderReturnsNilWhenNoFallbackSwitchIsAttempted() async throws {
+            try await WorkspaceAuthorityRootTestFixture.withFixture { fixture in
+                let active = try XCTUnwrap(fixture.manager.workspace(withID: fixture.workspace.id))
+                let inactive = try await fixture.createAdditionalWorkspace(name: "Inactive", repoPaths: [fixture.rootPaths[0]])
+                let unmatched = fixture.base.appendingPathComponent("not-a-configured-root").path
+                let results = try await fixture.perform("nil-returning removals") {
+                    let unmatchedResult = await fixture.manager.removeFolder(unmatched, from: active)
+                    let whitespaceResult = await fixture.manager.removeFolder(" \n\t ", from: active)
+                    let inactiveResult = await fixture.manager.removeFolder(fixture.rootPaths[0], from: inactive)
+                    let nonFinalResult = await fixture.manager.removeFolder(fixture.rootPaths[1], from: active)
+                    return [unmatchedResult, whitespaceResult, inactiveResult, nonFinalResult]
+                }
+                XCTAssertEqual(results.count, 4)
+                XCTAssertTrue(results.allSatisfy { $0 == nil }, "\(results)")
+            }
+        }
+
+        func testFinalRootRemovalReturnsFallbackSwitchResult() async throws {
+            try await WorkspaceAuthorityRootTestFixture.withFixture(configuration: { [$0[0]] }) { fixture in
+                let fallback = try await fixture.createAdditionalWorkspace(
+                    name: "Default", repoPaths: [], isSystemWorkspace: true
+                )
+                let active = try XCTUnwrap(fixture.manager.workspace(withID: fixture.workspace.id))
+                let result = try await fixture.perform("final-root removal returned") {
+                    await fixture.manager.removeFolder(fixture.rootPaths[0], from: active)
+                }
+                XCTAssertEqual(result, .switched)
+                try await fixture.settle()
+                XCTAssertEqual(fixture.manager.activeWorkspaceID, fallback.id)
+                XCTAssertEqual(fixture.manager.workspace(withID: fixture.workspace.id)?.repoPaths, [fixture.rootPaths[0]])
+            }
+        }
+
+        func testFinalRootRemovalReturnsBlockageWhileAnotherSwitchIsHeld() async throws {
+            try await WorkspaceAuthorityRootTestFixture.withFixture(configuration: { [$0[0]] }) { fixture in
+                _ = try await fixture.createAdditionalWorkspace(name: "Default", repoPaths: [], isSystemWorkspace: true)
+                let held = try await fixture.createAdditionalWorkspace(name: "Held", repoPaths: [])
+                let active = try XCTUnwrap(fixture.manager.workspace(withID: fixture.workspace.id))
+                let gate = BoundedGate()
+                defer {
+                    gate.release()
+                    fixture.manager.setWorkspaceSwitchDidBeginHandlerForTesting(nil)
+                }
+                fixture.manager.setWorkspaceSwitchDidBeginHandlerForTesting { targetID in
+                    if targetID == held.id { await gate.hold() }
+                }
+                let heldSwitch = fixture.startOwnedTask {
+                    _ = await fixture.manager.requestWorkspaceSwitch(to: held, saveState: false)
+                }
+                let entered = await gate.waitUntilEntered()
+                XCTAssertTrue(entered)
+                let result = try await fixture.perform("final-root removal returned while switch held") {
+                    await fixture.manager.removeFolder(fixture.rootPaths[0], from: active, origin: .programmatic)
+                }
+                guard case let .blocked(message)? = result else {
+                    XCTFail("expected a blocked result, got \(String(describing: result))")
+                    return
+                }
+                XCTAssertTrue(message.contains("\"Held\""), message)
+                XCTAssertEqual(fixture.manager.workspace(withID: fixture.workspace.id)?.repoPaths, [fixture.rootPaths[0]])
+                gate.release()
+                await heldSwitch.value
+            }
+        }
+
+        func testUIFinalRootRemovalIgnoresBlockedFallbackSwitchAsBefore() async throws {
+            try await WorkspaceAuthorityRootTestFixture.withFixture(configuration: { [$0[0]] }) { fixture in
+                _ = try await fixture.createAdditionalWorkspace(name: "Default", repoPaths: [], isSystemWorkspace: true)
+                let held = try await fixture.createAdditionalWorkspace(name: "Held", repoPaths: [])
+                let gate = BoundedGate()
+                defer {
+                    gate.release()
+                    fixture.manager.setWorkspaceSwitchDidBeginHandlerForTesting(nil)
+                }
+                fixture.manager.setWorkspaceSwitchDidBeginHandlerForTesting { targetID in
+                    if targetID == held.id { await gate.hold() }
+                }
+                let heldSwitch = fixture.startOwnedTask {
+                    _ = await fixture.manager.requestWorkspaceSwitch(to: held, saveState: false)
+                }
+                let entered = await gate.waitUntilEntered()
+                XCTAssertTrue(entered)
+                try await fixture.perform("UI final-root removal returned while switch held") {
+                    await fixture.manager.removeActiveWorkspaceRoot(path: fixture.rootPaths[0])
+                }
+                XCTAssertNil(fixture.manager.pendingWorkspaceSwitchBlockedNotice)
+                XCTAssertNotNil(fixture.manager.lastWorkspaceSwitchBlockageReport)
+                XCTAssertEqual(fixture.manager.workspace(withID: fixture.workspace.id)?.repoPaths, [fixture.rootPaths[0]])
+                gate.release()
+                await heldSwitch.value
+            }
+        }
+
         func testInactiveRemovalNeverCapturesOrUnloadsActiveWorkspace() async throws {
             try await WorkspaceAuthorityRootTestFixture.withFixture { fixture in
                 let inactive = try await fixture.createAdditionalWorkspace(name: "Inactive", repoPaths: fixture.rootPaths)

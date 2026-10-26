@@ -607,6 +607,59 @@ class WindowState: ObservableObject {
     /// Accepted restore execution and the protection session capture relies on. See
     /// `WindowRestoreLifetime` for why the two lifetimes stay independent.
     private var restoreLifetime = WindowRestoreLifetime()
+    private(set) var acceptsLaunchRestoreEntries = true
+
+    func declineLaunchRestoreEntries() {
+        acceptsLaunchRestoreEntries = false
+    }
+
+    #if DEBUG
+        private(set) var restoreDispatchCountForTesting = 0 {
+            didSet { resumeRestoreQuiescenceWaiters() }
+        }
+
+        private(set) var restoreDispatchCompletedCountForTesting = 0 {
+            didSet { resumeRestoreQuiescenceWaiters() }
+        }
+
+        private(set) var initializationCallbackDidRunForTesting = false {
+            didSet { resumeRestoreQuiescenceWaiters() }
+        }
+
+        private var restoreQuiescenceWaiters: [UUID: CheckedContinuation<Void, Never>] = [:]
+
+        var isRestoreQuiescentForTesting: Bool {
+            initializationCallbackDidRunForTesting
+                && restoreDispatchCountForTesting == restoreDispatchCompletedCountForTesting
+        }
+
+        func awaitRestoreQuiescenceForTesting() async {
+            while !isRestoreQuiescentForTesting, !Task.isCancelled {
+                let waiterID = UUID()
+                await withTaskCancellationHandler {
+                    await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+                        if Task.isCancelled {
+                            continuation.resume()
+                            return
+                        }
+                        restoreQuiescenceWaiters[waiterID] = continuation
+                    }
+                } onCancel: {
+                    Task { @MainActor [weak self] in
+                        self?.restoreQuiescenceWaiters.removeValue(forKey: waiterID)?.resume()
+                    }
+                }
+            }
+        }
+
+        private func resumeRestoreQuiescenceWaiters() {
+            let waiters = restoreQuiescenceWaiters
+            restoreQuiescenceWaiters.removeAll()
+            for waiter in waiters.values {
+                waiter.resume()
+            }
+        }
+    #endif
     private(set) var claimedInitialRefreshDeferralID: UUID?
     private(set) var claimedInitialRefreshDeferralWaiterID: UUID?
     private(set) var claimedOpenRequestID: UUID?
@@ -646,6 +699,43 @@ class WindowState: ObservableObject {
     }
 
     #if DEBUG
+        /// Applies an already-claimed open request to a window that was initialized without one,
+        /// reproducing the claim-after-attach order that the initializer claim makes unreachable.
+        func adoptClaimedOpenRequestForTesting(_ claimed: ClaimedWindowOpenRequest) {
+            claimedOpenRequestID = claimed.request.id
+            parkOnOpenHandle = claimed.parkHandle
+            claimedInitialRefreshDeferralID = claimed.request.refreshDeferralID
+            claimedInitialRefreshDeferralWaiterID = claimed.request.refreshDeferralID == nil ? nil : claimed.request.id
+            if !claimed.request.consumesRestoreEntry { declineLaunchRestoreEntries() }
+        }
+    #endif
+
+    convenience init(openRequestID: UUID?) {
+        self.init(
+            contextBuilderProviderFactory: nil,
+            loadStoredAPISettingsDataOnInit: true,
+            codexModelPollingService: .shared,
+            domainRuntimeOverride: nil,
+            openRequestID: openRequestID
+        )
+    }
+
+    #if DEBUG
+        convenience init(
+            domainRuntime: MCPDomainRuntime,
+            openRequestID: UUID?,
+            agentModeViewModelFactory: @escaping WindowStateCompositionFactory.AgentModeViewModelFactory
+        ) {
+            self.init(
+                contextBuilderProviderFactory: nil,
+                loadStoredAPISettingsDataOnInit: true,
+                codexModelPollingService: .shared,
+                domainRuntimeOverride: domainRuntime,
+                agentModeViewModelFactory: agentModeViewModelFactory,
+                openRequestID: openRequestID
+            )
+        }
+
         convenience init(
             agentModeViewModelFactory: @escaping WindowStateCompositionFactory.AgentModeViewModelFactory,
             contextBuilderProviderFactory: @escaping ContextBuilderAgentViewModel.ProviderFactory,
@@ -859,6 +949,7 @@ class WindowState: ObservableObject {
         // A prepared session is deliberately absent from the UI window/restore registry. The
         // ordinary run, save, endpoint and MCP owners above are retained without UI startup work.
         if isPreparedSessionOwner { return }
+        if claimedOpenRequest?.request.consumesRestoreEntry == false { declineLaunchRestoreEntries() }
 
         // Set up additional actions
         setupSendPromptAction()
@@ -894,6 +985,9 @@ class WindowState: ObservableObject {
                 guard !self.isClosing else { return }
                 StartupPhaseLog.mark(.initCallbackStart, window: self.windowID)
                 self.applyPendingRestoreEntryIfPossible()
+                #if DEBUG
+                    self.initializationCallbackDidRunForTesting = true
+                #endif
                 await self.processCommands()
             }
         }
@@ -1892,12 +1986,18 @@ class WindowState: ObservableObject {
         // The dispatch task owns this acceptance's completion from here on, even if a newer
         // acceptance arrives before it finishes.
         guard let dispatch = restoreLifetime.takePendingForDispatch() else { return }
+        #if DEBUG
+            restoreDispatchCountForTesting += 1
+        #endif
 
         StartupPhaseLog.mark(.restoreDispatchEnqueue, window: windowID)
         Task {
             if !self.isClosing {
                 await restoreWorkspace(from: dispatch.entry, acceptanceSequence: dispatch.acceptanceSequence)
             }
+            #if DEBUG
+                self.restoreDispatchCompletedCountForTesting += 1
+            #endif
             dispatch.completion?()
         }
     }
@@ -1936,7 +2036,7 @@ class WindowState: ObservableObject {
                 restoreLifetime.releaseProtection(forDispatchedAcceptance: acceptanceSequence)
             }
             switchOutcome = await StartupPhaseLog.SwitchOutcome(
-                workspaceManager.requestWorkspaceSwitch(to: target, saveState: true, reason: "restore")
+                workspaceManager.requestWorkspaceSwitch(to: target, saveState: true, reason: "restore", origin: .programmatic)
             )
             #if DEBUG
                 if let restoreStartMS {
@@ -3077,7 +3177,5 @@ class WindowState: ObservableObject {
         pendingWindowTitleUpdateTask?.cancel()
         pendingFocusUpdateTask?.cancel()
         pendingFocusSideEffectsTask?.cancel()
-        // Do not call unregisterWindowState here; deinit is nonisolated and
-        // you can't hop to @MainActor. Unregistration happens in ContentView onDisappear.
     }
 }

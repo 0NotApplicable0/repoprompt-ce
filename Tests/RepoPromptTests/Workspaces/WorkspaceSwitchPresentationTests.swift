@@ -117,6 +117,134 @@ final class WorkspaceSwitchPresentationTests: XCTestCase {
         XCTAssertFalse(newerUnrelatedNotice.isBlocked(by: owningOperationID))
     }
 
+    func testProgrammaticBlockedSwitchReturnsBlockageWithoutNotice() async throws {
+        try await HeldFirstSwitch.run(makeComposition().workspaceManager) { held in
+            let result = await held.manager.requestWorkspaceSwitch(
+                to: held.other,
+                saveState: false,
+                origin: .programmatic
+            )
+
+            guard case let .blocked(message) = result else {
+                return XCTFail("Expected programmatic request to be blocked")
+            }
+            XCTAssertTrue(message.contains("is blocked by a active switch to \"\(held.target.name)\""), message)
+            XCTAssertNotNil(held.manager.lastWorkspaceSwitchBlockageReport)
+            XCTAssertNil(held.manager.pendingWorkspaceSwitchBlockedNotice)
+        }
+    }
+
+    func testPersonBlockedSwitchStillPublishesNoticeDuringActiveSwitch() async throws {
+        try await HeldFirstSwitch.run(makeComposition().workspaceManager) { held in
+            let result = await held.manager.requestWorkspaceSwitch(to: held.other, saveState: false)
+
+            guard case let .blocked(message) = result else {
+                return XCTFail("Expected person request to be blocked")
+            }
+            XCTAssertEqual(held.manager.pendingWorkspaceSwitchBlockedNotice?.message, message)
+        }
+    }
+
+    func testProgrammaticBlockedRequestReturnsWhileFirstSwitchIsHeld() async throws {
+        try await HeldFirstSwitch.run(makeComposition().workspaceManager) { held in
+            let secondReturned = await awaitBounded(label: "programmatic request returns while first switch held") {
+                _ = await held.manager.requestWorkspaceSwitch(to: held.other, saveState: false, origin: .programmatic)
+            }
+            XCTAssertTrue(secondReturned)
+            held.gate.release()
+            let firstResult = await awaitBoundedResult(label: "first switch completes") { await held.first.value }
+            XCTAssertEqual(try firstResult.get(), .switched)
+        }
+    }
+
+    func testProgrammaticRefreshBlockPublishesNoNotice() async {
+        let manager = makeComposition().workspaceManager
+        await manager.awaitInitialized()
+        manager.isRefreshing = true
+        defer { manager.isRefreshing = false }
+        let target = manager.createWorkspace(
+            name: "Programmatic Refresh Target \(UUID().uuidString.prefix(8))",
+            repoPaths: [],
+            ephemeral: true
+        )
+
+        let result = await manager.requestWorkspaceSwitch(to: target, origin: .programmatic)
+
+        guard case .blocked = result else {
+            return XCTFail("Expected refresh-state request to be blocked")
+        }
+        XCTAssertNil(manager.pendingWorkspaceSwitchBlockedNotice)
+    }
+
+    @MainActor
+    private final class HeldFirstSwitch {
+        let manager: WorkspaceManagerViewModel
+        let target: WorkspaceModel
+        let other: WorkspaceModel
+        let gate = BoundedGate()
+        var first: Task<WorkspaceSwitchResult, Never>!
+
+        private init(manager: WorkspaceManagerViewModel, target: WorkspaceModel, other: WorkspaceModel) {
+            self.manager = manager
+            self.target = target
+            self.other = other
+        }
+
+        static func begin(_ manager: WorkspaceManagerViewModel) async throws -> HeldFirstSwitch {
+            await manager.awaitInitialized()
+            let target = manager.createWorkspace(
+                name: "Held Switch Target \(UUID().uuidString.prefix(8))",
+                repoPaths: [],
+                ephemeral: true
+            )
+            let other = manager.createWorkspace(
+                name: "Blocked Switch Target \(UUID().uuidString.prefix(8))",
+                repoPaths: [],
+                ephemeral: true
+            )
+            let held = HeldFirstSwitch(manager: manager, target: target, other: other)
+            manager.setWorkspaceSwitchDidBeginHandlerForTesting { [gate = held.gate] id in
+                if id == target.id { await gate.hold() }
+            }
+            held.first = Task { @MainActor in
+                await manager.requestWorkspaceSwitch(to: target, saveState: false)
+            }
+            let entered = await held.gate.waitUntilEntered()
+            if !entered {
+                await held.join()
+                throw BoundedWaitTimeout(label: "first switch entered hold")
+            }
+            return held
+        }
+
+        static func run(
+            _ manager: WorkspaceManagerViewModel,
+            _ body: @MainActor (HeldFirstSwitch) async throws -> Void
+        ) async throws {
+            let held = try await begin(manager)
+            defer { held.finish() }
+            do {
+                try await body(held)
+            } catch {
+                await held.join()
+                throw error
+            }
+            await held.join()
+        }
+
+        func join() async {
+            finish()
+            _ = await awaitBounded(label: "first switch joined") { [first] in
+                _ = await first?.value
+            }
+        }
+
+        func finish() {
+            gate.release()
+            manager.setWorkspaceSwitchDidBeginHandlerForTesting(nil)
+        }
+    }
+
     private func makeComposition() -> WindowStateComposition {
         let previousAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
         GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)

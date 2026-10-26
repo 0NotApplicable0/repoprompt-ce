@@ -8528,7 +8528,30 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         }
     }
 
+    func settleMCPStartupFailure(
+        _ startup: AgentMCPStartAttempt,
+        session: TabSession,
+        state: AgentSessionRunState,
+        reason: AgentRunMCPSnapshot.FailureReason,
+        message: String
+    ) async {
+        guard sessions[session.tabID] === session, session.mcpStartupAttempt === startup else { return }
+        if session.mcpControlContext?.currentEpoch == nil {
+            await prepareMCPWaitTrackingForRunStart(session: session, stopFence: AgentRunStartStopFence(session: session))
+        }
+        guard sessions[session.tabID] === session, session.mcpStartupAttempt === startup else { return }
+        await runService.failBeforeProviderStartup(
+            session: session, message: message, terminalState: state, failureReason: reason
+        )
+    }
+
     func mcpSnapshot(sessionID: UUID) -> AgentRunMCPSnapshot? {
+        if let session = try? authoritativeLiveSession(for: sessionID),
+           let startup = session.mcpStartupAttempt,
+           session.mcpControlContext == nil || startup.hasFailed
+        {
+            return startup.snapshot
+        }
         guard let session = mcpControlledSession(sessionID: sessionID) else { return nil }
         return mcpSnapshot(for: session)
     }
@@ -8570,6 +8593,11 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         canonicalProviderRunID: UUID? = nil,
         canonicalFailureReason: AgentRunMCPSnapshot.FailureReason? = nil
     ) -> AgentRunMCPSnapshot? {
+        if canonicalTerminalState == nil, let startup = session.mcpStartupAttempt,
+           session.mcpControlContext == nil || startup.hasFailed
+        {
+            return startup.snapshot
+        }
         guard let context = session.mcpControlContext else { return nil }
         let interaction = canonicalTerminalState == nil ? mcpPendingInteraction(for: session) : nil
         let status: AgentRunMCPSnapshot.Status = {
@@ -8627,7 +8655,10 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                session.acpSteeringFlushTask == nil
             {
                 Self.steeringDebugLog("[AgentRunSteeringWake] clearing stale MCP running mask sessionID=\(context.sessionID) tab=\(session.tabID) runState=\(session.runState.rawValue) terminal=\(terminalStatus.rawValue) followUp=\(session.mcpFollowUpRunPending) superseding=\(session.pendingSupersedingTurnCompletions)")
-                session.mcpFollowUpRunPending = false
+                // ponytail: An activation-owned pending start keeps its pending mask.
+                if session.mcpControlContext?.currentEpoch != nil || session.mcpStartupAttempt?.isPending != true {
+                    session.mcpFollowUpRunPending = false
+                }
                 session.pendingSupersedingTurnCompletions = 0
             }
             if session.mcpFollowUpRunPending || session.pendingSupersedingTurnCompletions > 0 {
@@ -9203,6 +9234,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         expectedWorkspaceID: UUID,
         allowMatchingControlledSession: Bool = false
     ) throws {
+        try Task.checkCancellation()
         guard workspaceManager?.activeWorkspaceID == expectedWorkspaceID,
               let sessionID = target.sessionID,
               let session = sessions[target.tabID],
@@ -11712,6 +11744,10 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             throw MCPError.invalidParams("The requested agent session binding changed before MCP control activation.")
         }
         try requireSessionConfigurationAdmission(session, creationHandle: creationHandle)
+        if session.mcpStartupAttempt?.hasFailed == true {
+            session.mcpStartupAttempt = nil
+            session.runningStatusText = nil
+        }
         if requireInactiveRunState, session.runState.isActive {
             throw MCPError.invalidParams(
                 "The requested agent session is already running and cannot be reactivated for inactive MCP control."
@@ -11844,6 +11880,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         // Publication transfers ownership from the app-owned admission to this exact control context.
         activationOwnership = .installed(context: activatedContext, generation: activationGeneration)
         func releaseFailedInstalledActivation() async {
+            if let startup = session.mcpStartupAttempt, startup.acknowledged || startup.hasFailed { return }
             guard sessions[tabID] === session,
                   session.currentRestorationBindingToken == activationBindingToken,
                   session.mcpControlActivationGeneration == activationGeneration,
@@ -11980,6 +12017,12 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     /// by durable admission; accepted targets retain their durable ownership.
     @discardableResult
     func mcpDiscardSessionTarget(_ target: MCPSessionTarget) async -> MCPSessionTargetDiscardResult {
+        if let startup = sessions[target.tabID]?.mcpStartupAttempt,
+           startup.target == target, startup.isPending, startup.acknowledged
+        {
+            startup.cancel()
+            return .complete
+        }
         guard let claim = target.recoveryClaim else {
             switch target.origin {
             case .existingSession, .existingTab:
@@ -12344,6 +12387,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
 
     /// Stop is a control read, so it must not mutate a session whose recovery owner has not settled.
     func mcpSettledLiveSessionForStop(sessionID: UUID) throws -> TabSession? {
+        if let session = try authoritativeLiveSession(for: sessionID) {
+            session.mcpStartupAttempt?.cancel()
+        }
         if let workspaceManager,
            let workspaceID = workspaceManager.activeWorkspaceID,
            workspaceManager.hasActiveProvisionalAgentSession(
@@ -22876,6 +22922,10 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 return
             }
         }
+        if let startup = session.mcpStartupAttempt, startup.isPending {
+            startup.cancel()
+            return
+        }
         retireTimedOutManagedStopIfEligible(session)
         await runService.cancelRun(tabID: tabID, session: session, completion: completion, origin: origin)
     }
@@ -24922,6 +24972,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     func requireSessionConfigurationAdmission(
         _ session: TabSession, creationHandle: AgentSessionCreationHandle?
     ) throws {
+        try Task.checkCancellation()
         if let creationHandle {
             guard creationHandle.session === session else { throw PersistentBindingMutationError.staleTransition }
             try requireCurrentCreationPreparation(creationHandle)
@@ -24934,7 +24985,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     }
 
     func failSessionCreation(_ handle: AgentSessionCreationHandle?, message: String) {
-        guard let handle, freshSessionCreationIsCurrent(handle) else { return }
+        guard let handle, freshSessionCreationIsCurrent(handle),
+              handle.session.mcpStartupAttempt?.hasFailed != true,
+              handle.session.mcpStartupAttempt?.acknowledged != true else { return }
         handle.session.failCreationPreparation(handle, message: message)
     }
 

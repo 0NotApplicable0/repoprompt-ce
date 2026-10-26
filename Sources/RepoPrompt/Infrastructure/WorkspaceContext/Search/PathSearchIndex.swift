@@ -36,18 +36,33 @@ final class PathSearchIndex: @unchecked Sendable {
     private let originalPaths: [String]
     private let filenames: [String]
 
-    init(paths: [String]) {
+    convenience init(paths: [String]) {
+        self.init(paths: paths, filenames: paths.map { Self.filename(forPath: $0, explicitNonDirectory: false) })
+    }
+
+    /// Candidate filename metadata preserves original bytes; the matcher uses the original keys.
+    /// Only a path without a usable final component falls back to `URL`, which the debug observer counts.
+    private static func filename(forPath path: String, explicitNonDirectory: Bool) -> String {
+        let bytes = path.utf8
+        let start = bytes.lastIndex(of: 0x2F).map { bytes.index(after: $0) } ?? bytes.startIndex
+        let filename = String(decoding: bytes[start...], as: UTF8.self)
+        if !filename.isEmpty, filename != ".", filename != ".." { return filename }
+        #if DEBUG
+            WorkspaceFileSearchDebugContext.catalogBuildObserver?.recordFilenameURLInput(
+                isRelative: !path.hasPrefix("/"),
+                explicitNonDirectory: explicitNonDirectory
+            )
+        #endif
+        return explicitNonDirectory
+            ? URL(fileURLWithPath: path, isDirectory: false).lastPathComponent
+            : URL(fileURLWithPath: path).lastPathComponent
+    }
+
+    /// `paths` and `filenames` must be count- and order-aligned.
+    private init(paths: [String], filenames: [String]) {
+        precondition(paths.count == filenames.count)
         originalPaths = paths
-        filenames = paths.map { path in
-            // Candidate filename metadata preserves original bytes; the matcher uses the original keys.
-            let bytes = path.utf8
-            let start = bytes.lastIndex(of: 0x2F).map { bytes.index(after: $0) } ?? bytes.startIndex
-            let filename = String(decoding: bytes[start...], as: UTF8.self)
-            guard !filename.isEmpty, filename != ".", filename != ".." else {
-                return URL(fileURLWithPath: path).lastPathComponent
-            }
-            return filename
-        }
+        self.filenames = filenames
 
         guard !paths.isEmpty else {
             cIndex = nil
@@ -60,6 +75,13 @@ final class PathSearchIndex: @unchecked Sendable {
         cIndex = cPathPointers.withUnsafeBufferPointer { buffer in
             path_search_create(buffer.baseAddress, paths.count)
         }
+    }
+
+    convenience init(catalogEntries entries: [WorkspaceSearchCatalogEntry], keys: [String]? = nil) {
+        self.init(
+            paths: keys ?? entries.map(\.pathSearchIndexKey),
+            filenames: entries.map { Self.filename(forPath: $0.standardizedFullPath, explicitNonDirectory: true) }
+        )
     }
 
     deinit {
@@ -474,13 +496,13 @@ final class WorkspaceSearchRootPathIndex: @unchecked Sendable {
                     nanoseconds: WorkspaceFileSearchDebugTiming.elapsed(since: keyStart, through: keyEnd)
                 )
                 let indexStart = WorkspaceFileSearchDebugTiming.now()
-                index = PathSearchIndex(paths: keys)
+                index = PathSearchIndex(catalogEntries: entries, keys: keys)
                 let indexEnd = WorkspaceFileSearchDebugTiming.now()
                 WorkspaceFileSearchDebugContext.catalogBuildObserver?.recordPathIndexConstruction(
                     nanoseconds: WorkspaceFileSearchDebugTiming.elapsed(since: indexStart, through: indexEnd)
                 )
             #else
-                index = PathSearchIndex(paths: entries.map(\.pathSearchIndexKey))
+                index = PathSearchIndex(catalogEntries: entries)
             #endif
         }
     }
@@ -492,7 +514,7 @@ final class WorkspaceSearchRootPathIndex: @unchecked Sendable {
 
         init(entries: [WorkspaceSearchCatalogEntry], affectedEntryIDs: Set<UUID>) {
             self.entries = entries
-            index = entries.isEmpty ? nil : PathSearchIndex(paths: entries.map(\.pathSearchIndexKey))
+            index = entries.isEmpty ? nil : PathSearchIndex(catalogEntries: entries)
             self.affectedEntryIDs = affectedEntryIDs
         }
     }
@@ -954,7 +976,7 @@ final class WorkspaceProjectedPathSearchIndex: @unchecked Sendable {
 
         init(entries: [WorkspaceSearchCatalogEntry], affectedRelativePaths: AffectedRelativePaths) {
             self.entries = entries
-            index = entries.isEmpty ? nil : PathSearchIndex(paths: entries.map(\.pathSearchIndexKey))
+            index = entries.isEmpty ? nil : PathSearchIndex(catalogEntries: entries)
             self.affectedRelativePaths = affectedRelativePaths
         }
     }

@@ -34,6 +34,39 @@ A routed target starts on the provider it names, from the composer and from `age
 
 For a routed new task, the selected service receives bounded user-authored task text (or a deterministic beginning/end excerpt for a long task), saved routing guidance, role references, and candidate provider/model/effort descriptions with advisory profile evidence. The local task-text ceiling is 4,000 characters / 16 KiB, independent of a service's larger capability bound. RepoPrompt CE does not append attached files, workspace context, repository/file paths, selections, diffs, transcript/history, workflow templates, tool results, system prompts, session IDs, provider credentials, or downstream provider state. Text the user wrote in the task or guidance **can itself contain** paths or secrets; masking is best effort, not anonymization. The full task still goes to the chosen execution provider under its normal submission path.
 
+## Jev exploration and override order
+
+For a routed start, overrides run in this order: **provider limit → maker exclusion → Jev → exploration → usage balancing**. Provider preferences first narrow the available frontier; maker exclusions then remove disallowed models before Jev sees any choices. A single surviving model is selected locally without Jev or an exploration count. An empty allowed set rejects the start.
+
+Randomness controls deterministic exploration, not sampling. Each scope (`primarySession`, `subagent`, including headless subagent starts) has its own counter. Only a Jev model-stage `.selected` outcome over at least two eligible candidates advances it, including while Randomness is Off. Other services, local single-candidate picks, abstentions, failures, cancellations before selection, and effort/Auto Effort decisions do not count. A selected decision remains counted if a later effort stage, freshness check, or submission fails. Counting does not depend on diagnostic logging.
+
+Every 20 counted decisions, exploration occurs at these one-based positions:
+
+| Randomness | Positions | Rate |
+| --- | --- | --- |
+| Off | none | 0/20 |
+| Low | 10 | 1/20 |
+| Medium | 5, 15 | 2/20 |
+| High | 3, 8, 13, 18 | 4/20 |
+
+At an exploration position, the advisor applies the second-highest-probability candidate from Jev's validated `DecisionEvidence.probabilities` (`opaqueKey` / `value`), breaking runner-up ties by candidate-builder order. The probabilities must cover exactly the candidate keys, be finite and within `0...1`, and have Jev's original choice as their unique maximum. Missing or unusable probabilities never cause a guessed runner-up: the choice stays unchanged and the override is `explorationUnavailable`. Scores are not used as probabilities.
+
+An explored model proceeds through its own ordinary effort stage. Usage balancing does not run for that start and cannot replace the explored pick. Non-exploring starts retain normal usage balancing. Cancellation, freshness, provider authority, and target checks still apply before submission.
+
+Counters persist separately from `globalSettings.json` under the build-flavored application-support root supplied by `AppProfileLocations`: `~/Library/Application Support/RepoPrompt CE/ModelRouter/exploration-counters.json` for release and `~/Library/Application Support/RepoPrompt CE Debug/ModelRouter/exploration-counters.json` for debug. The builds do not share counters. A locked read/increment/atomic-write transaction serializes advisors and processes sharing the file. Advancing a counter does not change Router settings or their revision. Storage failures degrade to a non-durable in-memory counter and emit a bounded error diagnostic; malformed data is quarantined, and a newer schema is left untouched. The decision log records the original and applied candidate keys plus the count, cycle position, override kind and durability; see [decision-log fields](model-routing-decision-log.md).
+
+## MCP diversity arguments
+
+`agent_run start` and `agent_explore start` accept optional `exclude_makers` and `diverse_from_sessions` arrays. Maker IDs are exactly `anthropic`, `openai`, `google`, `xai`, and `cursor`. Session references must be full UUIDs with a classifiable current provider/model maker in the captured workspace. Live state wins over stored metadata; cold references read only that workspace's metadata. Unknown makers, unknown or unclassifiable explicit sessions, malformed UUIDs, nulls, and non-arrays are `invalidParams`. Neither tool accepts these keys on non-start operations.
+
+The shared parser is `AgentRunMCPToolService.resolveDiversityOptions`; Explore has no second parser. The arrays union their exclusions and de-duplicate session references. Decision logs keep the existing canonical exclusion-source order: `exclude_makers`, `diverse_from_sessions`, `review_diversity`. Referenced session UUIDs are not logged. Any present diversity key requires Model Router to be enabled and rejects an explicit compound `model_id` or a present `model_parameters` key, including `[]` or null. Role labels remain routable. Empty diversity arrays contribute no exclusion but still activate these presence-based checks.
+
+Default Review diversity applies only when the workflow's `builtInWorkflow` is `.review`, Router is enabled, `reviewDiversityEnabled` is on, and neither diversity key is present. It excludes the validated parent's current maker. No parent or an unclassifiable automatic parent adds no exclusion. The predicate rejects explicit model/parameter pins even without a classifiable parent. A custom workflow named Review does not qualify. Either present diversity key, including `[]`, suppresses the automatic default. Router off makes Review diversity inert. Explore has no implicit Review and accepts no custom model or workflow pin.
+
+The existing routing pipeline filters excluded makers after provider limits and before the decision service. A successful routed target does not require a baseline. If routing needs a fallback, only the same frozen pre-route role selection or an allowed usage-balancing substitute may be used; missing, unknown, or excluded baseline makers reject that fallback. There is no arbitrary survivor or Pair substitution. Workspace/configuration freshness and cancellation are checked across metadata reads; live references are re-proven after suspension. Explore retains its captured diversity configuration across child starts and checks it before and after routing. All provider-submission fences remain in force.
+
+Both live tool schemas, the readable canonical transform, and `docs/spec/mcp-domain-canonical-tool-definitions.generated.json` advertise the arrays. `DirectHeadlessCompositionTests.testCanonicalDefinitionsMatchReadableGeneratedReviewSnapshot` guards byte-for-byte parity with the canonical transform.
+
 ## Local usage balancing and Fast opt-in
 
 Tip’s quota-aware usage balancing remains a local, opt-in policy. On a non-exploring start it can substitute a currently executable Codex/Claude peer before the effort decision; peers carry the same catalog scope and profile identity checks as Router choices. Explicit cancellation blocks submission even after substitution. The separate paid Fast opt-in only admits provider-advertised Fast targets to Router effort choices; it never synthesizes a model or enables Fast implicitly.

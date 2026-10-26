@@ -83,6 +83,10 @@ enum MCPClientIdentity {
         canonicalFamilyID(raw) ?? normalized(raw)
     }
 
+    static func pendingRunContextStorageKey(_ clientName: String) -> String {
+        sameFamily(clientName, "grok-client") ? "grok-client" : clientName
+    }
+
     static func sameFamily(_ lhs: String?, _ rhs: String?) -> Bool {
         guard let lhsFamily = canonicalFamilyID(lhs),
               let rhsFamily = canonicalFamilyID(rhs)

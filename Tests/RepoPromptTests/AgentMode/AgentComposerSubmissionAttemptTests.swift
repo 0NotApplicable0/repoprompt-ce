@@ -1173,6 +1173,149 @@ extension AgentComposerSubmissionAttemptTests {
         }
     }
 
+    func testComposerRoutedSubmissionDispatchesAntigravityTarget() async throws {
+        let fixture = try await RoutedStartFixture.make(
+            testCase: self, modelClass: "gemini-flash", effortRaw: "low", recordTurnDelivery: true
+        )
+        let (viewModel, session, tabID) = try await routedComposerSession(fixture)
+        let claim = try routingClaim(viewModel: viewModel, session: session, text: "Implement a parser")
+
+        let result = await viewModel.submitUserTurnAfterFreshTaskRouting(
+            text: "Implement a parser",
+            claim: claim,
+            session: session,
+            destinationTabID: tabID
+        )
+
+        XCTAssertEqual(result, .submitted)
+        XCTAssertEqual(session.selectedAgent, .antigravity)
+        XCTAssertNotEqual(session.selectedAgent, .claudeCode)
+        XCTAssertNotEqual(session.selectedAgent, .codexExec)
+        XCTAssertEqual(session.selectedModelRaw, "gemini-3.8-flash-low")
+        XCTAssertEqual(session.acpModelParameterSelections, [])
+        XCTAssertEqual(fixture.recorder.claudeNativeStartCount, 0)
+        XCTAssertTrue(fixture.recorder.acpRunRequests.isEmpty)
+        let audit = try XCTUnwrap(session.automationTurnAudit.last)
+        XCTAssertEqual(audit.router.decision, .selected)
+        XCTAssertEqual(audit.router.chosenModelRaw, "gemini-3.8-flash-low")
+        XCTAssertEqual(audit.acceptedProviderRaw, AgentProviderKind.antigravity.rawValue)
+        XCTAssertEqual(audit.acceptedModelRaw, "gemini-3.8-flash-low")
+        let stages = await fixture.service.questionNames
+        XCTAssertEqual(stages, ["model_route", "effort_route"])
+
+        try await AsyncTestWait.waitUntil("composer Antigravity dispatch received", timeout: 5) {
+            !fixture.recorder.headlessStarts.isEmpty
+        }
+        XCTAssertEqual(fixture.recorder.headlessStarts, [
+            .init(agent: .antigravity, model: "gemini-3.8-flash-low")
+        ])
+        try await AsyncTestWait.waitUntil("composer Antigravity turn delivered or failed", timeout: 5) {
+            !fixture.recorder.headlessTurns.isEmpty || session.runState == .failed
+        }
+        let deliveredTurns = try fixture.recorder.headlessTurns.map { turn in
+            try RoutedStartDispatchRecorder.DeliveredTurn(
+                agent: turn.agent,
+                model: turn.model,
+                parameters: turn.parameters,
+                message: routedComposerInstruction(in: turn.message)
+            )
+        }
+        XCTAssertEqual(deliveredTurns, [
+            .init(agent: .antigravity, model: "gemini-3.8-flash-low", parameters: [], message: expectedRoutedComposerInstruction(fixture))
+        ])
+    }
+
+    func testComposerRoutedSubmissionKeepsCursorParameters() async throws {
+        let fixture = try await RoutedStartFixture.make(
+            testCase: self, modelClass: "cursor-grok", effortRaw: "xhigh", grokCLIConnected: false,
+            recordTurnDelivery: true
+        )
+        let (viewModel, session, tabID) = try await routedComposerSession(fixture)
+        let claim = try routingClaim(viewModel: viewModel, session: session, text: "Implement a parser")
+
+        let result = await viewModel.submitUserTurnAfterFreshTaskRouting(
+            text: "Implement a parser",
+            claim: claim,
+            session: session,
+            destinationTabID: tabID
+        )
+
+        XCTAssertEqual(result, .submitted)
+        let expected = [RoutedStartFixture.cursorGrokThinking("xhigh")]
+        XCTAssertEqual(session.selectedAgent, .cursor)
+        XCTAssertEqual(session.selectedModelRaw, "grok-4.7")
+        XCTAssertFalse(session.acpModelParameterSelections.isEmpty)
+        XCTAssertEqual(session.acpModelParameterSelections, expected)
+        XCTAssertEqual(viewModel.executableTarget(for: session).modelParameters, expected)
+        XCTAssertEqual(fixture.recorder.claudeNativeStartCount, 0)
+        XCTAssertTrue(fixture.recorder.headlessStarts.isEmpty)
+        let audit = try XCTUnwrap(session.automationTurnAudit.last)
+        XCTAssertEqual(audit.router.decision, .selected)
+        XCTAssertEqual(audit.acceptedProviderRaw, AgentProviderKind.cursor.rawValue)
+        XCTAssertEqual(audit.acceptedModelRaw, "grok-4.7")
+        let stages = await fixture.service.questionNames
+        XCTAssertEqual(stages, ["model_route", "effort_route"])
+
+        try await AsyncTestWait.waitUntil("composer Cursor dispatch received", timeout: 5) {
+            !fixture.recorder.acpRunRequests.isEmpty
+        }
+        XCTAssertEqual(fixture.recorder.acpRunRequests.count, 1)
+        let request = try XCTUnwrap(fixture.recorder.acpRunRequests.first)
+        XCTAssertEqual(request.agentKind, .cursor)
+        XCTAssertEqual(request.modelString, "grok-4.7")
+        XCTAssertEqual(request.modelParameterSelections, expected)
+        try await AsyncTestWait.waitUntil("composer Cursor turn delivered or failed", timeout: 5) {
+            !fixture.recorder.acpTurns.isEmpty || session.runState == .failed
+        }
+        let expectedMessage = expectedRoutedComposerInstruction(fixture)
+        XCTAssertEqual(fixture.recorder.acpTurns, [
+            .init(agent: .cursor, model: "grok-4.7", parameters: expected, message: expectedMessage)
+        ])
+        try await AsyncTestWait.waitUntil("composer Cursor session/prompt received", timeout: 5) {
+            (try? fixture.recorder.receivedCursorTurns().isEmpty) == false
+        }
+        XCTAssertEqual(try fixture.recorder.receivedCursorTurns(), [
+            ["model": "grok-4.7", "reasoning_effort": "xhigh", "message": expectedMessage]
+        ])
+    }
+
+    private func expectedRoutedComposerInstruction(_ fixture: RoutedStartFixture) -> String {
+        """
+        Implement a parser
+        \("")
+        <file_map>
+        \(fixture.workspaceRoot.lastPathComponent)
+        ├── routed_cursor_acp.py
+        ├── settings.json
+        └── settings.json.lock
+        </file_map>
+        """
+    }
+
+    private func routedComposerInstruction(in message: String) throws -> String {
+        guard message.hasPrefix("<previous_conversation>\n") else { return message }
+        let envelope = try NSRegularExpression(
+            pattern: #"\A<previous_conversation>\n.*?\n</previous_conversation>\n\n<current_instruction>\n(.*)\n</current_instruction>\z"#,
+            options: .dotMatchesLineSeparators
+        )
+        let match = try XCTUnwrap(envelope.firstMatch(in: message, range: NSRange(message.startIndex..., in: message)))
+        let instructionRange = try XCTUnwrap(Range(match.range(at: 1), in: message))
+        return String(message[instructionRange])
+    }
+
+    private func routedComposerSession(
+        _ fixture: RoutedStartFixture
+    ) async throws -> (AgentModeViewModel, AgentModeViewModel.TabSession, UUID) {
+        let viewModel = fixture.window.agentModeViewModel
+        let createdTabID = await viewModel.createAndActivateSessionTab()
+        let tabID = try XCTUnwrap(createdTabID)
+        viewModel.test_setCurrentTabIDOverride(tabID)
+        let session = viewModel.session(for: tabID)
+        session.selectedAgent = .claudeCode
+        session.selectedModelRaw = AgentModel.claudeSonnet.rawValue
+        return (viewModel, session, tabID)
+    }
+
     private func makeRoutingViewModel(
         backend: any DecisionService,
         otherBackends: [any DecisionService] = [],
@@ -1634,7 +1777,7 @@ final class AgentSlashCommandSuggestionsTests: XCTestCase {
             testWorkspacePath: root?.path,
             skillCatalog: catalog,
             codexControllerFactory: { _, _, _, _, _, _ in preconditionFailure("Slash suggestions must not start Codex") },
-            headlessProviderFactory: { _, _ in UnsupportedHeadlessAgentProvider(reason: "slash suggestions test") }
+            headlessProviderFactory: { _, _, _, _, _ in UnsupportedHeadlessAgentProvider(reason: "slash suggestions test") }
         )
     }
 }

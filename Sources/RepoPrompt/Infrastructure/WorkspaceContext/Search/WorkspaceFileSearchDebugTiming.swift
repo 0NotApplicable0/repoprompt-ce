@@ -111,8 +111,14 @@
             let materializationNanoseconds: UInt64
             let pathIndexKeyNanoseconds: UInt64
             let pathIndexConstructionNanoseconds: UInt64
+            let filenameURLInputCount: Int
+            let relativeFilenameURLInputCount: Int
+            let explicitNonDirectoryFilenameURLInputCount: Int
+            let storeScalarUTF8BytePairCount: Int
+            let contiguousUTF8MemcmpCallCount: Int
         }
 
+        let recordsBinaryComparisonWork: Bool
         private let lock = NSLock()
         private var filterNanoseconds: UInt64 = 0
         private var sortNanoseconds: UInt64 = 0
@@ -126,6 +132,23 @@
         private var materializationNanoseconds: UInt64 = 0
         private var pathIndexKeyNanoseconds: UInt64 = 0
         private var pathIndexConstructionNanoseconds: UInt64 = 0
+        private var filenameURLInputCount = 0
+        private var relativeFilenameURLInputCount = 0
+        private var explicitNonDirectoryFilenameURLInputCount = 0
+        private var storeScalarUTF8BytePairCount = 0
+        private var contiguousUTF8MemcmpCallCount = 0
+
+        init(recordBinaryComparisonWorkForTesting: Bool = false) {
+            recordsBinaryComparisonWork = recordBinaryComparisonWorkForTesting
+        }
+
+        func recordStoreScalarUTF8BytePairs(_ count: Int) {
+            withLock { storeScalarUTF8BytePairCount += count }
+        }
+
+        func recordContiguousUTF8Memcmp() {
+            withLock { contiguousUTF8MemcmpCallCount += 1 }
+        }
 
         func recordFilter(nanoseconds: UInt64) {
             withLock { filterNanoseconds &+= nanoseconds }
@@ -172,6 +195,14 @@
             withLock { pathIndexConstructionNanoseconds &+= nanoseconds }
         }
 
+        func recordFilenameURLInput(isRelative: Bool, explicitNonDirectory: Bool) {
+            withLock {
+                filenameURLInputCount += 1
+                if isRelative { relativeFilenameURLInputCount += 1 }
+                if explicitNonDirectory { explicitNonDirectoryFilenameURLInputCount += 1 }
+            }
+        }
+
         func snapshot() -> Snapshot {
             withLock {
                 Snapshot(
@@ -186,7 +217,12 @@
                     sortFolderInputCount: sortFolderInputCount,
                     materializationNanoseconds: materializationNanoseconds,
                     pathIndexKeyNanoseconds: pathIndexKeyNanoseconds,
-                    pathIndexConstructionNanoseconds: pathIndexConstructionNanoseconds
+                    pathIndexConstructionNanoseconds: pathIndexConstructionNanoseconds,
+                    filenameURLInputCount: filenameURLInputCount,
+                    relativeFilenameURLInputCount: relativeFilenameURLInputCount,
+                    explicitNonDirectoryFilenameURLInputCount: explicitNonDirectoryFilenameURLInputCount,
+                    storeScalarUTF8BytePairCount: storeScalarUTF8BytePairCount,
+                    contiguousUTF8MemcmpCallCount: contiguousUTF8MemcmpCallCount
                 )
             }
         }

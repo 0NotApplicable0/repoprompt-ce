@@ -34,6 +34,13 @@ enum WorkspaceCodemapGraphOrdering {
     private static func bytesPrecede(_ lhs: UnsafeRawBufferPointer, _ rhs: UnsafeRawBufferPointer) -> Bool {
         let common = Swift.min(lhs.count, rhs.count)
         if common > 0, let left = lhs.baseAddress, let right = rhs.baseAddress {
+            #if DEBUG
+                if let observer = WorkspaceFileSearchDebugContext.catalogBuildObserver,
+                   observer.recordsBinaryComparisonWork
+                {
+                    observer.recordContiguousUTF8Memcmp()
+                }
+            #endif
             let comparison = memcmp(left, right, common)
             if comparison != 0 { return comparison < 0 }
         }

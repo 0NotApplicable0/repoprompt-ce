@@ -1,5 +1,6 @@
 import Combine
 import Foundation
+import MCP
 import RepoPromptDomainRuntime
 import RepoPromptInstrumentation
 import RepoPromptSettingsCore
@@ -188,10 +189,13 @@ final class AgentTabSession: ObservableObject {
         private(set) var test_fullRetentionPayloadMapScannedItemCount = 0
     #endif
 
+    var mcpStartupAttempt: AgentMCPStartAttempt?
+
     /// Run state
     @Published var runState: AgentSessionRunState = .idle {
         didSet {
             guard runState != oldValue else { return }
+            if runState.isTerminalForCommit { mcpStartupAttempt?.runtimeDidSettle() }
             noteMonitorObservationInputsChanged()
             onRunStateChanged?(self)
         }
@@ -1639,6 +1643,8 @@ final class AgentTabSession: ObservableObject {
     /// instruction, applyEditsReview, MCP control, run cancellation) remain
     /// on the VM and are called separately by each teardown path.
     func cancelEphemeralRuntimeState() {
+        mcpStartupAttempt?.cancel()
+        mcpStartupAttempt = nil
         selfCompactNativeCompletion?.cancelRuntimeWork()
         selfCompactNativeCompletion = nil
         // Without its worker, an active request could never settle and would hold overseer delivery,
@@ -2068,6 +2074,9 @@ final class AgentTabSession: ObservableObject {
             retryIntent: retryIntent,
             timestampUptimeNanoseconds: timestampUptimeNanoseconds
         )
+        if case .accepted = result, stage == .running || stage == .waitingForInteraction {
+            mcpStartupAttempt?.runtimeReady(ownership: ownership)
+        }
         recordRunProgressDiagnostic(result, kind: kind, stage: stage)
         return result
     }
@@ -2075,6 +2084,9 @@ final class AgentTabSession: ObservableObject {
     @discardableResult
     func acceptRunProgress(_ signal: AgentRunProgressSignal) -> AgentRunProgressAcceptance {
         let result = runLifecycle.acceptProgress(signal)
+        if case .accepted = result, signal.stage == .running || signal.stage == .waitingForInteraction {
+            mcpStartupAttempt?.runtimeReady(ownership: signal.ownership)
+        }
         recordRunProgressDiagnostic(result, kind: signal.kind, stage: signal.stage)
         return result
     }
@@ -3148,4 +3160,315 @@ final class AgentSessionCreationClaim {
 extension AgentModeViewModel {
     /// Source-compatibility alias for the extracted per-tab session type.
     typealias TabSession = AgentTabSession
+}
+
+@MainActor
+final class AgentMCPStartAttempt {
+    static let acknowledgmentDelay: Duration = .seconds(1)
+    static let startupDeadline: Duration = .seconds(60)
+
+    let target: AgentModeViewModel.MCPSessionTarget
+    private let sessionID: UUID
+    private let session: AgentModeViewModel.TabSession
+    private weak var viewModel: AgentModeViewModel?
+    private let binding: AgentPersistentSessionBindingIdentity?
+    private let priorMCPOriginated: Bool
+    private let name: String?
+    private let now: @Sendable () -> Duration
+    private let sleep: @Sendable (Duration) async throws -> Void
+    private let responseValue: (AgentRunMCPSnapshot) -> Value
+    private var worker: Task<Void, Never>?
+    private var acknowledgmentTask: Task<Void, Never>?
+    private var deadlineTask: Task<Void, Never>?
+    private var continuation: CheckedContinuation<Value, Error>?
+    private var result: Result<Value, Error>?
+    private var terminalState: AgentSessionRunState?
+    private var failureReason: AgentRunMCPSnapshot.FailureReason?
+    private var terminalMessage: String?
+    private var startedSnapshot: AgentRunMCPSnapshot?
+    private var runtimeSettled = false
+    private var runtimeCleanup: (@MainActor () async -> Void)?
+    private var startupWaiters: [UUID: CheckedContinuation<Bool, Never>] = [:]
+    private var startupWaitTimers: [UUID: Task<Void, Never>] = [:]
+    private(set) var isPending = true
+    private(set) var acknowledged = false
+
+    var hasFailed: Bool {
+        terminalState != nil
+    }
+
+    private var ownsTarget: Bool {
+        viewModel?.session(for: target.tabID, createIfNeeded: false) === session
+            && session.activeAgentSessionID == target.sessionID
+            && session.persistentSessionBindingIdentity == binding
+            && session.mcpStartupAttempt === self
+    }
+
+    init(
+        target: AgentModeViewModel.MCPSessionTarget,
+        sessionID: UUID,
+        session: AgentModeViewModel.TabSession,
+        viewModel: AgentModeViewModel,
+        name: String?,
+        now: @escaping @Sendable () -> Duration,
+        sleep: @escaping @Sendable (Duration) async throws -> Void,
+        responseValue: @escaping (AgentRunMCPSnapshot) -> Value
+    ) {
+        self.target = target
+        self.sessionID = sessionID
+        self.session = session
+        self.viewModel = viewModel
+        binding = session.persistentSessionBindingIdentity
+        priorMCPOriginated = session.isMCPOriginated
+        self.name = name
+        self.now = now
+        self.sleep = sleep
+        self.responseValue = responseValue
+    }
+
+    var snapshot: AgentRunMCPSnapshot {
+        AgentRunMCPSnapshot(
+            sessionID: sessionID,
+            runID: session.runID,
+            tabID: target.tabID,
+            sessionName: name,
+            agentRaw: session.selectedAgent.rawValue,
+            agentDisplayName: session.selectedAgent.displayName,
+            modelRaw: session.selectedModelRaw,
+            reasoningEffortRaw: session.selectedReasoningEffortRaw,
+            status: terminalState == .cancelled ? .cancelled : hasFailed ? .failed : .running,
+            statusText: terminalMessage ?? AgentRunMCPSnapshot.startupPendingStatusText,
+            latestAssistantPreview: nil,
+            interaction: nil,
+            transcriptItemCount: session.items.count,
+            updatedAt: Date(),
+            parentSessionID: session.parentSessionID,
+            failureReason: failureReason,
+            worktreeBindings: session.worktreeBindings.map { .init(binding: $0) },
+            appActiveWorktreeMerges: session.worktreeMergeOperations.activeWorktreeMergeSummaries
+        )
+    }
+
+    func run(detach: Bool, operation: @escaping @MainActor () async throws -> Value) async throws -> Value {
+        if Task.isCancelled {
+            await viewModel?.mcpDiscardSessionTarget(target)
+            throw CancellationError()
+        }
+        if session.mcpStartupAttempt?.isPending == true {
+            await viewModel?.mcpDiscardSessionTarget(target)
+            throw MCPError.invalidParams("The Agent session already has an owned startup in progress.")
+        }
+        session.mcpStartupAttempt = self
+        if target.creationHandle != nil || !AgentModeViewModel.isMCPResidentAppOwned(session) {
+            session.isMCPOriginated = true
+        }
+        let admittedAt = now()
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                self.continuation = continuation
+                if detach {
+                    acknowledgmentTask = Task { @MainActor in
+                        do {
+                            try await sleep(max(.zero, admittedAt + Self.acknowledgmentDelay - now()))
+                            guard result == nil, !hasFailed, !Task.isCancelled else { return }
+                            acknowledged = true
+                            reply(.success(responseValue(startedSnapshot ?? snapshot)))
+                        } catch {}
+                    }
+                }
+                deadlineTask = Task { @MainActor in
+                    do {
+                        try await sleep(max(.zero, admittedAt + Self.startupDeadline - now()))
+                        guard !Task.isCancelled else { return }
+                        terminate(state: .failed, reason: .timeout, message: "Agent startup timed out after 60 seconds while routing or provider setup was pending.")
+                    } catch {}
+                }
+                worker = Task { @MainActor in
+                    do {
+                        let value = try await operation()
+                        if !hasFailed {
+                            if detach, isPending { acknowledged = true }
+                            reply(.success(value))
+                        }
+                    } catch {
+                        if isPending, acknowledged {
+                            terminate(state: .failed, reason: .agentError, message: error.localizedDescription)
+                        } else if !hasFailed {
+                            if ownsTarget, !acknowledged { session.isMCPOriginated = priorMCPOriginated }
+                            isPending = false
+                            reply(.failure(error))
+                        }
+                    }
+                    if !hasFailed, !isPending {
+                        finishStartupWaiters()
+                        clearOwner()
+                    }
+                    acknowledgmentTask?.cancel()
+                    acknowledgmentTask = nil
+                    if !isPending {
+                        deadlineTask?.cancel()
+                        deadlineTask = nil
+                    }
+                    worker = nil
+                }
+            }
+        } onCancel: {
+            Task { @MainActor in
+                if self.isPending {
+                    self.terminate(state: .cancelled, reason: .cancelled, message: "Agent startup was cancelled.", responseError: CancellationError())
+                } else {
+                    self.worker?.cancel()
+                    self.reply(.failure(CancellationError()))
+                }
+            }
+        }
+    }
+
+    func instructionSubmitted(snapshot: AgentRunMCPSnapshot) throws {
+        try Task.checkCancellation()
+        guard !hasFailed, ownsTarget, isPending || runtimeSettled else { throw CancellationError() }
+        startedSnapshot = snapshot
+        if runtimeSettled { clearOwner() }
+    }
+
+    func installRuntimeCleanup(ownership: AgentRunOwnership, cleanup: @escaping @MainActor () async -> Void) {
+        guard isPending, ownsTarget, session.isCurrentRunAttemptForCurrentBinding(ownership) else { return }
+        runtimeCleanup = cleanup
+    }
+
+    func runtimeReady(ownership: AgentRunOwnership) {
+        guard session.isCurrentRunAttemptForCurrentBinding(ownership) else { return }
+        runtimeDidSettle()
+    }
+
+    func runtimeDidSettle() {
+        guard isPending, ownsTarget else { return }
+        runtimeSettled = true
+        runtimeCleanup = nil
+        isPending = false
+        deadlineTask?.cancel()
+        deadlineTask = nil
+        finishStartupWaiters()
+        if startedSnapshot != nil { clearOwner() }
+    }
+
+    func cancel() {
+        terminate(state: .cancelled, reason: .cancelled, message: "Agent startup was stopped before provider dispatch.")
+    }
+
+    func prepareForRollback(_ error: Error) {
+        guard isPending else { return }
+        if acknowledged {
+            terminate(state: .failed, reason: .agentError, message: error.localizedDescription)
+        } else {
+            isPending = false
+            cancelTimers()
+            finishStartupWaiters()
+            if ownsTarget { session.isMCPOriginated = priorMCPOriginated }
+            clearOwner()
+        }
+    }
+
+    private func terminate(
+        state: AgentSessionRunState,
+        reason: AgentRunMCPSnapshot.FailureReason,
+        message: String,
+        responseError: Error? = nil
+    ) {
+        guard isPending else { return }
+        isPending = false
+        terminalState = state
+        failureReason = reason
+        terminalMessage = message
+        let cleanup = runtimeCleanup
+        runtimeCleanup = nil
+        cancelTimers()
+        worker?.cancel()
+        worker = nil
+        if ownsTarget, let viewModel {
+            session.stopState.invalidateScheduledStarts()
+            viewModel.mcpAcceptSessionTarget(target)
+            session.mcpFollowUpRunPending = false
+            session.runningStatusText = message
+            session.runState = state
+            session.agentTask?.cancel()
+        }
+        Task { @MainActor [self] in
+            await cleanup?()
+            guard ownsTarget, let viewModel else { return }
+            if let handle = target.creationHandle,
+               await !(viewModel.commitConfiguredSessionCreation(handle: handle)), ownsTarget
+            {
+                terminalMessage = message + " The failed startup could not be saved; retry its initial save or clean up this session."
+                session.runningStatusText = terminalMessage
+            }
+            guard ownsTarget else { return }
+            await viewModel.settleMCPStartupFailure(
+                self, session: session, state: state, reason: reason, message: message
+            )
+        }
+        finishStartupWaiters()
+        if let responseError { reply(.failure(responseError)) }
+        else { reply(.success(responseValue(snapshot))) }
+    }
+
+    func waitUntilSettled(timeoutSeconds: TimeInterval) async -> (settled: Bool, remaining: TimeInterval) {
+        let beganAt = now()
+        let deadline = beganAt + .seconds(timeoutSeconds)
+        let id = UUID()
+        let settled = await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                guard isPending else {
+                    continuation.resume(returning: true)
+                    return
+                }
+                guard !Task.isCancelled else {
+                    continuation.resume(returning: false)
+                    return
+                }
+                startupWaiters[id] = continuation
+                startupWaitTimers[id] = Task { @MainActor in
+                    do {
+                        try await sleep(max(.zero, deadline - now()))
+                        guard !Task.isCancelled else { return }
+                        finishStartupWaiter(id, settled: false)
+                    } catch {}
+                }
+            }
+        } onCancel: {
+            Task { @MainActor in self.finishStartupWaiter(id, settled: false) }
+        }
+        let remaining = max(.zero, deadline - now()).components
+        return (settled, Double(remaining.seconds) + Double(remaining.attoseconds) / 1e18)
+    }
+
+    private func finishStartupWaiter(_ id: UUID, settled: Bool) {
+        startupWaitTimers.removeValue(forKey: id)?.cancel()
+        startupWaiters.removeValue(forKey: id)?.resume(returning: settled)
+    }
+
+    private func finishStartupWaiters() {
+        for id in Array(startupWaiters.keys) {
+            finishStartupWaiter(id, settled: true)
+        }
+    }
+
+    private func reply(_ result: Result<Value, Error>) {
+        guard self.result == nil else { return }
+        self.result = result
+        continuation?.resume(with: result)
+        continuation = nil
+    }
+
+    private func cancelTimers() {
+        acknowledgmentTask?.cancel()
+        acknowledgmentTask = nil
+        deadlineTask?.cancel()
+        deadlineTask = nil
+    }
+
+    private func clearOwner() {
+        guard session.mcpStartupAttempt === self else { return }
+        session.mcpStartupAttempt = nil
+    }
 }

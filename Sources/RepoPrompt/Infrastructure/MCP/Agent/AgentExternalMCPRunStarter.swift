@@ -257,12 +257,15 @@ enum AgentExternalMCPRunStarter {
             #endif
             return StartOutcome(snapshot: snapshot, delivery: delivery)
         } catch {
+            activatedSession?.mcpStartupAttempt?.prepareForRollback(error)
             agentModeVM.failSessionCreation(
                 target.creationHandle,
                 message: "This session did not finish preparing its first run. Create a new session."
             )
             if let activatedSession,
                agentModeVM.session(for: target.tabID, createIfNeeded: false) === activatedSession,
+               activatedSession.mcpStartupAttempt?.acknowledged != true,
+               activatedSession.mcpStartupAttempt?.hasFailed != true,
                activatedSession.mcpControlContext == ownedActivation
             {
                 _ = await agentModeVM.mcpDeactivateOwnedControlContext(

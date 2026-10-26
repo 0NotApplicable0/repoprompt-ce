@@ -37,7 +37,208 @@ struct WindowSessionCaptureCandidate {
 
 struct WindowOpenRequest: Equatable {
     let id: UUID
-    let waiterID: UUID
+    let refreshDeferralID: UUID?
+    let parkOnOpen: Bool
+    var consumesRestoreEntry = true
+}
+
+struct ClaimedWindowOpenRequest {
+    let request: WindowOpenRequest
+    let parkHandle: WindowParkOnOpenHandle?
+}
+
+struct WindowOpenResult {
+    let window: WindowState
+    let requestID: UUID?
+    let parkHandle: WindowParkOnOpenHandle?
+}
+
+/// One time source defines the park deadline for both attach admission and the outcome wait.
+struct WindowParkOnOpenClock {
+    var now: @MainActor () -> TimeInterval
+    var sleep: @MainActor (TimeInterval) async throws -> Void
+
+    static let system = WindowParkOnOpenClock(
+        now: { ProcessInfo.processInfo.systemUptime },
+        sleep: { try await Task.sleep(nanoseconds: UInt64(max($0, 0) * 1_000_000_000)) }
+    )
+}
+
+/// Owns one agent-opened window's park outcome: one absolute deadline, at most one outcome
+/// continuation and at most one timeout task. The coordinator alone parks and unparks.
+@MainActor
+final class WindowParkOnOpenHandle {
+    static let parkDeadline: TimeInterval = 5
+
+    enum Phase: Equatable {
+        case pending, parked, timedOut, abandoned
+    }
+
+    enum Outcome: Equatable {
+        case parked, timedOut
+    }
+
+    private let clock: WindowParkOnOpenClock
+    private let park: @MainActor (Int) -> Bool
+    private let unpark: @MainActor (Int) -> Void
+    private(set) var phase: Phase = .pending
+    private(set) var windowID: Int?
+    private(set) var deadline: TimeInterval?
+    private var outcomeContinuation: CheckedContinuation<Outcome, Error>?
+    private var timeoutTask: Task<Void, Never>?
+    private var timeoutToken: UUID?
+    private(set) var didReveal = false
+
+    init(
+        clock: WindowParkOnOpenClock,
+        park: @escaping @MainActor (Int) -> Bool = { FleetParkingCoordinator.shared.park(windowID: $0, reason: .onOpen) },
+        unpark: @escaping @MainActor (Int) -> Void = { FleetParkingCoordinator.shared.unpark(windowID: $0) }
+    ) {
+        self.clock = clock
+        self.park = park
+        self.unpark = unpark
+    }
+
+    deinit {
+        timeoutTask?.cancel()
+    }
+
+    var hasActiveWaiter: Bool {
+        outcomeContinuation != nil || timeoutTask != nil
+    }
+
+    func markRegistered(windowID: Int) {
+        guard self.windowID == nil else { return }
+        self.windowID = windowID
+        deadline = clock.now() + Self.parkDeadline
+    }
+
+    /// Parks only while pending, registered and strictly before the deadline; the deadline instant is late.
+    func attemptParkIfAdmitted() {
+        guard phase == .pending, let windowID, let deadline else { return }
+        guard clock.now() < deadline else {
+            settle(.timedOut)
+            return
+        }
+        if park(windowID) {
+            settle(.parked)
+        }
+    }
+
+    func awaitOutcome() async throws -> Outcome {
+        try Task.checkCancellation()
+        switch phase {
+        case .parked: return .parked
+        case .timedOut: return .timedOut
+        case .abandoned: throw CancellationError()
+        case .pending: break
+        }
+        let remaining = (deadline ?? clock.now()) - clock.now()
+        guard remaining > 0 else {
+            settle(.timedOut)
+            return .timedOut
+        }
+        return try await withCheckedThrowingContinuation { continuation in
+            guard !Task.isCancelled else {
+                settle(.abandoned)
+                continuation.resume(throwing: CancellationError())
+                return
+            }
+            outcomeContinuation = continuation
+            let token = UUID()
+            timeoutToken = token
+            timeoutTask = Task { [weak self, clock] in
+                do { try await clock.sleep(remaining) } catch { return }
+                self?.timeoutFired(token: token)
+            }
+        }
+    }
+
+    /// Cancels a pending outcome, or reveals an already parked window once.
+    func cancelOwned() {
+        if phase == .parked {
+            revealParkedOnce()
+        } else {
+            settle(.abandoned)
+        }
+    }
+
+    func revealParkedOnce() {
+        guard phase == .parked, !didReveal, let windowID else { return }
+        didReveal = true
+        unpark(windowID)
+    }
+
+    private func timeoutFired(token: UUID) {
+        guard token == timeoutToken, phase == .pending else { return }
+        settle(.timedOut)
+    }
+
+    private func settle(_ newPhase: Phase) {
+        guard phase == .pending else { return }
+        phase = newPhase
+        let continuation = outcomeContinuation
+        outcomeContinuation = nil
+        timeoutTask?.cancel()
+        timeoutTask = nil
+        timeoutToken = nil
+        switch newPhase {
+        case .parked: continuation?.resume(returning: .parked)
+        case .timedOut: continuation?.resume(returning: .timedOut)
+        case .abandoned, .pending: continuation?.resume(throwing: CancellationError())
+        }
+    }
+}
+
+/// Route-local owner of a new agent window: allocated before opening, covers waiting, adoption
+/// and every later await of the route. Before adoption the manager owns delivery.
+@MainActor
+final class WindowParkOnOpenScope {
+    let requestID = UUID()
+    private unowned let manager: WindowStatesManager
+    private var handle: WindowParkOnOpenHandle?
+    private var isAdopted = false
+    private(set) var adoptedWindowID: Int?
+    private(set) var isCancelled = false
+
+    init(manager: WindowStatesManager) {
+        self.manager = manager
+    }
+
+    func cancel() {
+        guard !isCancelled else { return }
+        isCancelled = true
+        if isAdopted {
+            handle?.cancelOwned()
+        } else {
+            manager.cancelOpen(requestID: requestID)
+        }
+    }
+
+    func adopt() throws -> WindowState {
+        let result = try manager.adoptOpen(requestID: requestID)
+        isAdopted = true
+        adoptedWindowID = result.window.windowID
+        handle = result.parkHandle
+        if isCancelled || Task.isCancelled {
+            handle?.cancelOwned()
+            // The route caller never receives the window, so its deferral `defer` will not run.
+            result.window.agentModeViewModel.finishInitialSystemWorkspaceSessionListRefreshDeferral(refreshIfStillSystem: true)
+            throw CancellationError()
+        }
+        return result.window
+    }
+
+    func requireParked(windowID: Int) async throws {
+        try Task.checkCancellation()
+        guard let handle else { return }
+        switch try await handle.awaitOutcome() {
+        case .parked:
+            try Task.checkCancellation()
+        case .timedOut:
+            throw WindowOpenError.notParked(windowID: windowID)
+        }
+    }
 }
 
 enum WindowSessionSnapshotBuilder {
@@ -842,20 +1043,7 @@ class WindowStatesManager: ObservableObject {
                     let applyStartMS = WorkspaceRestorePerfLog.timestampMSIfEnabled()
                 #endif
 
-                // Seed instance-number state from snapshot for deterministic restore
-                self.preseedInstanceNumberState(from: snapshot)
-
-                self.restoreQueue = entries
-                // Count every restore entry as in-progress before handing any out, so
-                // entries destined for windows that have not registered yet keep the
-                // persistence gate held (multi-window crash restore).
-                self.restorePersistenceGate.finishRestoreSessionLoad(pendingEntryCount: entries.count)
-                if !entries.isEmpty {
-                    self.applyRestoreEntriesIfPossible()
-                }
-                self.flushDeferredWindowSessionPersistIfRestoreIdle()
-                self.scheduleLeftoverRestoreEntryGraceReleaseIfNeeded()
-                self.updateAgentSessionOversightTopologyState()
+                self.installRestoreEntries(entries, snapshot: snapshot)
                 #if DEBUG
                     if let applyStartMS {
                         WorkspaceRestorePerfLog.log(
@@ -865,6 +1053,23 @@ class WindowStatesManager: ObservableObject {
                 #endif
             }
         }
+    }
+
+    private func installRestoreEntries(_ entries: [WindowSessionEntry], snapshot: WindowSessionSnapshot?) {
+        // Seed instance-number state from snapshot for deterministic restore
+        preseedInstanceNumberState(from: snapshot)
+
+        restoreQueue = entries
+        // Count every restore entry as in-progress before handing any out, so
+        // entries destined for windows that have not registered yet keep the
+        // persistence gate held (multi-window crash restore).
+        restorePersistenceGate.finishRestoreSessionLoad(pendingEntryCount: entries.count)
+        if !entries.isEmpty {
+            applyRestoreEntriesIfPossible()
+        }
+        flushDeferredWindowSessionPersistIfRestoreIdle()
+        scheduleLeftoverRestoreEntryGraceReleaseIfNeeded()
+        updateAgentSessionOversightTopologyState()
     }
 
     /// Pre-seeds instance number state from a loaded session snapshot.
@@ -900,23 +1105,23 @@ class WindowStatesManager: ObservableObject {
 
     // MARK: - Programmatic Window Creation
 
-    /// Opens a new main window and waits for it to be registered.
-    ///
-    /// This method uses `AppWindowOpener` to trigger SwiftUI's `openWindow(id: "main")`,
-    /// then waits for the new window to appear in `allWindows`.
-    ///
-    /// - Returns: The newly created `WindowState`
-    /// - Throws: `WindowOpenError.openerUnavailable` if no opener is installed
-    func openNewMainWindow(deferringInitialAgentSystemWorkspaceRefresh: Bool = false) async throws -> WindowState {
+    /// Opens a new main window, waits for registration, and returns it; throws `WindowOpenError.openerUnavailable` without an opener.
+    func openNewMainWindow(
+        deferringInitialAgentSystemWorkspaceRefresh: Bool = false,
+        parkOnOpen: Bool = false,
+        consumesRestoreEntry: Bool = true,
+        requestID: UUID = UUID()
+    ) async throws -> WindowOpenResult {
+        if parkOnOpen { try Task.checkCancellation() }
         // Capture existing window IDs to identify the new one
         let excludeWindowIDs = Set(allWindows.map(\.windowID))
-        let waiterID = UUID()
-        let refreshDeferral = deferringInitialAgentSystemWorkspaceRefresh
-            ? WindowInitialRefreshDeferral(id: UUID(), waiterID: waiterID)
-            : nil
-        if let refreshDeferral {
-            pendingInitialRefreshDeferrals.append(refreshDeferral)
-        }
+        let request = WindowOpenRequest(
+            id: requestID,
+            refreshDeferralID: deferringInitialAgentSystemWorkspaceRefresh ? UUID() : nil,
+            parkOnOpen: parkOnOpen,
+            consumesRestoreEntry: consumesRestoreEntry
+        )
+        let handle = parkOnOpen ? WindowParkOnOpenHandle(clock: parkOnOpenClock) : nil
 
         // Wait for the new window to be registered
         let result = try await withTaskCancellationHandler {
@@ -1000,7 +1205,6 @@ class WindowStatesManager: ObservableObject {
     }
 
     private func cleanupInitialRefreshDeferral(waiterID: UUID, reason: String) {
-        clearPendingInitialRefreshDeferral(waiterID: waiterID)
         let claimedWindows = allWindows.filter { $0.claimedInitialRefreshDeferralWaiterID == waiterID }
         for window in claimedWindows {
             #if DEBUG
@@ -1031,9 +1235,10 @@ class WindowStatesManager: ObservableObject {
               case let .waiting(continuation) = openOperations[index].delivery
         else { return }
 
-        let waiter = windowOpenWaiters.remove(at: index)
-        if waiter.defersInitialAgentSystemWorkspaceRefresh {
-            verifyInitialRefreshDeferralClaim(waiter: waiter, newState: newState)
+        let operation = openOperations[index]
+        if !operation.request.consumesRestoreEntry { newState.declineLaunchRestoreEntries() }
+        if operation.request.refreshDeferralID != nil {
+            verifyInitialRefreshDeferralClaim(request: operation.request, newState: newState)
         }
         operation.handle?.markRegistered(windowID: newState.windowID)
         let result = WindowOpenResult(window: newState, requestID: operation.request.id, parkHandle: operation.handle)
@@ -1055,7 +1260,6 @@ class WindowStatesManager: ObservableObject {
             if let index = openOperations.firstIndex(where: { $0.request.id == claimedID && isOpen($0) }) {
                 return index
             }
-
             cleanupClaimedInitialRefreshDeferral(
                 for: newState,
                 reason: "noMatchingClaimedWindowOpenWaiter"
@@ -1102,7 +1306,8 @@ class WindowStatesManager: ObservableObject {
     }
 
     private func applyNextRestoreEntryIfAvailable(to state: WindowState) {
-        guard !restoreQueue.isEmpty else { return }
+        // routed windows never take launch-restore entries
+        guard state.acceptsLaunchRestoreEntries, !restoreQueue.isEmpty else { return }
         let entry = restoreQueue.removeFirst()
         #if DEBUG
             WorkspaceRestorePerfLog.log(
@@ -1508,6 +1713,46 @@ class WindowStatesManager: ObservableObject {
             restoredInstanceNumbersByWorkspace = state.restored
             return previous
         }
+
+        func deliverRestoreSessionForTesting(_ snapshot: WindowSessionSnapshot?) {
+            hasLoadedRestoreSession = true
+            restorePersistenceGate.beginRestoreSessionLoad()
+            installRestoreEntries(snapshot?.windows.filter { !$0.isEphemeral } ?? [], snapshot: snapshot)
+            leftoverRestoreEntryGraceTask?.cancel()
+        }
+
+        var restoreQueueCountForTesting: Int {
+            restoreQueue.count
+        }
+
+        var restoreGateStateForTesting: (pendingEntryCount: Int, restoringWindowIDs: Set<Int>) {
+            (restorePersistenceGate.pendingRestoreEntryCount, restorePersistenceGate.restoringWindowIDs)
+        }
+
+        var isRestoreStateColdForTesting: Bool {
+            restoreQueue.isEmpty && !restorePersistenceGate.isRestoreSessionLoadPending && restorePersistenceGate.pendingRestoreEntryCount == 0 && restorePersistenceGate.restoringWindowIDs.isEmpty && leftoverRestoreEntryGraceTask == nil
+        }
+
+        /// Requires `isRestoreStateColdForTesting`; the caller skips the body otherwise.
+        func withIsolatedRestoreStateForTesting<T>(_ body: () async throws -> T) async throws -> T {
+            let saved = (restoreQueue, hasLoadedRestoreSession, restorePersistenceGate, abandonedRestoreEntryCount, initialWindowRestoreCompletion, agentSessionOversightRestoreTopologyState, afterOpenResultGateForTesting, afterOpenAdoptionGateForTesting, replaceInstanceAllocatorStateForTesting())
+            restoreQueue = []
+            restorePersistenceGate = WindowSessionRestorePersistenceGate()
+            abandonedRestoreEntryCount = 0
+            initialWindowRestoreCompletion = nil
+            agentSessionOversightRestoreTopologyState = .pending
+            afterOpenResultGateForTesting = nil
+            afterOpenAdoptionGateForTesting = nil
+            let outcome: Result<T, Error>
+            do { outcome = try await .success(body()) } catch { outcome = .failure(error) }
+            let grace = leftoverRestoreEntryGraceTask
+            grace?.cancel()
+            await grace?.value
+            leftoverRestoreEntryGraceTask = nil
+            (restoreQueue, hasLoadedRestoreSession, restorePersistenceGate, abandonedRestoreEntryCount, initialWindowRestoreCompletion, agentSessionOversightRestoreTopologyState, afterOpenResultGateForTesting, afterOpenAdoptionGateForTesting, _) = saved
+            replaceInstanceAllocatorStateForTesting(saved.8)
+            return try outcome.get()
+        }
     #endif
 
     /// Cancels Combine subscriptions and clears state that could trigger updates during shutdown.
@@ -1598,7 +1843,6 @@ class WindowStatesManager: ObservableObject {
         await providerQuotaRuntime.claudeTelemetry.shutdown()
         await OpenCodeACPModelPollingService.shared.shutdown()
         await CursorACPModelPollingService.shared.shutdown()
-        await GrokBuildACPModelPollingService.shared.shutdown()
     }
 
     private func deduplicatedWindows(_ windows: [WindowState]) -> [WindowState] {

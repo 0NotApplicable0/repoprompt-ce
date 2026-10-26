@@ -121,6 +121,9 @@ final class ClaudeIntegratedAgentModeRunner {
             return
         }
         let ownership = session.beginRunAttempt(source: "claudeNative")
+        session.mcpStartupAttempt?.installRuntimeCleanup(ownership: ownership) { [weak session] in
+            await Self.cancelAttemptLease(lease, session: session, runID: runID)
+        }
         session.installRunAttemptTerminalResources(ownership: ownership) { [weak session] terminalState in
             {
                 switch terminalState {
@@ -218,7 +221,10 @@ final class ClaudeIntegratedAgentModeRunner {
                         // policy re-armed; the lease that installed it still owns it here.
                         reinstallRunRoutingPolicy: { await lease.reinstallPolicyForReplacementProcess() }
                     )
-                    if sendOutcome == .sent { session.settleLocalComposerOrigin(localComposerCandidate, disposition: .retained) }
+                    if sendOutcome == .sent {
+                        session.mcpStartupAttempt?.runtimeReady(ownership: ownership)
+                        session.settleLocalComposerOrigin(localComposerCandidate, disposition: .retained)
+                    }
                     if let dedicatedNoteID, sendOutcome != .sent {
                         AgentSelfCompactParkedPrefix.reparkUnattemptedDedicatedNote(dedicatedNoteID, session: session) {
                             self.hooks.persistence.scheduleSave(session)
@@ -520,6 +526,7 @@ final class ClaudeIntegratedAgentModeRunner {
         ownership: AgentRunOwnership,
         attachmentReservationID: UUID?
     ) async {
+        guard session.mcpStartupAttempt?.hasFailed != true else { return }
         hooks.providerInput.recordPendingHandoffSendOutcome(session, false)
         await terminalCommitBarrier.commit(.init(
             binding: hooks.bindTerminalSession(session),
@@ -546,7 +553,8 @@ final class ClaudeIntegratedAgentModeRunner {
         notifyTurnComplete: Bool,
         shouldShutdownSession: Bool = false
     ) async -> AgentRunTerminalCommitRevision? {
-        await terminalCommitBarrier.commit(.init(
+        guard session.mcpStartupAttempt?.hasFailed != true else { return nil }
+        return await terminalCommitBarrier.commit(.init(
             binding: hooks.bindTerminalSession(session),
             ownership: ownership,
             expectedRunID: runID,

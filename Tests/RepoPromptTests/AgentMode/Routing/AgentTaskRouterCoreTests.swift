@@ -1498,7 +1498,19 @@ final class RoutingModelProfileResolverTests: XCTestCase {
         let resolver = RoutingModelProfileResolver.bundled
         let document = try XCTUnwrap(resolver.document)
         XCTAssertEqual(document.schemaVersion, 1)
-        XCTAssertEqual(document.models.count, 17)
+        XCTAssertEqual(document.models.count, 22)
+        let addedProfiles: [(AgentProviderKind, String, String)] = [
+            (.antigravity, "gemini-3.8-flash", "gemini-flash"),
+            (.antigravity, "gemini-3.1-pro", "gemini-pro"),
+            (.grok, "grok-4.7", "grok"),
+            (.cursor, "grok-4.7", "cursor-grok"),
+            (.cursor, "composer-2.5", "composer")
+        ]
+        for (provider, modelID, utilityTier) in addedProfiles {
+            let profile = resolver.resolve(model(modelID, provider: provider), catalogRevision: "catalog-1", now: date)
+            XCTAssertEqual(profile.match, .exact, "\(provider.rawValue):\(modelID)")
+            XCTAssertEqual(profile.utilityTier.value, utilityTier)
+        }
         let luna = resolver.resolve(model("gpt-6-luna"), catalogRevision: "catalog-1", now: date)
         XCTAssertEqual(luna.match, .exact)
         XCTAssertTrue(luna.description(snapshotDate: resolver.snapshotDate).contains("$0.10 input / $0.50 output"))

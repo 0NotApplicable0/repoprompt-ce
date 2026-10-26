@@ -9,6 +9,166 @@ import RepoPromptSettingsCore
 
     final class PersistedMCPRoutingIdentityTests: XCTestCase {
         @MainActor
+        func testGrokSessionMCPConnectionRoutesToItsWindowWithMultipleWindows() async throws {
+            let fixture = try await makeGrokRoutingFixture()
+            let manager = ServerNetworkManager.shared
+            let clientName = "grok-shell-RepoPromptCE"
+            await manager.registerExpectedAgentPID(getppid(), for: AgentProviderKind.grokMCPClientID, runID: fixture.runID)
+            addTeardownBlock { @MainActor in
+                await manager.clearExpectedAgentPID(getppid(), for: AgentProviderKind.grokMCPClientID, runID: fixture.runID)
+            }
+            let connection = try await makeProductionMCPConnection(
+                networkManager: manager,
+                clientName: clientName,
+                sessionToken: "grok-routing-\(fixture.runID)",
+                requireAppManagedAdmission: true
+            )
+            addTeardownBlock { await connection.cleanup() }
+
+            let completed = await manager.debugCompleteApprovedAgentInitialization(
+                clientName: clientName,
+                connectionID: connection.connectionID,
+                sessionToken: "grok-routing-\(fixture.runID)",
+                clientPid: Int(getpid())
+            )
+            XCTAssertTrue(completed)
+            let result = try await connection.client.callTool(
+                name: "get_file_tree",
+                arguments: ["type": .string("files"), "max_depth": .int(1)]
+            )
+            XCTAssertNotEqual(result.isError, true, toolText(result))
+            XCTAssertTrue(toolText(result).contains("GrokRoutingTarget.swift"), toolText(result))
+            XCTAssertFalse(toolText(result).contains("GrokRoutingOther.swift"), toolText(result))
+            let bound = try XCTUnwrap(fixture.window.mcpServer.tabContextByConnectionID[connection.connectionID])
+            XCTAssertEqual(bound.windowID, fixture.window.windowID)
+            XCTAssertEqual(bound.workspaceID, fixture.workspaceID)
+            XCTAssertEqual(bound.tabID, fixture.tabID)
+            XCTAssertEqual(bound.runID, fixture.runID)
+            XCTAssertNotEqual(fixture.window.workspaceManager.activeWorkspace?.activeComposeTabID, fixture.tabID)
+            let selectedWindow = await manager.selectedWindow(for: connection.connectionID)
+            XCTAssertEqual(selectedWindow, fixture.window.windowID)
+        }
+
+        @MainActor
+        func testUnverifiedGrokNamedConnectionIsNotRouted() async throws {
+            let fixture = try await makeGrokRoutingFixture()
+            let manager = ServerNetworkManager.shared
+            let clientName = "grok-shell-RepoPromptCE"
+            let token = "unverified-grok-\(fixture.runID)"
+            let connection = try await makeProductionMCPConnection(
+                networkManager: manager,
+                clientName: clientName,
+                sessionToken: token
+            )
+            addTeardownBlock { await connection.cleanup() }
+
+            let admitted = await manager.authorizeAutomaticAppManagedAgentAdmission(
+                connectionID: connection.connectionID,
+                clientName: clientName,
+                verifiedBundledHelperPID: -1
+            )
+            XCTAssertFalse(admitted)
+            let completed = await manager.debugCompleteApprovedAgentInitialization(
+                clientName: clientName,
+                connectionID: connection.connectionID,
+                sessionToken: token,
+                clientPid: Int(getpid())
+            )
+            XCTAssertFalse(completed)
+            let result = try await connection.client.callTool(
+                name: "get_file_tree",
+                arguments: ["type": .string("files"), "max_depth": .int(1)]
+            )
+            XCTAssertEqual(result.isError, true, toolText(result))
+            XCTAssertNil(fixture.window.mcpServer.tabContextByConnectionID[connection.connectionID])
+            XCTAssertNil(fixture.window.mcpServer.connectionID(forRunID: fixture.runID))
+            let selectedWindow = await manager.selectedWindow(for: connection.connectionID)
+            XCTAssertNil(selectedWindow)
+            XCTAssertEqual(
+                fixture.window.mcpServer.pendingContextQueueLength(
+                    clientName: AgentProviderKind.grokMCPClientID,
+                    windowID: fixture.window.windowID
+                ),
+                1
+            )
+        }
+
+        @MainActor
+        private func makeGrokRoutingFixture() async throws -> (
+            window: WindowState, workspaceID: UUID, tabID: UUID, runID: UUID
+        ) {
+            let manager = ServerNetworkManager.shared
+            let previousWindows = WindowStatesManager.shared.allWindows
+            addTeardownBlock { @MainActor in
+                await manager.debugRestorePersistedRoutingFixtureForTesting()
+                WindowStatesManager.shared.allWindows = previousWindows
+            }
+            await manager.debugInstallPersistedRoutingFixtureForTesting(records: [])
+            WindowStatesManager.shared.allWindows = []
+            let root = FileManager.default.temporaryDirectory.appendingPathComponent("GrokMCPRouting-\(UUID())")
+            try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+            addTeardownBlock { try? FileManager.default.removeItem(at: root) }
+            var windows: [WindowState] = []
+            for name in ["Target", "Other"] {
+                let directory = root.appendingPathComponent(name)
+                try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+                try "struct GrokRouting\(name) {}\n".write(
+                    to: directory.appendingPathComponent("GrokRouting\(name).swift"),
+                    atomically: true,
+                    encoding: .utf8
+                )
+                let window = try await makeWindow(activeWorkspace: workspace(name: "Grok \(name)", root: directory.path))
+                windows.append(window)
+                addTeardownBlock { @MainActor in
+                    _ = await window.mcpServer.setWindowToolsEnabled(false)
+                    WindowStatesManager.shared.allWindows.removeAll { $0 === window }
+                    WindowStatesManager.shared.clearInstanceAssignment(forWindowID: window.windowID)
+                    if !window.isClosing {
+                        await window.tearDown()
+                    }
+                }
+            }
+            WindowStatesManager.shared.allWindows = windows
+            try await AppGlobalMCPServiceComposition.shared.ensureRegistered()
+            for window in windows {
+                let enabled = await window.mcpServer.setWindowToolsEnabled(true)
+                XCTAssertTrue(enabled)
+            }
+            let window = windows[0]
+            let workspaceID = try XCTUnwrap(window.workspaceManager.activeWorkspace?.id)
+            let backgroundTab = await window.promptManager.createBackgroundComposeTab(strategy: .blank, name: "Grok run")
+            let tab = try XCTUnwrap(backgroundTab)
+            let runID = UUID()
+            window.mcpServer.installTabContext(
+                clientID: nil,
+                clientName: AgentProviderKind.grokMCPClientID,
+                windowID: window.windowID,
+                workspaceID: workspaceID,
+                snapshot: tab,
+                runID: runID
+            )
+            await manager.installClientConnectionPolicy(
+                for: AgentProviderKind.grokMCPClientID,
+                windowID: window.windowID,
+                restrictedTools: [],
+                oneShot: true,
+                ttl: 60,
+                runID: runID,
+                purpose: .agentModeRun,
+                requiresExpectedAgentPID: true
+            )
+            addTeardownBlock { @MainActor in
+                await manager.clearClientConnectionPolicy(
+                    for: AgentProviderKind.grokMCPClientID,
+                    windowID: window.windowID,
+                    runID: runID
+                )
+                await manager.cleanupRunRoutingState(for: runID, windowID: window.windowID)
+            }
+            return (window, workspaceID, tab.id, runID)
+        }
+
+        @MainActor
         func testAppManagedAdmissionRequiresObservedHelperAndCurrentRunOwnership() async throws {
             let manager = ServerNetworkManager(domainHost: AppDomainRuntimeComposition.shared.runtime.domainHost)
             let previousAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
