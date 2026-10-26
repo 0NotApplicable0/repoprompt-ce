@@ -5584,6 +5584,12 @@ class PromptViewModel: ObservableObject {
         await tokenCountingViewModel.stopTokenCountUpdateTimer()
     }
 
+    func tearDown() async {
+        cancellables.removeAll()
+        apiSettingsCancellables.removeAll()
+        await stopTokenCountUpdateTimer()
+    }
+
     private func configureTokenCountingViewModel() {
         tokenCountingViewModel.configure(
             fileManager: fileManager,

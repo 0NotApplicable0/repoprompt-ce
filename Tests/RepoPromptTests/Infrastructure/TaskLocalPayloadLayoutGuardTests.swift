@@ -32,6 +32,7 @@ final class TaskLocalPayloadLayoutGuardTests: XCTestCase {
         "Sources/RepoPrompt/Infrastructure/MCP/MCPToolWorkCountDiagnostics.swift#currentGitCapture": "final class",
         "Sources/RepoPrompt/Infrastructure/MCP/MCPToolWorkCountDiagnostics.swift#currentReadFileCapture": "final class",
         "Sources/RepoPrompt/Infrastructure/MCP/MCPInvocationContext.swift#diagnosticSink": "closure",
+        "Sources/RepoPrompt/Infrastructure/MCP/WindowRoutingService.swift#scope": "final class",
         "Sources/RepoPrompt/Infrastructure/MCP/MCPToolObserverDiagnostics.swift#recorder": "final class",
         "Sources/RepoPrompt/Infrastructure/WorkspaceContext/Search/WorkspaceFileSearchDebugTiming.swift#collector": "final class",
         "Sources/RepoPrompt/Infrastructure/WorkspaceContext/Search/WorkspaceFileSearchDebugTiming.swift#catalogBuildObserver":

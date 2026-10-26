@@ -26,7 +26,7 @@ struct AdvancedSettingsView: View {
     @ObservedObject var fileManager: WorkspaceFilesViewModel
     @ObservedObject var promptViewModel: PromptViewModel
     @ObservedObject private var globalSettings = GlobalSettingsStore.shared
-    let windowState: WindowState
+    let windowID: Int?
 
     private var historyIdleThresholdDoubleBinding: Binding<Double> {
         Binding(
@@ -93,11 +93,11 @@ struct AdvancedSettingsView: View {
     init(
         fileManager: WorkspaceFilesViewModel,
         promptViewModel: PromptViewModel,
-        windowState: WindowState
+        windowID: Int?
     ) {
         self.fileManager = fileManager
         self.promptViewModel = promptViewModel
-        self.windowState = windowState
+        self.windowID = windowID
     }
 
     var body: some View {
@@ -316,7 +316,7 @@ struct AdvancedSettingsView: View {
                 NotificationCenter.default.post(
                     name: .showKeyboardShortcutsSettingsTab,
                     object: nil,
-                    userInfo: ["windowID": windowState.windowID]
+                    userInfo: windowID.map { ["windowID": $0] }
                 )
             }
             .buttonStyle(CustomButtonStyle())

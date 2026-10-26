@@ -253,6 +253,10 @@ class WindowState: ObservableObject {
         }
     }
 
+    private var windowCloseCleanupClaimed = false
+    private weak var nativeCloseObservedWindow: NSWindow?
+    private var nativeCloseCancellable: AnyCancellable?
+
     private var focusCancellables = Set<AnyCancellable>()
     private weak var focusObservedWindow: NSWindow?
 
@@ -308,6 +312,10 @@ class WindowState: ObservableObject {
 
     /// Reference to the NSWindow this state is associated with
     weak var nsWindow: NSWindow?
+    private weak var accessorAttachmentSource: AnyObject?
+    #if DEBUG
+        var test_beforePostActivationReveal: (@MainActor () -> Void)?
+    #endif
     private var windowDelegateProxy: InterceptingWindowDelegateProxy?
 
     // MARK: - Agent Mode Titlebar Accessory
@@ -550,6 +558,13 @@ class WindowState: ObservableObject {
         isClosing || WindowStatesManager.shared.isTerminating
     }
 
+    func claimWindowCloseCleanup() -> Bool {
+        guard !windowCloseCleanupClaimed else { return false }
+        windowCloseCleanupClaimed = true
+        removeNativeCloseObserver()
+        return true
+    }
+
     func beginClose(preservingOversightIntent: Bool = true) {
         guard !isClosing else { return }
         let manager = windowStatesManager ?? WindowStatesManager.shared
@@ -558,6 +573,7 @@ class WindowState: ObservableObject {
         }
         if !isPreparedSessionOwner { manager.detachPreparedRuntimeCarriers(from: self) }
         isClosing = true
+        FleetParkingCoordinator.shared.clearIfParked(windowID: windowID)
         failUnstartedCommandsForWindowClose()
 
         if !manager.isTerminating, !isPreparedSessionOwner {
@@ -593,6 +609,12 @@ class WindowState: ObservableObject {
     private var restoreLifetime = WindowRestoreLifetime()
     private(set) var claimedInitialRefreshDeferralID: UUID?
     private(set) var claimedInitialRefreshDeferralWaiterID: UUID?
+    private(set) var claimedOpenRequestID: UUID?
+    private(set) var parkOnOpenHandle: WindowParkOnOpenHandle?
+    /// True while this window's park-on-open outcome is undecided; the accessor delivers its attach early only then.
+    var holdsPendingParkIntent: Bool {
+        parkOnOpenHandle?.phase == .pending
+    }
 
     // MARK: - Initialization
 
@@ -606,13 +628,20 @@ class WindowState: ObservableObject {
         )
     }
 
-    convenience init(domainRuntime: MCPDomainRuntime, automaticProviderModelDiscoveryEnabled: Bool = true) {
+    /// A window created by `WindowStatesManager.openNewMainWindow` claims its request by this
+    /// identity; nil, stale, consumed or duplicate values claim nothing.
+    convenience init(
+        domainRuntime: MCPDomainRuntime,
+        automaticProviderModelDiscoveryEnabled: Bool = true,
+        openRequestID: UUID? = nil
+    ) {
         self.init(
             contextBuilderProviderFactory: nil,
             loadStoredAPISettingsDataOnInit: true,
             codexModelPollingService: .shared,
             automaticProviderModelDiscoveryEnabled: automaticProviderModelDiscoveryEnabled,
-            domainRuntimeOverride: domainRuntime
+            domainRuntimeOverride: domainRuntime,
+            openRequestID: openRequestID
         )
     }
 
@@ -775,10 +804,13 @@ class WindowState: ObservableObject {
         windowID = WindowState.allocateWindowID()
         let manager = WindowStatesManager.shared
 
-        let claimedInitialRefreshDeferral = sessionRuntimeWorkspace == nil ? manager.claimInitialRefreshDeferralForNewWindow() : nil
-        let deferredInitialAgentSystemWorkspaceRefresh = sessionRuntimeWorkspace != nil || claimedInitialRefreshDeferral != nil
-        claimedInitialRefreshDeferralID = claimedInitialRefreshDeferral?.id
-        claimedInitialRefreshDeferralWaiterID = claimedInitialRefreshDeferral?.waiterID
+        let claimedOpenRequest = sessionRuntimeWorkspace == nil ? manager.claimOpenRequest(id: openRequestID) : nil
+        let claimedRefreshDeferralID = claimedOpenRequest?.request.refreshDeferralID
+        let deferredInitialAgentSystemWorkspaceRefresh = sessionRuntimeWorkspace != nil || claimedRefreshDeferralID != nil
+        claimedOpenRequestID = claimedOpenRequest?.request.id
+        parkOnOpenHandle = claimedOpenRequest?.parkHandle
+        claimedInitialRefreshDeferralID = claimedRefreshDeferralID
+        claimedInitialRefreshDeferralWaiterID = claimedRefreshDeferralID == nil ? nil : claimedOpenRequest?.request.id
 
         // ️⃣ Connect to the global WindowStatesManager singleton
         windowStatesManager = manager
@@ -978,7 +1010,25 @@ class WindowState: ObservableObject {
     /// Uses deferred title update to avoid triggering layout during window lifecycle events
     /// (REPOPROMPT-1K4 fix).
     func attachWindow(_ window: NSWindow?) {
-        performWindowAttachment(window, update: updateAttachedWindow)
+        performWindowAttachment(window) { acceptedWindow in
+            accessorAttachmentSource = nil
+            updateAttachedWindow(acceptedWindow)
+        }
+    }
+
+    func attachWindow(_ window: NSWindow?, source: AnyObject) {
+        guard window != nil || accessorAttachmentSource === source else { return }
+        performWindowAttachment(window) { acceptedWindow in
+            updateAttachedWindow(acceptedWindow)
+            accessorAttachmentSource = acceptedWindow == nil ? nil : source
+        }
+    }
+
+    func accessorAttachmentIsCurrent(_ window: NSWindow?, source: AnyObject) -> Bool {
+        if window == nil {
+            return nsWindow == nil && accessorAttachmentSource == nil
+        }
+        return nsWindow === window && accessorAttachmentSource === source
     }
 
     /// The admission boundary is window-independent so a deferred attach can be tested without
@@ -992,6 +1042,7 @@ class WindowState: ObservableObject {
     private func updateAttachedWindow(_ window: NSWindow?) {
         // Detach path (always do the cleanup even if both are nil)
         if window == nil {
+            removeNativeCloseObserver()
             let oldWindow = nsWindow
             detachTitlebarAccessoryControllers(from: oldWindow)
             nsWindow = nil
@@ -1008,6 +1059,7 @@ class WindowState: ObservableObject {
         guard let window else { return }
 
         if nsWindow === window {
+            installNativeCloseObserver(for: window)
             configureWindowChrome(for: window)
             ensureWindowDelegateProxy(for: window)
             scheduleFocusUpdate(from: window)
@@ -1021,6 +1073,7 @@ class WindowState: ObservableObject {
             detachTitlebarAccessoryControllers(from: oldWindow)
         }
         nsWindow = window
+        installNativeCloseObserver(for: window)
         if AppLaunchConfiguration.current.isUITestSession {
             DispatchQueue.main.async {
                 NSApp.activate(ignoringOtherApps: true)
@@ -1038,6 +1091,34 @@ class WindowState: ObservableObject {
         // Install Agent mode titlebar accessory if requested before window was attached
         applyAgentTitlebarAccessoryIfPossible()
         StartupPhaseLog.mark(.windowAttached, window: windowID)
+        parkOnOpenHandle?.attemptParkIfAdmitted()
+    }
+
+    private func installNativeCloseObserver(for window: NSWindow) {
+        guard nativeCloseObservedWindow !== window || nativeCloseCancellable == nil else { return }
+        removeNativeCloseObserver()
+        nativeCloseObservedWindow = window
+        nativeCloseCancellable = NotificationCenter.default.publisher(
+            for: NSWindow.willCloseNotification, object: window
+        ).sink { [weak self, weak window] notification in
+            MainActor.assumeIsolated {
+                guard let self, let window,
+                      let closedWindow = notification.object as? NSWindow,
+                      closedWindow === window,
+                      self.nativeCloseObservedWindow === window,
+                      self.nsWindow === window
+                else { return }
+                let manager = self.windowStatesManager ?? .shared
+                guard manager.window(withID: self.windowID) === self else { return }
+                manager.handleWindowClosed(self)
+            }
+        }
+    }
+
+    private func removeNativeCloseObserver() {
+        nativeCloseCancellable?.cancel()
+        nativeCloseCancellable = nil
+        nativeCloseObservedWindow = nil
     }
 
     private func configureWindowChrome(for window: NSWindow) {
@@ -2054,12 +2135,7 @@ class WindowState: ObservableObject {
             return .workspaceUnavailable
         }
 
-        NSApplication.shared.activate(ignoringOtherApps: true)
-        if let window = nsWindow {
-            window.makeKeyAndOrderFront(nil)
-        } else {
-            focusWindowIfPossible()
-        }
+        revealWindow()
 
         if workspaceManager.activeWorkspaceID != route.workspaceID {
             let switchResult = await workspaceManager.requestWorkspaceSwitch(to: targetWorkspace, saveState: true)
@@ -2116,11 +2192,10 @@ class WindowState: ObservableObject {
             return agentSessionRouteResult(for: finalActivationResult)
         }
 
-        if let window = nsWindow {
-            window.makeKeyAndOrderFront(nil)
-        } else {
-            focusWindowIfPossible()
-        }
+        #if DEBUG
+            test_beforePostActivationReveal?()
+        #endif
+        revealWindow()
         if route.interactionID != nil {
             agentModeViewModel.revealPendingNotificationInteraction(tabID: route.tabID)
         }
@@ -2200,11 +2275,21 @@ class WindowState: ObservableObject {
             )
 
             // Send to a window exactly the same way we already do for /open
-            if focusFlag == true,
-               let wsMgr = windowStatesManager,
-               let front = wsMgr.latestWindowState
-            { // fall back to latest-created
-                front.enqueueCommand(cmd)
+            if focusFlag == true, let wsMgr = windowStatesManager {
+                let candidates = FleetCommandTargeting.liveCandidates(
+                    manager: wsMgr,
+                    parked: FleetParkingCoordinator.shared.parkedWindowIDs
+                )
+                switch FleetCommandTargeting.promptTarget(candidates) {
+                case let .window(id):
+                    (wsMgr.window(withID: id) ?? self).enqueueCommand(cmd)
+                case let .revealParked(id):
+                    let front = wsMgr.window(withID: id) ?? self
+                    front.revealWindow()
+                    front.enqueueCommand(cmd)
+                case nil:
+                    enqueueCommand(cmd)
+                }
             } else {
                 enqueueCommand(cmd)
             }
@@ -2962,18 +3047,21 @@ class WindowState: ObservableObject {
         }
     }
 
-    /// Attempts to bring this window to the front if possible
-    func focusWindowIfPossible() {
+    func revealWindow() {
+        FleetParkingCoordinator.shared.unpark(windowID: windowID)
         NSApplication.shared.activate(ignoringOtherApps: true)
         nsWindow?.makeKeyAndOrderFront(nil)
     }
 
+    func focusWindowIfPossible() {
+        revealWindow()
+    }
+
     @discardableResult
     func revealPendingInteraction(tabID: UUID, surface: PendingInteractionSurface) async -> Bool {
-        guard let window = nsWindow else { return false }
+        guard nsWindow != nil else { return false }
 
-        NSApp.activate(ignoringOtherApps: true)
-        window.makeKeyAndOrderFront(nil)
+        revealWindow()
 
         _ = surface
 

@@ -241,6 +241,40 @@ package enum DomainWorkspaceLocationSelection: Equatable, Sendable {
     case notRegistered
 }
 
+package struct DomainUnavailableWorkspaceSummary: Equatable, Sendable {
+    package let workspaceID: UUID
+    package let fileURL: URL
+    package let name: String?
+    package let repoPaths: [String]?
+    package let isAbsentENOENT: Bool
+
+    package init(workspaceID: UUID, fileURL: URL, name: String?, repoPaths: [String]?, isAbsentENOENT: Bool) {
+        self.workspaceID = workspaceID
+        self.fileURL = fileURL
+        self.name = name
+        self.repoPaths = repoPaths
+        self.isAbsentENOENT = isAbsentENOENT
+    }
+}
+
+extension DomainWorkspaceDocument {
+    static let maximumSalvageByteCount: UInt64 = 16 * 1024 * 1024
+
+    static func salvageIdentity(
+        from fileURL: URL,
+        expectedWorkspaceID: UUID
+    ) -> (name: String?, repoPaths: [String]?)? {
+        guard let size = (try? FileManager.default.attributesOfItem(atPath: fileURL.path)[.size] as? NSNumber)?.uint64Value,
+              size <= maximumSalvageByteCount,
+              let data = try? Data(contentsOf: fileURL),
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let idString = object["id"] as? String,
+              UUID(uuidString: idString) == expectedWorkspaceID
+        else { return nil }
+        return (object["name"] as? String, object["repoPaths"] as? [String])
+    }
+}
+
 package struct DomainWorkspaceCatalogSnapshot: Equatable {
     package let runtimeIdentity: DomainRuntimeIdentity
     package let isBootstrapped: Bool
@@ -251,6 +285,7 @@ package struct DomainWorkspaceCatalogSnapshot: Equatable {
     /// Known, nondeleted catalog members the authority cannot currently supply a record for.
     /// Transient: completeness is separate from aggregate `health`, which may remain writable.
     package let unavailableWorkspaceIDs: Set<UUID>
+    package let unavailableWorkspaces: [DomainUnavailableWorkspaceSummary]
 
     package init(
         runtimeIdentity: DomainRuntimeIdentity,
@@ -259,7 +294,8 @@ package struct DomainWorkspaceCatalogSnapshot: Equatable {
         catalogRevision: UInt64,
         health: DomainAuthorityHealth,
         workspaces: [DomainWorkspaceSnapshot],
-        unavailableWorkspaceIDs: Set<UUID> = []
+        unavailableWorkspaceIDs: Set<UUID> = [],
+        unavailableWorkspaces: [DomainUnavailableWorkspaceSummary] = []
     ) {
         self.runtimeIdentity = runtimeIdentity
         self.isBootstrapped = isBootstrapped
@@ -268,6 +304,7 @@ package struct DomainWorkspaceCatalogSnapshot: Equatable {
         self.health = health
         self.workspaces = workspaces
         self.unavailableWorkspaceIDs = unavailableWorkspaceIDs
+        self.unavailableWorkspaces = unavailableWorkspaces
     }
 }
 

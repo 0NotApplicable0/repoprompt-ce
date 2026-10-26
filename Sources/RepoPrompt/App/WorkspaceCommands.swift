@@ -3,46 +3,25 @@ import SwiftUI
 
 /// Extra File-menu items that operate on the *focused* window’s workspace.
 struct WorkspaceCommands: Commands {
-    /// Shared window tracker injected from the app. Not observed: `focusedWindow` is resolved when
-    /// an action runs, so the menu does not need to rebuild on every window open/close.
+    /// Shared window tracker injected from the app. Not observed.
     let windowStatesManager: WindowStatesManager
 
-    /// The window currently in focus, or (as a fallback) the most-recently created one.
-    private var focusedWindow: WindowState? {
-        windowStatesManager.allWindows.first { $0.isCurrentlyFocused }
-            ?? windowStatesManager.latestWindowState
+    /// Observed only for its `hasTarget` flag, which publishes on change, so the menu rebuilds
+    /// when enablement flips and not on every window open/close.
+    @ObservedObject var center: FleetCommandCenter
+
+    @MainActor
+    init(windowStatesManager: WindowStatesManager, center: FleetCommandCenter? = nil) {
+        self.windowStatesManager = windowStatesManager
+        _center = ObservedObject(wrappedValue: center ?? .live())
     }
 
     var body: some Commands {
         // Insert immediately after the system "Save" item.
         CommandGroup(after: .saveItem) {
-            // MARK: Save Workspace  ⌘S
-
-            Button("Save Workspace") {
-                saveActiveWorkspace()
+            ForEach(center.descriptors(for: .afterSaveItem)) {
+                FleetCommandButton(descriptor: $0, center: center)
             }
-            .keyboardShortcut("s", modifiers: .command)
-
-            // MARK: Save & Exit Workspace  ⇧⌘S
-
-            Button("Save & Exit Workspace") {
-                Task { @MainActor in
-                    await saveAndExitActiveWorkspace()
-                }
-            }
-            .keyboardShortcut("s", modifiers: [.command, .shift])
         }
-    }
-
-    /// Save the currently active workspace (same as toolbar menu)
-    private func saveActiveWorkspace() {
-        guard let ws = focusedWindow else { return }
-        ws.workspaceManager.pollAndSaveState()
-    }
-
-    /// Save and exit to fallback workspace (system workspace)
-    private func saveAndExitActiveWorkspace() async {
-        guard let ws = focusedWindow else { return }
-        await ws.workspaceManager.saveAndExitToFallback()
     }
 }

@@ -1047,6 +1047,14 @@ package class GlobalSettingsStore: ObservableObject, CodexHookApprovalSettingsPr
         }
     }
 
+    package func fleetParkAgentWindows() -> Bool {
+        scalarPreferences.agentMode?.fleetParkAgentWindows == true
+    }
+
+    package func setFleetParkAgentWindows(_ enabled: Bool, commit: Bool = true) {
+        updateAgentModeScalar(commit: commit) { $0.fleetParkAgentWindows = enabled }
+    }
+
     /// Independent of Model Router. Missing settings retain the manual-effort path.
     package func routingSettingsSnapshot() -> RoutingSettingsSnapshot {
         .init(

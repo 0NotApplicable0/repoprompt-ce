@@ -3277,22 +3277,15 @@ final class MCPServerViewModel: ObservableObject {
         }
     }
 
-    /// Brings this window to front to show the approval overlay
     @MainActor
-    private func bringWindowToFront() {
+    func bringWindowToFront() {
         guard let windowState = WindowStatesManager.shared.allWindows.first(where: { $0.windowID == windowID }),
-              let nsWindow = windowState.nsWindow
+              windowState.nsWindow != nil
         else {
             return
         }
 
-        // Activate the app if not active
-        if !NSApp.isActive {
-            NSApp.activate(ignoringOtherApps: true)
-        }
-
-        // Bring window to front and make it key
-        nsWindow.makeKeyAndOrderFront(nil)
+        windowState.revealWindow()
     }
 
     @MainActor

@@ -27,6 +27,7 @@ package enum DomainWorkspaceCommand: Codable, Equatable, Sendable {
     case replaceWorkingDocument(DomainWorkspaceDocument)
     case saveWorkspaceDocument(workspaceID: UUID)
     case deleteWorkspace(workspaceID: UUID)
+    case removeMissingWorkspaceCatalogEntries(workspaceIDs: [UUID])
     case resolveExternalConflict(
         workspaceID: UUID,
         acceptExternal: Bool,
@@ -105,6 +106,8 @@ package struct DomainWorkspaceCommandEnvelope: Codable, Equatable, Sendable {
             components += ["save", workspaceID.uuidString]
         case let .deleteWorkspace(workspaceID):
             components += ["delete", workspaceID.uuidString]
+        case let .removeMissingWorkspaceCatalogEntries(workspaceIDs):
+            components += ["remove-missing-catalog-entries"] + Set(workspaceIDs).map(\.uuidString).sorted()
         case let .resolveExternalConflict(workspaceID, acceptExternal, protectedAgentIdentities):
             components += ["resolve", workspaceID.uuidString, acceptExternal ? "external" : "local"]
             components += protectedAgentIdentities

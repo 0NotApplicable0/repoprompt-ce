@@ -59,7 +59,7 @@ struct RepoPromptFileLogHandler: LogHandler {
     }
 }
 
-struct RepoPromptSwiftUIApp: App {
+private struct RepoPromptSwiftUIApp<LaunchPolicy: FleetWorkspaceLaunchPolicy>: App {
     init() {
         let appInitSpan = StartupPhaseLog.begin(.appInit)
         defer { appInitSpan.end() }
@@ -140,18 +140,41 @@ struct RepoPromptSwiftUIApp: App {
         WindowStatesManager.shared
     }
 
+    @StateObject private var fleetCommandCenter = FleetCommandCenter.live()
+
     /// Root font scaling source so inherited SwiftUI text updates when the preset changes.
     @StateObject private var fontScale: FontScaleManager
 
     // MARK: - Body
 
     var body: some Scene {
-        WindowGroup(id: "main") {
+        LaunchPolicy.scene(
+            RepoPromptWorkspaceScene(
+                versionManager: versionManager,
+                sparkleManager: appDelegate.sparkleManager,
+                windowStatesManager: windowStatesManager,
+                fleetCommandCenter: fleetCommandCenter,
+                fontScale: fontScale
+            ),
+            restoreWindows: windowStatesManager.autoRestoreWorkspacesEnabled
+        )
+    }
+}
+
+private struct RepoPromptWorkspaceScene: Scene {
+    let versionManager: VersionManager
+    let sparkleManager: SparkleUpdaterManager
+    let windowStatesManager: WindowStatesManager
+    let fleetCommandCenter: FleetCommandCenter
+    let fontScale: FontScaleManager
+
+    var body: some Scene {
+        WindowGroup(id: "main", for: UUID.self) { openRequestID in
             // IMPORTANT: Each time a new SwiftUI window/scene is created,
             // we instantiate a fresh WindowContentView (and thus a new WindowState)
-            WindowContentView()
+            WindowContentView(openRequestID: openRequestID.wrappedValue)
                 .environmentObject(versionManager)
-                .environmentObject(appDelegate.sparkleManager)
+                .environmentObject(sparkleManager)
                 .environmentObject(windowStatesManager)
                 .environmentObject(fontScale)
                 .toolbarRole(.automatic)
@@ -172,30 +195,23 @@ struct RepoPromptSwiftUIApp: App {
         .windowStyle(.automatic)
         .windowToolbarStyle(.unified)
         .commands {
-            UpdateMenu(sparkleManager: appDelegate.sparkleManager)
+            UpdateMenu(sparkleManager: sparkleManager)
 
-            // macOS standard "Settings…" (⌘,) menu item
-            CommandGroup(replacing: .appSettings) {
-                Button("Settings…") {
-                    // Identify the currently focused window (or fall back to latest)
-                    if let target = windowStatesManager
-                        .allWindows.first(where: { $0.isCurrentlyFocused })
-                        ?? windowStatesManager.latestWindowState
-                    {
-                        SettingsWindowCoordinator.shared.open(windowState: target)
-                    }
-                }
-                .keyboardShortcut(",", modifiers: .command)
-            }
+            AppSettingsCommands()
 
             // ➜ New File-menu commands (Save Workspace / Exit Workspace)
-            WorkspaceCommands(windowStatesManager: windowStatesManager)
+            WorkspaceCommands(windowStatesManager: windowStatesManager, center: fleetCommandCenter)
 
             CommandGroup(before: .saveItem) {
-                Button("Close Window") {
-                    NSApplication.shared.keyWindow?.performClose(nil)
+                ForEach(fleetCommandCenter.descriptors(for: .beforeSaveItem)) { descriptor in
+                    FleetCommandButton(descriptor: descriptor, center: fleetCommandCenter)
                 }
-                .keyboardShortcut("w", modifiers: [.command, .shift])
+            }
+
+            CommandGroup(after: .windowArrangement) {
+                ForEach(fleetCommandCenter.descriptors(for: .afterWindowArrangement)) { descriptor in
+                    FleetCommandButton(descriptor: descriptor, center: fleetCommandCenter)
+                }
             }
 
             CommandGroup(replacing: .help) {
@@ -203,6 +219,26 @@ struct RepoPromptSwiftUIApp: App {
                     .environmentObject(versionManager)
             }
         }
+    }
+}
+
+private protocol FleetWorkspaceLaunchPolicy {
+    associatedtype Body: Scene
+    @MainActor
+    static func scene(_ workspace: RepoPromptWorkspaceScene, restoreWindows: Bool) -> Body
+}
+
+private enum LegacyFleetWorkspaceLaunchPolicy: FleetWorkspaceLaunchPolicy {
+    static func scene(_ workspace: RepoPromptWorkspaceScene, restoreWindows: Bool) -> some Scene {
+        workspace
+    }
+}
+
+@available(macOS 15.0, *)
+private enum FleetWorkspaceLaunchPolicy15: FleetWorkspaceLaunchPolicy {
+    static func scene(_ workspace: RepoPromptWorkspaceScene, restoreWindows: Bool) -> some Scene {
+        workspace.defaultLaunchBehavior(.suppressed)
+            .restorationBehavior(restoreWindows ? .automatic : .disabled)
     }
 }
 
@@ -274,6 +310,10 @@ public enum RepoPromptApplication {
         GlobalSettingsStore.installProcessApplicationEventBridge()
         FileSystemAppIntegration.installHooks()
         bootstrapSpan.end()
-        RepoPromptSwiftUIApp.main()
+        if #available(macOS 15.0, *) {
+            RepoPromptSwiftUIApp<FleetWorkspaceLaunchPolicy15>.main()
+        } else {
+            RepoPromptSwiftUIApp<LegacyFleetWorkspaceLaunchPolicy>.main()
+        }
     }
 }

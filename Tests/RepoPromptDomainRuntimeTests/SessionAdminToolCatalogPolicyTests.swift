@@ -234,6 +234,85 @@ final class SessionAdminToolCatalogPolicyTests: XCTestCase {
         XCTAssertEqual(disabled.hiddenReasonsByToolName[toolName], .disabled)
     }
 
+    func testWindowlessCatalogBackfillMatchesSingleWindowFilteredNamesAndSkipsDisabledWindow() async throws {
+        let direct = MCPDomainClientPolicySnapshot(
+            restrictedToolNames: [], additionalToolNames: [], role: .direct, allowsAgentExternalControlTools: false
+        )
+        let globalNames = MCPDomainToolCatalog.globalToolNames
+        let windowed = try await makeRuntime()
+        _ = try await windowed.toolRegistry.register(
+            registrationID: MCPDomainToolRegistrationID(),
+            scope: .application,
+            bindings: globalNames.map { try binding(toolName: $0) }
+        )
+        _ = try await windowed.toolRegistry.register(
+            registrationID: MCPDomainToolRegistrationID(),
+            scope: .window(id: 1),
+            bindings: MCPDomainToolCatalog.windowToolNames.map { try binding(toolName: $0) }
+        )
+        let windowless = try await makeRuntime()
+        _ = try await windowless.toolRegistry.register(
+            registrationID: MCPDomainToolRegistrationID(),
+            scope: .application,
+            bindings: globalNames.map { try binding(toolName: $0) }
+        )
+
+        let baseline = await windowed.domainHost.advertisedCatalog(.init(isGloballyEnabled: true, disabledToolNames: [], policy: direct))
+        XCTAssertGreaterThan(baseline.definitions.count, globalNames.count)
+
+        let withoutBackfill = await windowless.domainHost.advertisedCatalog(.init(isGloballyEnabled: true, disabledToolNames: [], policy: direct))
+        XCTAssertEqual(withoutBackfill.definitions.map(\.name), globalNames)
+
+        let backfilled = await windowless.domainHost.advertisedCatalog(.init(
+            isGloballyEnabled: true, disabledToolNames: [], policy: direct,
+            includeCanonicalWindowToolsWhenWindowless: true
+        ))
+        XCTAssertEqual(backfilled.definitions.map(\.name), baseline.definitions.map(\.name))
+        XCTAssertEqual(backfilled.hiddenReasonsByToolName, baseline.hiddenReasonsByToolName)
+
+        let windowToolNames = Set(MCPDomainToolCatalog.windowToolNames)
+        let overriddenName = try XCTUnwrap(baseline.definitions.map(\.name).first {
+            windowToolNames.contains($0) && $0 != MCPWindowToolName.agentSessionLink && $0 != MCPWindowToolName.becomeOverseer
+        })
+        let canonical = try XCTUnwrap(MCPDomainCanonicalToolDefinitions.definition(named: overriddenName))
+        let registered = MCPDomainToolDefinition(
+            name: overriddenName, description: "registry-owned \(overriddenName)", inputSchema: canonical.inputSchema,
+            annotations: canonical.annotations, isEnabledByDefault: canonical.isEnabledByDefault
+        )
+        let registryOwned = try await makeRuntime()
+        _ = try await registryOwned.toolRegistry.register(
+            registrationID: MCPDomainToolRegistrationID(),
+            scope: .application,
+            bindings: globalNames.map { try binding(toolName: $0) }
+        )
+        _ = try await registryOwned.toolRegistry.register(
+            registrationID: MCPDomainToolRegistrationID(),
+            scope: .window(id: 1),
+            bindings: [MCPDomainToolBinding(definition: registered, operation: { _ in .null })]
+        )
+        let registryWins = await registryOwned.domainHost.advertisedCatalog(.init(
+            isGloballyEnabled: true, disabledToolNames: [], policy: direct,
+            includeCanonicalWindowToolsWhenWindowless: true
+        ))
+        XCTAssertEqual(registryWins.definitions.map(\.name), baseline.definitions.map(\.name))
+        XCTAssertEqual(Set(registryWins.definitions.map(\.name)).count, registryWins.definitions.count)
+        XCTAssertEqual(registryWins.definitions.first { $0.name == overriddenName }?.description, registered.description)
+        for definition in registryWins.definitions where definition.name != overriddenName {
+            XCTAssertEqual(definition, baseline.definitions.first { $0.name == definition.name })
+        }
+
+        let disabledName = MCPWindowToolName.orderedToolNames[0]
+        let disabledBaseline = await windowed.domainHost.advertisedCatalog(.init(
+            isGloballyEnabled: true, disabledToolNames: [disabledName], policy: direct
+        ))
+        let disabledBackfill = await windowless.domainHost.advertisedCatalog(.init(
+            isGloballyEnabled: true, disabledToolNames: [disabledName], policy: direct,
+            includeCanonicalWindowToolsWhenWindowless: true
+        ))
+        XCTAssertEqual(disabledBackfill.definitions.map(\.name), disabledBaseline.definitions.map(\.name))
+        XCTAssertEqual(disabledBackfill.hiddenReasonsByToolName[disabledName], .disabled)
+    }
+
     // MARK: - Fixtures
 
     private func makeRuntime() async throws -> MCPDomainRuntime {

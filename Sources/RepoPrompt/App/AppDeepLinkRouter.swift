@@ -306,11 +306,7 @@ final class AppDeepLinkRouter {
     }
 
     private func routeAgentSession(_ route: AgentSessionDeepLinkRoute, on targetWindow: WindowState) async -> AgentSessionRouteResult {
-        if let window = targetWindow.nsWindow {
-            window.makeKeyAndOrderFront(nil)
-        } else {
-            targetWindow.focusWindowIfPossible()
-        }
+        targetWindow.revealWindow()
 
         return await targetWindow.routeToAgentSession(route)
     }

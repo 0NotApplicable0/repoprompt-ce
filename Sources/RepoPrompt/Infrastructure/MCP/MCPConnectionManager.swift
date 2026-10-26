@@ -843,6 +843,11 @@ actor ServerNetworkManager {
         return multiWindowSelectionGuidance()
     }
 
+    nonisolated static func noOpenWindowsSelectionGuidance() -> String {
+        "No RepoPrompt workspace window is open. Call `bind_context` with `{\"op\":\"bind\",\"working_dirs\":[\"/absolute/path/to/root\"]}` (add `\"create_if_missing\":true` to create one) " +
+            "or `manage_workspaces` with `{\"action\":\"switch\",\"workspace\":\"<name or id>\",\"open_in_new_window\":true}` (or `\"action\":\"create\"`) to open a workspace window, then retry."
+    }
+
     nonisolated static func invalidWindowSelectionGuidance(
         windowID: Int,
         purpose: MCPRunPurpose,
@@ -3501,7 +3506,9 @@ actor ServerNetworkManager {
     ) async -> Data? {
         guard let snapshot else { return nil }
         let policy = effectivePolicyState(for: connectionID)
-        let disabled = await MainActor.run { ToolAvailabilityStore.shared.effectiveDisabledTools }
+        let (disabled, isWindowless) = await MainActor.run {
+            (ToolAvailabilityStore.shared.effectiveDisabledTools, WindowStatesManager.shared.allWindows.isEmpty)
+        }
         let domainPolicy = MCPToolAdmissionPolicy.clientPolicySnapshot(
             restricted: policy.restricted,
             additional: policy.additional.union(snapshot.additionalGrants),
@@ -3515,7 +3522,8 @@ actor ServerNetworkManager {
             isGloballyEnabled: isEnabledState,
             disabledToolNames: disabled,
             policy: domainPolicy,
-            agentSessionLinkSurface: snapshot.toolSurface
+            agentSessionLinkSurface: snapshot.toolSurface,
+            includeCanonicalWindowToolsWhenWindowless: isWindowless
         ))
         var tools: [MCP.Tool] = []
         for definition in catalog.definitions where AgentSessionLinkCatalogSurface.toolNames.contains(definition.name) {
@@ -11946,8 +11954,8 @@ actor ServerNetworkManager {
                 )
             }
 
-            let disabled = await MainActor.run {
-                ToolAvailabilityStore.shared.effectiveDisabledTools
+            let (disabled, isWindowless) = await MainActor.run {
+                (ToolAvailabilityStore.shared.effectiveDisabledTools, WindowStatesManager.shared.allWindows.isEmpty)
             }
             let policy = effectivePolicyState(for: connectionID)
             let sessionLinkGrantSnapshot = await liveSessionLinkGrantSnapshot(connectionID: connectionID)
@@ -11967,7 +11975,8 @@ actor ServerNetworkManager {
                     isGloballyEnabled: isEnabledState,
                     disabledToolNames: disabled,
                     policy: domainPolicy,
-                    agentSessionLinkSurface: sessionLinkGrantSnapshot?.toolSurface ?? .full
+                    agentSessionLinkSurface: sessionLinkGrantSnapshot?.toolSurface ?? .full,
+                    includeCanonicalWindowToolsWhenWindowless: isWindowless
                 )
             )
             let names = advertisement.definitions.map(\.name).sorted()
@@ -13556,8 +13565,8 @@ actor ServerNetworkManager {
                 reason: "tools/list"
             )
 
-            let disabled = await MainActor.run {
-                ToolAvailabilityStore.shared.effectiveDisabledTools
+            let (disabled, isWindowless) = await MainActor.run {
+                (ToolAvailabilityStore.shared.effectiveDisabledTools, WindowStatesManager.shared.allWindows.isEmpty)
             }
             let policy = await effectivePolicyState(for: connectionID)
             let sessionLinkGrantSnapshot = await liveSessionLinkGrantSnapshot(connectionID: connectionID)
@@ -13579,7 +13588,8 @@ actor ServerNetworkManager {
                     isGloballyEnabled: isEnabledState,
                     disabledToolNames: disabled,
                     policy: domainPolicy,
-                    agentSessionLinkSurface: sessionLinkGrantSnapshot?.toolSurface ?? .full
+                    agentSessionLinkSurface: sessionLinkGrantSnapshot?.toolSurface ?? .full,
+                    includeCanonicalWindowToolsWhenWindowless: isWindowless
                 )
             )
             #if DEBUG
@@ -14675,6 +14685,17 @@ actor ServerNetworkManager {
                                         return Self.toolErrorResult(
                                             rawJSON: capturedRawJSON,
                                             message: Self.persistedRoutingAffinityFailureGuidance()
+                                        )
+                                    }
+
+                                    if !bypassWindowRouting,
+                                       windowCount == 0,
+                                       chosenID == nil,
+                                       !Self.isWindowSelectionExempt(toolName: toolName, args: capturedArguments)
+                                    {
+                                        return Self.toolErrorResult(
+                                            rawJSON: capturedRawJSON,
+                                            message: Self.noOpenWindowsSelectionGuidance()
                                         )
                                     }
 

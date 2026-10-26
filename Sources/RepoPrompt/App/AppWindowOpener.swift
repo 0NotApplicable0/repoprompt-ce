@@ -22,20 +22,29 @@ import SwiftUI
 final class AppWindowOpener {
     static let shared = AppWindowOpener()
 
-    private var openMainWindowImpl: (() -> Void)?
+    private var openMainWindowImpl: ((UUID?) throws -> Void)?
     private var pendingDockWindowRequestCount = 0
+    /// False for a legacy zero-argument opener, which drops the request identity.
+    private(set) var deliversRequestIdentity = false
 
     private init() {}
 
     /// Installs the openWindow action from a SwiftUI view.
     /// Called from WindowContentView on appear.
     func install(openMainWindow: @escaping () -> Void) {
+        installRequestAware { _ in openMainWindow() }
+        deliversRequestIdentity = false
+    }
+
+    /// Installs an opener that receives the request identity (nil for requests with no identity).
+    func installRequestAware(openMainWindow: @escaping (UUID?) throws -> Void) {
         openMainWindowImpl = openMainWindow
+        deliversRequestIdentity = true
 
         let pendingRequestCount = pendingDockWindowRequestCount
         pendingDockWindowRequestCount = 0
         for _ in 0 ..< pendingRequestCount {
-            openMainWindow()
+            try? openMainWindow(nil)
         }
     }
 
@@ -46,16 +55,17 @@ final class AppWindowOpener {
             pendingDockWindowRequestCount += 1
             return
         }
-        openMainWindowImpl()
+        try? openMainWindowImpl(nil)
     }
 
     /// Opens a new main window.
+    /// - Parameter requestID: identity delivered to the scene; nil for requests with no identity.
     /// - Throws: `WindowOpenError.openerUnavailable` if no action has been installed.
-    func openMainWindow() throws {
+    func openMainWindow(requestID: UUID? = nil) throws {
         guard let impl = openMainWindowImpl else {
             throw WindowOpenError.openerUnavailable
         }
-        impl()
+        try impl(requestID)
     }
 
     /// Checks if the opener is ready to create windows.
@@ -65,11 +75,18 @@ final class AppWindowOpener {
 
     #if DEBUG
         func installForTesting(openMainWindow: @escaping () -> Void) {
+            openMainWindowImpl = { _ in openMainWindow() }
+            deliversRequestIdentity = false
+        }
+
+        func installRequestAwareForTesting(openMainWindow: @escaping (UUID?) throws -> Void) {
             openMainWindowImpl = openMainWindow
+            deliversRequestIdentity = true
         }
 
         func resetForTesting() {
             openMainWindowImpl = nil
+            deliversRequestIdentity = false
             pendingDockWindowRequestCount = 0
         }
     #endif
@@ -78,11 +95,14 @@ final class AppWindowOpener {
 /// Errors that can occur when opening windows programmatically.
 enum WindowOpenError: Error, LocalizedError {
     case openerUnavailable
+    case notParked(windowID: Int)
 
     var errorDescription: String? {
         switch self {
         case .openerUnavailable:
             "Window opener not available. No SwiftUI view has installed the openWindow action."
+        case let .notParked(windowID):
+            "Window \(windowID) opened but was not parked within 5 s; it stays on screen and unparked."
         }
     }
 }

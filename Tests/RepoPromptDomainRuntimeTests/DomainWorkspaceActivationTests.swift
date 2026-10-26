@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 @testable import RepoPromptDomainRuntime
 import XCTest
@@ -228,6 +229,155 @@ final class DomainWorkspaceActivationTests: XCTestCase {
         _ = await store.registerReadDocument(missing)
         let afterOverlay = await store.readLocation(matching: .id(missing.workspaceID))
         XCTAssertEqual(afterOverlay, .unavailable, "A routing overlay cannot authorize unavailable canonical storage")
+    }
+
+    func testRemoveMissingWorkspaceCatalogEntriesRefusesExistingOrNewlyCreatedFileAndUnblocksExactName() async throws {
+        let fixture = try ActivationFixture()
+        defer { fixture.remove() }
+        let writer = fixture.authority()
+        let available = try fixture.document(name: "Available")
+        let absent = try fixture.document(name: "Absent", workspaceID: UUID())
+        let unreadable = try fixture.document(name: "Unreadable", workspaceID: UUID())
+        let raceCreated = try fixture.document(name: "RaceCreated", workspaceID: UUID())
+        let permissionDenied = try fixture.document(name: "PermissionDenied", workspaceID: UUID())
+        for document in [available, absent, unreadable, raceCreated, permissionDenied] {
+            let created = await writer.execute(.init(
+                operationID: UUID(), origin: .appPresentation(windowID: 0), command: .createWorkspace(document)
+            ))
+            XCTAssertEqual(created.disposition, .applied)
+        }
+        for document in [absent, raceCreated, permissionDenied] {
+            try FileManager.default.removeItem(at: document.fileURL)
+        }
+        let unreadableBytes = Data("not JSON".utf8)
+        try unreadableBytes.write(to: unreadable.fileURL)
+        let store = DomainWorkspaceStore(authority: fixture.authority())
+        let initial = await store.snapshot()
+        let unavailableIDs: Set<UUID> = [absent.workspaceID, unreadable.workspaceID, raceCreated.workspaceID, permissionDenied.workspaceID]
+        XCTAssertEqual(initial.unavailableWorkspaceIDs, unavailableIDs)
+        let beforeLookup = await store.readLocation(matching: .exactName("Available"))
+        XCTAssertEqual(beforeLookup, .unavailable)
+        let catalogURL = fixture.root
+            .appendingPathComponent(DomainPersistenceCoordinator.runtimeDirectoryName(profileIdentifier: "activation-tests"))
+            .appendingPathComponent("workspace-catalog.json")
+        let catalogBytes = try Data(contentsOf: catalogURL)
+        try raceCreated.documentBytes.write(to: raceCreated.fileURL)
+
+        for ids in [[unreadable.workspaceID], [absent.workspaceID, raceCreated.workspaceID]] {
+            let refused = await store.execute(.init(
+                operationID: UUID(), origin: .appPresentation(windowID: 0),
+                command: .removeMissingWorkspaceCatalogEntries(workspaceIDs: ids)
+            ))
+            XCTAssertEqual(refused.disposition, .conflict)
+            XCTAssertEqual(refused.errorCode, .workspaceExternalConflict)
+            XCTAssertEqual(refused.diagnostic, "missing_workspace_entry_not_removable")
+            XCTAssertEqual(try Data(contentsOf: catalogURL), catalogBytes)
+            let afterRefusal = await store.snapshot()
+            XCTAssertEqual(afterRefusal.unavailableWorkspaceIDs, unavailableIDs)
+            XCTAssertEqual(afterRefusal.catalogRevision, initial.catalogRevision)
+            XCTAssertEqual(try Data(contentsOf: unreadable.fileURL), unreadableBytes)
+            XCTAssertEqual(try Data(contentsOf: raceCreated.fileURL), raceCreated.documentBytes)
+            XCTAssertFalse(FileManager.default.fileExists(atPath: absent.fileURL.path))
+        }
+        do {
+            let directory = permissionDenied.fileURL.deletingLastPathComponent()
+            XCTAssertEqual(chmod(directory.path, 0o000), 0)
+            defer { XCTAssertEqual(chmod(directory.path, 0o700), 0) }
+            var metadata = stat()
+            XCTAssertEqual(lstat(permissionDenied.fileURL.path, &metadata), -1)
+            XCTAssertEqual(errno, EACCES)
+            let refused = await store.execute(.init(
+                operationID: UUID(), origin: .appPresentation(windowID: 0),
+                command: .removeMissingWorkspaceCatalogEntries(workspaceIDs: [permissionDenied.workspaceID])
+            ))
+            XCTAssertEqual(refused.disposition, .conflict)
+            XCTAssertEqual(refused.errorCode, .workspaceExternalConflict)
+            XCTAssertEqual(refused.diagnostic, "missing_workspace_entry_not_removable")
+            XCTAssertEqual(try Data(contentsOf: catalogURL), catalogBytes)
+            let afterRefusal = await store.snapshot()
+            XCTAssertEqual(afterRefusal.unavailableWorkspaceIDs, unavailableIDs)
+        }
+
+        try unreadable.documentBytes.write(to: unreadable.fileURL)
+        try permissionDenied.documentBytes.write(to: permissionDenied.fileURL)
+        await store.reloadExternalChanges()
+        let beforeRemoval = await store.snapshot()
+        XCTAssertEqual(beforeRemoval.unavailableWorkspaceIDs, [absent.workspaceID])
+        let removal = DomainWorkspaceCommandEnvelope(
+            operationID: UUID(), origin: .appPresentation(windowID: 0),
+            command: .removeMissingWorkspaceCatalogEntries(workspaceIDs: [absent.workspaceID, absent.workspaceID])
+        )
+        let removed = await store.execute(removal)
+        XCTAssertEqual(removed.disposition, .applied)
+        XCTAssertEqual(removed.catalogRevision, beforeRemoval.catalogRevision + 1)
+        let after = await store.snapshot()
+        XCTAssertTrue(after.unavailableWorkspaceIDs.isEmpty)
+        XCTAssertEqual(Set(after.workspaces.map(\.document.workspaceID)), [available.workspaceID, unreadable.workspaceID, raceCreated.workspaceID, permissionDenied.workspaceID])
+        let lookup = await store.readLocation(matching: .exactName("Available"))
+        guard case let .matched(location) = lookup else { return XCTFail("Expected exact-name lookup after removal") }
+        XCTAssertEqual(location.workspaceID, available.workspaceID)
+        let absentByID = await store.readLocation(matching: .id(absent.workspaceID))
+        XCTAssertEqual(absentByID, .notRegistered)
+        for document in [available, unreadable, raceCreated, permissionDenied] {
+            XCTAssertEqual(try Data(contentsOf: document.fileURL), document.documentBytes)
+        }
+        let replay = await store.execute(removal)
+        XCTAssertEqual(replay.disposition, .deduplicated)
+        let cold = DomainWorkspaceStore(authority: fixture.authority())
+        let coldSnapshot = await cold.snapshot()
+        XCTAssertTrue(coldSnapshot.unavailableWorkspaceIDs.isEmpty)
+        XCTAssertEqual(coldSnapshot.catalogRevision, removed.catalogRevision)
+        let coldAbsent = await cold.readLocation(matching: .id(absent.workspaceID))
+        XCTAssertEqual(coldAbsent, .notRegistered)
+        let coldReplay = await cold.execute(removal)
+        XCTAssertEqual(coldReplay.disposition, .deduplicated)
+    }
+
+    func testReloadRefreshesUnavailableObservationsWhenOnlyTheDocumentChanges() async throws {
+        let fixture = try ActivationFixture()
+        defer { fixture.remove() }
+        let writer = fixture.authority()
+        let corruptThenGone = try fixture.document(name: "CorruptThenGone", workspaceID: UUID())
+        let goneThenCorrupt = try fixture.document(name: "GoneThenCorrupt", workspaceID: UUID())
+        for document in [corruptThenGone, goneThenCorrupt] {
+            let created = await writer.execute(.init(
+                operationID: UUID(), origin: .appPresentation(windowID: 0), command: .createWorkspace(document)
+            ))
+            XCTAssertEqual(created.disposition, .applied)
+        }
+        try Data("not JSON".utf8).write(to: corruptThenGone.fileURL)
+        try FileManager.default.removeItem(at: goneThenCorrupt.fileURL)
+        let store = DomainWorkspaceStore(authority: fixture.authority())
+        let initial = await store.snapshot()
+        func summary(_ snapshot: DomainWorkspaceCatalogSnapshot, _ id: UUID) -> DomainUnavailableWorkspaceSummary? {
+            snapshot.unavailableWorkspaces.first { $0.workspaceID == id }
+        }
+        XCTAssertEqual(summary(initial, corruptThenGone.workspaceID)?.isAbsentENOENT, false)
+        XCTAssertEqual(summary(initial, goneThenCorrupt.workspaceID)?.isAbsentENOENT, true)
+
+        try FileManager.default.removeItem(at: corruptThenGone.fileURL)
+        try Data("not JSON".utf8).write(to: goneThenCorrupt.fileURL)
+        await store.reloadExternalChanges()
+        let after = await store.snapshot()
+        XCTAssertEqual(after.catalogRevision, initial.catalogRevision)
+        XCTAssertGreaterThan(after.publicationSequence, initial.publicationSequence)
+        XCTAssertEqual(after.unavailableWorkspaceIDs, initial.unavailableWorkspaceIDs)
+        XCTAssertEqual(summary(after, corruptThenGone.workspaceID)?.isAbsentENOENT, true)
+        XCTAssertEqual(summary(after, goneThenCorrupt.workspaceID)?.isAbsentENOENT, false)
+
+        let refused = await store.execute(.init(
+            operationID: UUID(), origin: .appPresentation(windowID: 0),
+            command: .removeMissingWorkspaceCatalogEntries(workspaceIDs: [goneThenCorrupt.workspaceID])
+        ))
+        XCTAssertEqual(refused.disposition, .conflict)
+        let removed = await store.execute(.init(
+            operationID: UUID(), origin: .appPresentation(windowID: 0),
+            command: .removeMissingWorkspaceCatalogEntries(workspaceIDs: [corruptThenGone.workspaceID])
+        ))
+        XCTAssertEqual(removed.disposition, .applied)
+        let final = await store.snapshot()
+        XCTAssertEqual(final.unavailableWorkspaceIDs, [goneThenCorrupt.workspaceID])
+        XCTAssertEqual(try Data(contentsOf: goneThenCorrupt.fileURL), Data("not JSON".utf8))
     }
 
     #if DEBUG
