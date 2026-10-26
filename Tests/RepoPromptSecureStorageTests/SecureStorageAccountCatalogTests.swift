@@ -39,7 +39,7 @@ final class SecureStorageAccountCatalogTests: XCTestCase {
                 "rp.agent.permissions.devin.v1"
             ]
         )
-        XCTAssertEqual(Set(SecureStorageAccountCatalog.allAccounts.map(\.identifier)).count, 28)
+        XCTAssertEqual(Set(SecureStorageAccountCatalog.allAccounts.map(\.identifier)).count, 29)
     }
 
     func testDecisionsAccountIsIsolatedAndIncludedInRepairInventory() {

@@ -14,10 +14,45 @@ struct DecisionInvocationContext: Equatable {
 actor DecisionCoordinator {
     private struct Reservation {
         let ownershipID: UUID
+        let serviceID: DecisionServiceID
         let consumerID: DecisionConsumerID
         let consumerRevision: UInt64?
         let settlement: DecisionSettlement
         var task: Task<Void, Never>?
+    }
+
+    fileprivate static func traced(
+        _ outcome: DecisionOutcome,
+        serviceID: DecisionServiceID,
+        latencyMs: Double? = nil
+    ) -> DecisionTracedOutcome {
+        let evidence: DecisionEvidence? = switch outcome {
+        case let .selected(_, answerEvidence),
+             let .abstained(_, answerEvidence),
+             let .failed(_, _, answerEvidence):
+            answerEvidence
+        case .cancelled:
+            nil
+        }
+        let serviceModel: String? = if serviceID == .jev,
+                                       evidence?.acceptancePolicyVersion == JevRouterCredentialService.routingPolicyVersion
+        {
+            JevRouterCredentialService.pinnedModel
+        } else if serviceID == .openAIDecisions,
+                  evidence?.acceptancePolicyVersion == OpenAIDecisionsRouterCredentialService.routingPolicyVersion
+        {
+            OpenAIDecisionsRouterCredentialService.pinnedModel
+        } else {
+            nil
+        }
+        return DecisionTracedOutcome(
+            outcome: outcome,
+            trace: DecisionTrace(
+                serviceID: serviceID,
+                jevModel: serviceModel,
+                latencyMs: latencyMs
+            )
+        )
     }
 
     private let registry: DecisionServiceRegistry
@@ -39,23 +74,41 @@ actor DecisionCoordinator {
         request: FiniteChoiceDecisionRequest,
         consumerRevision: UInt64? = nil
     ) async -> DecisionOutcome {
-        guard !Task.isCancelled else { return .cancelled }
-        guard reservationsByRequestID[request.requestID] == nil else { return .invalidRequest }
+        await decideTraced(
+            serviceID: serviceID,
+            request: request,
+            consumerRevision: consumerRevision
+        ).outcome
+    }
+
+    /// Same execution as `decide`, returning the identical outcome plus the decision-log trace.
+    func decideTraced(
+        serviceID: DecisionServiceID,
+        request: FiniteChoiceDecisionRequest,
+        consumerRevision: UInt64? = nil
+    ) async -> DecisionTracedOutcome {
+        guard !Task.isCancelled else { return Self.traced(.cancelled, serviceID: serviceID) }
+        guard reservationsByRequestID[request.requestID] == nil else {
+            return Self.traced(.invalidRequest, serviceID: serviceID)
+        }
         if let consumerRevision {
             let latest = latestRevisionByConsumerID[request.consumerID]
-            guard latest.map({ consumerRevision >= $0 }) ?? true else { return .cancelled }
+            guard latest.map({ consumerRevision >= $0 }) ?? true else {
+                return Self.traced(.cancelled, serviceID: serviceID)
+            }
             advanceConsumerRevision(consumerID: request.consumerID, revision: consumerRevision)
         }
         let ownershipID = UUID()
         let settlement = DecisionSettlement()
         reservationsByRequestID[request.requestID] = Reservation(
             ownershipID: ownershipID,
+            serviceID: serviceID,
             consumerID: request.consumerID,
             consumerRevision: consumerRevision,
             settlement: settlement,
             task: nil
         )
-        let outcome = await withTaskCancellationHandler {
+        let tracedOutcome = await withTaskCancellationHandler {
             await withCheckedContinuation { continuation in
                 guard settlement.install(continuation) else {
                     cancel(requestID: request.requestID, ownershipID: ownershipID)
@@ -66,12 +119,12 @@ actor DecisionCoordinator {
         } onCancel: {
             // The caller claims cancellation synchronously; actor-owned cleanup follows
             // when the suspended decide call resumes, without a competing queued task.
-            settlement.settle(.cancelled)
+            settlement.settle(Self.traced(.cancelled, serviceID: serviceID))
         }
         if settlement.isCancelled {
             cancel(requestID: request.requestID, ownershipID: ownershipID)
         }
-        return outcome
+        return tracedOutcome
     }
 
     func advanceConsumerRevision(consumerID: DecisionConsumerID, revision: UInt64) {
@@ -88,7 +141,7 @@ actor DecisionCoordinator {
 
     func cancel(requestID: UUID) {
         guard let reservation = reservationsByRequestID.removeValue(forKey: requestID) else { return }
-        reservation.settlement.settle(.cancelled)
+        reservation.settlement.settle(Self.traced(.cancelled, serviceID: reservation.serviceID))
         reservation.task?.cancel()
     }
 
@@ -149,6 +202,7 @@ actor DecisionCoordinator {
             acceptancePolicyVersion: policyVersion,
             configurationContextID: registration.configuration?.credentialContext?.contextID
         )
+        let routeStart = ContinuousClock.now
         let outcome = await registration.service.decide(request)
         guard isActive(requestID: request.requestID, ownershipID: ownershipID) else { return }
         let currentReadiness = await registration.service.readinessSnapshot()
@@ -157,10 +211,14 @@ actor DecisionCoordinator {
             finish(.unavailable, requestID: request.requestID, ownershipID: ownershipID)
             return
         }
+        let elapsed = routeStart.duration(to: ContinuousClock.now)
+        let latencyMs = Double(elapsed.components.seconds) * 1000
+            + Double(elapsed.components.attoseconds) / 1e15
         finish(
             validator.validateOutcome(outcome, request: request, acceptancePolicyVersion: invocation.acceptancePolicyVersion),
             requestID: request.requestID,
-            ownershipID: ownershipID
+            ownershipID: ownershipID,
+            latencyMs: latencyMs
         )
     }
 
@@ -169,14 +227,19 @@ actor DecisionCoordinator {
         cancel(requestID: requestID)
     }
 
-    private func finish(_ outcome: DecisionOutcome, requestID: UUID, ownershipID: UUID) {
+    private func finish(
+        _ outcome: DecisionOutcome,
+        requestID: UUID,
+        ownershipID: UUID,
+        latencyMs: Double? = nil
+    ) {
         guard let reservation = reservationsByRequestID[requestID],
               reservation.ownershipID == ownershipID
         else { return }
         // A synchronous test seam can cancel the caller at this precise boundary.
         beforeSettlement?(requestID, outcome)
         reservationsByRequestID.removeValue(forKey: requestID)
-        reservation.settlement.settle(outcome)
+        reservation.settlement.settle(Self.traced(outcome, serviceID: reservation.serviceID, latencyMs: latencyMs))
     }
 
     private func owns(requestID: UUID, ownershipID: UUID) -> Bool {
@@ -195,18 +258,18 @@ actor DecisionCoordinator {
 /// claim synchronous while the actor continues to own request IDs, workers, and cleanup.
 private final class DecisionSettlement: @unchecked Sendable {
     private let lock = NSLock()
-    private var continuation: CheckedContinuation<DecisionOutcome, Never>?
-    private var terminal: DecisionOutcome?
+    private var continuation: CheckedContinuation<DecisionTracedOutcome, Never>?
+    private var terminal: DecisionTracedOutcome?
 
     var isCancelled: Bool {
         lock.lock()
         defer { lock.unlock() }
-        if case .cancelled = terminal { return true }
+        if case .cancelled = terminal?.outcome { return true }
         return false
     }
 
     /// Returns false when cancellation settled before the continuation was installed.
-    func install(_ continuation: CheckedContinuation<DecisionOutcome, Never>) -> Bool {
+    func install(_ continuation: CheckedContinuation<DecisionTracedOutcome, Never>) -> Bool {
         lock.lock()
         if let terminal {
             lock.unlock()
@@ -218,7 +281,7 @@ private final class DecisionSettlement: @unchecked Sendable {
         return true
     }
 
-    func settle(_ outcome: DecisionOutcome) {
+    func settle(_ outcome: DecisionTracedOutcome) {
         lock.lock()
         guard terminal == nil else {
             lock.unlock()

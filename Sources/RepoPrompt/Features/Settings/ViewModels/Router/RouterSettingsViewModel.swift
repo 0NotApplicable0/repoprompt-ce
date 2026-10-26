@@ -100,6 +100,7 @@ final class RouterSettingsViewModel: ObservableObject {
     @Published private(set) var targetPreviews: [TargetPreview] = []
     @Published private(set) var unavailableTargetPreviews: [UnavailableTargetPreview] = []
     @Published private(set) var policyCanBuildCandidates = false
+    @Published private(set) var connectedProviders: Set<AgentProviderKind> = []
 
     private let settingsStore: GlobalSettingsStore
     private let runtime: AgentTaskRouterRuntime
@@ -172,6 +173,11 @@ final class RouterSettingsViewModel: ObservableObject {
             .store(in: &cancellables)
         apiSettingsViewModel.$availableCodexModels
             .dropFirst()
+            .receive(on: RunLoop.main)
+            .sink { [weak self] _ in _ = self?.agentExecutionCatalogDidChange() }
+            .store(in: &cancellables)
+        NotificationCenter.default.publisher(for: .antigravityModelsChanged)
+            .merge(with: NotificationCenter.default.publisher(for: .grokModelsChanged))
             .receive(on: RunLoop.main)
             .sink { [weak self] _ in _ = self?.agentExecutionCatalogDidChange() }
             .store(in: &cancellables)
@@ -345,6 +351,16 @@ final class RouterSettingsViewModel: ObservableObject {
 
     func setAllowPaidFastRouting(_ enabled: Bool) {
         settingsStore.setAllowPaidFastRouting(enabled)
+        synchronizeConfiguration()
+    }
+
+    func setRandomness(_ level: AgentRoutingRandomness) {
+        settingsStore.setRandomness(level)
+        synchronizeConfiguration()
+    }
+
+    func setReviewDiversityEnabled(_ enabled: Bool) {
+        settingsStore.setReviewDiversityEnabled(enabled)
         synchronizeConfiguration()
     }
 
@@ -614,6 +630,12 @@ final class RouterSettingsViewModel: ObservableObject {
 
     private func rebuildTargetPreviews() {
         let availability = availabilityProvider()
+        let connected = Set(AgentTaskRoutingCandidateBuilder.curatedProviders.filter {
+            AgentModelCatalog.isAgentAvailable($0, availability: availability)
+        })
+        if connectedProviders != connected {
+            connectedProviders = connected
+        }
         guard targetPreviewAvailability != availability else {
             updatePolicyCanBuildCandidates()
             return
@@ -650,15 +672,18 @@ final class RouterSettingsViewModel: ObservableObject {
         }
     }
 
-    private static func buildTargetPreviews(
-        availability: AgentModelCatalog.AvailabilityContext
+    static func buildTargetPreviews(
+        availability: AgentModelCatalog.AvailabilityContext,
+        catalogOptions: @escaping @MainActor (AgentProviderKind, AgentModelCatalog.AvailabilityContext) -> [AgentModelOption] = {
+            AgentModelCatalog.options(for: $0, availability: $1)
+        }
     ) throws -> [TargetPreview] {
         var optionsByProvider: [AgentProviderKind: [AgentModelOption]] = [:]
         let modelOptions: @MainActor (AgentProviderKind, AgentModelCatalog.AvailabilityContext) -> [AgentModelOption] = { provider, context in
             if let options = optionsByProvider[provider] {
                 return options
             }
-            let options = AgentModelCatalog.options(for: provider, availability: context)
+            let options = catalogOptions(provider, context)
             optionsByProvider[provider] = options
             return options
         }
@@ -691,10 +716,13 @@ final class RouterSettingsViewModel: ObservableObject {
         }
     }
 
-    private static func buildUnavailableTargetPreviews(
-        availability: AgentModelCatalog.AvailabilityContext
+    static func buildUnavailableTargetPreviews(
+        availability: AgentModelCatalog.AvailabilityContext,
+        catalogOptions: @escaping @MainActor (AgentProviderKind, AgentModelCatalog.AvailabilityContext) -> [AgentModelOption] = {
+            AgentModelCatalog.options(for: $0, availability: $1)
+        }
     ) -> [UnavailableTargetPreview] {
-        AgentTaskRoutingCandidateBuilder().modelFamilyAvailability(availability: availability).compactMap { family in
+        AgentTaskRoutingCandidateBuilder(modelOptions: catalogOptions).modelFamilyAvailability(availability: availability).compactMap { family in
             guard let reason = family.unavailableReason else { return nil }
             return .init(
                 id: family.id,
@@ -718,5 +746,28 @@ final class RouterSettingsViewModel: ObservableObject {
         available: Set<AgentProviderKind>
     ) -> Set<AgentProviderKind> {
         configuration.allowedProvidersMaterialized ? configuration.allowedProviders : available
+    }
+}
+
+extension RouterSettingsViewModel {
+    /// Every provider of the five-provider frontier, in frontier order, connected or not.
+    var visibleProviders: [AgentProviderKind] {
+        AgentTaskRoutingCandidateBuilder.curatedProviders
+    }
+
+    func providerIsAvailable(_ provider: AgentProviderKind) -> Bool {
+        connectedProviders.contains(provider)
+    }
+
+    func providerStatusLabel(for provider: AgentProviderKind) -> String {
+        providerIsAvailable(provider) ? provider.displayName : provider.displayName + " (authentication needed)"
+    }
+
+    var routerCandidatesDescription: String {
+        "Model Router chooses from the available models below, built from the connected Claude Code, Codex, Cursor, Antigravity and Grok CLI catalogs. It chooses the base model first, then that model's reasoning effort; a model with no advertised effort control runs at its provider default."
+    }
+
+    var routerEmptyStateText: String {
+        "No curated execution targets are currently available. Connect Claude Code, Codex, Cursor, Antigravity or Grok CLI and check model availability."
     }
 }

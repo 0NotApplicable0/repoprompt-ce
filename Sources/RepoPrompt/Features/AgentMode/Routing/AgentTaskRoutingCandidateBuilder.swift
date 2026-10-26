@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptSettingsCore
 
 /// Builds router-owned choices from one provider-authoritative metadata snapshot.
 /// Profile prose is advisory and never admits a model or effort.
@@ -40,11 +41,17 @@ struct AgentTaskRoutingCandidateBuilder {
         case insufficientCapacity
     }
 
+    private struct NewestVersionedBase {
+        let prefix: String
+        let suffix: String?
+    }
+
     private struct ModelDefinition {
         let provider: AgentProviderKind
         let baseModelAliases: [String]
         let modelClass: String
         let preferredCodexFamily: String?
+        let newestVersionedBase: NewestVersionedBase?
         let rubric: String
 
         /// Explicit substitution constraints, not a claim of identical model capabilities.
@@ -63,12 +70,14 @@ struct AgentTaskRoutingCandidateBuilder {
             baseModelAliases: [String],
             modelClass: String,
             preferredCodexFamily: String? = nil,
+            newestVersionedBase: NewestVersionedBase? = nil,
             rubric: String
         ) {
             self.provider = provider
             self.baseModelAliases = baseModelAliases
             self.modelClass = modelClass
             self.preferredCodexFamily = preferredCodexFamily
+            self.newestVersionedBase = newestVersionedBase
             self.rubric = rubric
         }
     }
@@ -101,12 +110,15 @@ struct AgentTaskRoutingCandidateBuilder {
         opaqueKey: @escaping () -> String = { UUID().uuidString.lowercased() },
         profileResolver: RoutingModelProfileResolver? = nil,
         profileSnapshot: RoutingModelProfileSnapshot? = nil,
+        cursorThinking: @escaping @MainActor (String) -> ACPModelParameterDefinition? = {
+            ACPModelParameterResolver.parameterSet(providerID: .cursor, selectedModelRaw: $0)?.definition(kind: .thinking)
+        },
         modelOptions: @escaping @MainActor (AgentProviderKind, AgentModelCatalog.AvailabilityContext) -> [AgentModelOption] = {
             AgentModelCatalog.options(for: $0, availability: $1)
         }
     ) {
         self.opaqueKey = opaqueKey
-        metadata = RoutingExecutionMetadataAdapter(modelOptions: modelOptions)
+        metadata = RoutingExecutionMetadataAdapter(cursorThinking: cursorThinking, modelOptions: modelOptions)
         let snapshot = profileSnapshot ?? RoutingModelProfileSnapshot.bundled
         self.profileSnapshot = snapshot
         profiles = profileResolver ?? snapshot.resolver
@@ -137,10 +149,16 @@ struct AgentTaskRoutingCandidateBuilder {
     func build(
         snapshot: RoutingExecutionMetadataSnapshot,
         roleDefaults: [RoleDefaultReference] = [],
+        excludedMakers: Set<String> = [],
         maximumChoices: Int = FiniteChoiceDecisionValidator.maximumChoices
     ) throws -> [Candidate] {
-        let allSelected = Self.executableModels(in: snapshot)
-        guard !allSelected.isEmpty else { throw BuildError.noAvailableTargets }
+        let available = Self.executableModels(in: snapshot)
+        guard !available.isEmpty else { throw BuildError.noAvailableTargets }
+        let allSelected = excludedMakers.isEmpty ? available : available.filter { _, model in
+            guard let maker = AgentTaskRoutingMakerCatalog.maker(for: model.baseTarget) else { return false }
+            return !excludedMakers.contains(maker.rawValue)
+        }
+        guard !allSelected.isEmpty else { return [] }
         let capacity = min(maximumChoices, FiniteChoiceDecisionValidator.maximumChoices)
         guard capacity > 0, allSelected.count == 1 || capacity >= 2 else {
             throw BuildError.insufficientCapacity
@@ -212,7 +230,8 @@ struct AgentTaskRoutingCandidateBuilder {
                 $0.provider == .codexExec && Self.isPaidFast($0.baseTarget)
                     && CodexModelSpecifier(raw: $0.baseModelRaw).baseModel == selected.baseModelRaw
             } : []
-        let baseTargets = [selected.baseTarget] + selected.efforts.compactMap(\.executableTarget)
+        let baseTargets = (Self.offersBaseEffortTarget(selected) ? [selected.baseTarget] : [])
+            + selected.efforts.compactMap(\.executableTarget)
         var seen: Set<AgentRoutingExecutableTarget> = []
         let ordinaryTargets = baseTargets.filter { !Self.isPaidFast($0) && seen.insert($0).inserted }
         let capacity = min(maximumChoices, FiniteChoiceDecisionValidator.maximumChoices)
@@ -245,6 +264,18 @@ struct AgentTaskRoutingCandidateBuilder {
         }
         guard !candidates.isEmpty else { throw BuildError.noAvailableTargets }
         return candidates
+    }
+
+    /// Antigravity and Cursor advertise effort as exact variants of a base the router selects. When
+    /// such variants exist the effort stage is exactly those variants; the bare base is offered only
+    /// when the provider advertised it as its own model option (Antigravity) or no control exists.
+    private static func offersBaseEffortTarget(_ model: RoutingExecutionModelMetadata) -> Bool {
+        guard model.efforts.contains(where: \.isExecutable) else { return true }
+        switch model.provider {
+        case .antigravity: return model.advertisedOptionRawValues.contains(model.baseModelRaw)
+        case .cursor: return false
+        default: return true
+        }
     }
 
     func usageCandidates(
@@ -326,9 +357,12 @@ struct AgentTaskRoutingCandidateBuilder {
         for scope: AgentTaskRoutingScope,
         configuration: AgentTaskRouterConfiguration,
         availability: AgentModelCatalog.AvailabilityContext,
-        surface: AgentModelCatalog.AgentSelectionSurface = .general
+        surface: AgentModelCatalog.AgentSelectionSurface = .general,
+        modelOptions: @escaping @MainActor (AgentProviderKind, AgentModelCatalog.AvailabilityContext) -> [AgentModelOption] = {
+            AgentModelCatalog.options(for: $0, availability: $1)
+        }
     ) -> Set<AgentProviderKind> {
-        let available = availableProviders(availability: availability, surface: surface)
+        let available = availableProviders(availability: availability, surface: surface, modelOptions: modelOptions)
         let preferred = scope == .primarySession ? configuration.primaryProvider : configuration.subagentProvider
         if let preferred, available.contains(preferred) { return [preferred] }
         return available
@@ -353,12 +387,23 @@ struct AgentTaskRoutingCandidateBuilder {
         availability: AgentModelCatalog.AvailabilityContext,
         surface: AgentModelCatalog.AgentSelectionSurface = .general
     ) -> [ModelFamilyAvailability] {
+        // Claude Code and Codex families are always listed. Cursor, Antigravity and Grok CLI
+        // families are listed only while their provider is available; Cursor Grok only while
+        // the Grok CLI is unavailable, as in the executable frontier.
+        let grokCLIAvailable = AgentModelCatalog.isAgentAvailable(.grok, availability: availability)
+        let definitions = Self.modelDefinitions.filter { definition in
+            if Self.familyProjectionProviders.contains(definition.provider) { return true }
+            guard surface.allows(definition.provider),
+                  AgentModelCatalog.isAgentAvailable(definition.provider, availability: availability)
+            else { return false }
+            return definition.modelClass != "cursor-grok" || !grokCLIAvailable
+        }
         let snapshot = capture(
-            allowedProviders: Set(Self.curatedProviders),
+            allowedProviders: Set(definitions.map(\.provider)),
             availability: availability,
             surface: surface
         )
-        return Self.modelDefinitions.map { definition in
+        return definitions.map { definition in
             let displayName = Self.familyDisplayName(for: definition)
             let providerAvailable = surface.allows(definition.provider)
                 && AgentModelCatalog.isAgentAvailable(definition.provider, availability: availability)
@@ -432,14 +477,66 @@ struct AgentTaskRoutingCandidateBuilder {
             baseModelAliases: ["claude-fable-5-1", "fable"],
             modelClass: "claude-fable",
             rubric: "Judge Fable as a base model using its capability, expected completion reliability, and premium price."
+        ),
+        .init(
+            provider: .antigravity,
+            baseModelAliases: [],
+            modelClass: "gemini-flash",
+            newestVersionedBase: .init(prefix: "gemini-", suffix: "-flash"),
+            rubric: "Judge Gemini Flash as a base model using its capability, expected completion reliability, and price."
+        ),
+        .init(
+            provider: .antigravity,
+            baseModelAliases: [],
+            modelClass: "gemini-pro",
+            newestVersionedBase: .init(prefix: "gemini-", suffix: nil),
+            rubric: "Judge Gemini Pro as a base model using its capability, expected completion reliability, and price."
+        ),
+        .init(
+            provider: .grok,
+            baseModelAliases: [],
+            modelClass: "grok",
+            newestVersionedBase: .init(prefix: "grok-", suffix: ""),
+            rubric: "Judge Grok as a base model using its capability, expected completion reliability, and price."
+        ),
+        .init(
+            provider: .cursor,
+            baseModelAliases: ["composer-2.5"],
+            modelClass: "composer",
+            rubric: "Judge Composer as a base model using its capability, expected completion reliability, and price."
+        ),
+        .init(
+            provider: .cursor,
+            baseModelAliases: ["grok-4.7"],
+            modelClass: "cursor-grok",
+            rubric: "Judge Cursor Grok as a base model using its capability, expected completion reliability, and price."
         )
     ]
 
-    private static let curatedProviders: [AgentProviderKind] = [.codexExec, .claudeCode]
+    var registeredTargetMakers: [String: AgentTaskRoutingMaker?] {
+        Dictionary(uniqueKeysWithValues: Self.modelDefinitions.map { definition in
+            (
+                definition.modelClass,
+                AgentTaskRoutingMakerCatalog.maker(
+                    provider: definition.provider,
+                    modelRaw: definition.baseModelAliases.first ?? definition.modelClass
+                )
+            )
+        })
+    }
+
+    static let curatedProviders: [AgentProviderKind] = [.codexExec, .claudeCode, .cursor, .antigravity, .grok]
+    private static let familyProjectionProviders: [AgentProviderKind] = [.codexExec, .claudeCode]
 
     private static func familyDisplayName(for definition: ModelDefinition) -> String {
-        definition.modelClass.split(separator: "-").last.map(String.init)?.capitalized
-            ?? definition.modelClass.capitalized
+        switch definition.modelClass {
+        case "gemini-flash": "Gemini Flash"
+        case "gemini-pro": "Gemini Pro"
+        case "cursor-grok": "Cursor Grok"
+        default:
+            definition.modelClass.split(separator: "-").last.map(String.init)?.capitalized
+                ?? definition.modelClass.capitalized
+        }
     }
 
     private static func executableModels(
@@ -450,6 +547,9 @@ struct AgentTaskRoutingCandidateBuilder {
             guard snapshot.scope.allowedProviders.contains(provider),
                   snapshot.scope.surface.allows(provider),
                   AgentModelCatalog.isAgentAvailable(provider, availability: snapshot.scope.availability),
+                  // Cursor's Grok is a fallback while the Grok CLI is unavailable, never a second Grok.
+                  definition.modelClass != "cursor-grok"
+                  || !AgentModelCatalog.isAgentAvailable(.grok, availability: snapshot.scope.availability),
                   let model = resolveModel(
                       definition,
                       from: snapshot.models.filter { $0.provider == provider }
@@ -481,6 +581,9 @@ struct AgentTaskRoutingCandidateBuilder {
                let model = providerModels.first(where: { $0.baseModelRaw == preferred.rawValue })
             { return model }
         }
+        if let rule = definition.newestVersionedBase {
+            return newestModel(in: providerModels, rule: rule)
+        }
         return definition.baseModelAliases.lazy.compactMap { alias in
             providerModels.first { model in
                 model.baseModelRaw.caseInsensitiveCompare(alias) == .orderedSame
@@ -488,10 +591,50 @@ struct AgentTaskRoutingCandidateBuilder {
         }.first
     }
 
+    private static func newestModel(
+        in models: [RoutingExecutionModelMetadata],
+        rule: NewestVersionedBase
+    ) -> RoutingExecutionModelMetadata? {
+        var newest: RoutingExecutionModelMetadata?
+        var newestVersion: [Int] = []
+        for model in models {
+            let base = model.baseModelRaw.lowercased()
+            guard base.hasPrefix(rule.prefix) else { continue }
+            let versionedBase = base.dropFirst(rule.prefix.count)
+            let versionText: Substring
+            if let suffix = rule.suffix {
+                guard versionedBase.hasSuffix(suffix), versionedBase.count > suffix.count else { continue }
+                versionText = versionedBase.dropLast(suffix.count)
+            } else {
+                guard !versionedBase.split(separator: "-").contains("flash") else { continue }
+                versionText = versionedBase.prefix { $0 != "-" }
+            }
+            let components = versionText.split(separator: ".", omittingEmptySubsequences: false)
+            let version = components.compactMap { Int($0) }
+            guard !version.isEmpty, version.count == components.count else { continue }
+            if newest == nil || isEarlier(newestVersion, than: version) {
+                newest = model
+                newestVersion = version
+            }
+        }
+        return newest
+    }
+
+    private static func isEarlier(_ lhs: [Int], than rhs: [Int]) -> Bool {
+        for index in 0 ..< max(lhs.count, rhs.count) {
+            let left = index < lhs.count ? lhs[index] : 0
+            let right = index < rhs.count ? rhs[index] : 0
+            if left != right { return left < right }
+        }
+        return false
+    }
+
     private static func baseModelRaw(_ raw: String, provider: AgentProviderKind) -> String? {
         switch provider {
         case .codexExec: CodexModelSpecifier(raw: raw).baseModel
         case .claudeCode: ClaudeModelSpecifier(raw: raw).baseModel
+        case .antigravity: RoutingModelIdentity.antigravityEffortSplit(raw)?.base ?? raw
+        case .cursor, .grok: raw
         default: nil
         }
     }

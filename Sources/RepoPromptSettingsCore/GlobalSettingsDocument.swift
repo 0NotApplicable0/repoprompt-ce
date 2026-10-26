@@ -844,6 +844,8 @@ package struct GlobalScalarPreferences: Codable, Equatable {
         package var usageBalancingOverride: Bool?
         package var usageLargerPlan: String? // Legacy value retained for lossless settings round trips; no longer used.
         package var allowPaidFastRouting: Bool?
+        package var randomness: String?
+        package var reviewDiversityEnabled: Bool?
 
         package init(
             enabled: Bool? = nil,

@@ -1,4 +1,5 @@
 import Foundation
+import MCP
 @testable import RepoPromptApp
 import XCTest
 
@@ -199,7 +200,7 @@ final class RoutingExecutionMetadataTests: XCTestCase {
         _ catalog: [AgentProviderKind: [AgentModelOption]],
         key: @escaping () -> String = { UUID().uuidString }
     ) -> AgentTaskRoutingCandidateBuilder {
-        AgentTaskRoutingCandidateBuilder(opaqueKey: key) { provider, _ in catalog[provider] ?? [] }
+        AgentTaskRoutingCandidateBuilder(opaqueKey: key, modelOptions: { provider, _ in catalog[provider] ?? [] })
     }
 
     func testPreviewCatalogMemoRetainsExactOutputsAndRemovesDuplicateRead() throws {

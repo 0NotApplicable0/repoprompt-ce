@@ -313,7 +313,7 @@ final class ACPToolObservationCorrelationTests: XCTestCase {
     }
 
     private func fixture(toolTrackingHooks: AgentToolTrackingHooks = .noOp) -> (AgentSessionLinkRunnerHarness, AgentTabSession, ACPIntegratedAgentModeRunner) {
-        let harness = AgentSessionLinkRunnerHarness(headlessProviderFactory: { _, _ in AgentSessionLinkCapturingHeadlessProvider() })
+        let harness = AgentSessionLinkRunnerHarness(headlessProviderFactory: { _, _, _, _, _ in AgentSessionLinkCapturingHeadlessProvider() })
         let runner = ACPIntegratedAgentModeRunner(hooks: harness.hooks, terminalCommitBarrier: AgentRunTerminalCommitBarrier(), toolTrackingHooks: toolTrackingHooks, providerFactory: { _, _ in nil }, controllerFactory: { provider, request in try ACPAgentSessionController(provider: provider, runRequest: request) })
         return (harness, harness.makeSession(agent: .devin), runner)
     }
@@ -595,7 +595,7 @@ final class AgentToolResultPayloadRetentionTests: XCTestCase {
 
     @MainActor
     func testNormalizedTrackerSequenceKeepsOneCompletedResultCard() throws {
-        let harness = AgentSessionLinkRunnerHarness(headlessProviderFactory: { _, _ in AgentSessionLinkCapturingHeadlessProvider() })
+        let harness = AgentSessionLinkRunnerHarness(headlessProviderFactory: { _, _, _, _, _ in AgentSessionLinkCapturingHeadlessProvider() })
         let session = harness.makeSession(agent: .devin)
         let runner = ACPIntegratedAgentModeRunner(
             hooks: harness.hooks, terminalCommitBarrier: AgentRunTerminalCommitBarrier(),
@@ -643,7 +643,7 @@ final class AgentToolResultPayloadRetentionTests: XCTestCase {
     func testSubstantiveTerminalTextAndArraysReplaceProviderLifecycleOnBothRunnerPaths() throws {
         for trackerPath in [false, true] {
             for output: Any in ["terminal finding", [["type": "text", "text": "terminal finding"]]] {
-                let harness = AgentSessionLinkRunnerHarness(headlessProviderFactory: { _, _ in AgentSessionLinkCapturingHeadlessProvider() })
+                let harness = AgentSessionLinkRunnerHarness(headlessProviderFactory: { _, _, _, _, _ in AgentSessionLinkCapturingHeadlessProvider() })
                 let session = harness.makeSession(agent: .devin)
                 let runner = ACPIntegratedAgentModeRunner(
                     hooks: harness.hooks, terminalCommitBarrier: AgentRunTerminalCommitBarrier(),
@@ -748,7 +748,7 @@ final class AgentToolResultPayloadRetentionTests: XCTestCase {
     func testDetachedAgentRunSnapshotSurvivesProviderTerminalEchoOnBothRunnerPaths() {
         let snapshot = #"{"status":"running","session_id":"detached-child","context_id":"child-context"}"#
         for trackerPath in [false, true] {
-            let harness = AgentSessionLinkRunnerHarness(headlessProviderFactory: { _, _ in AgentSessionLinkCapturingHeadlessProvider() })
+            let harness = AgentSessionLinkRunnerHarness(headlessProviderFactory: { _, _, _, _, _ in AgentSessionLinkCapturingHeadlessProvider() })
             let session = harness.makeSession(agent: .devin)
             let runner = ACPIntegratedAgentModeRunner(
                 hooks: harness.hooks, terminalCommitBarrier: AgentRunTerminalCommitBarrier(),

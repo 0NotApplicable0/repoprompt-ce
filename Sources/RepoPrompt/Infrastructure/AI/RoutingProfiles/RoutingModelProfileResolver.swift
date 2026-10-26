@@ -70,6 +70,29 @@ struct ResolvedRoutingProfile: Equatable {
     }
 }
 
+/// Provider-scoped identity normalization shared by metadata capture and profile lookup.
+/// Antigravity advertises Gemini effort as a suffix on the model ID (`gemini-3.8-flash-high`);
+/// the base identity drops that suffix. Other providers and non-Gemini IDs are never rewritten.
+enum RoutingModelIdentity {
+    /// Longer suffixes first so `x-high` is not read as `high`.
+    private static let antigravityEffortSuffixes = ["x-high", "xhigh", "none", "minimal", "low", "medium", "high", "max", "maximum", "ultra"]
+
+    static func antigravityEffortSplit(_ raw: String) -> (base: String, effort: String)? {
+        let lowered = raw.lowercased()
+        guard lowered.hasPrefix("gemini-") else { return nil }
+        for suffix in antigravityEffortSuffixes where lowered.hasSuffix("-\(suffix)") {
+            let base = String(raw.dropLast(suffix.count + 1))
+            guard base.count > "gemini-".count else { return nil }
+            return (base, String(raw.suffix(suffix.count)))
+        }
+        return nil
+    }
+
+    static func profileLookupID(provider: AgentProviderKind, raw: String) -> String {
+        provider == .antigravity ? (antigravityEffortSplit(raw)?.base ?? raw) : raw
+    }
+}
+
 /// Immutable profile annotation over an already-authorized execution catalog model.
 /// The result has no executable-target constructor and cannot admit a model or effort.
 struct RoutingModelProfileResolver {
@@ -115,9 +138,10 @@ struct RoutingModelProfileResolver {
             )
         }
         let profileFreshness: RoutingProfileFreshness = document?.expiresAt.map { now > $0 ? .stale : .current } ?? .unknown
-        let exact = document?.models.first { $0.providerID == provider && $0.id == model.baseModelRaw }
+        let lookupID = RoutingModelIdentity.profileLookupID(provider: model.provider, raw: model.baseModelRaw)
+        let exact = document?.models.first { $0.providerID == provider && $0.id == lookupID }
         let alias = exact == nil ? document?.models.first {
-            $0.providerID == provider && $0.aliases.contains(model.baseModelRaw)
+            $0.providerID == provider && $0.aliases.contains(lookupID)
         } : nil
         let matched = exact ?? alias
         let family: RoutingProfileDocument.Family?
@@ -134,9 +158,9 @@ struct RoutingModelProfileResolver {
             let candidates = document?.families.filter { family in
                 guard family.providerID == provider else { return false }
                 return family.id == providerFamilyID
-                    || family.aliases.contains(model.baseModelRaw)
+                    || family.aliases.contains(lookupID)
                     || family.matchers.contains { matcher in
-                        Self.matches(model.baseModelRaw, prefix: matcher.prefix)
+                        Self.matches(lookupID, prefix: matcher.prefix)
                     }
             } ?? []
             family = candidates.count == 1 && (providerFamilyID == nil || candidates[0].id == providerFamilyID)

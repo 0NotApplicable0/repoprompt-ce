@@ -356,11 +356,21 @@ scalarPreferences.modelRouter.allowedProviderRawValues
 scalarPreferences.modelRouter.primaryProviderRawValue
 scalarPreferences.modelRouter.subagentProviderRawValue
 scalarPreferences.modelRouter.customInstructions
+scalarPreferences.modelRouter.usageBalancingEnabled
+scalarPreferences.modelRouter.usageBalancingPreset
+scalarPreferences.modelRouter.usageLargerPlan
+scalarPreferences.modelRouter.allowPaidFastRouting
+scalarPreferences.modelRouter.randomness
+scalarPreferences.modelRouter.reviewDiversityEnabled
 ```
 
 The base group is a schema-v9 feature fence. Its absence leaves the document's minimum schema unchanged; any presence requires v9 so older typed writers reject the document instead of silently dropping router consent. A nonnil primary provider, subagent provider, or custom guidance field requires v10. Clearing all three returns the content-derived minimum to v9. The group stores no API keys or backend secrets. Unknown nonblank backend, role, and provider raws are preserved during sibling edits and ignored by current runtime validation. An unknown backend is never replaced by the first registered backend.
 
 Missing values resolve disabled. Production materializes Jev only for an absent Router service raw value before initial demand reconciliation; blank/unknown raw values are preserved and unavailable, not normalized into a different service. Provider scope fields are optional preferences: an available selected provider narrows that scope's candidates to it, while an unavailable selection falls back to the other connected providers. The legacy candidate-role and allowed-provider arrays remain for schema/rollback preservation but no longer authorize the provider-catalog frontier. Custom guidance is trimmed on supported writes, removed when empty, and bounded to 1,000 characters and 4,096 UTF-8 bytes. `GlobalSettingsStore.modelRouterSettingsRevision` is process-local and changes only after an actual in-memory Router mutation. Future/foreign blocking, compatible import, raw unknown-field preservation, and rollback rules remain those of the owning global settings document.
+
+`usageBalancingEnabled` defaults to false. `usageBalancingPreset` accepts the current strategies (`nearLimits`, `evenPace`, `expiringQuota`) and legacy aliases; an unknown preset disables balancing without discarding its raw value. `allowPaidFastRouting` defaults to false. `usageLargerPlan` is retained only for lossless round trips and is no longer used.
+
+`randomness` accepts exactly `off`, `low`, `medium`, or `high`; missing, unknown, empty, whitespace-prefixed, or wrong-case strings read as `off`. `reviewDiversityEnabled` enables only on literal `true` and defaults to false. Both fields reuse the existing optional document fields and survive sibling edits unchanged; an explicit setter replaces the corresponding raw value. Neither raises the schema (unscoped router fields remain v9, while scoped provider or guidance fields require v10). Both setters are normal router updates and bump the revision only on an actual change. Router Settings exposes the four-level Randomness picker and Review diversity toggle. These preferences persist independently of the later exploration schedule and Review-start enforcement.
 
 ## Independent Auto Effort service selection
 
@@ -369,6 +379,8 @@ The existing `scalarPreferences.agentMode.autoEffortEnabled` flag remains a sepa
 ## Legacy routing-profile settings
 
 `scalarPreferences.modelRoutingProfiles.remoteUpdatesDisabled` and `lastCheckAt` are deprecated, inert optional fields retained for schema-v12 Codable and rollback compatibility. The content-derived schema fence still requires v12 whenever either value is present. Current code has no active manager reader/writer for them: it does not materialize, update, clear, or migrate them. Unrelated settings edits preserve both values and continue to write a schema-v12-compatible document, allowing an older v12-aware app to read them after rollback. These fields do not control any current profile behavior; bundled routing profiles are the only source. See [model routing](model-routing.md) and the [bundled profile publication boundary](routing-profile-publication.md).
+
+`usageLargerPlan` on `scalarPreferences.modelRouter` is a legacy inert optional field retained for tolerant decoding and lossless round-trip preservation.
 
 ## Agent Mode Handoff instructions
 

@@ -99,6 +99,26 @@ enum DecisionOutcome: Equatable {
     static let unavailable: Self = .failed(category: .policyUnavailable, retryable: false, evidence: nil)
 }
 
+/// Route evidence that is not part of the wire outcome: which service answered and how long it took.
+/// Used only by the decision log; it never changes decision selection or error semantics.
+struct DecisionTrace: Equatable {
+    let serviceID: DecisionServiceID
+    /// The pinned service evaluator model when the service answered with validated evidence.
+    let jevModel: String?
+    /// Monotonic milliseconds from just before the service call through the validated terminal result.
+    /// Nil when no service call was made (invalid request, unavailable policy, cancellation before start).
+    let latencyMs: Double?
+
+    var backendID: DecisionServiceID {
+        serviceID
+    }
+}
+
+struct DecisionTracedOutcome: Equatable {
+    let outcome: DecisionOutcome
+    let trace: DecisionTrace
+}
+
 enum DecisionReadiness: Equatable {
     case ready(generation: UInt64, policyVersion: String)
     case needsConfiguration(generation: UInt64, reason: String)

@@ -765,6 +765,7 @@ class WindowState: ObservableObject {
         domainRuntimeOverride: MCPDomainRuntime?,
         keyManager injectedKeyManager: KeyManager? = nil,
         agentModeViewModelFactory: WindowStateCompositionFactory.AgentModeViewModelFactory? = nil,
+        openRequestID: UUID? = nil,
         sessionRuntimeWorkspace: WorkspaceModel? = nil,
         borrowedAPISettingsViewModel: APISettingsViewModel? = nil
     ) {

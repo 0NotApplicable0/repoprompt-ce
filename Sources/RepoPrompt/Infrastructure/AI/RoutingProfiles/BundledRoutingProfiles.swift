@@ -6,10 +6,10 @@ enum BundledRoutingProfiles {
     static let data = Data((#"""
     {
       "schemaVersion": 1,
-      "profileVersion": "rpce.bundled-routing-profiles.2026-09-30.2",
-      "evidenceVersion": "rpce.model-routing-evidence.2026-09-30.2",
-      "rubricVersion": "rpce.automatic-utility-frontier.v2-evidence-2026-09-30.2",
-      "issuedAt": "2026-09-23T00:00:00Z",
+      "profileVersion": "rpce.bundled-routing-profiles.2026-10-10.1",
+      "evidenceVersion": "rpce.model-routing-evidence.2026-10-10.1",
+      "rubricVersion": "rpce.automatic-utility-frontier.v2-evidence-2026-10-10.1",
+      "issuedAt": "2026-10-10T00:00:00Z",
       "expiresAt": "2027-09-23T00:00:00Z",
       "families": [
         {
@@ -392,6 +392,91 @@ enum BundledRoutingProfiles {
             "expiresAt": "2026-12-31T00:00:00Z"
           },
           "evidenceIDs": []
+        },
+        {
+          "providerID": "antigravity",
+          "id": "gemini-3.8-flash",
+          "aliases": [],
+          "familyID": null,
+          "utilityTier": "gemini-flash",
+          "summary": "Gemini 3.8 Flash (published 2026-09-02) is Google's workhorse tier for long-horizon agentic workflows, with a 1,048,576-token context window and 65,536-token maximum output.",
+          "rubric": null,
+          "price": {
+            "text": "API list price: $0.75 input / $3.75 output per 1M tokens through December 31, 2026 ($1.50/$7.50 starting January 1, 2027), cached input $0.075 through December 31, 2026 ($0.15 from 2027-01-01).",
+            "checkedAt": "2026-10-10T00:00:00Z",
+            "expiresAt": "2026-12-31T00:00:00Z"
+          },
+          "evidenceIDs": [
+            "published-8"
+          ]
+        },
+        {
+          "providerID": "antigravity",
+          "id": "gemini-3.1-pro",
+          "aliases": [],
+          "familyID": null,
+          "utilityTier": "gemini-pro",
+          "summary": "Gemini 3.1 Pro (published 2026-02-19) is Google's flagship multimodal reasoning tier for complex coding tasks, with a 1,048,576-token context window and 65,536-token maximum output.",
+          "rubric": null,
+          "price": {
+            "text": "API list price: $2.00 input / $12.00 output per 1M tokens (prompts <= 200k; $4.00 / $18.00 above), cached input $0.20 for prompts <= 200k ($0.40 above).",
+            "checkedAt": "2026-10-10T00:00:00Z",
+            "expiresAt": "2026-12-31T00:00:00Z"
+          },
+          "evidenceIDs": [
+            "published-9"
+          ]
+        },
+        {
+          "providerID": "grok",
+          "id": "grok-4.7",
+          "aliases": [],
+          "familyID": null,
+          "utilityTier": "grok",
+          "summary": "Grok 4.7 (released 2026-09-21) is xAI's flagship model for agentic coding and knowledge work, with a 500,000-token context window.",
+          "rubric": null,
+          "price": {
+            "text": "API list price: $2.00 input / $0.50 cached / $6.00 output per 1M tokens for prompts < 200k; $4.00 / $1.00 / $12.00 at >= 200k.",
+            "checkedAt": "2026-10-10T00:00:00Z",
+            "expiresAt": "2026-12-31T00:00:00Z"
+          },
+          "evidenceIDs": [
+            "published-10"
+          ]
+        },
+        {
+          "providerID": "cursor",
+          "id": "grok-4.7",
+          "aliases": [],
+          "familyID": null,
+          "utilityTier": "cursor-grok",
+          "summary": "Grok 4.7 (released 2026-09-21) is xAI's flagship model for agentic coding and knowledge work, with a 500,000-token context window.",
+          "rubric": null,
+          "price": {
+            "text": "API list price: $2.00 input / $0.50 cached / $6.00 output per 1M tokens for prompts < 200k; $4.00 / $1.00 / $12.00 at >= 200k.",
+            "checkedAt": "2026-10-10T00:00:00Z",
+            "expiresAt": "2026-12-31T00:00:00Z"
+          },
+          "evidenceIDs": [
+            "published-10"
+          ]
+        },
+        {
+          "providerID": "cursor",
+          "id": "composer-2.5",
+          "aliases": [],
+          "familyID": null,
+          "utilityTier": "composer",
+          "summary": "Composer 2.5 (released 2026-05-18) is Cursor's proprietary agentic coding model optimized for edit-test-edit loops, with a 200K-token context window.",
+          "rubric": null,
+          "price": {
+            "text": "API list price: Standard $0.50 input / $2.50 output per 1M tokens, Fast $3.00 / $15.00; cache read $0.2 Standard / $0.5 Fast.",
+            "checkedAt": "2026-10-10T00:00:00Z",
+            "expiresAt": "2026-12-31T00:00:00Z"
+          },
+          "evidenceIDs": [
+            "published-11"
+          ]
         }
       ],
       "evidence": [
@@ -455,6 +540,42 @@ enum BundledRoutingProfiles {
           "publisher": "Anthropic",
           "sourceURL": null,
           "checkedAt": "2026-09-23T00:00:00Z",
+          "expiresAt": "2026-12-31T00:00:00Z",
+          "familyWide": false
+        },
+        {
+          "id": "published-8",
+          "text": "Google reports 73.7% on DeepSWE v1.1.",
+          "publisher": "Google",
+          "sourceURL": null,
+          "checkedAt": "2026-10-10T00:00:00Z",
+          "expiresAt": "2026-12-31T00:00:00Z",
+          "familyWide": false
+        },
+        {
+          "id": "published-9",
+          "text": "Google reports 80.6% on SWE-Bench Verified (single attempt, Thinking (High)).",
+          "publisher": "Google",
+          "sourceURL": null,
+          "checkedAt": "2026-10-10T00:00:00Z",
+          "expiresAt": "2026-12-31T00:00:00Z",
+          "familyWide": false
+        },
+        {
+          "id": "published-10",
+          "text": "xAI reports 46.3% on CursorBench 4.0 at xHigh effort.",
+          "publisher": "xAI",
+          "sourceURL": null,
+          "checkedAt": "2026-10-10T00:00:00Z",
+          "expiresAt": "2026-12-31T00:00:00Z",
+          "familyWide": false
+        },
+        {
+          "id": "published-11",
+          "text": "Cursor reports 69.3% on Terminal-Bench 2.0 and 79.8% on SWE-Bench Multilingual (image, changelog benchmark table).",
+          "publisher": "Cursor",
+          "sourceURL": null,
+          "checkedAt": "2026-10-10T00:00:00Z",
           "expiresAt": "2026-12-31T00:00:00Z",
           "familyWide": false
         }

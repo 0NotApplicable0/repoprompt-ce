@@ -5,6 +5,19 @@ import RepoPromptSettingsCore
 import XCTest
 
 final class AgentTaskRouterCoreTests: XCTestCase {
+    func testAntigravityEffortSplitHandlesNonFlashGeminiBases() {
+        for effort in ["low", "medium", "high", "x-high"] {
+            let split = RoutingModelIdentity.antigravityEffortSplit("gemini-4-argon-\(effort)")
+            XCTAssertEqual(split?.base, "gemini-4-argon", effort)
+            XCTAssertEqual(split?.effort, effort, effort)
+        }
+        for raw in ["claude-opus-5-5-high", "claude-sonnet-5-5-low", "gpt-oss-120b-medium", "grok-4.7-high", "gemini-4-argon"] {
+            XCTAssertNil(RoutingModelIdentity.antigravityEffortSplit(raw), raw)
+            XCTAssertEqual(RoutingModelIdentity.profileLookupID(provider: .antigravity, raw: raw), raw)
+        }
+        XCTAssertEqual(RoutingModelIdentity.profileLookupID(provider: .cursor, raw: "gemini-4-argon-high"), "gemini-4-argon-high")
+    }
+
     func testLongRoutingExcerptIsDeterministicBoundedAndMasksBothEnds() {
         let task = "Investigate the parser. password=openingSecret "
             + String(repeating: "irrelevant middle ", count: 300)
@@ -525,7 +538,7 @@ final class AgentTaskRoutingCandidateBuilderPolicyTests: XCTestCase {
     }
 
     func testAdvertisedModelsOutsideCuratedDefinitionsAreNotRouterCandidates() {
-        let excludedProviders: [AgentProviderKind] = [.openCode, .cursor, .grokBuild, .devin]
+        let excludedProviders: [AgentProviderKind] = [.openCode, .grokBuild, .devin]
         let availability = AgentModelCatalog.AvailabilityContext(
             claudeCodeAvailable: false, codexAvailable: false, openCodeAvailable: true,
             cursorAvailable: true, grokBuildAvailable: true, devinAvailable: true
@@ -545,6 +558,14 @@ final class AgentTaskRoutingCandidateBuilderPolicyTests: XCTestCase {
             allowedProviders: Set(excludedProviders),
             availability: availability
         )) { error in
+            XCTAssertEqual(error as? AgentTaskRoutingCandidateBuilder.BuildError, .noAvailableTargets)
+        }
+
+        // Cursor is curated, but only its named families are candidates: an unlisted model is not.
+        let cursorBuilder = AgentTaskRoutingCandidateBuilder(cursorThinking: { _ in nil }, modelOptions: { provider, _ in
+            provider == .cursor ? [Self.modelOption("advertised-cursor", "Cursor")] : []
+        })
+        XCTAssertThrowsError(try cursorBuilder.build(allowedProviders: [.cursor], availability: availability)) { error in
             XCTAssertEqual(error as? AgentTaskRoutingCandidateBuilder.BuildError, .noAvailableTargets)
         }
     }
@@ -1655,5 +1676,625 @@ final class RoutingModelProfileSnapshotTests: XCTestCase {
         let second = RoutingModelProfileSnapshot(resolver: resolver, digest: "second")
 
         XCTAssertNotEqual(first.identity, second.identity)
+    }
+}
+
+private extension DecisionServiceCapabilities {
+    /// Same finite-choice limits Jev and OpenAI Decisions register (12 choices).
+    static let routerFrontier = Self(
+        contextKinds: [.text],
+        finiteChoice: .init(
+            minimumChoices: 2, maximumChoices: 12, maximumContextBytes: 24 * 1024,
+            maximumInstructionsBytes: 16 * 1024, maximumChoiceDescriptionBytes: 8 * 1024,
+            maximumAggregateBytes: 128 * 1024
+        ),
+        evidence: .init(confidence: true, probabilityDistribution: true, usage: true)
+    )
+}
+
+@MainActor
+final class AgentTaskRoutingCandidateBuilderProviderTests: XCTestCase {
+    override func setUp() {
+        super.setUp()
+        GlobalSettingsStore.installApplicationModelIdentityPolicy()
+    }
+
+    private static let providers: Set<AgentProviderKind> = [.codexExec, .claudeCode, .antigravity, .grok, .cursor]
+    private static let catalogs: [AgentProviderKind: [String]] = [
+        .codexExec: ["gpt-6-luna", "gpt-5.6-terra", "gpt-6.1-sol", "gpt-6-astra"],
+        .claudeCode: ["claude-haiku-4-5", "claude-sonnet-5-5", "claude-opus-5-5", "claude-fable-5-1"],
+        .antigravity: [
+            "gemini-3.8-flash-high", "gemini-3.8-flash-medium", "gemini-3.8-flash-low", "gemini-3.7-flash-high",
+            "gemini-3.1-pro-high", "gemini-3.1-pro-low", "claude-opus-5-5-high", "gpt-oss-120b-medium"
+        ],
+        .grok: ["grok-4.7", "grok-4.6"],
+        .cursor: ["composer-2.5", "grok-4.7", "claude-opus-5-5", "gemini-3.8-flash", "kimi-k3"]
+    ]
+    private static let expectedIdentities = [
+        "codexExec:gpt-6-luna", "codexExec:gpt-5.6-terra", "codexExec:gpt-6.1-sol", "codexExec:gpt-6-astra",
+        "claudeCode:claude-haiku-4-5", "claudeCode:claude-sonnet-5-5", "claudeCode:claude-opus-5-5", "claudeCode:claude-fable-5-1",
+        "antigravity:gemini-3.8-flash", "antigravity:gemini-3.1-pro", "grok:grok-4.7", "cursor:composer-2.5"
+    ]
+
+    private func availability(grok: Bool = true) -> AgentModelCatalog.AvailabilityContext {
+        .init(
+            claudeCodeAvailable: true, codexAvailable: true, openCodeAvailable: true,
+            cursorAvailable: true, antigravityAvailable: true, grokAvailable: grok,
+            grokBuildAvailable: true, devinAvailable: true,
+            zaiConfigured: true, kimiConfigured: true, customClaudeCompatibleConfigured: true
+        )
+    }
+
+    private static func options(
+        _ extra: [AgentProviderKind: [String]] = [:]
+    ) -> @MainActor (AgentProviderKind, AgentModelCatalog.AvailabilityContext) -> [AgentModelOption] {
+        { provider, _ in
+            ((Self.catalogs[provider] ?? []) + (extra[provider] ?? [])).map {
+                AgentModelOption(rawValue: $0, displayName: $0, description: nil, isDefault: false)
+            }
+        }
+    }
+
+    private func builder() -> AgentTaskRoutingCandidateBuilder {
+        AgentTaskRoutingCandidateBuilder(cursorThinking: { _ in nil }, modelOptions: Self.options())
+    }
+
+    private func availableProviders(
+        _ availability: AgentModelCatalog.AvailabilityContext,
+        surface: AgentModelCatalog.AgentSelectionSurface = .general
+    ) -> Set<AgentProviderKind> {
+        AgentTaskRoutingCandidateBuilder.availableProviders(
+            availability: availability, surface: surface, modelOptions: Self.options()
+        )
+    }
+
+    private func models(
+        _ builder: AgentTaskRoutingCandidateBuilder,
+        availability: AgentModelCatalog.AvailabilityContext
+    ) throws -> [AgentTaskRoutingCandidateBuilder.Candidate] {
+        try builder.build(allowedProviders: availableProviders(availability), availability: availability)
+    }
+
+    private func identity(_ candidate: AgentTaskRoutingCandidateBuilder.Candidate) -> String {
+        "\(candidate.target.agentRaw):\(candidate.target.modelRaw)"
+    }
+
+    private func configuration(
+        primary: AgentProviderKind?,
+        subagent: AgentProviderKind?
+    ) -> AgentTaskRouterConfiguration {
+        AgentTaskRouterConfiguration(
+            enabled: true, selectedBackendID: .jev, selectedBackendRawValue: "jev",
+            candidateRoles: [], allowedProviders: [], candidateRolesMaterialized: false,
+            allowedProvidersMaterialized: false, unknownRoleRawValues: [], unknownProviderRawValues: [],
+            primaryProvider: primary, subagentProvider: subagent, customInstructions: "",
+            validity: .valid, revision: 1
+        )
+    }
+
+    func testAllFiveProvidersContributeTheirFamilies() throws {
+        let availability = availability()
+        XCTAssertEqual(availableProviders(availability), Self.providers)
+        let candidates = try models(builder(), availability: availability)
+        XCTAssertEqual(candidates.map(identity), Self.expectedIdentities)
+        XCTAssertTrue(candidates.allSatisfy { $0.target.reasoningEffortRaw == nil && $0.target.modelParameters.isEmpty })
+        let newFamilies = candidates.filter { ["antigravity", "grok", "cursor"].contains($0.target.agentRaw) }
+        XCTAssertEqual(newFamilies.map(\.utilityTier), ["gemini-flash", "gemini-pro", "grok", "composer"])
+        for candidate in newFamilies {
+            XCTAssertNil(candidate.usagePeerClass)
+            XCTAssertEqual(candidate.usageModelAliases, [candidate.target.modelRaw])
+            XCTAssertFalse(AgentTaskRoutingCandidateBuilder.isPaidFast(candidate.target))
+        }
+        // Invert: nothing outside the named families, and no older Gemini while the newer is advertised.
+        let antigravity = candidates.filter { $0.target.agentRaw == "antigravity" }
+        XCTAssertFalse(antigravity.contains { $0.target.modelRaw.hasPrefix("claude-") || $0.target.modelRaw.hasPrefix("gpt-") })
+        XCTAssertFalse(antigravity.contains { $0.target.modelRaw.hasPrefix("gemini-3.7-flash") })
+        XCTAssertEqual(candidates.filter { $0.target.agentRaw == "cursor" }.map(\.target.modelRaw), ["composer-2.5"])
+        XCTAssertEqual(candidates.filter { $0.target.agentRaw == "grok" }.map(\.target.modelRaw), ["grok-4.7"])
+        // Providers the context does not mark available stay out.
+        let partial = AgentModelCatalog.AvailabilityContext(claudeCodeAvailable: true, codexAvailable: true, openCodeAvailable: true)
+        XCTAssertEqual(availableProviders(partial), [.codexExec, .claudeCode])
+    }
+
+    func testFrontierWithAllClassesStaysWithinTwelveCandidates() throws {
+        // The decision path caps a question at FiniteChoiceDecisionValidator.maximumChoices (12);
+        // Jev and OpenAI Decisions register the same limit.
+        XCTAssertEqual(FiniteChoiceDecisionValidator.maximumChoices, 12)
+        XCTAssertEqual(DecisionServiceCapabilities.routerFrontier.finiteChoice.maximumChoices, 12)
+        XCTAssertTrue(ModelRouterDecisionPolicy.supports(.routerFrontier))
+        let candidates = try models(builder(), availability: availability())
+        XCTAssertEqual(candidates.count, 12)
+        XCTAssertLessThanOrEqual(candidates.count, FiniteChoiceDecisionValidator.maximumChoices)
+        XCTAssertEqual(Set(candidates.map(identity)), Set(Self.expectedIdentities))
+        let request = try ModelRouterDecisionPolicy().build(
+            requestID: UUID(), task: "Review this change", scope: .primarySession, stage: .model,
+            directive: "", candidates: candidates, capabilities: .routerFrontier
+        )
+        XCTAssertEqual(request.question.choices.count, 12)
+    }
+
+    func testCursorGrokIsFallbackOnlyWhenGrokCLIUnavailable() throws {
+        let builder = builder()
+        let fallback = try models(builder, availability: availability(grok: false)).filter { $0.target.modelRaw == "grok-4.7" }
+        XCTAssertEqual(fallback.map(identity), ["cursor:grok-4.7"])
+        let both = try models(builder, availability: availability()).filter { $0.target.modelRaw == "grok-4.7" }
+        XCTAssertEqual(both.map(identity), ["grok:grok-4.7"])
+    }
+
+    func testProviderLimitSelectsOnlyThatNewProvider() throws {
+        let availability = availability()
+        for provider in [AgentProviderKind.cursor, .antigravity, .grok] {
+            for surface in [AgentModelCatalog.AgentSelectionSurface.general, .headless] {
+                for scope in [AgentTaskRoutingScope.primarySession, .subagent] {
+                    let allowed = AgentTaskRoutingCandidateBuilder.providers(
+                        for: scope,
+                        configuration: configuration(primary: provider, subagent: provider),
+                        availability: availability,
+                        surface: surface,
+                        modelOptions: Self.options()
+                    )
+                    XCTAssertEqual(allowed, [provider])
+                    let candidates = try builder().build(allowedProviders: allowed, availability: availability, surface: surface)
+                    XCTAssertEqual(Set(candidates.map(\.target.agentRaw)), [provider.rawValue])
+                }
+            }
+        }
+        // A saved limit never gates availability: an unavailable provider falls back to the rest.
+        let unavailable = AgentModelCatalog.AvailabilityContext(claudeCodeAvailable: true, codexAvailable: true, openCodeAvailable: true)
+        XCTAssertEqual(
+            AgentTaskRoutingCandidateBuilder.providers(
+                for: .primarySession, configuration: configuration(primary: .cursor, subagent: nil),
+                availability: unavailable, modelOptions: Self.options()
+            ),
+            [.codexExec, .claudeCode]
+        )
+    }
+
+    func testAntigravityEffortStageUsesAdvertisedSuffixes() throws {
+        let builder = builder()
+        let availability = availability()
+        let candidates = try models(builder, availability: availability)
+        for (base, expected) in [
+            ("gemini-3.8-flash", ["gemini-3.8-flash-high", "gemini-3.8-flash-medium", "gemini-3.8-flash-low"]),
+            ("gemini-3.1-pro", ["gemini-3.1-pro-high", "gemini-3.1-pro-low"])
+        ] {
+            let selected = try XCTUnwrap(candidates.first { $0.target.agentRaw == "antigravity" && $0.target.modelRaw == base })
+            let efforts = try builder.buildEfforts(for: selected, availability: availability)
+            XCTAssertEqual(efforts.map(\.target.modelRaw), expected)
+            XCTAssertEqual(efforts.map(\.descriptor.roleLabels), expected.map { ["effort:\($0.split(separator: "-").last!)"] })
+            XCTAssertTrue(efforts.allSatisfy { $0.target.agentRaw == "antigravity" && $0.target.reasoningEffortRaw == nil && $0.target.modelParameters.isEmpty })
+            // Invert: no target names an effort the catalog does not advertise, and the bare base is not offered.
+            XCTAssertFalse(efforts.map(\.target.modelRaw).contains(base))
+            XCTAssertTrue(efforts.allSatisfy { Self.catalogs[.antigravity]?.contains($0.target.modelRaw) == true })
+        }
+    }
+
+    func testCursorEffortStageUsesAdvertisedModelParameter() throws {
+        let definitions: [String: ACPModelParameterDefinition] = [
+            "grok-4.7": .init(
+                kind: .thinking, configID: "reasoning_effort", displayName: "Reasoning effort",
+                choices: ["low", "medium", "high", "xhigh"].map { .init(rawValue: $0, displayName: $0) },
+                currentValueRaw: "medium"
+            ),
+            "grok-4.6": .init(
+                kind: .thinking, configID: "effort", displayName: "Effort",
+                choices: ["low", "high"].map { .init(rawValue: $0, displayName: $0) },
+                currentValueRaw: "low"
+            )
+        ]
+        let builder = AgentTaskRoutingCandidateBuilder(
+            cursorThinking: { definitions[$0] },
+            modelOptions: Self.options([.cursor: ["grok-4.6"]])
+        )
+        let availability = availability(grok: false)
+        let fallback = try XCTUnwrap(models(builder, availability: availability).first { identity($0) == "cursor:grok-4.7" })
+        for (raw, configID, values) in [
+            ("grok-4.7", "reasoning_effort", ["low", "medium", "high", "xhigh"]),
+            ("grok-4.6", "effort", ["low", "high"])
+        ] {
+            let selected = AgentTaskRoutingCandidateBuilder.Candidate(
+                opaqueKey: fallback.opaqueKey, utilityTier: fallback.utilityTier,
+                target: .init(agentRaw: "cursor", modelRaw: raw, reasoningEffortRaw: nil, modelParameters: []),
+                descriptor: fallback.descriptor, snapshotScope: fallback.snapshotScope,
+                profileIdentity: fallback.profileIdentity
+            )
+            let efforts = try builder.buildEfforts(for: selected, availability: availability)
+            XCTAssertEqual(efforts.map(\.target.modelRaw), Array(repeating: raw, count: values.count))
+            XCTAssertEqual(efforts.map(\.descriptor.roleLabels), values.map { ["effort:\($0)"] })
+            XCTAssertEqual(efforts.map(\.target.modelParameters), values.map { value in
+                [ACPModelParameterSelection(providerID: .cursor, baseModelRaw: raw, kind: .thinking, configID: configID, valueRaw: value)]
+            })
+            // Invert: effort lives in modelParameters, never in reasoningEffortRaw.
+            XCTAssertTrue(efforts.allSatisfy { $0.target.reasoningEffortRaw == nil })
+            XCTAssertFalse(efforts.contains { AgentTaskRoutingCandidateBuilder.isPaidFast($0.target) })
+            // The selected candidate's effort targets stay current against a fresh provider snapshot.
+            let scope = try XCTUnwrap(fallback.snapshotScope)
+            let current = builder.capture(
+                allowedProviders: scope.allowedProviders,
+                availability: availability,
+                surface: .general
+            )
+            XCTAssertTrue(efforts.allSatisfy { current.contains($0.target) })
+        }
+    }
+
+    func testModelWithoutEffortControlHasOneProviderDefaultTarget() throws {
+        let builder = builder()
+        let availability = availability()
+        let candidates = try models(builder, availability: availability)
+        for expected in ["grok:grok-4.7", "cursor:composer-2.5"] {
+            let selected = try XCTUnwrap(candidates.first { identity($0) == expected })
+            let efforts = try builder.buildEfforts(for: selected, availability: availability)
+            XCTAssertEqual(efforts.count, 1)
+            XCTAssertEqual(efforts.map(identity), [expected])
+            XCTAssertEqual(efforts.map(\.descriptor.roleLabels), [["effort:provider-default"]])
+            XCTAssertTrue(efforts.allSatisfy { $0.target.reasoningEffortRaw == nil && $0.target.modelParameters.isEmpty })
+            // Invert: a single target never produces an effort-stage decision request.
+            XCTAssertThrowsError(try ModelRouterDecisionPolicy().build(
+                requestID: UUID(), task: "Review this change", scope: .primarySession, stage: .effort,
+                directive: "", candidates: efforts, capabilities: .routerFrontier
+            )) { error in
+                XCTAssertEqual(error as? ModelRouterDecisionPolicy.BuildError, .invalidRequest)
+            }
+        }
+    }
+}
+
+@MainActor
+final class AgentTaskRoutingProviderAvailabilityTests: XCTestCase {
+    override func setUp() {
+        super.setUp()
+        GlobalSettingsStore.installApplicationModelIdentityPolicy()
+    }
+
+    private enum Subject: CaseIterable {
+        case cursor
+        case antigravity
+        case grok
+
+        var expectedIdentities: [String] {
+            switch self {
+            case .cursor: ["cursor:composer-2.5", "cursor:grok-4.7"]
+            case .antigravity: ["antigravity:gemini-3.8-flash", "antigravity:gemini-3.1-pro"]
+            case .grok: ["grok:grok-4.7"]
+            }
+        }
+    }
+
+    private struct Fixture {
+        let suiteName: String
+        let defaults: UserDefaults
+        let coordinator: AntigravityConnectionCoordinator
+        let viewModel: APISettingsViewModel
+
+        func cleanup() {
+            defaults.removePersistentDomain(forName: suiteName)
+        }
+    }
+
+    private static let connectionHintKey = "AntigravityCLIConnected"
+    private static let catalogs: [AgentProviderKind: [String]] = [
+        .antigravity: [
+            "gemini-3.8-flash-high", "gemini-3.8-flash-medium", "gemini-3.8-flash-low", "gemini-3.7-flash-high",
+            "gemini-3.1-pro-high", "gemini-3.1-pro-low", "claude-opus-5-5-high", "gpt-oss-120b-medium"
+        ],
+        .grok: ["grok-4.7", "grok-4.6"],
+        .cursor: ["composer-2.5", "grok-4.7", "claude-opus-5-5", "gemini-3.8-flash", "kimi-k3"]
+    ]
+
+    private static let modelOptions: @MainActor (AgentProviderKind, AgentModelCatalog.AvailabilityContext) -> [AgentModelOption] = { provider, _ in
+        (catalogs[provider] ?? []).map {
+            AgentModelOption(rawValue: $0, displayName: $0, description: nil, isDefault: false)
+        }
+    }
+
+    private func makeFixture() throws -> Fixture {
+        let suiteName = "AgentTaskRoutingProviderAvailabilityTests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defaults.removePersistentDomain(forName: suiteName)
+        let notificationCenter = NotificationCenter()
+        let coordinator = AntigravityConnectionCoordinator(notificationCenter: notificationCenter, userDefaults: defaults)
+        let keyManager = KeyManager(secureService: SecureKeysService(secureStorage: TestSecureStorageBackend()))
+        let viewModel = APISettingsViewModel(
+            aiQueriesService: AIQueriesService(keyManager: keyManager),
+            keyManager: keyManager,
+            loadStoredDataOnInit: false,
+            antigravityConnectionCoordinator: coordinator,
+            notificationCenter: notificationCenter
+        )
+        viewModel.isClaudeCodeConnected = false
+        viewModel.isCodexConnected = false
+        viewModel.isOpenCodeConnected = false
+        viewModel.isCursorConnected = false
+        viewModel.isGrokConnected = false
+        viewModel.test_resetContextBuilderProviderValidation()
+        return Fixture(suiteName: suiteName, defaults: defaults, coordinator: coordinator, viewModel: viewModel)
+    }
+
+    private func markConnectedWithoutVerification(_ subject: Subject, in fixture: Fixture) {
+        switch subject {
+        case .cursor: fixture.viewModel.isCursorConnected = true
+        case .grok: fixture.viewModel.isGrokConnected = true
+        case .antigravity: fixture.defaults.set(true, forKey: Self.connectionHintKey)
+        }
+    }
+
+    private func verifyAndConnect(_ subject: Subject, in fixture: Fixture) async throws {
+        switch subject {
+        case .cursor:
+            fixture.viewModel.isCursorConnected = true
+            fixture.viewModel.test_completeContextBuilderProviderValidation(verifiedProviders: [.cursor])
+        case .grok:
+            fixture.viewModel.isGrokConnected = true
+            fixture.viewModel.test_completeContextBuilderProviderValidation(verifiedProviders: [.grok])
+        case .antigravity:
+            try await publishAntigravity(isConnected: true, in: fixture)
+        }
+    }
+
+    private func disconnect(_ subject: Subject, in fixture: Fixture) async throws {
+        switch subject {
+        case .cursor:
+            fixture.viewModel.isCursorConnected = false
+            fixture.viewModel.test_completeContextBuilderProviderValidation(verifiedProviders: [])
+        case .grok:
+            fixture.viewModel.isGrokConnected = false
+            fixture.viewModel.test_completeContextBuilderProviderValidation(verifiedProviders: [])
+        case .antigravity:
+            try await publishAntigravity(isConnected: false, in: fixture)
+        }
+    }
+
+    private func publishAntigravity(isConnected: Bool, in fixture: Fixture) async throws {
+        let generation = await fixture.coordinator.beginManualMutation()
+        _ = await fixture.coordinator.publishIfCurrent(
+            generation: generation,
+            isConnected: isConnected,
+            errorMessage: nil,
+            hasOwnedMCPEntry: isConnected
+        )
+        let viewModel = fixture.viewModel
+        try await AsyncTestWait.waitUntil("Antigravity routing availability is \(isConnected)") {
+            viewModel.isAntigravityConnected == isConnected
+                && viewModel.modelRouterAvailabilityContext.antigravityAvailable == isConnected
+        }
+    }
+
+    /// Reads the production owner (`APISettingsViewModel.modelRouterAvailabilityContext`) exactly
+    /// as the Router does, then builds the model-stage frontier from it.
+    private func routedIdentities(_ viewModel: APISettingsViewModel) throws -> [String] {
+        let availability = viewModel.modelRouterAvailabilityContext
+        let builder = AgentTaskRoutingCandidateBuilder(cursorThinking: { _ in nil }, modelOptions: Self.modelOptions)
+        let candidates = try builder.build(
+            allowedProviders: AgentTaskRoutingCandidateBuilder.availableProviders(
+                availability: availability, modelOptions: Self.modelOptions
+            ),
+            availability: availability
+        )
+        return candidates.map { "\($0.target.agentRaw):\($0.target.modelRaw)" }
+    }
+
+    private func assertExcluded(_ viewModel: APISettingsViewModel, file: StaticString = #filePath, line: UInt = #line) {
+        XCTAssertThrowsError(try routedIdentities(viewModel), file: file, line: line) { error in
+            XCTAssertEqual(error as? AgentTaskRoutingCandidateBuilder.BuildError, .noAvailableTargets, file: file, line: line)
+        }
+    }
+
+    /// With no settings owner wired, the router fallback must not claim providers this process
+    /// never verified (`AvailabilityContext.current` marks Antigravity and Grok available).
+    func testRouterFallbackWithoutSettingsOwnerAdmitsOnlyClaudeAndCodex() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let viewModel = AgentModeViewModel(
+            testWorkspacePath: root.path,
+            codexControllerFactory: { _, _, _, _, _, _ in
+                preconditionFailure("Availability fallback test must not start Codex")
+            },
+            headlessProviderFactory: { _, _, _, _, _ in UnsupportedHeadlessAgentProvider(reason: "test terminal") }
+        )
+        let availability = viewModel.modelRouterAvailabilityContext
+        for provider in [AgentProviderKind.cursor, .antigravity, .grok] {
+            XCTAssertFalse(AgentModelCatalog.isAgentAvailable(provider, availability: availability), provider.rawValue)
+        }
+        for provider in [AgentProviderKind.claudeCode, .codexExec] {
+            XCTAssertTrue(AgentModelCatalog.isAgentAvailable(provider, availability: availability), provider.rawValue)
+        }
+    }
+
+    func testConnectedButUnverifiedProviderIsExcluded() throws {
+        for subject in Subject.allCases {
+            let fixture = try makeFixture()
+            defer { fixture.cleanup() }
+            markConnectedWithoutVerification(subject, in: fixture)
+            XCTAssertFalse(fixture.viewModel.isAntigravityConnected)
+            assertExcluded(fixture.viewModel)
+        }
+    }
+
+    func testVerifiedProviderIsIncluded() async throws {
+        for subject in Subject.allCases {
+            let fixture = try makeFixture()
+            defer { fixture.cleanup() }
+            try await verifyAndConnect(subject, in: fixture)
+            XCTAssertEqual(try routedIdentities(fixture.viewModel), subject.expectedIdentities)
+        }
+    }
+
+    func testDisconnectRemovesProvider() async throws {
+        for subject in Subject.allCases {
+            let fixture = try makeFixture()
+            defer { fixture.cleanup() }
+            try await verifyAndConnect(subject, in: fixture)
+            XCTAssertEqual(try routedIdentities(fixture.viewModel), subject.expectedIdentities)
+            try await disconnect(subject, in: fixture)
+            assertExcluded(fixture.viewModel)
+        }
+    }
+
+    func testReconnectRestoresProvider() async throws {
+        for subject in Subject.allCases {
+            let fixture = try makeFixture()
+            defer { fixture.cleanup() }
+            try await verifyAndConnect(subject, in: fixture)
+            try await disconnect(subject, in: fixture)
+            assertExcluded(fixture.viewModel)
+            try await verifyAndConnect(subject, in: fixture)
+            XCTAssertEqual(try routedIdentities(fixture.viewModel), subject.expectedIdentities)
+        }
+    }
+}
+
+@MainActor
+final class RoutingModelProfileNewFamilyTests: XCTestCase {
+    private static let snapshotDate = "2026-10-10"
+
+    /// Provider-published facts per profile id, as observed on the evidence date.
+    private static let facts: [String: [String]] = [
+        "gemini-3.8-flash": [
+            "Gemini 3.8 Flash (published 2026-09-02) is Google's workhorse tier for long-horizon agentic workflows",
+            "1,048,576-token context window and 65,536-token maximum output",
+            "Google reports 73.7% on DeepSWE v1.1.",
+            "API list price: $0.75 input / $3.75 output per 1M tokens through December 31, 2026"
+        ],
+        "gemini-3.1-pro": [
+            "Gemini 3.1 Pro (published 2026-02-19) is Google's flagship multimodal reasoning tier for complex coding tasks",
+            "1,048,576-token context window and 65,536-token maximum output",
+            "Google reports 80.6% on SWE-Bench Verified (single attempt, Thinking (High)).",
+            "API list price: $2.00 input / $12.00 output per 1M tokens (prompts <= 200k; $4.00 / $18.00 above)"
+        ],
+        "grok-4.7": [
+            "Grok 4.7 (released 2026-09-21) is xAI's flagship model for agentic coding and knowledge work",
+            "500,000-token context window",
+            "xAI reports 46.3% on CursorBench 4.0 at xHigh effort.",
+            "API list price: $2.00 input / $0.50 cached / $6.00 output per 1M tokens for prompts < 200k"
+        ],
+        "composer-2.5": [
+            "Composer 2.5 (released 2026-05-18) is Cursor's proprietary agentic coding model optimized for edit-test-edit loops",
+            "200K-token context window",
+            "Cursor reports 69.3% on Terminal-Bench 2.0 and 79.8% on SWE-Bench Multilingual",
+            "API list price: Standard $0.50 input / $2.50 output per 1M tokens, Fast $3.00 / $15.00"
+        ]
+    ]
+
+    private func metadata(_ provider: AgentProviderKind, _ raw: String) -> RoutingExecutionModelMetadata {
+        .init(
+            provider: provider, baseModelRaw: raw, displayName: raw, isProviderDefault: false,
+            catalogOrder: 0, advertisedOptionRawValues: [raw], defaultEffortID: nil, efforts: []
+        )
+    }
+
+    private func resolve(_ provider: AgentProviderKind, _ raw: String) -> ResolvedRoutingProfile {
+        RoutingModelProfileResolver.bundled.resolve(metadata(provider, raw), catalogRevision: "new-family-fixture")
+    }
+
+    private func description(_ profile: ResolvedRoutingProfile) -> String {
+        profile.description(snapshotDate: RoutingModelProfileResolver.bundled.snapshotDate)
+    }
+
+    func testNewFamiliesHaveAuditedProfiles() throws {
+        let fixtures: [(AgentProviderKind, String, String)] = [
+            (.antigravity, "gemini-3.8-flash-high", "gemini-3.8-flash"),
+            (.antigravity, "gemini-3.1-pro-high", "gemini-3.1-pro"),
+            (.grok, "grok-4.7", "grok-4.7"),
+            (.cursor, "grok-4.7", "grok-4.7"),
+            (.cursor, "composer-2.5", "composer-2.5")
+        ]
+        for (provider, raw, profileID) in fixtures {
+            let label = "\(provider.rawValue):\(raw)"
+            let profile = resolve(provider, raw)
+            let text = description(profile)
+            XCTAssertEqual(profile.match, .exact, label)
+            XCTAssertEqual(profile.summary.source, .exactProfile, label)
+            XCTAssertEqual(profile.price.source, .exactProfile, label)
+            XCTAssertEqual(profile.evidence.source, .exactProfile, label)
+            XCTAssertEqual(profile.summary.sourceID, "\(provider.rawValue):\(profileID)", label)
+            XCTAssertEqual(profile.price.freshness, .current, label)
+            XCTAssertTrue(text.hasPrefix("Evidence snapshot \(Self.snapshotDate) (provider-published;"), label)
+            for fact in try XCTUnwrap(Self.facts[profileID]) {
+                XCTAssertTrue(text.contains(fact), "\(label): \(fact)")
+            }
+            XCTAssertFalse(text.contains("No audited benchmark"), label)
+            XCTAssertFalse(text.contains("Price is unknown"), label)
+            // Invert: the provider catalog stays authoritative for identity.
+            XCTAssertEqual(profile.modelID.source, .providerCatalog, label)
+            XCTAssertEqual(profile.modelID.value, raw, label)
+        }
+    }
+
+    func testNewFamiliesReachCandidateDescriptions() throws {
+        GlobalSettingsStore.installApplicationModelIdentityPolicy()
+        let catalogs: [AgentProviderKind: [String]] = [
+            .antigravity: ["gemini-3.8-flash-high", "gemini-3.8-flash-low", "gemini-3.1-pro-high"],
+            .grok: ["grok-4.7"],
+            .cursor: ["composer-2.5"]
+        ]
+        let availability = AgentModelCatalog.AvailabilityContext(
+            claudeCodeAvailable: false, codexAvailable: false, openCodeAvailable: false,
+            cursorAvailable: true, antigravityAvailable: true, grokAvailable: true
+        )
+        let candidates = try AgentTaskRoutingCandidateBuilder(cursorThinking: { _ in nil }, modelOptions: { provider, _ in
+            (catalogs[provider] ?? []).map {
+                AgentModelOption(rawValue: $0, displayName: $0, description: nil, isDefault: false)
+            }
+        }).build(allowedProviders: [.antigravity, .grok, .cursor], availability: availability)
+        XCTAssertEqual(candidates.map(\.target.modelRaw), ["gemini-3.8-flash", "gemini-3.1-pro", "grok-4.7", "composer-2.5"])
+        for candidate in candidates {
+            XCTAssertTrue(candidate.descriptor.targetDescription.contains("API list price:"), candidate.target.modelRaw)
+            XCTAssertFalse(candidate.descriptor.targetDescription.contains("No audited benchmark"), candidate.target.modelRaw)
+            XCTAssertEqual(candidate.descriptor.rubricVersion, RoutingModelProfileResolver.bundled.rubricVersion)
+        }
+    }
+
+    func testAntigravityIdentityDropsEffortSuffix() {
+        let fixtures = [
+            ("gemini-3.8-flash-high", "gemini-3.8-flash"),
+            ("gemini-3.8-flash-medium", "gemini-3.8-flash"),
+            ("gemini-3.8-flash-low", "gemini-3.8-flash"),
+            ("gemini-3.1-pro-high", "gemini-3.1-pro"),
+            ("gemini-3.1-pro-low", "gemini-3.1-pro")
+        ]
+        for (raw, base) in fixtures {
+            let suffixed = resolve(.antigravity, raw)
+            let plain = resolve(.antigravity, base)
+            XCTAssertEqual(suffixed.match, .exact, raw)
+            XCTAssertEqual(suffixed.summary, plain.summary, raw)
+            XCTAssertEqual(suffixed.price, plain.price, raw)
+            XCTAssertEqual(description(suffixed), description(plain), raw)
+            XCTAssertFalse(description(suffixed).contains("No audited benchmark"), raw)
+        }
+        XCTAssertEqual(RoutingModelIdentity.antigravityEffortSplit("gemini-3.8-flash-x-high")?.base, "gemini-3.8-flash")
+        XCTAssertNil(RoutingModelIdentity.antigravityEffortSplit("gemini-3.8-flash"))
+    }
+
+    func testUnknownIdentityKeepsUncertainProfile() {
+        let fixtures: [(AgentProviderKind, String)] = [
+            (.antigravity, "gemini-3.7-flash-high"),
+            (.antigravity, "claude-opus-5-5-high"),
+            (.antigravity, "gpt-oss-120b-medium"),
+            (.cursor, "gemini-3.8-flash-high"),
+            (.grok, "gemini-3.1-pro-high"),
+            (.grok, "grok-4.6"),
+            (.cursor, "kimi-k3")
+        ]
+        for (provider, raw) in fixtures {
+            let profile = resolve(provider, raw)
+            let text = description(profile)
+            XCTAssertEqual(profile.match, .unknown, "\(provider.rawValue):\(raw)")
+            XCTAssertEqual(profile.summary.source, .genericFallback, "\(provider.rawValue):\(raw)")
+            XCTAssertTrue(text.contains("No audited benchmark or pricing profile"), "\(provider.rawValue):\(raw)")
+            XCTAssertTrue(text.contains("Treat capability and cost as uncertain"), "\(provider.rawValue):\(raw)")
+        }
+    }
+
+    func testEvidenceVersionAdvanced() {
+        let resolver = RoutingModelProfileResolver.bundled
+        XCTAssertEqual(resolver.evidenceVersion, "rpce.model-routing-evidence.2026-10-10.1")
+        XCTAssertEqual(resolver.rubricVersion, "rpce.automatic-utility-frontier.v2-evidence-2026-10-10.1")
+        XCTAssertEqual(resolver.profileVersion, "rpce.bundled-routing-profiles.2026-10-10.1")
+        XCTAssertEqual(resolver.snapshotDate, Self.snapshotDate)
+        XCTAssertNotEqual(resolver.evidenceVersion, "rpce.model-routing-evidence.2026-09-30.2")
+        XCTAssertNotEqual(resolver.rubricVersion, "rpce.automatic-utility-frontier.v2-evidence-2026-09-30.2")
+        XCTAssertNotEqual(resolver.profileVersion, "rpce.bundled-routing-profiles.2026-09-30.2")
     }
 }

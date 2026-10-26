@@ -164,6 +164,19 @@ struct RouterSettingsView: View {
         }
     }
 
+    private var diversityControls: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Picker("Randomness", selection: Binding(get: { viewModel.configuration.randomness }, set: viewModel.setRandomness)) {
+                ForEach(AgentRoutingRandomness.allCases) { level in Text(level.title).tag(level) }
+            }.pickerStyle(.segmented)
+            Text(viewModel.configuration.randomness.explanation).foregroundStyle(.secondary)
+            Toggle("Review diversity", isOn: Binding(get: { viewModel.configuration.reviewDiversityEnabled }, set: viewModel.setReviewDiversityEnabled))
+                .accessibilityLabel("Review diversity")
+            Text("Save preferences for routing variety and review diversity.")
+                .font(fontPreset.swiftUIFont(sizeAtNormal: 11)).foregroundStyle(.secondary)
+        }
+    }
+
     private var pageHeader: some View {
         VStack(alignment: .leading, spacing: 6) {
             Label {
@@ -190,6 +203,7 @@ struct RouterSettingsView: View {
             modelRouterFeatureHeader
             routingServiceControl
             automaticFastControl
+            diversityControls
             routingBehaviorDisclosure
             Divider()
             routerSharingSummary
@@ -346,14 +360,17 @@ struct RouterSettingsView: View {
 
     private var targetAvailability: some View {
         VStack(alignment: .leading, spacing: 8) {
-            Text("Model Router chooses from the available models below.")
+            Text(viewModel.routerCandidatesDescription)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
+            Text("Providers")
+                .font(.headline)
+            providerTags
             Text("Available models")
                 .font(.headline)
             modelTags
             if viewModel.availableProviders.isEmpty {
-                Text("No curated execution targets are currently available. Check the Codex or Claude CLI setup and model availability.")
+                Text(viewModel.routerEmptyStateText)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
             }
@@ -376,6 +393,23 @@ struct RouterSettingsView: View {
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private var providerTags: some View {
+        routingTagRow {
+            ForEach(viewModel.visibleProviders, id: \.self) { provider in
+                Text(viewModel.providerStatusLabel(for: provider))
+                    .font(fontPreset.swiftUIFont(sizeAtNormal: 9, weight: .semibold))
+                    .foregroundStyle(Color.secondary)
+                    .padding(.horizontal, 6)
+                    .padding(.vertical, 3)
+                    .background(Color.secondary.opacity(0.1), in: Capsule())
+                    .opacity(viewModel.providerIsAvailable(provider) ? 1 : 0.65)
+                    .fixedSize()
+                    .accessibilityElement(children: .ignore)
+                    .accessibilityLabel(viewModel.providerStatusLabel(for: provider))
+            }
+        }
     }
 
     private var modelTags: some View {

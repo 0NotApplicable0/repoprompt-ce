@@ -2025,7 +2025,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     }
 
     var modelRouterAvailabilityContext: AgentModelCatalog.AvailabilityContext {
-        promptManager?.apiSettingsViewModel?.modelRouterAvailabilityContext ?? .current
+        promptManager?.apiSettingsViewModel?.modelRouterAvailabilityContext ?? AgentModelCatalog.AvailabilityContext(claudeCodeAvailable: true, codexAvailable: true)
     }
 
     var hasAvailableAgentProviders: Bool {
@@ -20189,10 +20189,12 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             // the steer is withdrawn rather than becoming a new turn outside the durable idle path.
             let managedSteerRunID = session.runID
             let managedSteerAttemptID = session.activeRunAttemptID
+            let routeStartArm = AgentTaskRoutingStartSink.armCurrent()
             Task {
                 // This producer owns every rollback decision. Close only after those decisions,
                 // including serial-gate cancellation that deliberately retains the row.
                 defer { session.settleLocalComposerOrigin(localComposerCandidate, disposition: .retained) }
+                defer { routeStartArm?.settleRejected() }
                 var handedOffToSerialDispatch = false
                 defer {
                     if !handedOffToSerialDispatch {
@@ -20233,6 +20235,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                             && session.runID == managedSteerRunID
                             && session.activeRunAttemptID == managedSteerAttemptID
                     } ?? true
+                let routeStartRecorder = routeStartArm != nil ? AgentRunStartOutcomeRecorder() : nil
                 let sendOutcome: CodexAgentModeCoordinator.NativeSendOutcome? = if dispatchIsCurrent {
                     await self.startAgentRun(
                         tabID: tabID,
@@ -20241,11 +20244,26 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                         taggedFileAttachments: taggedFilesToSend,
                         codexFallbackContext: fallbackContext,
                         autoEffortSelection: autoEffortSelection,
-                        directStartOptions: AgentDirectRunStartOptions(skipsSlashExpansion: repromptedText != nil, stopFence: producerStopFence)
+                        directStartOptions: AgentDirectRunStartOptions(
+                            skipsSlashExpansion: repromptedText != nil,
+                            stopFence: producerStopFence
+                        ),
+                        startOutcome: routeStartRecorder
                     )
                 } else {
                     .preDispatchRejected(
                         message: "Codex did not send because the tab session changed before provider dispatch."
+                    )
+                }
+                if let routeStartArm, let routeStartRecorder {
+                    if let sendOutcome {
+                        routeStartRecorder.record(codexOutcome: sendOutcome)
+                    }
+                    let currentSession = self.sessions[tabID]
+                    routeStartArm.complete(
+                        recorder: routeStartRecorder,
+                        actual: currentSession.map(self.executableTarget(for:)),
+                        sessionID: currentSession?.activeAgentSessionID
                     )
                 }
                 if sendOutcome?.didSend != true {
@@ -20337,7 +20355,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         if session.runState == .waitingForUser {
             if session.selectedAgent.usesClaudeNativeRuntime, !attachmentsToSend.isEmpty {
                 let producerStopFence = stopFence ?? AgentRunStartStopFence(session: session)
+                let routeStartArm = AgentTaskRoutingStartSink.armCurrent()
                 Task { [weak self, weak session] in
+                    defer { routeStartArm?.settleRejected() }
                     guard let self, let session else { return }
                     defer { session.settleLocalComposerOrigin(localComposerCandidate, disposition: .retained) }
                     #if DEBUG
@@ -20379,14 +20399,28 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                         return
                     }
                     let resumedFence = AgentRunStartStopFence(session: session)
+                    let routeStartRecorder = routeStartArm != nil ? AgentRunStartOutcomeRecorder() : nil
                     await startAgentRun(
                         tabID: tabID,
                         initialMessage: wrappedText,
                         attachments: attachmentsToSend,
                         taggedFileAttachments: taggedFilesToSend,
                         autoEffortSelection: autoEffortSelection,
-                        directStartOptions: AgentDirectRunStartOptions(skipsSlashExpansion: repromptedText != nil, stopFence: resumedFence, localComposerCandidate: localComposerCandidate, initialUserItemID: userItem.id)
+                        directStartOptions: AgentDirectRunStartOptions(
+                            skipsSlashExpansion: repromptedText != nil,
+                            stopFence: resumedFence,
+                            localComposerCandidate: localComposerCandidate,
+                            initialUserItemID: userItem.id
+                        ),
+                        startOutcome: routeStartRecorder
                     )
+                    if let routeStartArm, let routeStartRecorder {
+                        routeStartArm.complete(
+                            recorder: routeStartRecorder,
+                            actual: executableTarget(for: session),
+                            sessionID: session.activeAgentSessionID
+                        )
+                    }
                 }
                 return UserTurnSubmissionResult.submitted
             }
@@ -20433,15 +20467,31 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         // If agent is not running, start it
         if !session.runState.isActive {
             let producerStopFence = stopFence ?? AgentRunStartStopFence(session: session)
+            let routeStartArm = AgentTaskRoutingStartSink.armCurrent()
+            let routeStartRecorder = routeStartArm != nil ? AgentRunStartOutcomeRecorder() : nil
             Task {
+                defer { routeStartArm?.settleRejected() }
                 await startAgentRun(
                     tabID: tabID,
                     initialMessage: wrappedText,
                     attachments: attachmentsToSend,
                     taggedFileAttachments: taggedFilesToSend,
                     autoEffortSelection: autoEffortSelection,
-                    directStartOptions: AgentDirectRunStartOptions(skipsSlashExpansion: repromptedText != nil, stopFence: producerStopFence, localComposerCandidate: localComposerCandidate, initialUserItemID: userItem.id)
+                    directStartOptions: AgentDirectRunStartOptions(
+                        skipsSlashExpansion: repromptedText != nil,
+                        stopFence: producerStopFence,
+                        localComposerCandidate: localComposerCandidate,
+                        initialUserItemID: userItem.id
+                    ),
+                    startOutcome: routeStartRecorder
                 )
+                if let routeStartArm, let routeStartRecorder {
+                    routeStartArm.complete(
+                        recorder: routeStartRecorder,
+                        actual: executableTarget(for: session),
+                        sessionID: session.activeAgentSessionID
+                    )
+                }
             }
         } else if let route = activeProviderSteeringRoute(for: session, attachments: attachmentsToSend) {
             submitActiveProviderSteering(

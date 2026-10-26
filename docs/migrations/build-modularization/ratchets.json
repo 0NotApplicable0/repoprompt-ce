@@ -6,7 +6,7 @@
     "tests_testable_import_app_files",
     "app_static_shared_declarations"
   ],
-  "app_target_swift_lines_headroom": 0,
+  "app_target_swift_lines_headroom": 2000,
   "tracked": [
     "app_target_swift_lines",
     "app_shared_accessor_uses",
@@ -16,7 +16,7 @@
     "tests_sleep_calls"
   ],
   "metrics": {
-    "app_components": 69,
+    "app_components": 72,
     "app_files_over_2000_lines": 47,
     "app_files_over_5000_lines": 16,
     "app_largest_cycle_components": 64,

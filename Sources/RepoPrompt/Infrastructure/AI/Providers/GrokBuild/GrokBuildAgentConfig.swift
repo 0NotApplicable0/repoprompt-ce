@@ -27,10 +27,8 @@ struct GrokBuildAgentConfig {
     /// Other callers retain their native profile by default.
     let discoveryMode: Bool
     /// Grok (xAI) API key resolved asynchronously at provider-construction time from
-    /// the existing `.grokAPI` KeyManager account. `makeLaunchConfiguration` is
-    /// synchronous while the keychain is not, so resolution happens upstream
-    /// (`ACPAgentProviderFactory`). nil means "no stored key" — Grok's own credential
-    /// precedence (`~/.grok/auth.json`, config.toml) still applies.
+    /// the existing `.grokAPI` KeyManager account. nil means "no stored key" — Grok's own
+    /// credential precedence (`~/.grok/auth.json`, config.toml) still applies.
     let apiKey: String?
     /// Process-local background-feature policy. Empty leaves the ACP caller's background
     /// policy unchanged; managed callers, including discovery, opt in explicitly.

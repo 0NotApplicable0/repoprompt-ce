@@ -482,8 +482,8 @@ public class APISettingsViewModel: ObservableObject {
         if isClaudeCodeConnected { providers.insert(.claudeCode) }
         if isOpenCodeConnected { providers.insert(.openCode) }
         if isCursorConnected { providers.insert(.cursor) }
-        if isGrokBuildConnected { providers.insert(.grokBuild) }
-        if isAntigravityRuntimeInstalled { providers.insert(.antigravity) }
+        if isAntigravityConnected { providers.insert(.antigravity) }
+        if isGrokConnected { providers.insert(.grok) }
         if isDevinRuntimeInstalled { providers.insert(.devin) }
         guard providers != directConnectedCLIProviders else { return }
         directConnectedCLIProviders = providers
@@ -1178,7 +1178,7 @@ public class APISettingsViewModel: ObservableObject {
         storedDataLoadBoundary: (@MainActor @Sendable () async -> Void)? = nil,
         contextBuilderProviderValidationWillBegin: (@MainActor @Sendable () async -> Void)? = nil,
         antigravityRuntimeInstalledProvider: @escaping @MainActor () -> Bool = {
-            AntigravityRuntimeManager.installedRuntimeSync() != nil
+            false
         },
         devinRuntimeInstalledProvider: @escaping @MainActor () -> Bool = {
             DevinRuntimeLocator.isInstalledSync()
@@ -1736,10 +1736,13 @@ public class APISettingsViewModel: ObservableObject {
 
     private func probeCachedGrokBuildConnection(ifNeeded: Bool) async -> Bool {
         guard ifNeeded else { return false }
-        if let latest = await GrokBuildACPModelPollingService.shared.latestSnapshot(),
-           latest.isLiveDiscovery
-        {
-            return true
+        do {
+            let support = try await GrokBuildCLILaunchResolver().probeSupport(for: GrokBuildAgentConfig())
+            if let reason = support.reason {
+                grokBuildError = reason
+            }
+        } catch {
+            grokBuildError = Self.friendlyGrokBuildMessage(for: error)
         }
         // Help establishes CLI capability, not authenticated Chat/Oracle readiness.
         return false

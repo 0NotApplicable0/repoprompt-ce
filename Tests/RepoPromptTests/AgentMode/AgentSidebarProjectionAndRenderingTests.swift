@@ -1512,7 +1512,7 @@ final class AgentSidebarRowInvalidationTests: XCTestCase {
                         LifecycleNoopCodexController(recorder: LifecycleRecorder())
                     },
                     claudeControllerFactory: { _, _, _, _ in MonitorFakeNativeController() },
-                    headlessProviderFactory: { _, _ in AgentSessionLinkCapturingHeadlessProvider(failuresRemaining: 1) },
+                    headlessProviderFactory: { _, _, _, _, _ in AgentSessionLinkCapturingHeadlessProvider(failuresRemaining: 1) },
                     acpProviderFactory: { _, _ in throw ProviderLaunchRefused.refused },
                     acpControllerFactory: { _, _ in throw ProviderLaunchRefused.refused },
                     connectionPolicyInstaller: { _, _, _, _, _, _, _, _, _, _, _, _, _ in },

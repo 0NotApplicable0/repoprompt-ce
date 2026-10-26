@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptSettingsCore
 
 /// An opaque provider value. An advertised value is not necessarily executable by this app.
 struct ExecutionEffortID: Hashable {
@@ -57,10 +58,19 @@ struct RoutingExecutionMetadataSnapshot: Equatable {
 @MainActor
 struct RoutingExecutionMetadataAdapter {
     private let modelOptions: @MainActor (AgentProviderKind, AgentModelCatalog.AvailabilityContext) -> [AgentModelOption]
+    /// Cursor's advertised effort control for a base model. Its exact `config_id` and values are
+    /// the only source of Cursor effort targets; absence means one provider-default target.
+    private let cursorThinking: @MainActor (String) -> ACPModelParameterDefinition?
 
-    init(modelOptions: @escaping @MainActor (AgentProviderKind, AgentModelCatalog.AvailabilityContext) -> [AgentModelOption] = {
-        AgentModelCatalog.options(for: $0, availability: $1)
-    }) {
+    init(
+        cursorThinking: @escaping @MainActor (String) -> ACPModelParameterDefinition? = {
+            ACPModelParameterResolver.parameterSet(providerID: .cursor, selectedModelRaw: $0)?.definition(kind: .thinking)
+        },
+        modelOptions: @escaping @MainActor (AgentProviderKind, AgentModelCatalog.AvailabilityContext) -> [AgentModelOption] = {
+            AgentModelCatalog.options(for: $0, availability: $1)
+        }
+    ) {
+        self.cursorThinking = cursorThinking
         self.modelOptions = modelOptions
     }
 
@@ -92,7 +102,7 @@ struct RoutingExecutionMetadataAdapter {
                     revision.append(effort.rawValue)
                 }
             }
-            models.append(contentsOf: Self.models(for: provider, options: options))
+            models.append(contentsOf: self.models(for: provider, options: options, revision: &revision))
         }
         return .init(
             scope: .init(
@@ -105,7 +115,11 @@ struct RoutingExecutionMetadataAdapter {
         )
     }
 
-    private static func models(for provider: AgentProviderKind, options: [AgentModelOption]) -> [RoutingExecutionModelMetadata] {
+    private func models(
+        for provider: AgentProviderKind,
+        options: [AgentModelOption],
+        revision: inout StableCatalogRevision
+    ) -> [RoutingExecutionModelMetadata] {
         struct Entry {
             var raw: String
             var displayName: String
@@ -119,14 +133,20 @@ struct RoutingExecutionMetadataAdapter {
         var order: [String] = []
         var entries: [String: Entry] = [:]
         for (index, option) in options.enumerated() where !option.isPlaceholderDefault {
-            let base = option.effortVariant?.baseModelRaw ?? option.rawValue
+            // Antigravity advertises effort as a suffix on the full model ID. Group those IDs under
+            // the base model; each advertised ID remains the exact executable effort target.
+            let antigravityVariant = provider == .antigravity
+                ? RoutingModelIdentity.antigravityEffortSplit(option.rawValue)
+                : nil
+            let isEffortVariant = option.effortVariant != nil || antigravityVariant != nil
+            let base = option.effortVariant?.baseModelRaw ?? antigravityVariant?.base ?? option.rawValue
             guard !base.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { continue }
             let key = base
             if entries[key] == nil {
                 order.append(key)
                 entries[key] = Entry(
                     raw: base,
-                    displayName: option.effortVariant == nil ? option.displayName : base,
+                    displayName: isEffortVariant ? base : option.displayName,
                     isDefault: false,
                     order: index,
                     effortRawValues: [],
@@ -136,7 +156,7 @@ struct RoutingExecutionMetadataAdapter {
                 )
             }
             guard var entry = entries[key] else { continue }
-            if option.effortVariant == nil { entry.displayName = option.displayName }
+            if !isEffortVariant { entry.displayName = option.displayName }
             entry.isDefault = entry.isDefault || option.isProviderDefault
             entry.optionRawValues.append(option.rawValue)
             entry.defaultEffortRaw = entry.defaultEffortRaw
@@ -153,14 +173,57 @@ struct RoutingExecutionMetadataAdapter {
                     modelParameters: []
                 )
             }
+            if let antigravityVariant {
+                entry.effortRawValues.append(antigravityVariant.effort)
+                entry.variantTargets[antigravityVariant.effort] = .init(
+                    agentRaw: provider.rawValue,
+                    modelRaw: option.rawValue,
+                    reasoningEffortRaw: nil,
+                    modelParameters: []
+                )
+            }
             entries[key] = entry
         }
         return order.compactMap { key in
             guard let entry = entries[key] else { return nil }
             var seen: Set<String> = []
+            if provider == .cursor,
+               let thinking = cursorThinking(entry.raw), !thinking.choices.isEmpty
+            {
+                revision.append(thinking.configID)
+                let efforts = thinking.choices.compactMap { choice -> RoutingExecutionEffort? in
+                    guard !choice.rawValue.isEmpty, seen.insert(choice.rawValue).inserted else { return nil }
+                    revision.append(choice.rawValue)
+                    return .init(
+                        id: .init(rawValue: choice.rawValue),
+                        executableTarget: .init(
+                            agentRaw: provider.rawValue,
+                            modelRaw: entry.raw,
+                            reasoningEffortRaw: nil,
+                            modelParameters: [ACPModelParameterSelection(
+                                providerID: .cursor,
+                                baseModelRaw: entry.raw,
+                                kind: .thinking,
+                                configID: thinking.configID,
+                                valueRaw: choice.rawValue
+                            )]
+                        )
+                    )
+                }
+                return .init(
+                    provider: provider,
+                    baseModelRaw: entry.raw,
+                    displayName: entry.displayName,
+                    isProviderDefault: entry.isDefault,
+                    catalogOrder: entry.order,
+                    advertisedOptionRawValues: entry.optionRawValues,
+                    defaultEffortID: thinking.currentValueRaw.isEmpty ? nil : ExecutionEffortID(rawValue: thinking.currentValueRaw),
+                    efforts: efforts
+                )
+            }
             let efforts = entry.effortRawValues.compactMap { raw -> RoutingExecutionEffort? in
                 guard !raw.isEmpty, seen.insert(raw).inserted else { return nil }
-                let target = executableEffortTarget(
+                let target = Self.executableEffortTarget(
                     provider: provider,
                     base: entry.raw,
                     raw: raw,
@@ -197,6 +260,8 @@ struct RoutingExecutionMetadataAdapter {
         {
             return variant
         }
+        // Antigravity executes only the exact full model ID it advertised for this effort.
+        if provider == .antigravity { return variant }
         // ACP and future effort values remain visible metadata until their execution bridge
         // can submit the exact raw value; profiles cannot authorize that bridge.
         return nil

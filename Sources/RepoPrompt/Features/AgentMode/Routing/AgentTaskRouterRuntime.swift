@@ -9,8 +9,16 @@ final class AgentTaskRouterRuntime: ObservableObject {
     let serviceDisplayNamesByID: [DecisionServiceID: String]
     let coordinator: DecisionCoordinator
     let defaultBackendID: DecisionServiceID?
+    /// The single production decision-log instance for this composition.
+    let decisionLog: AgentTaskRoutingDecisionLog
+    let explorationAdvisor: AgentTaskRoutingExplorationAdvisor
     let objectWillChange = ObservableObjectPublisher()
     @MainActor var usageBalancer: AgentUsageBalancer?
+    /// Builds the candidate builder used for one routing decision. The default is the production
+    /// builder; a caller may inject `modelOptions` through it.
+    @MainActor var candidateBuilderFactory: @MainActor () -> AgentTaskRoutingCandidateBuilder = {
+        AgentTaskRoutingCandidateBuilder()
+    }
 
     private let readinessLock = NSLock()
     private var readinessByBackendID: [DecisionServiceID: DecisionReadiness] = [:]
@@ -20,12 +28,16 @@ final class AgentTaskRouterRuntime: ObservableObject {
     init(
         registrations: [DecisionServiceRegistration],
         demandSource: (any AgentTaskRouterDemandSource)? = nil,
-        defaultBackendID: DecisionServiceID? = nil
+        defaultBackendID: DecisionServiceID? = nil,
+        decisionLog: AgentTaskRoutingDecisionLog = AgentTaskRoutingDecisionLog(),
+        explorationAdvisor: AgentTaskRoutingExplorationAdvisor = AgentTaskRoutingExplorationAdvisor(fileURL: nil)
     ) throws {
         let registry = try DecisionServiceRegistry(registrations: registrations)
         self.registry = registry
         serviceDisplayNamesByID = Dictionary(uniqueKeysWithValues: registrations.map { ($0.id, $0.displayName) })
         self.defaultBackendID = defaultBackendID
+        self.decisionLog = decisionLog
+        self.explorationAdvisor = explorationAdvisor
         let coordinator = DecisionCoordinator(registry: registry)
         self.coordinator = coordinator
         activation = AgentTaskRouterActivation(registry: registry, coordinator: coordinator, source: demandSource)
@@ -41,7 +53,8 @@ final class AgentTaskRouterRuntime: ObservableObject {
         secureKeys: SecureKeysService = SecureKeysService(),
         jevClient: any JevRoutingClientProtocol = JevRoutingClient(),
         settingsStore: GlobalSettingsStore? = nil,
-        decisionsClient: OpenAIDecisionsRoutingClient = OpenAIDecisionsRoutingClient()
+        decisionsClient: OpenAIDecisionsRoutingClient = OpenAIDecisionsRoutingClient(),
+        decisionLog: AgentTaskRoutingDecisionLog = AgentTaskRoutingDecisionLog()
     ) {
         let settingsStore = settingsStore ?? .shared
         let jev = JevRouterCredentialService(secureKeys: secureKeys, client: jevClient)
@@ -50,18 +63,24 @@ final class AgentTaskRouterRuntime: ObservableObject {
         })
         settingsStore.materializeModelRouterDefaultIfAbsent(.jev)
         do {
-            try self.init(registrations: [
-                .init(
-                    service: JevDecisionService(credentialService: jev),
-                    configuration: JevDecisionService.settingsRegistration(controller: jev),
-                    displayOrder: 100
-                ),
-                .init(
-                    service: OpenAIDecisionsDecisionService(credentialService: decisions),
-                    configuration: OpenAIDecisionsDecisionService.settingsRegistration(controller: decisions),
-                    displayOrder: 200
-                )
-            ], demandSource: settingsStore, defaultBackendID: .jev)
+            try self.init(
+                registrations: [
+                    .init(
+                        service: JevDecisionService(credentialService: jev),
+                        configuration: JevDecisionService.settingsRegistration(controller: jev),
+                        displayOrder: 100
+                    ),
+                    .init(
+                        service: OpenAIDecisionsDecisionService(credentialService: decisions),
+                        configuration: OpenAIDecisionsDecisionService.settingsRegistration(controller: decisions),
+                        displayOrder: 200
+                    )
+                ],
+                demandSource: settingsStore,
+                defaultBackendID: .jev,
+                decisionLog: decisionLog,
+                explorationAdvisor: AgentTaskRoutingExplorationAdvisor(fileURL: AgentTaskRoutingExplorationAdvisor.defaultFileURL())
+            )
         } catch {
             preconditionFailure("Invalid bundled model-router registry: \(error)")
         }
@@ -82,6 +101,19 @@ final class AgentTaskRouterRuntime: ObservableObject {
     /// Wait for current demand admission and task-free bootstrap completion.
     func reconcileDemand(waitForBootstrap: Bool = true) async {
         await activation.reconcileAndWait(waitForBootstrap: waitForBootstrap)
+    }
+
+    /// Traced sibling of `coordinator.decide` for the view-model owner; same outcome plus the log trace.
+    func decideTraced(
+        serviceID: DecisionServiceID,
+        request: FiniteChoiceDecisionRequest,
+        consumerRevision: UInt64? = nil
+    ) async -> DecisionTracedOutcome {
+        await coordinator.decideTraced(
+            serviceID: serviceID,
+            request: request,
+            consumerRevision: consumerRevision
+        )
     }
 
     func isBackendReady(_ id: DecisionServiceID) -> Bool {

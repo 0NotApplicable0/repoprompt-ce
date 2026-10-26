@@ -381,6 +381,166 @@ struct AgentRunMCPToolService {
         return AgentModelCatalog.taskLabels.contains { $0.label == normalized }
     }
 
+    private enum DiversitySessionMaker: Equatable {
+        case notFound
+        case unclassifiable
+        case maker(AgentTaskRoutingMaker)
+    }
+
+    private struct DiversityReference {
+        let id: UUID
+        let automatic: Bool
+    }
+
+    static func resolveDiversityOptions(
+        args: [String: Value],
+        workspace: WorkspaceModel,
+        configuration: AgentTaskRouterConfiguration,
+        agentModeVM: AgentModeViewModel,
+        workflow: AgentWorkflowDefinition?,
+        validatedParentSessionID: UUID?,
+        hasExplicitModelPin: Bool,
+        sessionDataService: AgentSessionDataService
+    ) async throws -> AgentTaskRoutingDiversityOptions {
+        let hasExplicitKey = args["exclude_makers"] != nil || args["diverse_from_sessions"] != nil
+        let reviewDefault = workflow?.builtInWorkflow == .review
+            && configuration.enabled
+            && configuration.reviewDiversityEnabled
+            && !hasExplicitKey
+        guard hasExplicitKey || reviewDefault else { return .none }
+        guard configuration.enabled else {
+            throw MCPError.invalidParams("Diversity arguments require the model router to be enabled.")
+        }
+        guard !hasExplicitModelPin else {
+            throw MCPError.invalidParams("Diversity cannot be combined with an explicit model pin or model_parameters.")
+        }
+        var exclusions: [String: Set<AgentTaskRoutingDiversityOptions.ExclusionSource>] = [:]
+        var sessionIDs: [UUID] = []
+        if let value = args["exclude_makers"] {
+            guard let values = value.arrayValue else {
+                throw MCPError.invalidParams("exclude_makers must be an array of makers.")
+            }
+            for value in values {
+                guard let raw = value.stringValue,
+                      AgentTaskRoutingMaker(rawValue: raw) != nil
+                else {
+                    throw MCPError.invalidParams("exclude_makers must contain only supported makers.")
+                }
+                exclusions[raw, default: []].insert(.excludeMakers)
+            }
+        }
+        if let value = args["diverse_from_sessions"] {
+            guard let values = value.arrayValue else {
+                throw MCPError.invalidParams("diverse_from_sessions must be an array of UUIDs.")
+            }
+            for value in values {
+                guard let raw = value.stringValue, let id = UUID(uuidString: raw) else {
+                    throw MCPError.invalidParams("diverse_from_sessions must contain full UUIDs.")
+                }
+                if !sessionIDs.contains(id) { sessionIDs.append(id) }
+            }
+        }
+        var references = sessionIDs.map { DiversityReference(id: $0, automatic: false) }
+        if reviewDefault, let validatedParentSessionID {
+            references.append(DiversityReference(id: validatedParentSessionID, automatic: true))
+        }
+        var live: [UUID: DiversitySessionMaker] = [:]
+        var stored: [UUID: DiversitySessionMaker] = [:]
+        var begun: [DiversityReference] = []
+        for reference in references {
+            begun.append(reference)
+            try refreshLiveDiversity(begun, into: &live, workspace: workspace, agentModeVM: agentModeVM)
+            guard case .notFound? = live[reference.id] else { continue }
+            do {
+                stored[reference.id] = try await storedDiversityMaker(sessionID: reference.id, workspace: workspace, sessionDataService: sessionDataService)
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch {
+                throw MCPError.invalidParams("diverse_from_sessions could not read the referenced session metadata.")
+            }
+            try requireDiversityContextCurrent(workspace: workspace, configuration: configuration, agentModeVM: agentModeVM)
+            try refreshLiveDiversity(begun, into: &live, workspace: workspace, agentModeVM: agentModeVM)
+        }
+        try requireDiversityContextCurrent(workspace: workspace, configuration: configuration, agentModeVM: agentModeVM)
+        try refreshLiveDiversity(references, into: &live, workspace: workspace, agentModeVM: agentModeVM)
+        for reference in references {
+            var resolved = live[reference.id] ?? .notFound
+            if case .notFound = resolved { resolved = stored[reference.id] ?? .notFound }
+            if reference.automatic {
+                if case let .maker(maker) = resolved {
+                    exclusions[maker.rawValue, default: []].insert(.reviewDiversity)
+                }
+            } else {
+                guard case let .maker(maker) = resolved else {
+                    throw MCPError.invalidParams("diverse_from_sessions could not resolve an authorized session with a classifiable maker.")
+                }
+                exclusions[maker.rawValue, default: []].insert(.diverseFromSessions)
+            }
+        }
+        return exclusions.isEmpty ? .none : .init(exclusions: exclusions)
+    }
+
+    private static func refreshLiveDiversity(
+        _ references: [DiversityReference],
+        into live: inout [UUID: DiversitySessionMaker],
+        workspace: WorkspaceModel,
+        agentModeVM: AgentModeViewModel
+    ) throws {
+        for reference in references {
+            let current = liveDiversityMaker(sessionID: reference.id, workspace: workspace, agentModeVM: agentModeVM)
+            if !reference.automatic, case .maker? = live[reference.id], live[reference.id] != current {
+                throw MCPError.invalidParams("A referenced live session changed while diversity arguments were resolved.")
+            }
+            live[reference.id] = current
+        }
+    }
+
+    private static func liveDiversityMaker(
+        sessionID: UUID,
+        workspace: WorkspaceModel,
+        agentModeVM: AgentModeViewModel
+    ) -> DiversitySessionMaker {
+        let bound = agentModeVM.sessions.values.filter { $0.activeAgentSessionID == sessionID }
+        guard let live = bound.first else { return .notFound }
+        guard bound.count == 1 else { return .unclassifiable }
+        guard agentModeVM.agentSessionLifecycleIdentity(tabID: live.tabID, expectedSessionID: sessionID)?.workspaceID == workspace.id,
+              agentModeVM.workspaceManager?.agentSessionLifecycleTabs(workspaceID: workspace.id, sessionID: sessionID).map(\.id) == [live.tabID]
+        else { return .notFound }
+        return diversityMaker(provider: live.selectedAgent, modelRaw: live.selectedModelRaw)
+    }
+
+    private static func storedDiversityMaker(
+        sessionID: UUID,
+        workspace: WorkspaceModel,
+        sessionDataService: AgentSessionDataService
+    ) async throws -> DiversitySessionMaker {
+        guard let record = try await sessionDataService.metadataRecordForSessionID(sessionID, for: workspace) else {
+            return .notFound
+        }
+        guard let provider = record.agentKindRaw.flatMap(AgentProviderKind.init(rawValue:)),
+              let modelRaw = record.agentModelRaw
+        else { return .unclassifiable }
+        return diversityMaker(provider: provider, modelRaw: modelRaw)
+    }
+
+    private static func diversityMaker(provider: AgentProviderKind, modelRaw: String) -> DiversitySessionMaker {
+        AgentTaskRoutingMakerCatalog.maker(provider: provider, modelRaw: modelRaw).map(DiversitySessionMaker.maker) ?? .unclassifiable
+    }
+
+    private static func requireDiversityContextCurrent(
+        workspace: WorkspaceModel,
+        configuration: AgentTaskRouterConfiguration,
+        agentModeVM: AgentModeViewModel
+    ) throws {
+        try Task.checkCancellation()
+        guard agentModeVM.workspaceManager?.activeWorkspaceID == workspace.id else {
+            throw MCPError.invalidParams("The active workspace changed while diversity arguments were resolved.")
+        }
+        guard agentModeVM.modelRouterSettingsStore.modelRouterConfiguration() == configuration else {
+            throw MCPError.invalidParams("Model Router settings changed while diversity arguments were resolved.")
+        }
+    }
+
     let toolName: String
     var perfRecorder: any AgentModePerfRecording = NoopAgentModePerfRecorder()
     let captureRequestMetadata: () async -> RequestMetadata
@@ -452,6 +612,9 @@ struct AgentRunMCPToolService {
         if op != "start", startWorktreeCoordinator.containsArguments(args) {
             throw MCPError.invalidParams("agent_run worktree arguments are only supported with op=start.")
         }
+        if op != "start", args["exclude_makers"] != nil || args["diverse_from_sessions"] != nil {
+            throw MCPError.invalidParams("agent_run diversity arguments are only supported with op=start.")
+        }
         switch op {
         case "start":
             return try await executeStart(args: args)
@@ -484,6 +647,19 @@ struct AgentRunMCPToolService {
     }
 
     private func executeStart(args: [String: Value]) async throws -> Value {
+        let routeLogHolder = AgentTaskRoutingRouteContextHolder()
+        do {
+            return try await executeStartBody(args: args, routeLogHolder: routeLogHolder)
+        } catch {
+            await routeLogHolder.context?.finish(.rejected)
+            throw error
+        }
+    }
+
+    private func executeStartBody(
+        args: [String: Value],
+        routeLogHolder: AgentTaskRoutingRouteContextHolder
+    ) async throws -> Value {
         let message = try resolveMessage(args["message"], name: "message")
         let workflow = try resolveWorkflow(args: args)
         let worktreeStartRequest = try startWorktreeCoordinator.parseRequest(args: args)
@@ -592,13 +768,29 @@ struct AgentRunMCPToolService {
         var routedReasoningEffortRaw: String?
         var routerSelectedTarget = false
         let shouldRouteStart = Self.shouldRouteModelForStart(requestedModelID: requestedModelID, hasExplicitModelParameters: args["model_parameters"] != nil)
-        let canBalanceStart = shouldRouteStart && resolvedTabID == nil && agentModeVM.modelRouterSettingsStore.modelRouterConfiguration().usageBalancing.enabled
+        let routerConfiguration = agentModeVM.modelRouterSettingsStore.modelRouterConfiguration()
+        let diversity = try await Self.resolveDiversityOptions(
+            args: args,
+            workspace: workspace,
+            configuration: routerConfiguration,
+            agentModeVM: agentModeVM,
+            workflow: workflow,
+            validatedParentSessionID: spawnParentSessionID,
+            hasExplicitModelPin: !shouldRouteStart,
+            sessionDataService: .shared
+        )
+        let canBalanceStart = shouldRouteStart && resolvedTabID == nil && routerConfiguration.usageBalancing.enabled
         let usageBaseline: AgentMCPSelectionResolver.ResolvedSelection? = canBalanceStart ? try? AgentMCPSelectionResolver.resolve(
             modelID: requestedModelID, defaultTaskLabel: defaultTaskLabel,
             availability: targetWindow.apiSettingsViewModel.agentModeAvailabilityContext,
             workspaceID: workspace.id
         ) : nil
-        let baselineTarget = usageBaseline.flatMap { value -> AgentRoutingExecutableTarget? in
+        let frozenBaseline: AgentMCPSelectionResolver.ResolvedSelection? = diversity.exclusions.isEmpty ? usageBaseline : (usageBaseline ?? (try? AgentMCPSelectionResolver.resolve(
+            modelID: requestedModelID, defaultTaskLabel: defaultTaskLabel,
+            availability: targetWindow.apiSettingsViewModel.agentModeAvailabilityContext,
+            workspaceID: workspace.id
+        )))
+        let baselineTarget = frozenBaseline.flatMap { value -> AgentRoutingExecutableTarget? in
             guard let agent = value.agentRaw, let model = value.modelRaw else { return nil }
             return .init(agentRaw: agent, modelRaw: model, reasoningEffortRaw: nil, modelParameters: value.modelParameterSelections)
         }

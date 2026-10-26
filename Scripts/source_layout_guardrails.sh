@@ -814,6 +814,7 @@ allowed_tracked_docs=(
   "docs/architecture/context-composer.md"
   "docs/architecture/headless-mcp-runtime.md"
   "docs/architecture/mcp-lifecycle-diagnostics.md"
+  "docs/architecture/model-routing-decision-log.md"
   "docs/architecture/model-routing.md"
   "docs/architecture/modules.md"
   "docs/architecture/oracle-groups-rewrite.md"
@@ -861,8 +862,8 @@ while IFS= read -r path; do
   fi
 done < <(git ls-files docs)
 unexpected_tracked_docs="$(comm -23 \
-  <(printf '%s\n' "${existing_tracked_docs[@]}" | sort) \
-  <(printf '%s\n' "${allowed_tracked_docs[@]}" | sort))"
+  <(printf '%s\n' "${existing_tracked_docs[@]}" | sort -u) \
+  <(printf '%s\n' "${allowed_tracked_docs[@]}" | sort -u))"
 if [[ -n "$unexpected_tracked_docs" ]]; then
   fail "unexpected tracked docs found; keep agent-authored working documents local or add durable docs to the explicit allowlist"
   printf '%s\n' "$unexpected_tracked_docs" >&2

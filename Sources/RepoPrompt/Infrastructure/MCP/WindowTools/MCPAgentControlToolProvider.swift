@@ -169,6 +169,8 @@ final class MCPAgentControlToolProvider: MCPAppToolProviding {
             description: """
             Short-lived, read-only explore child agents for narrow codebase probes. Each child runs in a fresh session with its own context window. Always uses the `explore` role; no custom `model_id`, workflows, session reuse, `steer`, or `respond`.
 
+            Explore has no implicit Review and no model or workflow custom pin. It does not apply default built-in Review.
+
             When the app-global Model Router is enabled, each new explore child is routed across the configured subagent targets.
 
             Explore children inherit the caller's worktree bindings by default; pass `inherit_worktree=false` to opt out. Start-only worktree controls can bind an existing worktree or create one before provider startup, overriding an inherited primary-root binding. Multi-message creates produce one worktree per child when branch/path are implicit and reject a shared explicit branch or path.
@@ -187,7 +189,7 @@ final class MCPAgentControlToolProvider: MCPAppToolProviding {
                 description: """
                 Provide `op` plus operation-specific fields.
 
-                **start**: message or messages (required, mutually exclusive), detach?, timeout?, inherit_worktree?, worktree|worktree_id|worktree_create? and worktree_* args
+                **start**: message or messages (required, mutually exclusive), detach?, timeout?, exclude_makers?, diverse_from_sessions?, inherit_worktree?, worktree|worktree_id|worktree_create? and worktree_* args
                 **poll / wait**: session_id or session_ids (mutually exclusive), timeout? (wait only)
                 **cancel**: session_id (required)
                 """,
@@ -209,7 +211,9 @@ final class MCPAgentControlToolProvider: MCPAppToolProviding {
                     "worktree_color": .string(description: "[start] Optional visual color to persist for the bound worktree as #RRGGBB."),
                     "allow_external_worktree_path": .boolean(description: "[start + worktree_create] Allow explicit worktree_path outside RepoPrompt's app-managed worktree container."),
                     "session_id": .string(description: "[poll, wait, cancel] Explore child session UUID returned by start."),
-                    "session_ids": .array(description: "[wait, poll] Array of explore child session UUIDs. Mutually exclusive with session_id.", items: .string())
+                    "session_ids": .array(description: "[wait, poll] Array of explore child session UUIDs. Mutually exclusive with session_id.", items: .string()),
+                    "exclude_makers": diversityMakersSchema(explore: true),
+                    "diverse_from_sessions": diversitySessionsSchema(explore: true)
                 ],
                 required: ["op"]
             )
@@ -251,7 +255,9 @@ final class MCPAgentControlToolProvider: MCPAppToolProviding {
             "answers": .object(description: "[respond] Structured answers keyed by question ID."),
             "content": .object(description: "[respond] MCP elicitation content object to send with action=accept."),
             "meta": .object(description: "[respond] Optional MCP elicitation _meta object."),
-            "amendment": .string(description: "[respond] Amendment text for accept_with_amendment decisions.")
+            "amendment": .string(description: "[respond] Amendment text for accept_with_amendment decisions."),
+            "exclude_makers": diversityMakersSchema(explore: false),
+            "diverse_from_sessions": diversitySessionsSchema(explore: false)
         ]
         #if DEBUG
             properties["_worktree_startup_benchmark_token"] = .string(description: "[DEBUG start] Single-use token from the scoped worktree startup benchmark diagnostics surface.")
@@ -270,7 +276,7 @@ final class MCPAgentControlToolProvider: MCPAppToolProviding {
 
             Role labels resolve through the effective global role-default mapping; see the top-level `task_labels` array from `agent_manage.list_agents` for the authoritative label→model mapping. If `model_id` is omitted on `start`, RepoPrompt uses the `pair` role. To pin an exact agent+model+effort target, pass a specific compound `model_id` from `agents[].models[].model_id` in the same response.
 
-            When the app-global Model Router is enabled, new starts that omit `model_id` or use a role label are routed across the configured subagent targets. A compound `model_id` or explicit `model_parameters` remains an exact pin and bypasses routing.
+            When the app-global Model Router is enabled, new starts that omit `model_id` or use a role label are routed across the configured subagent targets. A compound `model_id` or a present `model_parameters` key, including [] or null, remains an exact pin and bypasses routing except under default built-in Review. A diversity key, including [], rejects that pin and `model_parameters` and suppresses default built-in Review. Default built-in Review is builtInWorkflow == .review, Router enabled, reviewDiversityEnabled, and neither diversity key. That predicate rejects the pin before parent resolution, even if the parent is missing or unclassifiable. A custom display name is inert. Explore has no implicit Review.
 
             **Operations**: start | poll | wait | cancel | steer | respond
 
@@ -294,7 +300,7 @@ final class MCPAgentControlToolProvider: MCPAppToolProviding {
                 description: """
                 Provide `op` plus operation-specific fields.
 
-                **start**: message (required), model_id? (defaults to pair), model_parameters? (Cursor exact config/value selections), session_name?, workflow_id|workflow_name?, detach?, timeout?, inherit_worktree?, worktree|worktree_id|worktree_create? and worktree_* args. Use workflow_name="orchestrate" to plan, decompose, and dispatch sub-agents.
+                **start**: message (required), model_id? (defaults to pair), model_parameters? (Cursor exact config/value selections), exclude_makers?, diverse_from_sessions?, session_name?, workflow_id|workflow_name?, detach?, timeout?, inherit_worktree?, worktree|worktree_id|worktree_create? and worktree_* args. Use workflow_name="orchestrate" to plan, decompose, and dispatch sub-agents.
                 **poll / wait**: session_id or session_ids (mutually exclusive), timeout? (wait only)
                 **cancel**: session_id (required)
                 **steer**: session_id (required, from a prior `start`/`steer` response), message (required), wait?, timeout_seconds?, workflow_id|workflow_name?
@@ -375,6 +381,44 @@ final class MCPAgentControlToolProvider: MCPAppToolProviding {
         ) { [dependencies] _, args in
             try await dependencies.executeAgentManage(args)
         }
+    }
+
+    private func diversityMakersSchema(explore: Bool) -> JSONSchema {
+        .array(
+            description: Self.diversityMakerDescription(explore: explore),
+            items: .string(
+                description: "Canonical maker id.",
+                enum: ["anthropic", "openai", "google", "xai", "cursor"]
+            )
+        )
+    }
+
+    private func diversitySessionsSchema(explore: Bool) -> JSONSchema {
+        .array(
+            description: Self.diversitySessionDescription(explore: explore),
+            items: .string(description: "One full session UUID.")
+        )
+    }
+
+    private static func diversityMakerDescription(explore: Bool) -> String {
+        var text = "[start] Optional start-only maker exclusion. Canonical ids are anthropic, openai, google, xai, and cursor. Omitting this field contributes no exclusions from this field and does not suppress diverse_from_sessions or default built-in Review. A present [] excludes nothing and is still a diversity key. Null is not an array and is rejected. Names union with diverse_from_sessions on the referenced session's current maker; sources stay in canonical order exclude_makers, diverse_from_sessions, review_diversity. With the router off, any present diversity key is rejected."
+        text += diversityPinScope(explore: explore)
+        text += " A missing, unknown, or excluded baseline rejects only a fallback that needs that baseline. A successful routed target stays eligible with no baseline. That fallback uses the same frozen pre-route baseline only, with no arbitrary survivor or Pair substitution."
+        return text
+    }
+
+    private static func diversitySessionDescription(explore: Bool) -> String {
+        var text = "[start] Optional start-only session diversity. Each entry is one full UUID. The resolved current maker is unioned with exclude_makers. Do not infer a maker from the UUID, scan other workspaces, or log the session id. Omitting this field contributes no exclusions from this field and does not suppress exclude_makers or default built-in Review. A present [] excludes nothing and is still a diversity key. Null is rejected. With the router off, any present diversity key is rejected."
+        text += diversityPinScope(explore: explore)
+        text += " Explicit unknown or unclassifiable sessions are rejected. An unproven automatic parent stays inert."
+        return text
+    }
+
+    private static func diversityPinScope(explore: Bool) -> String {
+        if explore {
+            return " Explore has no implicit Review and no model or workflow custom pin. Explore never accepts a compound model_id or model_parameters pin and never uses an ordinary routing bypass. Explore does not apply default built-in Review."
+        }
+        return " For agent_run, an ordinary compound model_id or present model_parameters key, including [] or null, bypasses routing except when a diversity key is present or default built-in Review applies. For agent_run, default built-in Review is builtInWorkflow == .review, Router enabled, reviewDiversityEnabled, and neither diversity key. That predicate rejects the pin before parent resolution, even if the parent is missing or unclassifiable. For agent_run, a custom display name is inert. For agent_run, a present key, including [], suppresses default built-in Review."
     }
 
     private func modelParametersSchema(operations: String) -> JSONSchema {

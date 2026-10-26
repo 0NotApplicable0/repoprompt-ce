@@ -2170,7 +2170,7 @@ final class AgentSessionLinkNativeAndHeadlessPromptAdapterTests: XCTestCase {
             session.appendItem(item)
             let token = session.registerLocalComposerCandidate(itemID: item.id, at: session.items.count - 1)
             let harness = AgentSessionLinkRunnerHarness(
-                headlessProviderFactory: { _, _ in AgentSessionLinkCapturingHeadlessProvider() }, sessionLinkHost: fixture.viewModel
+                headlessProviderFactory: { _, _, _, _, _ in AgentSessionLinkCapturingHeadlessProvider() }, sessionLinkHost: fixture.viewModel
             )
             let runner = ClaudeIntegratedAgentModeRunner(
                 claudeCoordinator: fixture.viewModel.test_claudeCoordinator, hooks: harness.hooks,
