@@ -18,6 +18,8 @@ struct AgentSessionAdministrationRequest {
     let preview: Bool
     /// Operation-specific arguments for the registered handler.
     let arguments: [String: Value]
+    /// The routed controller endpoint the call was admitted under; `nil` for surfaces with no routed endpoint.
+    let callerEndpoint: DomainAgentSessionLinkEndpointIdentity?
 
     init(
         operation: DomainAgentSessionTargetOperation,
@@ -28,7 +30,8 @@ struct AgentSessionAdministrationRequest {
         idempotencyKey: String? = nil,
         confirmationID: UUID? = nil,
         preview: Bool = false,
-        arguments: [String: Value] = [:]
+        arguments: [String: Value] = [:],
+        callerEndpoint: DomainAgentSessionLinkEndpointIdentity? = nil
     ) {
         self.operation = operation
         self.caller = caller
@@ -39,6 +42,7 @@ struct AgentSessionAdministrationRequest {
         self.confirmationID = confirmationID
         self.preview = preview
         self.arguments = arguments
+        self.callerEndpoint = callerEndpoint
     }
 
     /// Canonical digest of `arguments` that a batch card binds (targets, key, confirmation ID, scope,
@@ -53,7 +57,7 @@ struct AgentSessionAdministrationRequest {
         AgentSessionAdministrationRequest(
             operation: operation, caller: caller, callerTabID: callerTabID, scopeID: scopeID,
             targetSessionIDs: targetSessionIDs, idempotencyKey: idempotencyKey, confirmationID: nil,
-            preview: preview, arguments: arguments
+            preview: preview, arguments: arguments, callerEndpoint: callerEndpoint
         )
     }
 
@@ -62,7 +66,7 @@ struct AgentSessionAdministrationRequest {
         AgentSessionAdministrationRequest(
             operation: operation, caller: caller, callerTabID: callerTabID, scopeID: scopeID,
             targetSessionIDs: targets, idempotencyKey: idempotencyKey, confirmationID: confirmationID,
-            preview: preview, arguments: arguments
+            preview: preview, arguments: arguments, callerEndpoint: callerEndpoint
         )
     }
 }

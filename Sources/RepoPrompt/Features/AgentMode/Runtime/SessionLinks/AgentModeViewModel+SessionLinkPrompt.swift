@@ -718,9 +718,21 @@ extension AgentModeViewModel {
                 taskLabelKind: session.mcpControlContext?.taskLabelKind
             )
         )
-        let effectiveInventory = AgentSessionLinkPromptEligibility.effectiveInventory(
+        let scoped = AgentSessionLinkRuntimeBridge.shared.promptInventoryForCurrentScope(
             published.inventory,
-            input: input
+            observer: endpoint
+        )
+        let scopedInput = AgentSessionLinkPromptEligibility.Input(
+            isChildSession: input.isChildSession,
+            isMCPControlled: input.isMCPControlled,
+            isMCPOriginated: input.isMCPOriginated,
+            roleAllowsOutboundMonitoring: input.roleAllowsOutboundMonitoring,
+            scopedEvidence: scoped.evidence,
+            endpoint: endpoint
+        )
+        let effectiveInventory = AgentSessionLinkPromptEligibility.effectiveInventory(
+            scoped.inventory,
+            input: scopedInput
         )
         // Current exact membership and the claim/physical-acquisition fences own supplement
         // authority. Discovery may lag forever; it must not withhold this inventory or its wake.
@@ -728,7 +740,7 @@ extension AgentModeViewModel {
         return AgentSessionLinkPromptContext(
             epoch: AgentSessionLinkPromptEpoch(
                 endpoint: endpoint,
-                allowsSupplement: AgentSessionLinkPromptEligibility.allowsSupplement(input),
+                allowsSupplement: AgentSessionLinkPromptEligibility.allowsSupplement(scopedInput),
                 // Computed once, here, and carried on the epoch: the provider decides the
                 // model-visible tool name a fragment must use, and it is also what makes a cached
                 // fragment stale when the session is rebound to a different runtime. Deriving it

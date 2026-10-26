@@ -198,7 +198,7 @@ final class AgentRepromptTestFixture {
         viewModel = AgentModeViewModel(
             testWorkspacePath: root.path,
             codexControllerFactory: { _, _, _, _, _, _ in preconditionFailure("Re-prompt tests must not start Codex") },
-            headlessProviderFactory: { _, _ in UnsupportedHeadlessAgentProvider(reason: "test terminal") },
+            headlessProviderFactory: { _, _, _, _, _ in UnsupportedHeadlessAgentProvider(reason: "test terminal") },
             mcpServerEnabler: { await gate.wait() },
             testModelRouterSettingsStore: store
         )

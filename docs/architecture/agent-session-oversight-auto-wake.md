@@ -343,6 +343,108 @@ the user's card.
   handoff, and after retirement it retains the restart handoff with a visible recovery note.
 - **`worktree_inventory` drops `unbound`/`released` flags while any session binds the worktree**, even one outside the scope; this is a deliberate safety property, and nothing names or counts the outside binder.
 
+### Consented MCP controllers: `direct_children`
+
+`session_admin request_scope kind=direct_children` is a narrow consent path for a parentless,
+non-explore MCP-created controller with no creator-only lane provenance. The engine resolves its
+exact current durable run binding; a title, claimed role, native-host subagent, or another
+connection's catalog is not proof. Root equals grantee and workspace comes from that route;
+caller-supplied `session_id` or `workspace` replacements are rejected.
+
+Membership requires **both** immutable `parentSessionID == root` and current effective organizational
+parent `== root`, in that same workspace, with resolved provenance. The effective parent falls back
+to spawn provenance only when no organizational parent is set. Existing and future direct spawns
+qualify; the root itself, siblings, grandchildren, adopted workers, creator-only lanes, and
+cross-workspace children do not. `DelegationMembershipProjector` supplies the typed `directChild`
+proof; tool text never supplies it. This does not redefine existing parent-session controls or spawn
+admission/accounting.
+
+Only `observe`, `control`, and `restructure` are permitted, defaulting to all three for one hour.
+There is no self-management, spawn/worktree/destructive authority, or attenuation. Only expiry and
+bulk-confirmation threshold guardrails apply, not depth/session/worktree quotas. This kind needs
+explicit user consent **even with Overseer full access or prior session-wide approval**. A matching
+live grant can be reused only if it covers the requested capabilities, remaining lifetime, and
+bulk threshold. The user may narrow it. Pending requests authorize nothing; inspect the returned
+request ID rather than issuing duplicates. A controller with no independent ordinary live grant may use
+only `request_scope kind=direct_children`; `scope_status`/`release_scope` on its own request ID or its
+own `direct_children` grants (narrowed or not); and `link`/`unlink` observed by itself under an explicit
+full-capability `scope_id`. Every other `session_admin` operation is unavailable on that route, and
+Overseer full access never substitutes for, widens, or waives any gate there. The grantee may observe
+links under its own scope without becoming a member or managed target.
+There is no **Grant all for this session** option for this kind. Consent creates no link: explicitly
+activate each returned direct-worker UUID with `session_admin link` under the returned scope ID.
+
+`OverseerAuthorizationEngine+ScopedObservers` issues typed observer evidence and exact-target
+endorsements from current controller, scope, endpoint and membership facts. Scope authority remains
+an input to the four owners above, not a fifth owner. UUID-only consent cannot lift the MCP observer
+exclusion. Add, reservation/activation/commit, disclosure, response, release, prompt inventory and
+wake acquisition re-prove the original per-link source scope ID/generation and exact observer and
+target. A live grant B cannot replace revoked or expired source A; unlink/relink generations,
+reparenting/membership loss and binding replacement invalidate old work. Prompt eligibility,
+effective inventory and epochs consume that same fresh proof through the existing claim and
+physical-dispatch fences; there is no new wake scheduler or transport owner.
+
+Restoration preserves positively live, unexpired, server-origin scope-backed intent while current
+context proof is loading: `awaitingReproof` is transient and authorizes **no action**. Deletion in
+progress (controller or target) denies action the same way; only a committed deletion is permanent.
+An existing link sourced by another scope is reported as `source_scope_mismatch`, never re-sourced. Unknown,
+revoked, expired or unsupported authority is denied; saved intent alone never authorizes a response
+or wake. Reproof must recover current exact endpoints and membership; committed revocation wins.
+This is not hard containment of a compromised controller: independently valid parent API rights and
+work already physically dispatched remain separate limits. Ordinary exact-target and full-access
+behavior outside this qualified MCP path is unchanged.
+
+#### Standing rules for direct-child consent
+
+A human can let one MCP connection's later `direct_children` requests settle without a card. The
+rule is a value owned by `DelegationScopeRuntime`: workspace, starter stamp, creation and end
+times (4, 8 or 24 h; at most 24 h), a team-lead ceiling (5, 10, 25 or 50),
+a bulk-threshold ceiling (at most 25), the counted team leads, and the scopes it minted. States come
+from one function, `effectiveState(now:)`: `active`, `stopped`, `replaced`, `expired`, or
+`connectionClosed`. A full team-lead count is not a state: it refuses only new team leads, while a
+counted one whose grant expired naturally can be re-issued without counting again.
+
+**Connection anchor.** A control context carries a write-once starter stamp: connection ID plus that
+connection's lifecycle generation. It is set only at fresh MCP creation (`agent_run start`,
+`agent_manage create_session`) when the connection is live, and never by steer, resume or
+reactivation; a session without a stamp falls back to the card. A rule matches only a request from a
+session with the same stamp, in the rule's workspace, that passes the ordinary `direct_children`
+admission. Liveness is one synchronous sample taken in the same MainActor turn as the grant. That
+sample is the authorization point: a connection removed before it always refuses; a removal recorded
+afterwards does not undo that one settlement, just as ordinary grants outlive a disconnect. A
+transient not-live sample refuses without ending the rule; `connectionClosed` latches only once the
+connection's generation is gone for good.
+
+**App-run scope.** Rules live in memory only and are dropped at termination, because connection IDs
+mean nothing after a restart. Derived grants are ordinary `.user`, non-unrestricted `direct_children`
+grants: they persist and restore like card grants, expire no later than the rule, and are revocable
+one by one. After a restart there is no rule, and no provenance or `settled_by` on those grants.
+
+**Creation and sweep.** Only the human creates a rule: an unchecked checkbox on the presented
+`direct_children` card, offered when the requester has a stamp, its connection is live, and all three
+capabilities are ticked. **Grant** runs the normal card approval first; if the connection or request
+changed, the approval stands, no rule exists, and a notice names the failed check. On creation, in the
+same turn, other pending requests with the same stamp and workspace are evaluated oldest first; those
+within caps settle and their cards go. No `session_admin`, `agent_run`, `agent_manage` or
+`app_settings` operation creates, widens or extends a rule, and full access and Grant all do not
+touch one.
+
+**Caps and exclusions.** A request settles only when its whole lifetime ends before the rule does,
+its bulk threshold is at most the rule ceiling, and its capabilities are the permitted set; the grant
+is exactly what was requested, never clamped, so rule authority never exceeds what a card could grant.
+Otherwise the request stays pending for the card. A team lead is excluded from automatic settlement
+once the human denies its card, approves a capability subset, or revokes one of its grants, or once
+it releases one; only a human card approval still works for it. Exclusions end with session deletion.
+
+**Stop.** Active delegations shows the rule while it is active or any of its grants is live. **Stop
+rule** ends issuance and lets issued grants run to expiry. **Stop rule and revoke** also revokes the
+rule-minted grants through the ordinary revoke cascade, never the seed team lead's card grant or other
+grants. Neither decides a pending card.
+
+**Transport limit.** The anchor is one open connection: an MCP stdio host or the interactive REPL.
+`rpce-cli -e` opens a new connection per invocation, so a rule made from a one-shot EM matches nothing
+later; those EMs keep getting cards. A cross-connection EM identity is out of scope.
+
 ### Authorization ownership: Overseer full access versus restricted delegation
 
 `OverseerAuthorizationEngine` (`Runtime/Delegation/OverseerAuthorizationEngine*.swift`, one per
@@ -351,7 +453,11 @@ runtime's `isGlobalAutoApproveEnabled` input; production is the stored user sett
 authority from arguments, prompt text, or the existence of a recorded grant. Callers resolve exact
 routing and execute what the engine admits.
 
-Every gate is typed and classified in `OverseerAuthorizationGate`:
+The table and ordinary full-access fallback rules below describe the existing paths, **not** a
+waiver of `direct_children` consent, capability ceiling, current scoped-controller proof, or exact
+source/endpoint fences. Full access cannot manufacture that MCP exception.
+
+Every ordinary gate is typed and classified in `OverseerAuthorizationGate`:
 
 | Class | Gates | Full access |
 | --- | --- | --- |
@@ -377,8 +483,8 @@ Rules that keep it honest:
   completes with `result: applied`, `state_satisfied: true`, and `changed_count: 0`. It is not a
   refusal or a fabricated write. Failed, skipped, incomplete or control-blocked batches cannot
   claim this result, and unchanged requests recheck current authority and expected-order input.
-- An explicit restricted `scope_id` the caller owns (live, revoked, or expired) never narrows full
-  access. A fully admitting live scope keeps its placement; otherwise the full-access grant authorizes
+- Outside the qualified MCP `direct_children` path, an explicit restricted `scope_id` the caller
+  owns (live, revoked, or expired) never narrows full access. A fully admitting live scope keeps its placement; otherwise the full-access grant authorizes
   and is the placement, so no recovery call is needed. Unknown and foreign scope IDs stay
   identity/input refusals that disclose nothing. A presented card is validated against the scope it
   was issued for and claimed once.
@@ -745,7 +851,8 @@ existing provider sandbox access. The option never grants a broader sandbox or p
 workspace confinement is not claimed by this command-shape check. The listener is separate from the
 passive reducer and wake coordinator; presentation-only repaints never inspect or answer a prompt.
 
-The durable oversight document stores only observer → target UUID pairs. Older documents with a
+The durable oversight document stores observer → target UUID pairs, with the original `sourceScopeID`
+for scope-backed intent. Older documents with a
 `delegations` key decode safely because unknown fields are ignored; those values are never applied,
 and the next successful mutation rewrites the document without them. No saved management or
 permission-auto-approval choice can silently override the current grant default or manufacture a
@@ -777,7 +884,11 @@ existing result with metadata-only `wake_reason: local_user_input` and re-fenced
 
 Managed `poll` and `wait` may return the target's current pending approval, permission, MCP
 elicitation, or question beside the sanitized snapshot, with free text through the oversight redactor
-and one-time option labels verbatim. Restricted links never receive a prompt body; a single prompt
+and one-time option labels verbatim. Native command projections can include the actual command, cwd,
+advertised grant root/scope and proposed amendment; these details are data, not permission. Missing
+fields stay absent (reason is not projected); never guess command/cwd or infer authority from a
+brief, a successful RPC, or another prompt. If context is missing, oversized or otherwise unusable,
+leave the request manual and escalate under the observer's own instructions. Restricted links never receive a prompt body; a single prompt
 over 64 KiB yields an ID-only `too_large` manual-only stub, and multi-target results omit whole
 prompts beyond their 20 KiB aggregate prompt budget. A `respond_hint` appears only with a respondable
 pending interaction. `respond` answers exactly one `interaction_id`: the target view model compares the ID, validates the answer
@@ -1403,7 +1514,8 @@ live scope, never guesses from membership, and still runs ordinary chain, member
 capturing the lane as a child; child/admin calls retain their existing behavior. Raw child poll/log
 surfaces are not widened by a link: refusals direct overseers to the sanitized link surfaces.
 
-The approval card offers **Grant all for this session** as a separate user action. It grants every
+For ordinary scope kinds **other than `direct_children`**, the approval card offers
+**Grant all for this session** as a separate user action. It grants every
 capability permitted for the displayed scope kind, without expiry, retaining capacity and bulk-card
 limits. It does not widen membership, grant human-only actions, or enable read-only auto-approval.
 Ordinary Grant still cannot exceed the request. Active delegations display the actual capabilities

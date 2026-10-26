@@ -40,6 +40,17 @@ struct SessionAdminHandlerContext {
         scopes.authorization.permitsMember(sessionID, ofChainFrom: scope, projector: projector)
     }
 
+    /// Permission: `sessionID` may observe links created or removed under `scope`.
+    func permitsLinkObserver(_ sessionID: UUID, ofChainFrom scope: DomainDelegationScopeRecord) -> Bool {
+        scopes.authorization.permitsLinkObserver(sessionID, ofChainFrom: scope, projector: projector)
+    }
+
+    func requireLinkObserver(_ sessionID: UUID, of batch: AgentSessionAdministrationAuthorizedBatch) throws {
+        guard permitsLinkObserver(sessionID, ofChainFrom: batch.scope) else {
+            throw AgentSessionTargetOperationGuard.denialError(sessionID: sessionID)
+        }
+    }
+
     func memberships(of sessionID: UUID, inChainFrom scope: DomainDelegationScopeRecord) -> [DomainDelegationScopeMembershipProof] {
         scopeChain(of: scope).compactMap { projector.membershipProof(for: sessionID, in: $0.grant) }
     }

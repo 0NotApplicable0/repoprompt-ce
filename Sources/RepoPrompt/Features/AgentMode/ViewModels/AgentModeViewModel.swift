@@ -80,6 +80,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         _ requiresExpectedAgentPID: Bool
     ) async -> Void
     typealias MCPServerEnabler = () async -> Bool
+    var mcpStarterGenerationReader: (UUID) -> UInt64? = { ServerNetworkManager.shared.lifecycleGeneration(of: $0) }
+    var mcpStarterClientNameReader: (UUID) async -> String? = { await ServerNetworkManager.shared.clientIdentifier(forConnection: $0) }
     typealias MCPRunRoutingCleaner = (_ runID: UUID, _ windowID: Int, _ reason: String) async -> Void
     typealias MCPRunToolCanceller = (_ runID: UUID, _ reason: String?) -> Int
     typealias ProviderConversationCleaner = ProviderConversationCleanupRegistry.Cleaner
@@ -845,8 +847,6 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     private var openCodeModelParameterObservationTarget: (tabID: UUID, key: OpenCodeACPModelParameterKey)?
     private var openCodeModelParameterObservationGeneration: UInt64 = 0
     private var cursorModelsSubscriptionTask: Task<Void, Never>?
-    private var grokBuildModelsSubscriptionTask: Task<Void, Never>?
-    private var antigravityModelsSubscriptionTask: Task<Void, Never>?
     private var skillCatalogDeltaObservationTask: Task<Void, Never>?
     private var skillCatalogRefreshDebounceTask: Task<Void, Never>?
     lazy var sessionIndexStore = AgentWorkspaceSessionIndexStore(perfRecorder: perfRecorder)
@@ -2118,8 +2118,6 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         codexCoordinator.updateCodexModelPolling()
         updateOpenCodeModelPolling()
         updateCursorModelPolling(startPolling: startCursorPolling)
-        updateGrokBuildModelPolling(startPolling: startCursorPolling)
-        updateAntigravityModelPolling(startPolling: startCursorPolling)
     }
 
     private func updateOpenCodeModelPolling() {
@@ -2309,63 +2307,6 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     private func stopCursorModelsSubscription() {
         cursorModelsSubscriptionTask?.cancel()
         cursorModelsSubscriptionTask = nil
-    }
-
-    private func updateGrokBuildModelPolling(startPolling: Bool = true) {
-        guard selectedAgent == .grokBuild else {
-            stopGrokBuildModelsSubscription()
-            return
-        }
-        guard startPolling,
-              AgentModelCatalog.isAgentAvailable(.grokBuild, availability: agentAvailabilityContext)
-        else {
-            return
-        }
-        startGrokBuildModelsSubscriptionIfNeeded()
-    }
-
-    private func startGrokBuildModelsSubscriptionIfNeeded() {
-        guard grokBuildModelsSubscriptionTask == nil else { return }
-        let workspacePath = workspacePathProvider()
-        grokBuildModelsSubscriptionTask = Task { [weak self, workspacePath] in
-            let stream = await GrokBuildACPModelPollingService.shared.subscribe(workspacePath: workspacePath)
-            for await _ in stream {
-                guard !Task.isCancelled else { return }
-                await MainActor.run { [weak self] in
-                    guard let self else { return }
-                    acpDynamicModelRevision &+= 1
-                    syncSelectedACPModelFromRegistryIfNeeded(for: .grokBuild)
-                    syncComposerUIState()
-                }
-            }
-        }
-    }
-
-    private func stopGrokBuildModelsSubscription() {
-        grokBuildModelsSubscriptionTask?.cancel()
-        grokBuildModelsSubscriptionTask = nil
-    }
-
-    private func updateAntigravityModelPolling(startPolling: Bool = true) {
-        guard selectedAgent == .antigravity else { antigravityModelsSubscriptionTask?.cancel()
-            antigravityModelsSubscriptionTask = nil
-            return
-        }
-        guard startPolling, AgentModelCatalog.isAgentAvailable(.antigravity, availability: agentAvailabilityContext) else { return }
-        guard antigravityModelsSubscriptionTask == nil else { return }
-        let workspacePath = workspacePathProvider()
-        antigravityModelsSubscriptionTask = Task { [weak self, workspacePath] in
-            let stream = await AntigravityACPModelPollingService.shared.subscribe(workspacePath: workspacePath)
-            for await _ in stream {
-                guard !Task.isCancelled else { return }
-                await MainActor.run { [weak self] in
-                    guard let self else { return }
-                    acpDynamicModelRevision &+= 1
-                    syncSelectedACPModelFromRegistryIfNeeded(for: .antigravity)
-                    syncComposerUIState()
-                }
-            }
-        }
     }
 
     private func syncSelectedACPModelFromRegistryIfNeeded(for agent: AgentProviderKind) {
@@ -11731,6 +11672,12 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         requireInactiveRunState: Bool = false,
         creationHandle: AgentSessionCreationHandle? = nil
     ) async throws -> AgentMCPControlContext {
+        try Task.checkCancellation()
+        // The read suspends, so it precedes every ownership snapshot and guard below.
+        var starterClientName: String?
+        if creationHandle != nil, let originatingConnectionID {
+            starterClientName = await mcpStarterClientNameReader(originatingConnectionID)
+        }
         let admittedWindow = WindowStatesManager.shared.window(withID: windowID)
         var residentActivationTarget: MCPResidentTarget? = nil
         if creationHandle == nil {
@@ -11853,6 +11800,15 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         let priorAutoEditEnabled = existingContext?.sessionID == sessionID
             ? existingContext?.autoEditEnabledBeforeOverride ?? session.autoEditEnabled
             : session.autoEditEnabled
+        var starterStamp: StarterConnectionStamp?
+        if creationHandle != nil,
+           let originatingConnectionID,
+           let generation = mcpStarterGenerationReader(originatingConnectionID)
+        {
+            starterStamp = StarterConnectionStamp(
+                connectionID: originatingConnectionID, lifecycleGeneration: generation
+            )
+        }
         let activatedContext = AgentMCPControlContext(
             sessionID: sessionID,
             activationID: activationID,
@@ -11861,6 +11817,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             preparedEpoch: nil,
             pendingEpochTransition: nil,
             originatingConnectionID: originatingConnectionID,
+            startedBy: starterStamp,
+            startedByClientLabel: StarterClientLabel(name: starterStamp == nil ? nil : starterClientName),
             interactionTransport: .mcp(
                 sessionID: sessionID,
                 originatingConnectionID: originatingConnectionID
@@ -12385,7 +12343,6 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         }
     }
 
-    /// Stop is a control read, so it must not mutate a session whose recovery owner has not settled.
     func mcpSettledLiveSessionForStop(sessionID: UUID) throws -> TabSession? {
         if let session = try authoritativeLiveSession(for: sessionID) {
             session.mcpStartupAttempt?.cancel()
@@ -17454,6 +17411,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 persistedLoadProducerByTabID.removeValue(forKey: tabID)
             }
         }
+        AgentSessionLinkRuntimeBridge.shared.delegationScopes.standingRuleTabsDidRemove(runtimeCleanupTabIDs)
         // Drop any sidebar attention / observed run-state for tabs that are
         // going away so we don't leave dangling entries referring to dead IDs.
         if workspaceManager == nil || workspaceManager?.activeWorkspaceID == workspaceID {
@@ -21152,8 +21110,6 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         case .claudeCode, .claudeCodeGLM, .kimiCode, .customClaudeCompatible, .openCode, .cursor:
             return renderAtPathAttachmentMessage(text: text, attachments: attachments)
         case .codexExec, .grokBuild, .devin:
-            // These transports deliver pixels natively but no file path, so the agent could not
-            // otherwise name the image in ask_oracle `images`.
             return renderAttachmentPathNote(text: text, attachments: attachments)
         case .antigravity, .grok:
             return text
@@ -22918,7 +22874,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         guard let session = sessions[tabID] else { return }
         if let operation = repromptOperation, operation.sourceTabID == tabID {
             operation.invalidate(reason: "The run was stopped.")
-            if !session.runState.isActive {
+            if !session.runState.isActive, session.mcpStartupAttempt?.isPending != true {
                 return
             }
         }

@@ -35,6 +35,7 @@ import SwiftUI
 /// sandbox override policy, split into two in-pane scopes. The page does NOT claim to
 /// enforce MCP tool ACLs or RepoPrompt workspace operation approvals.
 struct AgentPermissionsSettingsView: View {
+    static let fullAccessDescription = "An Overseer can do everything to every session without asking: observe, organize, control, restructure, spawn, worktrees, retire, and delete sessions. It raises no approval or confirmation cards for its own operations, but direct-child delegation still asks for consent: tick the checkbox on that card to let a standing rule settle it. Its access shows in Active delegations. Turn this off to revoke it immediately."
     @StateObject private var providerVM: AgentProviderPermissionsSettingsViewModel
     @StateObject private var subagentVM: AgentSubagentPermissionsSettingsViewModel
     @StateObject private var diagnosticsVM: AgentPermissionStorageDiagnosticsViewModel
@@ -201,7 +202,7 @@ struct AgentPermissionsSettingsView: View {
             Toggle(isOn: $autoApproveDelegationRequests) {
                 VStack(alignment: .leading, spacing: 2) {
                     Text("Overseer full access (no approvals)")
-                    Text("An Overseer can do everything to every session without asking: observe, organize, control, restructure, spawn, worktrees, retire, and delete sessions. No approval or confirmation cards appear. Its access shows in Active delegations. Turn this off to revoke it immediately.")
+                    Text(Self.fullAccessDescription)
                         .font(.caption)
                         .foregroundColor(.secondary)
                         .fixedSize(horizontal: false, vertical: true)

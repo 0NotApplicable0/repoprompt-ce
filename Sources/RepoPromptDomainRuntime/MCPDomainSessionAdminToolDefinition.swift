@@ -41,21 +41,23 @@ package enum MCPDomainSessionAdminToolDefinition {
     package static let capabilityValues: [String] = DomainDelegationScopeCapability.allCases.map(\.rawValue)
 
     /// Shared static playbook; runtime receipts additionally identify the current setting.
-    package static let overseerPlaybook = "Overseer full access ON: just call the operation; no request_scope or cards. OFF: use a covering grant, or request_scope with needed capabilities. Existing standing consent may avoid a card; otherwise one card appears and RepoPrompt notifies you of the decision. scope_status lists operations, capabilities and grants."
+    package static let overseerPlaybook = "Overseer full access ON: no request_scope or cards, except direct_children: explicit consent or a live matching grant only. OFF: covering grant or request_scope; standing consent may skip the card, else one appears and you get a decision notice. scope_status lists operations, capabilities, grants."
 
     package static let definition = MCPDomainToolDefinition(
         name: MCPWindowToolName.sessionAdmin,
         description: """
         Administer Agent sessions inside a delegation scope the user granted to this session. Agent sessions only.
 
-        A scope is user-approved authority over a set of sessions: `session` (the grantee and one exact `session_id`, never descendants), `tree` (this session's owned subtree), `workspace`, or `all_sessions`. Capabilities: observe, organize, control, restructure, spawn, worktree; `destructive` is a reserved flag no op requires. Ordinary `all_sessions` scopes hold only observe, organize, and restructure; the user's full-access setting supplies an unrestricted grant with every capability. Membership comes from RepoPrompt's own provenance, never from arguments; naming a session grants nothing.
+        A scope is user-approved authority over a set of sessions: `session` (the grantee and one exact `session_id`, never descendants), `tree` (this session's owned subtree), `direct_children` (immutable direct spawns still organizationally under this requester in its installed workspace), `workspace`, or `all_sessions`. Capabilities: observe, organize, control, restructure, spawn, worktree; `destructive` is a reserved flag no op requires. Ordinary `all_sessions` scopes hold only observe, organize, and restructure; the user's full-access setting supplies an unrestricted grant with every capability. Membership comes from RepoPrompt's own provenance, never from arguments; naming a session grants nothing.
 
         \(overseerPlaybook)
+
+        `request_scope kind=direct_children` grants consent for explicit managed link activation; it creates no links automatically. Supported requester: a non-explore, parentless MCP-created controller on an exact current durable run route, with no creator-only lane provenance. Root and workspace come from that route; session_id/workspace replacements are rejected. Existing and future direct spawns only: no siblings, grandchildren, adopted workers, creator-only lanes, native-host subagents or cross-workspace children. Only observe, control and restructure are permitted, even with full access; default all three for 3600 seconds. Only expiry and bulk_confirmation_threshold guardrails apply; depth/session/worktree quotas are rejected. No attenuation. Before consent this route supports only that request and scope_status/release_scope with its own request_id, not inventory or management. A sufficient live grant permits scope_status/release_scope for its own scope_id and scoped management, including explicit link activation; every action rechecks current membership and exact endpoints. The user can narrow capabilities/expiry; reasons are unverified. Revoking the grant ends derived Overseer links and their managed actions; existing parent-session controls and already-started work are separate.
 
         For cleanup/organizing without covering authority, request `observe` together with mutation capabilities, then use `inventory`. A `workspace` scope covers only that workspace; cross-workspace `history` results are not scope membership.
 
         **Scope ops**
-        - `request_scope`: request missing authority with exact capabilities. Returns `granted` with the actual covering `scope`/`scope_id` under existing standing consent or full access; otherwise `pending_user_approval` with a `request_id`. Nothing is granted while pending; wait for the app-authored decision notice or inspect `scope_status` with that request_id, not a duplicate request.
+        - `request_scope`: request missing authority with exact capabilities. Returns `granted` with the actual covering `scope`/`scope_id` under applicable standing consent or full access (never substitutes for direct_children consent); otherwise `pending_user_approval` with a `request_id`. Nothing is granted while pending; wait for the app-authored decision notice or inspect `scope_status` with that request_id, not a duplicate request.
         - `scope_status`: when you need to inspect authority, call without selectors, for an operation catalog (tools, ops, required capabilities) alongside your current grants. Or inspect one `scope_id`/`request_id` (pending, granted, denied, revoked, expired). For a one-target request, `become_overseer` with `session_id` and optional `message` requests one exact-target approval and automatically prepares, links and dispatches; it does not require a filler user turn or a mid-turn catalog refresh.
         - `release_scope`: give up one of your scopes with `scope_id` (revokes its nested scopes too), or cancel your own pending request with `request_id`. Selectors are exclusive. A granted request requires releasing its actual scope; canceling a request grants no authority.
         - `confirmation_status`: read one of your batch cards by `confirmation_id`.
@@ -85,12 +87,12 @@ package enum MCPDomainSessionAdminToolDefinition {
                 ]),
                 "kind": .object([
                     "type": .string("string"),
-                    "enum": .array([.string("session"), .string("tree"), .string("workspace"), .string("all_sessions")]),
-                    "description": .string("[request_scope] Scope kind; session needs the exact session_id and defaults to observe + control + restructure. Default tree is rooted at this session.")
+                    "enum": .array([.string("session"), .string("tree"), .string("direct_children"), .string("workspace"), .string("all_sessions")]),
+                    "description": .string("[request_scope] Scope kind; session needs the exact session_id. direct_children requires a parentless MCP controller's exact route, forbids selectors, defaults to observe + control + restructure for 3600 seconds, and requires explicit consent. Default tree is rooted at this session.")
                 ]),
                 "workspace": .object([
                     "type": .string("string"),
-                    "description": .string("[request_scope] Workspace UUID for kind=workspace; default and limited to this session's workspace. [reorder_groups] Workspace UUID.")
+                    "description": .string("[request_scope] Workspace UUID for kind=workspace; default and limited to this session's workspace. Forbidden for direct_children, whose workspace is server-derived. [reorder_groups] Workspace UUID.")
                 ]),
                 "capabilities": .object([
                     "type": .string("array"),
@@ -116,9 +118,9 @@ package enum MCPDomainSessionAdminToolDefinition {
                         "expires_in_seconds": .object(["type": .string("integer"), "minimum": .int(60)]),
                         "bulk_confirmation_threshold": .object(["type": .string("integer"), "minimum": .int(1)])
                     ]),
-                    "description": .string("[request_scope, attenuate] Proposed guardrails; the user may tighten them.")
+                    "description": .string("[request_scope, attenuate] Proposed guardrails; the user may tighten them. direct_children accepts only expires_in_seconds (default 3600) and bulk_confirmation_threshold, never depth/session/worktree quotas.")
                 ]),
-                "reason": .stringSchema("[request_scope] Why you need the scope; shown on the approval card. Max 500 UTF-8 bytes."),
+                "reason": .stringSchema("[request_scope] Unverified agent reason shown on the approval card, never authority. Max 500 UTF-8 bytes."),
                 "scope_id": .stringSchema("[scope_status, release_scope, other ops except undo] Scope UUID; optional when you hold exactly one live scope. release_scope accepts either scope_id or request_id, never both."),
                 "request_id": .stringSchema("[scope_status, release_scope] Your request UUID returned by request_scope. release_scope cancels only a pending request; use scope_id to release an already granted scope."),
                 "session_id": .stringSchema("[target ops] One target session UUID."),

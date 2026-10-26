@@ -110,6 +110,7 @@ enum AgentSessionOversightLaunchTerminalReason: String, Equatable {
 @MainActor
 protocol AgentSessionOversightLaunchCoordinatorDelegate: AnyObject {
     var launchCoordinatorHost: AgentSessionLinkEndpointHost? { get }
+    func launchCoordinatorObserverEligibility(for candidate: AgentSessionLinkEndpointCandidate) -> AgentSessionLinkEndpointEligibility.OperationEligibility
     /// Termination freeze. A frozen process makes no new missing classification and performs no
     /// cleanup, so grace-uncertain and lazy entries stay durable for the next launch.
     var launchCoordinatorIsFrozen: Bool { get }
@@ -160,6 +161,10 @@ protocol AgentSessionOversightLaunchCoordinatorDelegate: AnyObject {
 }
 
 extension AgentSessionOversightLaunchCoordinatorDelegate {
+    func launchCoordinatorObserverEligibility(for candidate: AgentSessionLinkEndpointCandidate) -> AgentSessionLinkEndpointEligibility.OperationEligibility {
+        AgentSessionLinkEndpointEligibility.observerOperationEligibility(candidate.eligibilityInput, roleAllowsOutboundMonitoring: candidate.roleAllowsOutboundMonitoring)
+    }
+
     func launchCoordinatorTargetFailure(for candidate: AgentSessionLinkEndpointCandidate, observerSessionID: UUID) -> AgentSessionLinkResolveFailure? {
         AgentSessionLinkEndpointEligibility.targetResolveFailure(for: candidate, observerSessionID: observerSessionID)
     }
@@ -858,6 +863,9 @@ final class AgentSessionOversightLaunchCoordinator {
             noteObserved(pair: pair, sessionID: sessionID)
         }
         var resolved: [UUID: AgentSessionLinkEndpointCandidate] = [:]
+        // A transient observer standing never establishes, but must not hide the other endpoint's
+        // independently proven terminal fact.
+        var observerStandingDeferred = false
         for sessionID in [pair.observerSessionID, pair.targetSessionID] {
             let descriptorCount = descriptorCounts[sessionID] ?? 0
             let matches = candidatesBySession[sessionID] ?? []
@@ -901,11 +909,12 @@ final class AgentSessionOversightLaunchCoordinator {
             if sessionID == pair.targetSessionID,
                delegate?.launchCoordinatorTargetFailure(for: candidate, observerSessionID: pair.observerSessionID) == .childSession { return .terminal(.ineligible) }
             if candidate.isClosing { return .terminal(.ineligible) }
-            if sessionID == pair.observerSessionID, !candidate.roleAllowsOutboundMonitoring {
-                return .terminal(.ineligible)
-            }
-            if sessionID == pair.observerSessionID, candidate.isMCPControlled || candidate.isMCPOriginated {
-                return .terminal(.ineligible)
+            if sessionID == pair.observerSessionID {
+                switch delegate?.launchCoordinatorObserverEligibility(for: candidate) ?? .disqualified {
+                case .disqualified: return .terminal(.ineligible)
+                case .transientlyUnavailable: observerStandingDeferred = true
+                case .eligible: break
+                }
             }
 
             switch candidate.restorationReadiness {
@@ -924,7 +933,8 @@ final class AgentSessionOversightLaunchCoordinator {
                 return .wait
             }
         }
-        guard let observer = resolved[pair.observerSessionID],
+        guard !observerStandingDeferred,
+              let observer = resolved[pair.observerSessionID],
               let target = resolved[pair.targetSessionID],
               let proof = AgentSessionOversightRestorationProof(observer: observer, target: target)
         else {
@@ -977,7 +987,7 @@ final class AgentSessionOversightLaunchCoordinator {
             return .bindingDrift
         }
         if !observer.isTopLevel || observer.isClosing { return .ineligible }
-        if !observer.roleAllowsOutboundMonitoring || observer.isMCPControlled || observer.isMCPOriginated {
+        if delegate?.launchCoordinatorObserverEligibility(for: observer) == .disqualified {
             return .ineligible
         }
         if target.isClosing || delegate?.launchCoordinatorTargetFailure(for: target, observerSessionID: pair.observerSessionID) == .childSession { return .ineligible }

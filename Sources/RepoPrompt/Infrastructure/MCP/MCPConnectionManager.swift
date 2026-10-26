@@ -958,6 +958,10 @@ actor ServerNetworkManager {
             }
         }
 
+        func generation(of connectionID: UUID) -> UInt64? {
+            lock.withLock { generationsByID[connectionID] }
+        }
+
         func isLive(connectionID: UUID, generation expectedGeneration: UInt64) -> Bool {
             lock.withLock {
                 running && generation == expectedGeneration
@@ -4418,6 +4422,17 @@ actor ServerNetworkManager {
         connectionLifecycleState.isLive(
             connectionID: token.connectionID,
             generation: token.connectionLifecycleGeneration
+        )
+    }
+
+    nonisolated func lifecycleGeneration(of connectionID: UUID) -> UInt64? {
+        connectionLifecycleState.generation(of: connectionID)
+    }
+
+    nonisolated func isLiveStarter(_ stamp: StarterConnectionStamp) -> Bool {
+        connectionLifecycleState.isLive(
+            connectionID: stamp.connectionID,
+            generation: stamp.lifecycleGeneration
         )
     }
 

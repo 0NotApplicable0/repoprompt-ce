@@ -51,13 +51,19 @@ package actor DomainAgentSessionLinkAuthority {
         return true
     }
 
-    private func hasSourceConsent(scopeID: UUID?, observer: UUID, target: UUID) -> Bool {
+    /// The single source-scope fence. Every reader below passes exact endpoints so a `directChildren`
+    /// scope can only be satisfied by a current endpoint-qualified endorsement, never by session UUIDs.
+    private func hasSourceConsent(
+        scopeID: UUID?,
+        observer: DomainAgentSessionLinkEndpointIdentity,
+        target: DomainAgentSessionLinkEndpointIdentity
+    ) -> Bool {
         guard let scopeID else { return true }
         return scopeConsent?.permits(scopeID: scopeID, observer: observer, target: target, at: now()) == true
     }
 
     private func hasSourceConsent(_ grant: DomainAgentSessionLinkGrant) -> Bool {
-        hasSourceConsent(scopeID: grant.sourceScopeID, observer: grant.observer.sessionID, target: grant.target.sessionID)
+        hasSourceConsent(scopeID: grant.sourceScopeID, observer: grant.observer, target: grant.target)
     }
 
     /// The capabilities a grant authorizes now: its stored capabilities, or every capability while the
@@ -386,7 +392,7 @@ package actor DomainAgentSessionLinkAuthority {
         guard observer.hasResolvedPersistentBinding else { return .rejected(.observerBindingUnresolved) }
         guard target.hasResolvedPersistentBinding else { return .rejected(.targetBindingUnresolved) }
 
-        guard hasSourceConsent(scopeID: sourceScopeID, observer: observer.sessionID, target: target.sessionID) else {
+        guard hasSourceConsent(scopeID: sourceScopeID, observer: observer, target: target) else {
             return .rejected(.sourceScopeUnavailable)
         }
         if let existing = activeLink(observer: observer, target: target) {
@@ -454,7 +460,7 @@ package actor DomainAgentSessionLinkAuthority {
         guard let pending = pendingReservations[reservation.linkID], pending == reservation else {
             return .rejected(.unknownReservation)
         }
-        guard hasSourceConsent(scopeID: reservation.sourceScopeID, observer: reservation.observer.sessionID, target: reservation.target.sessionID) else {
+        guard hasSourceConsent(scopeID: reservation.sourceScopeID, observer: reservation.observer, target: reservation.target) else {
             pendingReservations.removeValue(forKey: reservation.linkID)
             return .rejected(.sourceScopeUnavailable)
         }

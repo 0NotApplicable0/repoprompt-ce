@@ -36,14 +36,13 @@ struct AgentSessionOverseerBootstrapRefusal: Equatable {
 
     static func classify(
         candidate: AgentSessionLinkEndpointCandidate?,
-        isOverseerLane: Bool
+        isOverseerLane: Bool,
+        scopedEvidence: DomainDelegationScopedObserverEvidence? = nil
     ) -> Self {
         if isOverseerLane { return .overseerLane }
         guard let candidate else { return .notLoaded }
         let input = candidate.eligibilityInput
-        if input.isChildSession || input.isMCPControlled || input.isMCPOriginated
-            || !candidate.roleAllowsOutboundMonitoring
-        {
+        if AgentSessionLinkEndpointEligibility.observerOperationEligibility(input, roleAllowsOutboundMonitoring: candidate.roleAllowsOutboundMonitoring, scopedEvidence: scopedEvidence, currentEndpoint: candidate.domainEndpoint) == .disqualified {
             return Self(
                 reason: "This session can't oversee others: it is a child, MCP-created, MCP-controlled or explore-role session. Ask the user to start oversight from a top-level session they opened.",
                 isPermanent: true
@@ -59,7 +58,8 @@ struct AgentSessionOverseerBootstrapRefusal: Equatable {
             )
         }
         if let reason = AgentSessionLinkEndpointEligibility.addDisabledReason(
-            input, roleAllowsOutboundMonitoring: candidate.roleAllowsOutboundMonitoring
+            input, roleAllowsOutboundMonitoring: candidate.roleAllowsOutboundMonitoring,
+            scopedEvidence: scopedEvidence, currentEndpoint: candidate.domainEndpoint
         ) {
             return Self(
                 reason: "\(reason) This is temporary: retry become_overseer once after this turn.",
@@ -80,7 +80,7 @@ extension AgentModeViewModel {
     ) -> AgentSessionOverseerBootstrapRefusal? {
         guard agentSessionLinkBootstrapState(for: endpoint) == nil else { return nil }
         let isLane = sessions[endpoint.tabID]?.createdByOverseerSessionID != nil
-        return .classify(candidate: agentSessionLinkModelCandidate(for: endpoint), isOverseerLane: isLane)
+        return .classify(candidate: agentSessionLinkModelCandidate(for: endpoint), isOverseerLane: isLane, scopedEvidence: AgentSessionLinkRuntimeBridge.shared.scopedObserverEvidence(for: endpoint))
     }
 }
 
@@ -124,7 +124,8 @@ extension AgentModeViewModel {
               session.createdByOverseerSessionID == nil,
               AgentSessionLinkEndpointEligibility.addDisabledReason(
                   candidate.eligibilityInput,
-                  roleAllowsOutboundMonitoring: candidate.roleAllowsOutboundMonitoring
+                  roleAllowsOutboundMonitoring: candidate.roleAllowsOutboundMonitoring,
+                  scopedEvidence: AgentSessionLinkRuntimeBridge.shared.scopedObserverEvidence(for: endpoint), currentEndpoint: endpoint
               ) == nil
         else { return nil }
         let activation = session.oversight.overseerActivation

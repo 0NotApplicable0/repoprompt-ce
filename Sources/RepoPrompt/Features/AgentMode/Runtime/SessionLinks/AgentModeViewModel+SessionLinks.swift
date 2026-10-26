@@ -1421,7 +1421,7 @@ extension AgentModeViewModel {
 
     /// Oversee props for the tab currently on screen, or an explicitly disabled projection when the
     /// tab has no durable top-level binding yet.
-    func currentMonitorPillProps() -> AgentMonitorPillProps {
+    func currentMonitorPillProps(bridge: AgentSessionLinkRuntimeBridge = .shared) -> AgentMonitorPillProps {
         guard let tabID = currentTabID,
               let session = sessions[tabID],
               let sessionID = session.activeAgentSessionID
@@ -1445,7 +1445,8 @@ extension AgentModeViewModel {
             roleAllowsOutboundMonitoring: AgentSessionLinkToolPolicy.allowsOutboundMonitoring(
                 taskLabelKind: session.mcpControlContext?.taskLabelKind
             ),
-            persistence: agentSessionLinkPersistencePresentation
+            persistence: agentSessionLinkPersistencePresentation,
+            scopedEvidence: endpoint.flatMap { bridge.scopedObserverEvidence(for: $0) }
         )
         // Overlaid here rather than baked into the stored projection: queue depth, Wake now
         // availability, and the countdown change on receipts and busy/idle transitions that move no
@@ -1478,11 +1479,14 @@ extension AgentModeViewModel {
         currentEndpoint: DomainAgentSessionLinkEndpointIdentity? = nil,
         eligibility: AgentSessionLinkEndpointEligibility.Input,
         roleAllowsOutboundMonitoring: Bool,
-        persistence: AgentSessionOversightPersistencePresentation = .noDurableLayer
+        persistence: AgentSessionOversightPersistencePresentation = .noDurableLayer,
+        scopedEvidence: DomainDelegationScopedObserverEvidence? = nil
     ) -> AgentMonitorPillProps {
         let eligibilityReason = AgentSessionLinkEndpointEligibility.addDisabledReason(
             eligibility,
-            roleAllowsOutboundMonitoring: roleAllowsOutboundMonitoring
+            roleAllowsOutboundMonitoring: roleAllowsOutboundMonitoring,
+            scopedEvidence: scopedEvidence,
+            currentEndpoint: currentEndpoint
         )
         guard let published else {
             return AgentMonitorPillProps(

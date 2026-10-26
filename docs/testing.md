@@ -131,6 +131,119 @@ or `ACPAgentSessionController`, or scope a launch/probe with
 to the configured instance or task, not a process-global environment switch. Mark a process
 `.tool` only for genuinely non-provider tooling, such as Git worktree operations.
 
+## Consented direct-child oversight regression map
+
+For the authority and transport contract, see
+[Consented MCP controllers](architecture/agent-session-oversight-auto-wake.md#consented-mcp-controllers-direct_children).
+Use owning suites rather than a new registry or duplicated source-shape tests:
+
+| Boundary / focused suite | Critical cases and observable proof |
+| --- | --- |
+| `SessionAdminScopeLifecycleTests` | `testGlobalFullAccessDoesNotReplaceDirectChildrenConsent`, `testPriorSessionWideConsentDoesNotApproveDirectChildren`, `testDirectChildrenCardNeverOffersSessionWideConsent`, and `testDirectChildrenMatchingGrantMustCoverRemainingLifetimeAndBulkThreshold`: explicit consent, no Grant all, sufficient matching reuse. `testDirectChildrenScopeRejectsOrganizationalOnlyAndIndirectMembers` and `testDirectChildrenRequestRejectsStaleEndpointWithoutMutation`: no inferred membership or stale route authority. |
+| `SessionAdminScopeLifecycleTests` | Qualified route through the real service and core: `testFrontDoorLinkOfDirectWorkerByControllerWithFullAccessOffCarriesScopeAsSource`, `testFullAccessNeverWidensTheQualifiedRouteAndWritesNothing`, `testQualifiedRouteRefusesEveryOperationExceptLifecycleAndOwnLinks`, `testQualifiedRouteLinkRefusesAnotherObserver`, `testAlreadyLinkedUnderAnotherSourceReportsMismatchWithoutResourcing`, `testSourceLessExistingLinkVersusSourcedRequestReportsMismatchWithoutResourcing`, `testSourceLessExistingLinkVersusSourceLessRequestStaysAlreadyLinked`, `testLinkCarriesOriginalControllerEndpointAndRefusesAfterRebind`, `testUnlinkCarriesOriginalControllerEndpointAndStopsNothingAfterRebind`, `testShippedWindowsHostRefusesCallerEndpointWithoutExactCurrentObserverBinding`, `testRealFrontDoorLinkDeliversOriginalControllerEndpointToTheStructureHost`, `testRealFrontDoorUnlinkDeliversOriginalControllerEndpointToTheStructureHost`, `testRealFrontDoorLinkRefusesWhenObserverReboundBeforeTheHostRuns`, `testShippedHostBridgeCallbackRefusesWhenObserverEndpointChangesAfterAdmission`, `testCallerContinuityLooksUpTheCallerNotTheObserver`, `testRealFrontDoorOrdinaryCallerLinksAnotherObserverAndDeliversItsOwnEndpoint`, `testUserNarrowedDirectChildrenGrantIsInspectableAndReleasableByItsGranteeButManagesNothing`, and `testDeletionInProgressIsTransientFailedDeletionRestoresAndCommittedDisqualifies`. |
+| `OverseerAuthorizationEngineTests`, `AgentSessionLinkEndpointResolverTests` | Typed engine decisions plus `testParentlessMCPObserverRequiresMatchingScopedEvidence` and `testPendingReproofEvidenceMapsToTransientWithZeroAuthority`: exact controller proof, not a title or saved intent. Lifecycle's `testLiveScopedObserverAwaitingReproofIsTransientAndAuthorizesNothing` and `testRevokedExpiredOrUnsupportedScopedObserverDisqualifies` cover restoration standing. |
+| `AgentSessionLinkRuntimeBridgeTests` | `testScopedManagedPollPreservesConcreteCommandDetails` and `testScopedApprovalProjectionKeepsAdvertisedScopeAmendmentAndOnlyOneTimeChoices`: command/cwd/grant-root/amendment projection, absent fields remain absent, oversized data yields a manual `tooLarge` stub with no usable prompt. `testScopedManagedPollWireCarriesConcreteCommandDetails` passes that scoped projection through the shipped `AgentSessionLinkResponseRenderer`: single- and multi-target `pending_interaction.details` carry the command and cwd, and the oversized case is the ID-only stub. |
+| `AgentSessionLinkRuntimeBridgeTests` | `testScopedFreshAcceptSubmitsExactlyOneProviderResponseAndStaleIDsCannotAnswerSuccessor`: recorder sees one response; duplicate/wrong/stale IDs cannot answer a successor. `testScopedWrongInteractionIDAndSourceARevocationWithLiveBApplyNothing`: live B cannot re-source revoked A. |
+| `AgentSessionLinkRuntimeBridgeTests` | `testScopedPromptOrEndpointReplacementDuringAuthorityAwaitAppliesNothing` and `testScopedSourceAndLinkInvalidationDuringAuthorityAwaitApplyNothing`: retained pending prompt and unchanged provider recorder after prompt replacement, A expiry, placement/membership loss, unlink/relink generation, or actual target/observer binding-owner replacement. Each invalidation row has a successful provider-response positive control. |
+| `AgentSessionLinkRuntimeBridgeTests`, `OverseerACPApprovalPolicyTests`, `AgentSessionLinkToolServiceTests` | `testScopedACPApprovalWithholdsOnlyAcceptWithoutGenuineOneTimeAllow` composes scoped projection/refusal with the real target parser; genuine one-time option selection has separate policy coverage. Keep legacy hooks, merge reviews, secrets, questions, persistent and amending responses manual. ToolService covers its existing JSON/service behavior; the scoped wire composition is in the bridge row above. |
+| `AgentSessionLinkPromptEligibilityTests` and the prompt suites below | `testScopedMCPObserverNeedsAuthorizedEvidenceForItsExactEndpoint`: only current exact typed evidence lifts MCP prompt suppression. Existing renderer, claim, decision, provider-parity and VM cases retain budget/receipt/physical-route fences. |
+| `AgentSessionLinkAutoWakeTests` | `testScopedMCPObserverWakesForWorkerTerminalResult`, `testScopedMCPObserverWakesForWorkerApprovalWithoutAnsweringIt`, `testScopeLossTombstoneStaysAFenceAndNeverFallsThroughToOrdinaryDispatch`, `testScopeRevokedDuringWakePreparationCannotDispatch`: wake acquisition/refusal without automatic approval; existing tombstone remains the transport fence. |
+
+Standing-rule coverage lives in two files, `StandingRuleRuntimeTests.swift` and `StandingRuleSurfaceTests.swift`
+(both under `Tests/RepoPromptTests/MCP`), plus starter-stamp and lifecycle-reader cases in the owning suites below:
+
+| Boundary / focused suite | What it pins |
+| --- | --- |
+| `StandingRuleModelTests` | Rule value and `effectiveState(now:)` (`active`, `stopped`, `replaced`, `expired`, `connectionClosed`); the pure engine decision over facts, including the capability, lifetime, bulk-ceiling, team-lead-count and workspace caps and the exclusion set. |
+| `StandingRuleSettlementTests` | Runtime settlement of a `direct_children` request under a matching rule: same grant, notice and announcement path as the card, derived grant never outlives the rule, reuse of a sufficient grant spends no budget, natural-expiry re-issue for a counted team lead, a failed grant leaves the request pending, and full access or Grant all never widen a rule. |
+| `StandingRuleCreationTests` | Creation only through the presented-card Grant with the checkbox ticked; a stale card, a rebound tab, a missing stamp or a dead starter connection creates nothing and publishes the notice; one active rule per connection and workspace, with replacement. |
+| `StandingRuleSweepTests` | The same-turn sweep of other pending requests with the same stamp and workspace: oldest first over a snapshot, cap-limited, and counted team leads only once the count is full. |
+| `StandingRuleRevocationTests` | Stop rule, Stop rule and revoke (rule-minted grants only, never the seed card grant or unrelated grants), the exclusion hooks (Deny, capability-subset approval, Revoke, release), session deletion, and automatic stops. |
+| `StandingRuleFactsProviderTests` | The facts provider proves the request's own presentation (tab, window, session, endpoint) and returns `nil` for a rebound or ambiguous tab. |
+| `StandingRuleSurfaceTests` | The wire surface through the `request_scope` and `scope_status` tools: `settled_by` / `rule_expires_at` only on rule-settled requests and never on card grants, a request that outlives the rule stays pending beside an in-rule control, a rule grant gets the same standing endorsement and link as a card grant, no top-level or guardrail rule arguments and no app-settings key, and the full-access settings text. |
+| `StandingRuleCardModelTests` | Card checkbox visibility (stamp present, starter live, all three capabilities ticked), pickers, replace wording, disclosure text and the self-declared client name with its fallback, the Grant route that still reaches the rule entry when the offer has since gone, and the Active delegations rule row: state lines, Stop and Stop-and-revoke action mapping, visibility, the "settled by standing rule" suffix and the notice messages. |
+| `MCPConnectionRemovalCompletionTests` | `lifecycleGeneration(of:)` and `isLiveStarter(_:)`: wrong generation, unknown connection and removal marked before the generation is cleared all report not live; `testStandingRuleLifecycleGenerationWitness` ties the reader to the real lifecycle state. |
+| `AgentRunMCPToolServiceStartDefaultTests`, `MCPWorkspaceScopedCursorModelParameterTests`, `AgentRunMCPToolServiceSteerResumeTests` | Starter stamp is written only at fresh MCP creation (`agent_run start`, `agent_manage create_session`) with a live connection, survives `replacingRegistration`, and stays `nil` after steer or resume reactivation. The starter's self-declared client name is captured beside it for display only and never takes part in context equality; `testDefaultReadersStampFromTheSharedConnectionManager` runs the default generation and name readers against `ServerNetworkManager.shared`. |
+| `AgentSessionLinkRuntimeBridgeTests` | `testRuleIssuedScopeRespondSubmitsOnceAndStopAndRevokeRefusesAFreshPrompt`: a rule-issued scope answers a linked `respond` exactly like a card-issued one, and Stop rule and revoke makes the next one refuse. `testProductionCompositionOffersAStandingRuleForALiveStampedAdmittedRequest` builds the bridge with its production facts, liveness and generation readers over a connection installed in `ServerNetworkManager.shared` and shows a live, stamped request is offered a rule until the connection is removed. |
+
+```sh
+make dev-test MODULE=RepoPromptTests FILTER='StandingRule(Model|Settlement|Creation|Sweep|Revocation)Tests'
+make dev-test MODULE=RepoPromptTests FILTER='StandingRule(FactsProvider|Surface|CardModel)Tests'
+make dev-test MODULE=RepoPromptTests FILTER=MCPConnectionRemovalCompletionTests
+make dev-test MODULE=RepoPromptTests FILTER=AgentRunMCPToolServiceStartDefaultTests
+make dev-test MODULE=RepoPromptTests FILTER=MCPWorkspaceScopedCursorModelParameterTests
+make dev-test MODULE=RepoPromptTests FILTER=AgentRunMCPToolServiceSteerResumeTests
+make dev-test MODULE=RepoPromptTests FILTER=AgentSessionLinkRuntimeBridgeTests/testRuleIssuedScopeRespondSubmitsOnceAndStopAndRevokeRefusesAFreshPrompt
+```
+
+Run the relevant row's suite with `make dev-test MODULE=RepoPromptTests FILTER=<suite>`.
+The prompt source file is **not** a suite: `FILTER=AgentSessionLinkPromptSupplementTests` matches
+zero tests. Use the actual six-suite filter:
+
+```sh
+make dev-test MODULE=RepoPromptTests FILTER='AgentSessionLinkPrompt(Renderer|Decision|ClaimStore|ProviderParity|Eligibility|ViewModel)Tests'
+```
+
+Retain executed case names, nonzero counts, exit status, conductor ticket and full log. The accepted
+Unit 4 functional checkpoint ran Bridge **231/0**, ToolService **97/0**, ACP policy **4/0** and
+ScopeLifecycle **88/0** (420 tests, zero failures); those historical counts are not future suite-size
+assertions or whole-branch acceptance. Unit 3's accepted prompt/wake/engine checkpoint is separate.
+The composed fixtures use FakeHost/FakeProvenance around real controller, scope, engine, projector,
+bridge and target parser. Provider recorders prove dispatch/retention at that boundary, not a live
+provider process. Restoration is same-process headless reproof, not full app/provider restart.
+Wake approval coverage proves reservation/acquisition and unchanged target approval, not a rendered
+approval payload/response. There is no live ACP controller hop or packaged pilot proof here.
+
+### Canonical tool review snapshot
+
+First run the real snapshot test unmodified, **without** the update marker. Retain a genuine stale
+snapshot failure, or honestly record that it was already green. Then regenerate through its owner;
+never patch the generated JSON by hand:
+
+```sh
+make dev-test MODULE=RepoPromptMCPCoreTests FILTER=DirectHeadlessCompositionTests/testCanonicalDefinitionsMatchReadableGeneratedReviewSnapshot
+touch .build/update-mcp-domain-schema-review-snapshot
+make dev-test MODULE=RepoPromptMCPCoreTests FILTER=DirectHeadlessCompositionTests/testCanonicalDefinitionsMatchReadableGeneratedReviewSnapshot
+make dev-test MODULE=RepoPromptMCPCoreTests FILTER=DirectHeadlessCompositionTests
+```
+
+The one-shot marker is consumed by the test which writes
+`docs/spec/mcp-domain-canonical-tool-definitions.generated.json` from the canonical definitions.
+An unrelated failure is not expected RED or permission to bless a snapshot; diagnose it first.
+
+### Installed-route gate and separately authorized pilot
+
+Source/schema tests establish the source contract, **not installed support**. Before use, discover
+`direct_children` on the actual installed TL connection and inspect an actual qualifying current
+`session_admin scope_status` grant there. A version string, source checkout, or another route's
+catalog cannot establish this. Unsupported routes retain the legacy advertised-option/EM path;
+never send session-wide acceptance through linked `respond` or treat parent fallback as proof of
+delegated management.
+
+The pilot has **not yet been performed or activated** for this change. After independent review and
+separately authorized matching-artifact activation, use this exact predicate:
+
+- One newly approved direct-child consent card; at least three concrete native-worker command
+  approval requests, including at least one build/test.
+- For every eligible decision, visible command and cwd plus the exact **current** interaction ID;
+  deliberate one-time linked `respond` only after checking requested scope, frozen assignment and
+  applicable standing instruction. Missing/oversized context stays manual; hooks, merge reviews,
+  secrets, persistent or amending decisions remain manual. ACP participates only with genuine
+  one-time options.
+- Keep **Auto-approve read-only commands OFF** so it cannot mask the management path; that
+  default-off, non-durable human allowlist is unchanged. Explicitly select ordinary Auto-wake if
+  needed; no silent preference change or new watcher/router helper.
+- Zero EM command-approval responses after delegation. Inject an out-of-assignment request: TL
+  refuses/defers and escalates once, with no linked acceptance or fallback parent response.
+- Measure proposed commands, TL decisions, manual exclusions/escalations, consent cards, EM
+  interventions and outcome latency against an equivalent measured legacy sample. Count the TL's
+  own command prompts honestly. Do not infer savings or impose an invented reduction percentage.
+
+Missing command context, extra consent cards, or a positive EM approval count fails the happy-path
+predicate. No user-workspace deletion or installed-app activation is part of the deterministic tests.
+Existing parent rights and already physically dispatched work are separate limits, not compromised
+controller containment guarantees.
+
 ## Oracle settled-response recovery
 
 | Reach / drive | Observable proof | Prerequisites / traps |

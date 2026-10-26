@@ -323,6 +323,13 @@ final class DelegationScopeRuntime: ObservableObject {
     private let now: () -> Date
     private let makeUUID: () -> UUID
     private let notifyCatalogChanged: (UUID) -> Void
+    private let standingRuleFacts: @MainActor (DelegationScopeRequest) -> StandingRuleFacts?
+    private let isStarterLive: (StarterConnectionStamp) -> Bool
+    private let starterGeneration: (UUID) -> UInt64?
+    @Published private(set) var rules: [DelegationStandingRule] = []
+    @Published private(set) var notices: [StandingRuleNotice] = []
+    private var standingRuleBook = DelegationStandingRuleBook()
+    private var standingRuleScopeIDs: [UUID: UUID] = [:]
 
     init(
         persistenceMode: PersistenceMode,
@@ -330,6 +337,9 @@ final class DelegationScopeRuntime: ObservableObject {
         makeUUID: @escaping () -> UUID = UUID.init,
         confirmations: BatchConfirmationCoordinator? = nil,
         windows: @escaping @MainActor () -> [WindowState] = { WindowStatesManager.shared.allWindows },
+        standingRuleFacts: @escaping @MainActor (DelegationScopeRequest) -> StandingRuleFacts? = { _ in nil },
+        isStarterLive: @escaping (StarterConnectionStamp) -> Bool = { _ in false },
+        starterGeneration: @escaping (UUID) -> UInt64? = { _ in nil },
         notifyCatalogChanged: @escaping (UUID) -> Void = { sessionID in
             // Forced: a scope change alters `session_admin` eligibility without changing any link
             // fact, so the link-only change detection would otherwise skip the relist.
@@ -342,6 +352,9 @@ final class DelegationScopeRuntime: ObservableObject {
         self.now = now
         self.makeUUID = makeUUID
         self.confirmations = confirmations ?? BatchConfirmationCoordinator(now: now, makeUUID: makeUUID)
+        self.standingRuleFacts = standingRuleFacts
+        self.isStarterLive = isStarterLive
+        self.starterGeneration = starterGeneration
         self.notifyCatalogChanged = notifyCatalogChanged
     }
 
@@ -390,6 +403,7 @@ final class DelegationScopeRuntime: ObservableObject {
                 guard !deletedSessionIDs.contains(grant.granteeSessionID) else { return false }
                 if case let .session(target) = grant.kind { return !deletedSessionIDs.contains(target) }
                 if case let .tree(root) = grant.kind { return !deletedSessionIDs.contains(root) }
+                if case let .directChildren(root, _) = grant.kind { return !deletedSessionIDs.contains(root) }
                 return true
             }
             let installed = authority.reactivate(compatible, revokedScopeIDs: Set(revokedScopeIDs), now: restorationDate)
@@ -433,6 +447,7 @@ final class DelegationScopeRuntime: ObservableObject {
             guard !deletedSessionIDs.contains(original.granteeSessionID) else { continue }
             if case let .session(target) = original.kind, deletedSessionIDs.contains(target) { continue }
             if case let .tree(root) = original.kind, deletedSessionIDs.contains(root) { continue }
+            if case let .directChildren(root, _) = original.kind, deletedSessionIDs.contains(root) { continue }
             do {
                 let request = try requestScope(
                     requesterSessionID: original.granteeSessionID,
@@ -461,7 +476,10 @@ final class DelegationScopeRuntime: ObservableObject {
         retryTask?.cancel()
         retryTask = nil
         availability = .terminating
-        linkConsent.replace([])
+        standingRuleBook = DelegationStandingRuleBook()
+        standingRuleScopeIDs.removeAll()
+        publishStandingRules()
+        linkConsent.publish([])
         overseeContinuations.removeAll()
         overseeInitialRequests.removeAll()
         for running in overseeContinuationTasks.values {
@@ -529,6 +547,11 @@ final class DelegationScopeRuntime: ObservableObject {
         guard canUseAuthority else { return false }
         expireDueScopes()
         return authority.hasLiveScope(grantedTo: sessionID, now: now())
+    }
+
+    /// This runtime's clock, so engine decisions share the grant-expiry time base.
+    var currentDate: Date {
+        now()
     }
 
     func liveScopes(grantedTo sessionID: UUID) -> [DomainDelegationScopeRecord] {
@@ -633,6 +656,7 @@ final class DelegationScopeRuntime: ObservableObject {
             anchors.insert(record.grant.granteeSessionID)
             if case let .session(target) = record.grant.kind { anchors.insert(target) }
             if case let .tree(root) = record.grant.kind { anchors.insert(root) }
+            if case let .directChildren(root, _) = record.grant.kind { anchors.insert(root) }
         }
         return anchors
     }
@@ -730,7 +754,8 @@ final class DelegationScopeRuntime: ObservableObject {
             now: now(),
             // Global auto-approve answers any request with an unrestricted grant, so no capability is
             // refused for its kind before that.
-            unrestricted: authorization.validatesScopeRequestsWithoutCeiling
+            unrestricted: authorization.validatesScopeRequestsWithoutCeiling,
+            granteeSessionID: requesterSessionID
         ) {
             return .failure(.invalid(denial))
         }
@@ -776,6 +801,7 @@ final class DelegationScopeRuntime: ObservableObject {
         requestOrder.append(request.id)
         if let key { requestIDByKey[key] = request.id }
         trimRequestRetention()
+        evaluateStandingRules()
         return .success(request)
     }
 
@@ -911,8 +937,57 @@ final class DelegationScopeRuntime: ObservableObject {
     /// `approve` path as the card, so the grant, requester notice and oversee continuation are
     /// identical. Returns false (card shown as usual) when no standing consent applies.
     @discardableResult
-    func approveWithStandingConsent(requestID: UUID) -> Bool {
+    func approveWithStandingConsent(
+        requestID: UUID,
+        standingRuleFacts: StandingRuleFacts? = nil,
+        onlyRuleID: UUID? = nil
+    ) -> Bool {
         guard let request = requests[requestID], request.state == .pending else { return false }
+        if case .directChildren = request.kind {
+            guard canUseAuthority else { return false }
+            let requestedExpiry = request.expiresInSeconds.map { now().addingTimeInterval(TimeInterval($0)) }
+            if let record = liveScopes(grantedTo: request.requesterSessionID).first(where: {
+                guard $0.grant.kind == request.kind, !$0.grant.unrestricted,
+                      $0.grant.capabilities.isSuperset(of: request.capabilities),
+                      $0.grant.guardrails.bulkConfirmationThreshold >= request.guardrails.bulkConfirmationThreshold
+                else { return false }
+                guard let expiry = $0.grant.guardrails.expiresAt else { return true }
+                return requestedExpiry.map { expiry >= $0 } ?? false
+            }) {
+                settleGranted(requestID: requestID, record: record)
+                return true
+            }
+            guard let facts = standingRuleFacts ?? self.standingRuleFacts(request) else { return false }
+            let grantedAt = now()
+            for rule in standingRuleBook.rules.values.sorted(by: { $0.id.uuidString < $1.id.uuidString }) {
+                if let onlyRuleID, rule.id != onlyRuleID { continue }
+                guard OverseerAuthorizationEngine.standingRuleDecision(
+                    rule: rule,
+                    request: request,
+                    facts: facts,
+                    now: grantedAt,
+                    isStarterLive: isStarterLive(rule.starter),
+                    isExcluded: standingRuleBook.isExcluded(request.requesterSessionID),
+                    isDeleted: deletedSessionIDs.contains(request.requesterSessionID)
+                ) == .settle else { continue }
+                var guardrails = request.guardrails
+                guard let expiresInSeconds = request.expiresInSeconds else { return false }
+                guardrails.expiresAt = grantedAt.addingTimeInterval(TimeInterval(expiresInSeconds))
+                let grantRequest = DomainDelegationScopeGrantRequest(
+                    granteeSessionID: request.requesterSessionID,
+                    kind: request.kind,
+                    capabilities: request.capabilities,
+                    guardrails: guardrails,
+                    unrestricted: false
+                )
+                guard case let .success(record) = authority.grant(grantRequest, scopeID: makeUUID(), now: grantedAt) else {
+                    return false
+                }
+                completeApproval(request: request, record: record, grantAllForSession: false, ruleID: rule.id)
+                return true
+            }
+            return false
+        }
         // Global is global: answer any request with the one unrestricted grant, however narrow.
         if let global = ensureGlobalAutoApproveScope(for: request.requesterSessionID) {
             settleGranted(requestID: requestID, record: global)
@@ -959,6 +1034,10 @@ final class DelegationScopeRuntime: ObservableObject {
         recordRevocations(changed)
     }
 
+    func standingRuleFacts(for request: DelegationScopeRequest) -> StandingRuleFacts? {
+        standingRuleFacts(request)
+    }
+
     /// Marks a pending request granted by an existing grant and runs the same notice and oversee
     /// continuation as a card approval.
     private func settleGranted(requestID: UUID, record: DomainDelegationScopeRecord) {
@@ -994,7 +1073,8 @@ final class DelegationScopeRuntime: ObservableObject {
         presentedSessionID: UUID,
         capabilities: Set<DomainDelegationScopeCapability>? = nil,
         guardrails: DomainDelegationScopeGuardrails? = nil,
-        grantAllForSession: Bool = false
+        grantAllForSession: Bool = false,
+        standingRuleOptions: StandingRuleOptions? = nil
     ) -> Result<DomainDelegationScopeRecord, DomainDelegationScopeDenial> {
         guard let request = requests[requestID], request.state == .pending,
               request.requesterTabID == presentedTabID,
@@ -1002,7 +1082,76 @@ final class DelegationScopeRuntime: ObservableObject {
               request.requesterWindowID == presentedWindowID,
               explicitPresentationWindow(tabID: presentedTabID, sessionID: presentedSessionID)?.windowID == presentedWindowID
         else { return .failure(.unknownScope) }
-        return approve(requestID: requestID, capabilities: capabilities, guardrails: guardrails, grantAllForSession: grantAllForSession)
+        let result = approve(
+            requestID: requestID,
+            capabilities: capabilities,
+            guardrails: guardrails,
+            grantAllForSession: grantAllForSession
+        )
+        guard case let .success(record) = result else { return result }
+        if case .directChildren = request.kind, record.grant.capabilities.count < request.capabilities.count {
+            standingRuleBook.exclude(request.requesterSessionID)
+        }
+        guard let standingRuleOptions else { return result }
+        guard let facts = standingRuleFacts(request) else {
+            publishStandingRuleNotice(.noStamp, for: request)
+            return result
+        }
+        guard case let .directChildren(_, workspaceID) = request.kind,
+              facts.workspaceID == workspaceID,
+              record.grant.capabilities == DomainDelegationScopeCapability.directChildrenPermitted
+        else {
+            publishStandingRuleNotice(.requestChanged, for: request)
+            return result
+        }
+        guard isStarterLive(facts.starter) else {
+            publishStandingRuleNotice(.connectionClosed, for: request)
+            return result
+        }
+        let createdAt = now()
+        let rule = DelegationStandingRule(
+            id: makeUUID(),
+            createdAt: createdAt,
+            expiresAt: createdAt.addingTimeInterval(
+                min(max(standingRuleOptions.duration, StandingRuleOptions.minimumDuration), StandingRuleOptions.maximumDuration)
+            ),
+            starter: facts.starter,
+            workspaceID: workspaceID,
+            countedTLs: [record.grant.granteeSessionID],
+            ruleGrants: [],
+            stoppedAt: nil,
+            replacedBy: nil,
+            closedAt: nil,
+            maxTeamLeads: min(max(standingRuleOptions.maxTeamLeads, StandingRuleOptions.minimumTeamLeads), StandingRuleOptions.maximumTeamLeads),
+            bulkThresholdCeiling: min(record.grant.guardrails.bulkConfirmationThreshold, StandingRuleOptions.maximumBulkThresholdCeiling),
+            clientLabel: facts.clientLabel
+        )
+        if standingRuleBook.rules.values.contains(where: {
+            $0.starter == rule.starter && $0.workspaceID == rule.workspaceID && $0.effectiveState(now: createdAt) == .active
+        }) {
+            standingRuleBook.replace(rule)
+        } else {
+            standingRuleBook.add(rule)
+        }
+        publishStandingRules()
+        settlePendingRequestsUnderStandingRule(rule)
+        return result
+    }
+
+    /// One pass, oldest first, over the requests pending when the rule was written, restricted to the
+    /// rule's own stamp and workspace and settled under that rule alone. Requests
+    /// recorded during the pass (a re-entrant `didChange` may record some) are outside the snapshot.
+    /// Each candidate re-reads its facts and samples starter liveness through the shared path.
+    private func settlePendingRequestsUnderStandingRule(_ rule: DelegationStandingRule) {
+        let snapshot = requestOrder
+        for id in snapshot {
+            guard let request = requests[id], request.state == .pending,
+                  case .directChildren = request.kind,
+                  let facts = standingRuleFacts(request),
+                  facts.starter == rule.starter, facts.workspaceID == rule.workspaceID
+            else { continue }
+            approveWithStandingConsent(requestID: id, standingRuleFacts: facts, onlyRuleID: rule.id)
+        }
     }
 
     /// The physical, loaded presentation shared by scope and batch approval. Catalog copies in
@@ -1036,7 +1185,11 @@ final class DelegationScopeRuntime: ObservableObject {
         grantAllForSession: Bool = false
     ) -> Result<DomainDelegationScopeRecord, DomainDelegationScopeDenial> {
         guard canUseAuthority else { return .failure(.unknownScope) }
+        defer { evaluateStandingRules() }
         guard var request = requests[requestID], request.state == .pending else { return .failure(.unknownScope) }
+        if grantAllForSession, case .directChildren = request.kind {
+            return .failure(.approvalExceedsRequest)
+        }
         // Only the explicit user-facing Grant all action sets this flag. No MCP argument can.
         let allCapabilities: Set<DomainDelegationScopeCapability> = request.kind == .allSessions
             ? DomainDelegationScopeCapability.allSessionsPermitted : DomainDelegationScopeCapability.fullPreset
@@ -1062,21 +1215,7 @@ final class DelegationScopeRuntime: ObservableObject {
         let result = authority.grant(grantRequest, scopeID: makeUUID(), now: approvedAt)
         switch result {
         case let .success(record):
-            request.state = .granted(scopeID: record.id)
-            requests[requestID] = request
-            if grantAllForSession { sessionWideApprovals.insert(request.requesterSessionID) }
-            didChange(grantees: [record.grant.granteeSessionID], invalidated: [])
-            let continuation = overseeContinuations.removeValue(forKey: requestID)
-            if let continuation {
-                startOverseeContinuation(request: request, record: record, continuation: continuation)
-            }
-            enqueueDecision(
-                sessionID: request.requesterSessionID,
-                tabID: request.requesterTabID,
-                result: "granted",
-                identifier: record.id,
-                automaticContinuation: continuation != nil
-            )
+            completeApproval(request: request, record: record, grantAllForSession: grantAllForSession)
         case let .failure(denial):
             overseeContinuations.removeValue(forKey: requestID)
             overseeInitialRequests.remove(requestID)
@@ -1092,18 +1231,140 @@ final class DelegationScopeRuntime: ObservableObject {
         return result
     }
 
+    private func completeApproval(
+        request: DelegationScopeRequest,
+        record: DomainDelegationScopeRecord,
+        grantAllForSession: Bool,
+        ruleID: UUID? = nil
+    ) {
+        var request = request
+        request.state = .granted(scopeID: record.id)
+        requests[request.id] = request
+        if grantAllForSession { sessionWideApprovals.insert(request.requesterSessionID) }
+        if let ruleID {
+            standingRuleBook.recordRuleGrant(scopeID: record.id, teamLead: request.requesterSessionID, in: ruleID)
+            standingRuleScopeIDs[record.id] = ruleID
+            publishStandingRules()
+        }
+        didChange(grantees: [record.grant.granteeSessionID], invalidated: [])
+        let continuation = overseeContinuations.removeValue(forKey: request.id)
+        if let continuation {
+            startOverseeContinuation(request: request, record: record, continuation: continuation)
+        }
+        enqueueDecision(
+            sessionID: request.requesterSessionID,
+            tabID: request.requesterTabID,
+            result: "granted",
+            identifier: record.id,
+            automaticContinuation: continuation != nil
+        )
+    }
+
+    /// Publishes only a real change: callers on read paths (`expireDueScopes`) must not
+    /// invalidate a view that is reading the runtime.
+    @discardableResult
+    private func publishStandingRules() -> Bool {
+        let nextRules = standingRuleBook.rules.values.sorted { $0.id.uuidString < $1.id.uuidString }
+        let nextNotices = standingRuleBook.notices.values.sorted { $0.id.uuidString < $1.id.uuidString }
+        guard nextRules != rules || nextNotices != notices else { return false }
+        rules = nextRules
+        notices = nextNotices
+        return true
+    }
+
+    /// Latches terminal connection loss, prunes ended rules and notices, and republishes. It calls
+    /// no mutator that calls it back.
+    private func evaluateStandingRules() {
+        guard !standingRuleBook.rules.isEmpty || !standingRuleBook.notices.isEmpty || !rules.isEmpty || !notices.isEmpty else { return }
+        let date = now()
+        let live = Set(authority.liveRecords(now: date).map(\.id))
+        standingRuleBook.evaluate(now: date, starterGeneration: starterGeneration, isGrantLive: live.contains)
+        standingRuleBook.pruneNotices { notice in notice.sessionID.map(deletedSessionIDs.contains) ?? false }
+        standingRuleScopeIDs = standingRuleScopeIDs.filter { standingRuleBook.rules[$0.value] != nil }
+        if publishStandingRules() { revision &+= 1 }
+    }
+
+    /// A removed tab ends the notices raised for it.
+    func standingRuleTabsDidRemove(_ tabIDs: Set<UUID>) {
+        standingRuleBook.pruneNotices { notice in notice.tabID.map(tabIDs.contains) ?? false }
+        evaluateStandingRules()
+    }
+
+    func standingRuleOffer(for request: DelegationScopeRequest) -> StandingRuleOffer? {
+        guard request.state == .pending,
+              case let .directChildren(_, workspaceID) = request.kind,
+              request.capabilities == DomainDelegationScopeCapability.directChildrenPermitted,
+              let facts = standingRuleFacts(request),
+              facts.workspaceID == workspaceID,
+              isStarterLive(facts.starter)
+        else { return nil }
+        let current = standingRuleBook.rules.values.first {
+            $0.starter == facts.starter && $0.workspaceID == workspaceID && $0.effectiveState(now: now()) == .active
+        }
+        return StandingRuleOffer(
+            ruleID: current?.id,
+            clientLabel: facts.clientLabel,
+            connectionPrefix: String(facts.starter.connectionID.uuidString.prefix(8)),
+            replacesExisting: current != nil
+        )
+    }
+
+    /// Stop ends issuance only and never decides a pending card. Revoking goes through
+    /// `revoke(scopeID:)` for the rule's live grants alone, never the seed team lead's card grant.
+    func stopStandingRule(id: UUID, revokeIssuedGrants: Bool) {
+        guard let rule = standingRuleBook.rules[id] else { return }
+        standingRuleBook.stop(id: id, now: now())
+        if revokeIssuedGrants {
+            let live = Set(authority.liveRecords(now: now()).map(\.id))
+            for scopeID in rule.ruleGrants.filter(live.contains).sorted(by: { $0.uuidString < $1.uuidString }) {
+                revoke(scopeID: scopeID)
+            }
+        }
+        evaluateStandingRules()
+    }
+
+    func dismissStandingRuleNotice(id: UUID) {
+        standingRuleBook.dismissNotice(id: id)
+        publishStandingRules()
+    }
+
+    private func publishStandingRuleNotice(_ cause: StandingRuleNotice.Cause, for request: DelegationScopeRequest) {
+        standingRuleBook.addNotice(.init(
+            id: makeUUID(), cause: cause, sessionID: request.requesterSessionID, tabID: request.requesterTabID
+        ))
+        publishStandingRules()
+    }
+
+    #if DEBUG
+        func debugInstallStandingRuleForTesting(_ rule: DelegationStandingRule, issuedScopeID: UUID) {
+            standingRuleBook.add(rule)
+            standingRuleScopeIDs[issuedScopeID] = rule.id
+            publishStandingRules()
+        }
+
+        func debugIsStandingRuleExcludedForTesting(_ sessionID: UUID) -> Bool {
+            standingRuleBook.isExcluded(sessionID)
+        }
+    #endif
+    func standingRuleProvenance(scopeID: UUID) -> (ruleID: UUID, expiresAt: Date)? {
+        guard let ruleID = standingRuleScopeIDs[scopeID], let rule = standingRuleBook.rules[ruleID] else { return nil }
+        return (ruleID, rule.expiresAt)
+    }
+
     func deny(requestID: UUID, reason: String? = nil) {
         guard var request = requests[requestID], request.state == .pending else { return }
         request.state = .denied(reason: reason)
         overseeContinuations.removeValue(forKey: requestID)
         overseeInitialRequests.remove(requestID)
         requests[requestID] = request
+        if case .directChildren = request.kind { standingRuleBook.exclude(request.requesterSessionID) }
         enqueueDecision(
             sessionID: request.requesterSessionID,
             tabID: request.requesterTabID,
             result: "denied",
             identifier: request.id
         )
+        evaluateStandingRules()
     }
 
     /// The requester may withdraw its own undecided card. Retaining its identity makes retries
@@ -1132,8 +1393,15 @@ final class DelegationScopeRuntime: ObservableObject {
         for record in changed {
             sessionWideApprovals.remove(record.grant.granteeSessionID)
         }
+        excludeGrantee(ofReleasedOrRevoked: scopeID, in: changed)
         recordRevocations(changed)
+        evaluateStandingRules()
         return changed
+    }
+
+    private func excludeGrantee(ofReleasedOrRevoked scopeID: UUID, in changed: [DomainDelegationScopeRecord]) {
+        guard let record = changed.first(where: { $0.id == scopeID }), case .directChildren = record.grant.kind else { return }
+        standingRuleBook.exclude(record.grant.granteeSessionID)
     }
 
     /// Revokes every scope granted to, or rooted at, a durably deleted session.
@@ -1142,6 +1410,8 @@ final class DelegationScopeRuntime: ObservableObject {
         let evidence = OverseerScopeEnding(reason: .sessionDeleted, at: now(), actorSessionID: origin.actorSessionID, originatingSessionID: sessionID, deletionOrigin: origin.kind, fileRemoved: fileRemoved)
         deletedSessionIDs.insert(sessionID)
         sessionWideApprovals.remove(sessionID)
+        standingRuleBook.removeExclusion(sessionID)
+        defer { evaluateStandingRules() }
         if availability == .terminating { return revokeAllWhileTerminating(involving: sessionID, evidence: evidence) }
         guard canUseAuthority else { return [] }
         let changed = authority.revokeAll(involving: sessionID)
@@ -1158,9 +1428,11 @@ final class DelegationScopeRuntime: ObservableObject {
     ) -> Result<[DomainDelegationScopeRecord], DomainDelegationScopeDenial> {
         guard canUseAuthority else { return .failure(.unknownScope) }
         let result = authority.release(scopeID: scopeID, caller: caller)
-        if case let .success(changed) = result {
+        if case let .success(changed) = result, !changed.isEmpty {
             captureEndings(changed, reason: .granteeReleased, origin: scopeID, actor: caller.agentSessionID)
+            excludeGrantee(ofReleasedOrRevoked: scopeID, in: changed)
             recordRevocations(changed)
+            evaluateStandingRules()
         }
         return result
     }
@@ -1202,6 +1474,7 @@ final class DelegationScopeRuntime: ObservableObject {
 
     private func expireDueScopes() {
         guard canUseAuthority else { return }
+        defer { evaluateStandingRules() }
         let date = now()
         let expired = authority.expire(now: date)
         guard !expired.isEmpty else { return }
@@ -1360,7 +1633,8 @@ final class DelegationScopeRuntime: ObservableObject {
     }
 
     private func didChange(grantees: Set<UUID>, invalidated: [UUID]) {
-        linkConsent.replace(authority.liveRecords(now: now()).map(\.grant))
+        // Records carry generations: a changed or removed record drops its endorsements before this returns.
+        linkConsent.publish(authority.liveRecords(now: now()))
         if !invalidated.isEmpty { scopesDidInvalidate?(Set(invalidated)) }
         liveScopesDidChange?()
         revision &+= 1

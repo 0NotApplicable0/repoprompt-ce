@@ -69,7 +69,8 @@ enum AgentSessionLinkPrompts {
     /// Revision 9 teaches Grok's isolated runtime server name.
     /// Revision 10 distinguishes full access from missing-scope approval without discarding standing consent.
     /// Revision 11 distinguishes managed task direction from coordination and clarifies recovery.
-    static let currentInventoryGuidanceRevision: UInt64 = 11
+    /// Revision 12 adds scoped direct-child supervision wording.
+    static let currentInventoryGuidanceRevision: UInt64 = 12
     /// Emitted only beside a managed, respondable pending interaction.
     static let respondHint =
         "Use `respond` for this exact `interaction_id` under your user's instruction. If it changes, refresh with `poll` or `wait`; never auto-retry approval."

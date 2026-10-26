@@ -1581,25 +1581,40 @@ enum AgentSessionLinkPromptEligibility {
         var isMCPControlled: Bool
         var isMCPOriginated: Bool
         var roleAllowsOutboundMonitoring: Bool
+        /// Engine-issued standing for `endpoint`. Data only: the caller re-derives it from the engine
+        /// at every boundary, and only an `.authorized` value for this exact endpoint lifts the MCP exclusion.
+        var scopedEvidence: DomainDelegationScopedObserverEvidence?
+        var endpoint: DomainAgentSessionLinkEndpointIdentity?
 
         init(
             isChildSession: Bool,
             isMCPControlled: Bool,
             isMCPOriginated: Bool,
-            roleAllowsOutboundMonitoring: Bool
+            roleAllowsOutboundMonitoring: Bool,
+            scopedEvidence: DomainDelegationScopedObserverEvidence? = nil,
+            endpoint: DomainAgentSessionLinkEndpointIdentity? = nil
         ) {
             self.isChildSession = isChildSession
             self.isMCPControlled = isMCPControlled
             self.isMCPOriginated = isMCPOriginated
             self.roleAllowsOutboundMonitoring = roleAllowsOutboundMonitoring
+            self.scopedEvidence = scopedEvidence
+            self.endpoint = endpoint
+        }
+
+        fileprivate var hasCurrentScopedEvidence: Bool {
+            guard let scopedEvidence, let endpoint else { return false }
+            return scopedEvidence.status == .authorized && scopedEvidence.observer == endpoint
         }
     }
 
     static func allowsSupplement(_ input: Input) -> Bool {
         !input.isChildSession
-            && !input.isMCPControlled
-            && !input.isMCPOriginated
             && input.roleAllowsOutboundMonitoring
+            && (
+                !(input.isMCPControlled || input.isMCPOriginated)
+                    || input.hasCurrentScopedEvidence
+            )
     }
 
     /// The inventory an ineligible observer is allowed to see.

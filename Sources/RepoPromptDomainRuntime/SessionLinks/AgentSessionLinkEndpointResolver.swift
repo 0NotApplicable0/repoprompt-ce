@@ -360,7 +360,8 @@ package struct AgentSessionLinkEndpointCandidate: Equatable {
             isMCPOriginated: isMCPOriginated,
             bindingTransitionInProgress: bindingTransitionInProgress,
             isClosing: isClosing,
-            isDeletionInProgress: isDeletionInProgress
+            isDeletionInProgress: isDeletionInProgress,
+            hasCreatorProvenance: createdByOverseerSessionID != nil
         )
     }
 
@@ -481,6 +482,8 @@ package enum AgentSessionLinkEndpointEligibility {
         /// together made a failed delete permanently disqualifying, which revoked live grants and
         /// deleted the saved rows behind them for a transcript that still exists.
         package var isDeletionInProgress: Bool
+        /// Immutable overseer-created lane provenance. Only the scoped-evidence exemption reads it.
+        package var hasCreatorProvenance: Bool
 
         package init(
             hasDurableBinding: Bool,
@@ -490,8 +493,10 @@ package enum AgentSessionLinkEndpointEligibility {
             isMCPOriginated: Bool,
             bindingTransitionInProgress: Bool,
             isClosing: Bool,
-            isDeletionInProgress: Bool = false
+            isDeletionInProgress: Bool = false,
+            hasCreatorProvenance: Bool = false
         ) {
+            self.hasCreatorProvenance = hasCreatorProvenance
             self.hasDurableBinding = hasDurableBinding
             self.hasLoadedPersistedState = hasLoadedPersistedState
             self.isChildSession = isChildSession
@@ -561,6 +566,21 @@ package enum AgentSessionLinkEndpointEligibility {
         case disqualified
     }
 
+    /// The evidence status that applies to this exact observer, or `nil`. Evidence lifts only the
+    /// MCP-control exclusion and only for a parentless, non-creator, role-permitted, live endpoint
+    /// whose exact identity equals the evidence's; it is never matched by session UUID.
+    private static func scopedStatus(
+        _ input: Input,
+        _ roleAllowsOutboundMonitoring: Bool,
+        _ evidence: DomainDelegationScopedObserverEvidence?,
+        _ currentEndpoint: DomainAgentSessionLinkEndpointIdentity?
+    ) -> DomainDelegationScopedObserverEvidence.Status? {
+        guard let evidence, let currentEndpoint, evidence.observer == currentEndpoint,
+              !input.isChildSession, !input.hasCreatorProvenance, !input.isClosing,
+              roleAllowsOutboundMonitoring else { return nil }
+        return evidence.status
+    }
+
     /// Re-checks an existing grant's observer against the same disqualifiers that gate Add.
     ///
     /// Transient and permanent losses are separated deliberately: revoking on a binding transition
@@ -569,16 +589,19 @@ package enum AgentSessionLinkEndpointEligibility {
     /// no longer drives.
     package static func observerOperationEligibility(
         _ input: Input,
-        roleAllowsOutboundMonitoring: Bool
+        roleAllowsOutboundMonitoring: Bool,
+        scopedEvidence: DomainDelegationScopedObserverEvidence? = nil,
+        currentEndpoint: DomainAgentSessionLinkEndpointIdentity? = nil
     ) -> OperationEligibility {
+        let scoped = scopedStatus(input, roleAllowsOutboundMonitoring, scopedEvidence, currentEndpoint)
         if input.isChildSession
-            || input.isMCPControlled
-            || input.isMCPOriginated
+            || (scoped == nil && (input.isMCPControlled || input.isMCPOriginated))
             || !roleAllowsOutboundMonitoring
             || input.isClosing
         {
             return .disqualified
         }
+        if scoped == .awaitingReproof { return .transientlyUnavailable }
         // A running deletion denies the operation and keeps the grant. Only a *committed* deletion is
         // permanent, and that arrives as a UUID-wide invalidation of its own rather than as an
         // eligibility loss inferred from an attempt that may still fail.
@@ -601,16 +624,22 @@ package enum AgentSessionLinkEndpointEligibility {
     ///   the catalog; until then a user-driven top-level session is permitted.
     package static func addDisabledReason(
         _ input: Input,
-        roleAllowsOutboundMonitoring: Bool
+        roleAllowsOutboundMonitoring: Bool,
+        scopedEvidence: DomainDelegationScopedObserverEvidence? = nil,
+        currentEndpoint: DomainAgentSessionLinkEndpointIdentity? = nil
     ) -> String? {
+        let scoped = scopedStatus(input, roleAllowsOutboundMonitoring, scopedEvidence, currentEndpoint)
         if input.isClosing {
             return "This session is closing."
         }
         if input.isDeletionInProgress {
             return "This session is being deleted."
         }
-        if input.isChildSession || input.isMCPControlled || input.isMCPOriginated {
+        if input.isChildSession || (scoped == nil && (input.isMCPControlled || input.isMCPOriginated)) {
             return roleDeniedReason
+        }
+        if scoped == .awaitingReproof {
+            return "This session is being re-verified. Try again in a moment."
         }
         if !roleAllowsOutboundMonitoring {
             return roleDeniedReason

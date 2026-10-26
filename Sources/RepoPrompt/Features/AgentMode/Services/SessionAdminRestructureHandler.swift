@@ -113,7 +113,7 @@ final class SessionAdminRestructureHandler: AgentSessionAdministrationOperationH
             try SessionAdminArguments.requireOnly(["observer_session_id"], in: args, op: "link")
             // A scope only mints links its own grantee observes; links between two other members are
             // the user's to create (links are durable and outlive the scope).
-            if context.scopes.authorization.requiresScopeLinksObservedByCaller,
+            if context.scopes.authorization.requiresScopeLinksObservedByCaller(scope: batch.scope),
                let caller = batch.request.caller.agentSessionID, try observer(of: batch) != caller
             {
                 return SessionAdminReply.refused(
@@ -121,7 +121,7 @@ final class SessionAdminRestructureHandler: AgentSessionAdministrationOperationH
                     detail: "Under a delegation scope you can only create links you observe yourself; omit observer_session_id."
                 )
             }
-            try context.requireMember(observer(of: batch), of: batch)
+            try context.requireLinkObserver(observer(of: batch), of: batch)
             if let missing = context.scopes.authorization.linkCeilingMissingCapability(
                 minted: host.mintedLinkCapabilities, scope: batch.scope
             ) {
@@ -130,7 +130,15 @@ final class SessionAdminRestructureHandler: AgentSessionAdministrationOperationH
             return nil
         case .adminUnlink:
             try SessionAdminArguments.requireOnly(["observer_session_id"], in: args, op: "unlink")
-            try context.requireMember(observer(of: batch), of: batch)
+            if context.scopes.authorization.isQualifiedControllerScope(batch.scope),
+               let caller = batch.request.caller.agentSessionID, try observer(of: batch) != caller
+            {
+                return SessionAdminReply.refused(
+                    code: "observer_must_be_caller",
+                    detail: "Under a delegation scope you can only remove links you observe yourself; omit observer_session_id."
+                )
+            }
+            try context.requireLinkObserver(observer(of: batch), of: batch)
             return nil
         case .adminReparent:
             try SessionAdminArguments.requireOnly(["parent_session_id"], in: args, op: "reparent")
@@ -204,12 +212,21 @@ final class SessionAdminRestructureHandler: AgentSessionAdministrationOperationH
                 items.append(SessionAdminItemResult(sessionID: target, result: "would_link"))
                 continue
             }
-            let existing = await host.activeLinkCapabilities(observer: observer, target: target)
-            if let existing {
+            let context = context
+            let scope = batch.scope
+            let sourceScopeID: UUID? = switch scope.grant.kind {
+            case .session, .directChildren: scope.id
+            default: nil
+            }
+            if let existing = await host.activeLink(observer: observer, target: target) {
+                if context.scopes.authorization.linkSourceConflicts(existing: existing.sourceScopeID, requested: sourceScopeID) {
+                    items.append(SessionAdminItemResult(sessionID: target, result: "not_applied", code: "source_scope_mismatch"))
+                    continue
+                }
                 // Never upgraded: the existing grant is reported exactly as it is.
                 items.append(SessionAdminItemResult(
                     sessionID: target, result: "already_linked",
-                    fields: ["capabilities": Self.capabilitiesValue(existing)]
+                    fields: ["capabilities": Self.capabilitiesValue(existing.capabilities)]
                 ))
                 continue
             }
@@ -221,11 +238,10 @@ final class SessionAdminRestructureHandler: AgentSessionAdministrationOperationH
             // The same write-time check as `unlink`, carried into the shared Add and re-proved at its
             // durable insert and around reservation/activation: a caller-side pre-check alone cannot
             // cover the Add's own suspensions.
-            let context = context
-            let scope = batch.scope
-            let sourceScopeID: UUID? = if case .session = scope.grant.kind { scope.id } else { nil }
-            let outcome = await host.addLink(observer: observer, target: target, sourceScopeID: sourceScopeID) {
-                context.isStillAuthorized(lease, scope: scope) && context.permitsMember(observer, ofChainFrom: scope)
+            let outcome = await host.addLink(
+                observer: observer, target: target, sourceScopeID: sourceScopeID, callerEndpoint: batch.request.callerEndpoint
+            ) {
+                context.isStillAuthorized(lease, scope: scope) && context.permitsLinkObserver(observer, ofChainFrom: scope)
             }
             if outcome == .revoked { authorityLost = true }
             items.append(Self.linkItem(target, outcome))
@@ -248,7 +264,7 @@ final class SessionAdminRestructureHandler: AgentSessionAdministrationOperationH
                 continue
             }
             if batch.request.preview {
-                let linked = await host.activeLinkCapabilities(observer: observer, target: target) != nil
+                let linked = await host.activeLink(observer: observer, target: target) != nil
                 items.append(SessionAdminItemResult(sessionID: target, result: linked ? "would_unlink" : "not_linked"))
                 continue
             }
@@ -256,8 +272,8 @@ final class SessionAdminRestructureHandler: AgentSessionAdministrationOperationH
             // endpoints are still members of the whole chain (management never chains).
             let context = context
             let scope = batch.scope
-            let outcome = await host.stopLink(observer: observer, target: target) {
-                context.isStillAuthorized(lease, scope: scope) && context.permitsMember(observer, ofChainFrom: scope)
+            let outcome = await host.stopLink(observer: observer, target: target, callerEndpoint: batch.request.callerEndpoint) {
+                context.isStillAuthorized(lease, scope: scope) && context.permitsLinkObserver(observer, ofChainFrom: scope)
             }
             items.append(Self.linkItem(target, outcome))
         }

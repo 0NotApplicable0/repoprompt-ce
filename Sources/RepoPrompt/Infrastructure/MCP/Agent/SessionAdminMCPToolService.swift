@@ -72,6 +72,24 @@ struct SessionAdminMCPToolService {
         }
 
         let endpoint = try await resolveCaller()
+        let window = try requireTargetWindow()
+        let isController = window.agentSessionLinkAdmitsDirectChildrenConsentRequest(endpoint: endpoint)
+        let requestsDirectChildren = op == "request_scope"
+            && AgentMCPToolHelpers.normalizedString(args["kind"])?.lowercased() == "direct_children"
+        if requestsDirectChildren, !isController { throw Self.unavailableError }
+        let routedRequestID: UUID? = isController && ["scope_status", "release_scope"].contains(op)
+            ? try Self.parseUUID(args["request_id"], field: "request_id") : nil
+        let scopeID = try Self.parseUUID(args["scope_id"], field: "scope_id")
+        guard window.agentSessionLinkScopeLifecycleAdmission(
+            endpoint: endpoint,
+            isController: isController,
+            runtime: scopes(),
+            op: op,
+            requestsDirectChildren: requestsDirectChildren,
+            hasScopeID: args["scope_id"] != nil,
+            requestID: routedRequestID,
+            scopeID: scopeID
+        ) else { throw Self.unavailableError }
         let caller = DomainAgentSessionCallerIdentity.agentSession(endpoint.sessionID)
         let value: Value = switch op {
         case "request_scope":
@@ -119,6 +137,11 @@ struct SessionAdminMCPToolService {
                 throw MCPError.invalidParams("session_admin request_scope kind=session needs one other session_id and no workspace selector.")
             }
             kind = .session(targetSessionID: target)
+        case "direct_children":
+            guard args["session_id"] == nil, args["workspace"] == nil else {
+                throw MCPError.invalidParams("session_admin direct_children derives its root and workspace from this exact route; selectors are not accepted.")
+            }
+            kind = .directChildren(rootSessionID: endpoint.sessionID, workspaceID: endpoint.workspaceID)
         case "tree":
             guard args["workspace"] == nil else {
                 throw MCPError.invalidParams("session_admin request_scope workspace applies only to kind=workspace.")
@@ -145,17 +168,27 @@ struct SessionAdminMCPToolService {
             }
             kind = .allSessions
         default:
-            throw MCPError.invalidParams("session_admin request_scope kind must be session, tree, workspace, or all_sessions.")
+            throw MCPError.invalidParams("session_admin request_scope kind must be session, tree, direct_children, workspace, or all_sessions.")
         }
 
         let capabilities = try Self.parseCapabilities(args["capabilities"], kind: kind)
-        let (guardrails, expiresInSeconds) = try Self.parseGuardrails(args["guardrails"])
+        let (guardrails, requestedExpiry) = try Self.parseGuardrails(args["guardrails"])
+        let expiresInSeconds: Int?
+        if case .directChildren = kind {
+            guard guardrails.maxDepth == nil, guardrails.maxLiveSessions == nil, guardrails.maxWorktrees == nil else {
+                throw MCPError.invalidParams("session_admin direct_children accepts only expiry and bulk_confirmation_threshold guardrails.")
+            }
+            expiresInSeconds = requestedExpiry ?? 3600
+        } else {
+            expiresInSeconds = requestedExpiry
+        }
         let reason = try Self.parseReason(args["reason"])
         let idempotencyKey = try Self.parseIdempotencyKey(args["idempotency_key"], required: false)
 
-        let workspaceName: String? = if case let .workspace(workspaceID) = kind {
+        let workspaceName: String? = switch kind {
+        case let .workspace(workspaceID), let .directChildren(_, workspaceID):
             DelegationDisplayNames.workspaceName(workspaceID)
-        } else {
+        default:
             nil
         }
         switch scopes().requestScope(
@@ -173,9 +206,13 @@ struct SessionAdminMCPToolService {
         case let .success(recorded):
             let runtime = scopes()
             // Standing user consent approves through the card's own path; no card is shown.
-            let autoApproved = recorded.state == .pending && runtime.approveWithStandingConsent(requestID: recorded.id)
+            let autoApproved = recorded.state == .pending && runtime.approveWithStandingConsent(
+                requestID: recorded.id,
+                standingRuleFacts: runtime.standingRuleFacts(for: recorded)
+            )
             let request = runtime.request(id: recorded.id, requesterSessionID: endpoint.sessionID) ?? recorded
             var value = Self.requestValue(request)
+            var standingRule: [String: Value] = [:]
             value["result"] = .string(request.state.label)
             if case let .granted(scopeID) = request.state, let record = runtime.record(id: scopeID) {
                 // The requested scope may be narrower than the authority that actually settled it.
@@ -193,16 +230,23 @@ struct SessionAdminMCPToolService {
                     value["guidance"] = .string(
                         "Granted by Overseer full access; no card was shown. scope is the actual unrestricted covering grant, not the narrower requested_scope. Just call the operation."
                     )
-                } else if autoApproved {
+                } else if autoApproved, runtime.standingRuleProvenance(scopeID: scopeID) == nil {
                     value["guidance"] = .string(
                         "Granted immediately by the user's standing consent for this session; no card was shown. scope describes the actual grant."
                     )
                 }
+                standingRule = Self.standingRuleFields(runtime, scopeID: scopeID)
+                value.merge(standingRule.filter { $0.key != "guidance" }) { _, new in new }
             }
             if request.state == .pending {
                 value["guidance"] = .string(
                     "Nothing is granted yet. The user sees an approval card in this session. Continue other work; RepoPrompt notifies this requesting session when the user decides (after its active turn settles). You can also check scope_status with this request_id; do not re-request. \(Self.inventoryGuidance)"
                 )
+            }
+            if case .directChildren = kind {
+                value["requires_explicit_link"] = .bool(true)
+                let base = "A granted sufficient direct-child scope permits explicit managed link activation to its direct workers using session_admin link with this scope_id; it creates no links automatically. Pending requests require this kind's explicit user card even with full access or session-wide approval and grant no management. Inspect or withdraw your own request using request_id; inspect or release your own granted scope using scope_id. Reasons are unverified agent statements."
+                value["guidance"] = .string(standingRule["guidance"]?.stringValue.map { "\(base) \($0)" } ?? base)
             }
             return Self.withScopeAvailability(value, runtime: scopes())
         case let .failure(.invalid(denial)):
@@ -225,6 +269,20 @@ struct SessionAdminMCPToolService {
 
     // MARK: - scope_status
 
+    /// Provenance exists only for a grant the running app minted under a standing rule; it is absent
+    /// for card grants and after restart.
+    private static func standingRuleFields(_ runtime: DelegationScopeRuntime, scopeID: UUID) -> [String: Value] {
+        guard let rule = runtime.standingRuleProvenance(scopeID: scopeID) else { return [:] }
+        let endsAt = ISO8601DateFormatter().string(from: rule.expiresAt)
+        return [
+            "settled_by": .string("standing_rule"),
+            "rule_expires_at": .string(endsAt),
+            "guidance": .string(
+                "Granted without a card under a standing rule your user set for this connection; it ends no later than \(endsAt); link explicitly with this scope_id. When this grant expires, request again with a new idempotency_key and an expires_in_seconds that ends before \(endsAt)."
+            )
+        ]
+    }
+
     private func scopeStatus(args: [String: Value], callerSessionID: UUID) throws -> Value {
         let runtime = scopes()
         if args["request_id"] != nil, args["scope_id"] != nil {
@@ -238,6 +296,7 @@ struct SessionAdminMCPToolService {
             value["result"] = .string(request.state.label)
             if case let .granted(scopeID) = request.state, let record = runtime.statusRecord(id: scopeID) {
                 value["scope"] = Self.scopeValue(record, now: now(), ending: runtime.ending(for: record.id))
+                value.merge(Self.standingRuleFields(runtime, scopeID: scopeID)) { _, new in new }
             }
             return Self.withScopeAvailability(value, runtime: runtime)
         }
@@ -248,13 +307,22 @@ struct SessionAdminMCPToolService {
             guard let record = runtime.statusRecord(id: scopeID), record.grant.granteeSessionID == callerSessionID else {
                 throw Self.unavailableError
             }
-            return Self.withScopeAvailability(["result": .string("ok"), "scope": Self.scopeValue(record, now: now(), ending: runtime.ending(for: record.id))], runtime: runtime)
+            var value: [String: Value] = ["result": .string("ok"), "scope": Self.scopeValue(record, now: now(), ending: runtime.ending(for: record.id))]
+            value.merge(Self.standingRuleFields(runtime, scopeID: scopeID)) { _, new in new }
+            return Self.withScopeAvailability(value, runtime: runtime)
         }
         let scopes = runtime.scopes(grantedTo: callerSessionID)
         return Self.withScopeAvailability([
             "result": .string("ok"),
             "has_live_scope": .bool(runtime.hasLiveScope(grantedTo: callerSessionID)),
-            "scopes": .array(scopes.map { Self.scopeValue($0, now: now(), ending: runtime.ending(for: $0.id)) }),
+            "scopes": .array(scopes.map { record in
+                var entry = Self.scopeValue(record, now: now(), ending: runtime.ending(for: record.id))
+                if case var .object(fields) = entry {
+                    fields.merge(Self.standingRuleFields(runtime, scopeID: record.id)) { _, new in new }
+                    entry = .object(fields)
+                }
+                return entry
+            }),
             "operation_catalog": Self.operationCatalog(),
             "guidance": .string("Capabilities describe authority, not tool discovery. For a one-target task, become_overseer with session_id and optional message requests exactly the needed capabilities and continues automatically after approval, without waiting for catalog refresh. Other catalog changes may arrive next turn. A new link authorizes operations immediately on a current route. Use agent_session_link list for exact live link capabilities. Scope membership and guardrails are checked on every call.")
         ], runtime: runtime)
@@ -408,7 +476,8 @@ struct SessionAdminMCPToolService {
             idempotencyKey: Self.parseIdempotencyKey(args["idempotency_key"], required: false),
             confirmationID: Self.parseUUID(args["confirmation_id"], field: "confirmation_id"),
             preview: Self.parsePreview(args["preview"]),
-            arguments: args
+            arguments: args,
+            callerEndpoint: endpoint
         )
         let outcome: AgentSessionAdministrationOutcome
         do {
@@ -628,6 +697,10 @@ struct SessionAdminMCPToolService {
             "capabilities": capabilitiesValue(request.capabilities),
             "guardrails": guardrails
         ]
+        if case let .directChildren(rootSessionID, workspaceID) = request.kind {
+            value["root_session_id"] = .string(rootSessionID.uuidString)
+            value["workspace_id"] = .string(workspaceID.uuidString)
+        }
         if case let .denied(reason) = request.state, let reason {
             value["denial_reason"] = .string(reason)
         }
@@ -660,6 +733,9 @@ struct SessionAdminMCPToolService {
             value["target_session_id"] = .string(target.uuidString)
         case let .tree(rootSessionID):
             value["root_session_id"] = .string(rootSessionID.uuidString)
+        case let .directChildren(rootSessionID, workspaceID):
+            value["root_session_id"] = .string(rootSessionID.uuidString)
+            value["workspace_id"] = .string(workspaceID.uuidString)
         case let .workspace(workspaceID):
             value["workspace_id"] = .string(workspaceID.uuidString)
         case .allSessions:
@@ -730,6 +806,7 @@ struct SessionAdminMCPToolService {
     ) throws -> Set<DomainDelegationScopeCapability> {
         guard let value else {
             if case .session = kind { return [.observe, .control, .restructure] }
+            if case .directChildren = kind { return [.observe, .control, .restructure] }
             if case .allSessions = kind { return DomainDelegationScopeCapability.organizeEverythingPreset }
             return DomainDelegationScopeCapability.manageTreePreset
         }

@@ -424,6 +424,8 @@ extension AgentModeViewModel {
         var preparedEpoch: AgentRunTurnEpoch?
         var pendingEpochTransition: AgentRunEpochTransitionIntent?
         let originatingConnectionID: UUID?
+        let startedBy: StarterConnectionStamp?
+        let startedByClientLabel: StarterClientLabel
         let interactionTransport: AgentInteractionTransport
         let suppressUserNotifications: Bool
         let forceAutoEditEnabled: Bool
@@ -431,6 +433,38 @@ extension AgentModeViewModel {
         /// The task label kind for this MCP-controlled run (e.g. explore, engineer).
         /// Used to customize tool advertisement and system prompts for role-specific behavior.
         let taskLabelKind: AgentModelCatalog.TaskLabelKind?
+
+        init(
+            sessionID: UUID,
+            activationID: UUID,
+            registration: AgentRunSessionStore.Registration,
+            currentEpoch: AgentRunTurnEpoch?,
+            preparedEpoch: AgentRunTurnEpoch?,
+            pendingEpochTransition: AgentRunEpochTransitionIntent?,
+            originatingConnectionID: UUID?,
+            startedBy: StarterConnectionStamp? = nil,
+            startedByClientLabel: StarterClientLabel = StarterClientLabel(name: nil),
+            interactionTransport: AgentInteractionTransport,
+            suppressUserNotifications: Bool,
+            forceAutoEditEnabled: Bool,
+            autoEditEnabledBeforeOverride: Bool,
+            taskLabelKind: AgentModelCatalog.TaskLabelKind?
+        ) {
+            self.sessionID = sessionID
+            self.activationID = activationID
+            self.registration = registration
+            self.currentEpoch = currentEpoch
+            self.preparedEpoch = preparedEpoch
+            self.pendingEpochTransition = pendingEpochTransition
+            self.originatingConnectionID = originatingConnectionID
+            self.startedBy = startedBy
+            self.startedByClientLabel = startedByClientLabel
+            self.interactionTransport = interactionTransport
+            self.suppressUserNotifications = suppressUserNotifications
+            self.forceAutoEditEnabled = forceAutoEditEnabled
+            self.autoEditEnabledBeforeOverride = autoEditEnabledBeforeOverride
+            self.taskLabelKind = taskLabelKind
+        }
 
         func replacingRegistration(_ registration: AgentRunSessionStore.Registration) -> Self {
             Self(
@@ -441,6 +475,8 @@ extension AgentModeViewModel {
                 preparedEpoch: preparedEpoch,
                 pendingEpochTransition: pendingEpochTransition,
                 originatingConnectionID: originatingConnectionID,
+                startedBy: startedBy,
+                startedByClientLabel: startedByClientLabel,
                 interactionTransport: interactionTransport,
                 suppressUserNotifications: suppressUserNotifications,
                 forceAutoEditEnabled: forceAutoEditEnabled,

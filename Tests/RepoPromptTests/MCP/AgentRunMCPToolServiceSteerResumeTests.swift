@@ -459,6 +459,48 @@ final class AgentRunMCPToolServiceSteerResumeTests: XCTestCase {
         await viewModel.mcpDeactivateControlContext(sessionID: sessionID, cleanupSessionStore: true)
     }
 
+    func testSteerReactivationLeavesStarterStampNilBesideFreshStartControl() async throws {
+        let window = try await makeWindow()
+        let viewModel = window.agentModeViewModel
+        viewModel.mcpStarterGenerationReader = { (_: UUID) in 7 }
+
+        let sessionID = UUID()
+        let session = try await makeWorkspaceOwnedSession(in: window, sessionID: sessionID)
+        session.isMCPOriginated = true
+        session.runState = .completed
+
+        var steered: AgentModeViewModel.AgentMCPControlContext?
+        var service = makeService(window: window)
+        service.testDispatchSteerInstruction = { _, _, _, agentModeVM in
+            let controlled = try XCTUnwrap(agentModeVM.mcpControlledSession(sessionID: sessionID))
+            steered = controlled.mcpControlContext
+            throw MCPError.internalError("synthetic steer dispatch stop")
+        }
+        do {
+            _ = try await service.execute(args: [
+                "op": .string("steer"),
+                "session_id": .string(sessionID.uuidString),
+                "message": .string("steer reactivation")
+            ])
+            XCTFail("Expected the synthetic steer stop")
+        } catch {
+            XCTAssertTrue(String(describing: error).contains("synthetic steer dispatch stop"), String(describing: error))
+        }
+        let steeredContext = try XCTUnwrap(steered)
+        XCTAssertNotNil(steeredContext.originatingConnectionID)
+        XCTAssertNil(steeredContext.startedBy)
+
+        let connectionID = UUID()
+        let target = try await viewModel.mcpResolveOrCreateSessionTarget(
+            tabID: nil, sessionID: nil, createIfNeeded: true, sessionName: "Fresh control"
+        )
+        let fresh = try await viewModel.mcpActivateControlContext(
+            forTabID: target.tabID, sessionID: XCTUnwrap(target.sessionID),
+            originatingConnectionID: connectionID, startPending: true, creationHandle: target.creationHandle
+        )
+        XCTAssertEqual(fresh.startedBy, StarterConnectionStamp(connectionID: connectionID, lifecycleGeneration: 7))
+    }
+
     func testSteerUnknownSessionIDStillFailsWithoutCreatingRegistration() async throws {
         let window = try await makeWindow()
 

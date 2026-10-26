@@ -163,6 +163,329 @@ final class AgentRunMCPToolServiceStartDefaultTests: XCTestCase {
         ))
     }
 
+    func testRoutedStartLaunchesAntigravityTarget() async throws {
+        let fixture = try await RoutedStartFixture.make(testCase: self, modelClass: "gemini-flash", effortRaw: "low")
+        let capture = try await fixture.start()
+
+        XCTAssertEqual(capture.agent, .antigravity)
+        XCTAssertNotEqual(capture.agent, .claudeCode)
+        XCTAssertNotEqual(capture.agent, .codexExec)
+        XCTAssertEqual(capture.model, "gemini-3.8-flash-low")
+        XCTAssertEqual(capture.parameters, [])
+        let stages = await fixture.service.questionNames
+        XCTAssertEqual(stages, ["model_route", "effort_route"])
+    }
+
+    func testRoutedStartLaunchesGrokTarget() async throws {
+        let fixture = try await RoutedStartFixture.make(testCase: self, modelClass: "grok", effortRaw: nil)
+        let capture = try await fixture.start()
+
+        XCTAssertEqual(capture.agent, .grok)
+        XCTAssertEqual(capture.model, "grok-4.7")
+        XCTAssertEqual(capture.parameters, [])
+        let stages = await fixture.service.questionNames
+        XCTAssertEqual(stages, ["model_route"])
+    }
+
+    func testRoutedStartLaunchesCursorTargetWithParameters() async throws {
+        let composer = try await RoutedStartFixture.make(testCase: self, modelClass: "composer", effortRaw: nil)
+        let composerCapture = try await composer.start()
+        XCTAssertEqual(composerCapture.agent, .cursor)
+        XCTAssertEqual(composerCapture.model, "composer-2.5")
+        XCTAssertEqual(composerCapture.parameters, [])
+
+        let grok = try await RoutedStartFixture.make(
+            testCase: self, modelClass: "cursor-grok", effortRaw: "xhigh", grokCLIConnected: false
+        )
+        let grokCapture = try await grok.start()
+        XCTAssertEqual(grokCapture.agent, .cursor)
+        XCTAssertEqual(grokCapture.model, "grok-4.7")
+        XCTAssertFalse(grokCapture.parameters.isEmpty)
+        XCTAssertEqual(grokCapture.parameters, [RoutedStartFixture.cursorGrokThinking("xhigh")])
+        let stages = await grok.service.questionNames
+        XCTAssertEqual(stages, ["model_route", "effort_route"])
+    }
+
+    func testExplicitModelIDStillBypassesRouting() async throws {
+        let fixture = try await RoutedStartFixture.make(testCase: self, modelClass: "gemini-flash", effortRaw: "low")
+        let modelID = AgentModelSelectionID(agentRaw: AgentProviderKind.cursor.rawValue, modelRaw: "composer-2.5").rawValue
+        let capture = try await fixture.start(modelID: modelID)
+
+        XCTAssertEqual(capture.agent, .cursor)
+        XCTAssertEqual(capture.model, "composer-2.5")
+        XCTAssertEqual(capture.parameters, [])
+        let stages = await fixture.service.questionNames
+        XCTAssertTrue(stages.isEmpty)
+    }
+
+    func testFreshCreationWouldCarryStarterConnectionStamp() async throws {
+        let fixture = try await RoutedStartFixture.make(testCase: self, modelClass: "gemini-flash", effortRaw: "low")
+        let viewModel = fixture.window.agentModeViewModel
+        let connectionID = UUID()
+        viewModel.mcpStarterGenerationReader = { (_: UUID) in 7 }
+        let target = try await viewModel.mcpResolveOrCreateSessionTarget(
+            tabID: nil, sessionID: nil, createIfNeeded: true, sessionName: "Starter stamp"
+        )
+        let sessionID = try XCTUnwrap(target.sessionID)
+        _ = try await viewModel.mcpActivateControlContext(
+            forTabID: target.tabID, sessionID: sessionID, originatingConnectionID: connectionID,
+            taskLabelKind: nil, startPending: true, creationHandle: target.creationHandle
+        )
+        let context = try XCTUnwrap(viewModel.session(for: target.tabID, createIfNeeded: false)?.mcpControlContext)
+        XCTAssertEqual(context.startedBy, StarterConnectionStamp(connectionID: connectionID, lifecycleGeneration: 7))
+    }
+
+    func testFreshCreationCapturesTheStartersSelfDeclaredNameBesideTheStamp() async throws {
+        let fixture = try await RoutedStartFixture.make(testCase: self, modelClass: "gemini-flash", effortRaw: "low")
+        let viewModel = fixture.window.agentModeViewModel
+        let connectionID = UUID()
+        viewModel.mcpStarterGenerationReader = { (_: UUID) in 7 }
+        var askedAbout: [UUID] = []
+        viewModel.mcpStarterClientNameReader = { askedAbout.append($0)
+            return "Codex CLI"
+        }
+        let target = try await viewModel.mcpResolveOrCreateSessionTarget(
+            tabID: nil, sessionID: nil, createIfNeeded: true, sessionName: "Starter name"
+        )
+        let sessionID = try XCTUnwrap(target.sessionID)
+        let named = try await viewModel.mcpActivateControlContext(
+            forTabID: target.tabID, sessionID: sessionID, originatingConnectionID: connectionID,
+            startPending: true, creationHandle: target.creationHandle
+        )
+        XCTAssertEqual(named.startedBy, StarterConnectionStamp(connectionID: connectionID, lifecycleGeneration: 7))
+        XCTAssertEqual(named.startedByClientLabel.name, "Codex CLI")
+        XCTAssertEqual(askedAbout, [connectionID])
+        XCTAssertEqual(named.replacingRegistration(named.registration).startedByClientLabel.name, "Codex CLI")
+
+        viewModel.mcpStarterClientNameReader = { _ in nil }
+        let unnamedTarget = try await viewModel.mcpResolveOrCreateSessionTarget(
+            tabID: nil, sessionID: nil, createIfNeeded: true, sessionName: "No name"
+        )
+        let unnamed = try await viewModel.mcpActivateControlContext(
+            forTabID: unnamedTarget.tabID, sessionID: XCTUnwrap(unnamedTarget.sessionID),
+            originatingConnectionID: connectionID, startPending: true, creationHandle: unnamedTarget.creationHandle
+        )
+        XCTAssertNotNil(unnamed.startedBy)
+        XCTAssertNil(unnamed.startedByClientLabel.name)
+    }
+
+    func testDefaultReadersStampFromTheSharedConnectionManager() async throws {
+        let fixture = try await RoutedStartFixture.make(testCase: self, modelClass: "gemini-flash", effortRaw: "low")
+        let viewModel = fixture.window.agentModeViewModel
+        let manager = ServerNetworkManager.shared
+        let connectionID = UUID()
+        await manager.debugInstallDirectAdmissionConnectionForTesting(
+            connectionID: connectionID, connection: StarterProbeConnection(), pendingClientID: "default-readers"
+        )
+        addTeardownBlock {
+            await manager.removeConnection(connectionID)
+            await manager.stop()
+        }
+        let generation = try XCTUnwrap(manager.lifecycleGeneration(of: connectionID))
+        let target = try await viewModel.mcpResolveOrCreateSessionTarget(
+            tabID: nil, sessionID: nil, createIfNeeded: true, sessionName: "Default readers"
+        )
+        let context = try await viewModel.mcpActivateControlContext(
+            forTabID: target.tabID, sessionID: XCTUnwrap(target.sessionID), originatingConnectionID: connectionID,
+            startPending: true, creationHandle: target.creationHandle
+        )
+        let stamp = StarterConnectionStamp(connectionID: connectionID, lifecycleGeneration: generation)
+        XCTAssertEqual(context.startedBy, stamp)
+        XCTAssertEqual(context.startedByClientLabel.name, "default-readers")
+        XCTAssertTrue(manager.isLiveStarter(stamp))
+    }
+
+    func testStarterNameNeverTakesPartInContextEquality() async throws {
+        let fixture = try await RoutedStartFixture.make(testCase: self, modelClass: "gemini-flash", effortRaw: "low")
+        let viewModel = fixture.window.agentModeViewModel
+        viewModel.mcpStarterGenerationReader = { (_: UUID) in 7 }
+        let target = try await viewModel.mcpResolveOrCreateSessionTarget(
+            tabID: nil, sessionID: nil, createIfNeeded: true, sessionName: "Equality"
+        )
+        let sessionID = try XCTUnwrap(target.sessionID)
+        let stamped = try await viewModel.mcpActivateControlContext(
+            forTabID: target.tabID, sessionID: sessionID, originatingConnectionID: UUID(),
+            startPending: true, creationHandle: target.creationHandle
+        )
+        func context(_ label: StarterClientLabel, stamp: StarterConnectionStamp?) -> AgentModeViewModel.AgentMCPControlContext {
+            AgentModeViewModel.AgentMCPControlContext(
+                sessionID: sessionID, activationID: stamped.activationID, registration: stamped.registration,
+                currentEpoch: nil, preparedEpoch: nil, pendingEpochTransition: nil,
+                originatingConnectionID: stamped.originatingConnectionID, startedBy: stamp, startedByClientLabel: label,
+                interactionTransport: stamped.interactionTransport,
+                suppressUserNotifications: stamped.suppressUserNotifications,
+                forceAutoEditEnabled: stamped.forceAutoEditEnabled,
+                autoEditEnabledBeforeOverride: stamped.autoEditEnabledBeforeOverride,
+                taskLabelKind: stamped.taskLabelKind
+            )
+        }
+        XCTAssertEqual(context(StarterClientLabel(name: "A"), stamp: nil), context(StarterClientLabel(name: "B"), stamp: nil))
+        XCTAssertEqual(context(StarterClientLabel(name: "A"), stamp: nil), context(StarterClientLabel(name: nil), stamp: nil))
+        let stamp = try XCTUnwrap(stamped.startedBy)
+        XCTAssertNotEqual(context(StarterClientLabel(name: "A"), stamp: stamp), context(StarterClientLabel(name: "A"), stamp: nil), "control: the stamp still takes part")
+    }
+
+    func testExistingTabFreshStartStampsAndReactivationWithoutHandleDoesNot() async throws {
+        let fixture = try await RoutedStartFixture.make(testCase: self, modelClass: "gemini-flash", effortRaw: "low")
+        let viewModel = fixture.window.agentModeViewModel
+        let connectionID = UUID()
+        viewModel.mcpStarterGenerationReader = { (_: UUID) in 7 }
+        viewModel.mcpStarterClientNameReader = { _ in "Codex CLI" }
+        let tabID = try XCTUnwrap(fixture.window.workspaceManager.activeWorkspace?.activeComposeTabID)
+        let target = try await viewModel.mcpResolveOrCreateSessionTarget(
+            tabID: tabID, sessionID: nil, createIfNeeded: true, sessionName: "Existing tab stamp"
+        )
+        XCTAssertNotNil(target.creationHandle)
+        let sessionID = try XCTUnwrap(target.sessionID)
+        let fresh = try await viewModel.mcpActivateControlContext(
+            forTabID: target.tabID, sessionID: sessionID, originatingConnectionID: connectionID,
+            startPending: true, creationHandle: target.creationHandle
+        )
+        XCTAssertEqual(fresh.startedBy, StarterConnectionStamp(connectionID: connectionID, lifecycleGeneration: 7))
+        XCTAssertEqual(fresh.startedByClientLabel.name, "Codex CLI")
+        try await viewModel.mcpConfigureSession(
+            tabID: target.tabID, agentRaw: AgentProviderKind.cursor.rawValue,
+            modelRaw: "composer-2.5", reasoningEffortRaw: nil, creationHandle: target.creationHandle
+        )
+        let committed = await viewModel.commitConfiguredSessionCreation(target: target)
+        XCTAssertTrue(committed)
+        viewModel.mcpAcceptSessionTarget(target)
+
+        await viewModel.mcpDeactivateControlContext(sessionID: sessionID, cleanupSessionStore: true)
+        let reactivated = try await viewModel.mcpActivateControlContext(
+            forTabID: target.tabID, sessionID: sessionID, originatingConnectionID: connectionID
+        )
+        XCTAssertNil(reactivated.startedBy)
+        XCTAssertNil(reactivated.startedByClientLabel.name)
+    }
+
+    func testFreshCreationLeavesStampNilWithoutReaderGenerationOrConnection() async throws {
+        let fixture = try await RoutedStartFixture.make(testCase: self, modelClass: "gemini-flash", effortRaw: "low")
+        let viewModel = fixture.window.agentModeViewModel
+        let connectionID = UUID()
+
+        viewModel.mcpStarterGenerationReader = { (_: UUID) in nil }
+        let unreadable = try await viewModel.mcpResolveOrCreateSessionTarget(
+            tabID: nil, sessionID: nil, createIfNeeded: true, sessionName: "Reader nil"
+        )
+        let unreadableContext = try await viewModel.mcpActivateControlContext(
+            forTabID: unreadable.tabID, sessionID: XCTUnwrap(unreadable.sessionID),
+            originatingConnectionID: connectionID, startPending: true, creationHandle: unreadable.creationHandle
+        )
+        XCTAssertNil(unreadableContext.startedBy)
+
+        viewModel.mcpStarterGenerationReader = { (_: UUID) in 7 }
+        let anonymous = try await viewModel.mcpResolveOrCreateSessionTarget(
+            tabID: nil, sessionID: nil, createIfNeeded: true, sessionName: "Connection nil"
+        )
+        let anonymousContext = try await viewModel.mcpActivateControlContext(
+            forTabID: anonymous.tabID, sessionID: XCTUnwrap(anonymous.sessionID),
+            originatingConnectionID: nil, startPending: true, creationHandle: anonymous.creationHandle
+        )
+        XCTAssertNil(anonymousContext.startedBy)
+
+        let control = try await viewModel.mcpResolveOrCreateSessionTarget(
+            tabID: nil, sessionID: nil, createIfNeeded: true, sessionName: "Positive control"
+        )
+        let controlContext = try await viewModel.mcpActivateControlContext(
+            forTabID: control.tabID, sessionID: XCTUnwrap(control.sessionID),
+            originatingConnectionID: connectionID, startPending: true, creationHandle: control.creationHandle
+        )
+        XCTAssertEqual(controlContext.startedBy, StarterConnectionStamp(connectionID: connectionID, lifecycleGeneration: 7))
+    }
+
+    func testStaleFreshActivationLeavesASuccessorsControlContextIntactWhileTheNameIsRead() async throws {
+        let fixture = try await RoutedStartFixture.make(testCase: self, modelClass: "gemini-flash", effortRaw: "low")
+        let viewModel = fixture.window.agentModeViewModel
+        viewModel.mcpStarterGenerationReader = { (_: UUID) in 7 }
+        let gate = StartStallGate()
+        viewModel.mcpStarterClientNameReader = { _ in
+            await gate.suspend()
+            return "Codex CLI"
+        }
+        let target = try await viewModel.mcpResolveOrCreateSessionTarget(
+            tabID: nil, sessionID: nil, createIfNeeded: true, sessionName: "Stale activation"
+        )
+        let staleSessionID = try XCTUnwrap(target.sessionID)
+        let stale = Task { @MainActor in
+            try await viewModel.mcpActivateControlContext(
+                forTabID: target.tabID, sessionID: staleSessionID, originatingConnectionID: UUID(),
+                startPending: true, creationHandle: target.creationHandle
+            )
+        }
+        await gate.waitUntilEntered()
+
+        let session = try XCTUnwrap(viewModel.session(for: target.tabID, createIfNeeded: false))
+        let successorID = UUID()
+        _ = try XCTUnwrap(viewModel.test_installPersistentSessionBinding(sessionID: successorID, on: session))
+        let registration = await AgentRunSessionStore.register(sessionID: successorID)
+        let successor = AgentModeViewModel.AgentMCPControlContext(
+            sessionID: successorID, activationID: UUID(), registration: registration,
+            currentEpoch: nil, preparedEpoch: nil, pendingEpochTransition: nil,
+            originatingConnectionID: nil,
+            interactionTransport: .mcp(sessionID: successorID, originatingConnectionID: nil),
+            suppressUserNotifications: true, forceAutoEditEnabled: true,
+            autoEditEnabledBeforeOverride: false, taskLabelKind: nil
+        )
+        session.mcpControlContext = successor
+        let queuedWork = Task<Void, Never> { try? await Task.sleep(for: .seconds(60)) }
+        session.codexFallbackSuccessorRetryTask = queuedWork
+        defer {
+            queuedWork.cancel()
+            session.codexFallbackSuccessorRetryTask = nil
+        }
+
+        gate.release()
+        do {
+            _ = try await stale.value
+            XCTFail("A fresh activation whose carrier changed owner must not succeed")
+        } catch {
+            XCTAssertTrue(error is MCPError, "Unexpected error: \(error)")
+        }
+
+        XCTAssertEqual(session.mcpControlContext, successor)
+        XCTAssertEqual(session.activeAgentSessionID, successorID)
+        XCTAssertFalse(queuedWork.isCancelled, "queued follow-up work belongs to the successor")
+        XCTAssertNotNil(session.codexFallbackSuccessorRetryTask)
+        let successorRegistered = await AgentRunSessionStore.hasActiveRegistration(sessionID: successorID)
+        XCTAssertTrue(successorRegistered)
+        await AgentRunSessionStore.cleanup(registration: registration)
+    }
+
+    func testStarterStampSurvivesReplacingRegistrationAndStamplessContextsStayEqual() async throws {
+        let fixture = try await RoutedStartFixture.make(testCase: self, modelClass: "gemini-flash", effortRaw: "low")
+        let viewModel = fixture.window.agentModeViewModel
+        let connectionID = UUID()
+        viewModel.mcpStarterGenerationReader = { (_: UUID) in 7 }
+        let target = try await viewModel.mcpResolveOrCreateSessionTarget(
+            tabID: nil, sessionID: nil, createIfNeeded: true, sessionName: "Replace registration"
+        )
+        let sessionID = try XCTUnwrap(target.sessionID)
+        let stamped = try await viewModel.mcpActivateControlContext(
+            forTabID: target.tabID, sessionID: sessionID, originatingConnectionID: connectionID,
+            startPending: true, creationHandle: target.creationHandle
+        )
+        let replacement = await AgentRunSessionStore.register(sessionID: UUID())
+        let replaced = stamped.replacingRegistration(replacement)
+        XCTAssertEqual(replaced.startedBy, stamped.startedBy)
+        XCTAssertNotNil(replaced.startedBy)
+        XCTAssertEqual(replaced, stamped.replacingRegistration(replacement))
+        XCTAssertNotEqual(replaced, stamped)
+
+        let bare = AgentModeViewModel.AgentMCPControlContext(
+            sessionID: sessionID, activationID: stamped.activationID, registration: stamped.registration,
+            currentEpoch: nil, preparedEpoch: nil, pendingEpochTransition: nil,
+            originatingConnectionID: connectionID, interactionTransport: stamped.interactionTransport,
+            suppressUserNotifications: stamped.suppressUserNotifications,
+            forceAutoEditEnabled: stamped.forceAutoEditEnabled,
+            autoEditEnabledBeforeOverride: stamped.autoEditEnabledBeforeOverride,
+            taskLabelKind: stamped.taskLabelKind
+        )
+        XCTAssertNil(bare.startedBy)
+        XCTAssertEqual(bare, bare.replacingRegistration(bare.registration))
+        XCTAssertNotEqual(bare, stamped)
+    }
+
     private func makeBindingService(
         defaults: UserDefaults,
         secureStore: AgentPermissionSecureStore? = nil

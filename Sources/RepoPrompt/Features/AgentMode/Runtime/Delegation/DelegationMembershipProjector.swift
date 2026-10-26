@@ -377,6 +377,18 @@ struct SpawnProvenanceDelegationMembershipProjector: DelegationMembershipProject
                 targetSessionID: targetSessionID,
                 basis: .treePath(path)
             )
+        case let .directChildren(rootSessionID, workspaceID):
+            let targetState = pointResolutionState(for: targetSessionID)
+            guard Self.isResolvedAnchor(
+                state: pointResolutionState(for: rootSessionID), record: source.provenance(for: rootSessionID), workspaceID: workspaceID
+            ), targetState != .ambiguous, targetState != .unproven,
+            let provenance = source.provenance(for: targetSessionID),
+            Self.isDirectChild(provenance, of: rootSessionID, workspaceID: workspaceID) else { return nil }
+            return DomainDelegationScopeMembershipProof(
+                scopeID: scope.id,
+                targetSessionID: targetSessionID,
+                basis: .directChild(rootSessionID: rootSessionID, workspaceID: workspaceID)
+            )
         case let .workspace(workspaceID):
             guard target.workspaceID == workspaceID else { return nil }
             return DomainDelegationScopeMembershipProof(
@@ -406,9 +418,26 @@ struct SpawnProvenanceDelegationMembershipProjector: DelegationMembershipProject
         case let .session(target): record.sessionID == target || record.sessionID == scope.granteeSessionID
         case .allSessions: true
         case let .workspace(id): record.workspaceID == id
+        case let .directChildren(root, workspaceID):
+            Self.isResolvedAnchor(state: census.resolutionState(for: root), record: census.byID[root], workspaceID: workspaceID)
+                && census.resolutionState(for: record.sessionID) != .ambiguous && census.resolutionState(for: record.sessionID) != .unproven
+                && Self.isDirectChild(record, of: root, workspaceID: workspaceID)
         case let .tree(root):
             census.ancestry.distance(from: record.sessionID, to: root, onLookup: onAncestryLookup).map { $0 < Self.maxChainLength } ?? false
         }
+    }
+
+    /// Immutable `parentSessionID`, current organizational parent, and workspace must all name the root.
+    static func isDirectChild(_ record: DelegationSessionProvenance, of root: UUID, workspaceID: UUID) -> Bool {
+        record.sessionID != root
+            && record.workspaceID == workspaceID
+            && record.parentSessionID == root
+            && record.effectiveOrganizationalParentID == root
+    }
+
+    /// The scope root must itself be uniquely resolved and currently placed in the scope workspace.
+    static func isResolvedAnchor(state: DelegationSessionResolutionState, record: DelegationSessionProvenance?, workspaceID: UUID) -> Bool {
+        state != .absent && state != .ambiguous && state != .unproven && record?.workspaceID == workspaceID
     }
 
     func members(of scope: DomainDelegationScopeGrant) -> [UUID] {

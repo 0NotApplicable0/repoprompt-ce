@@ -45,7 +45,7 @@ extension OverseerAuthorizationEngine {
         }
         return .scopes(liveScopes.filter { record in
             switch record.grant.kind {
-            case .session, .allSessions:
+            case .session, .allSessions, .directChildren:
                 false
             case .workspace:
                 isDelegated(creator, under: record, projector: projector)
